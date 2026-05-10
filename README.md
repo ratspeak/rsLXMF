@@ -2,7 +2,7 @@
 
 # rsLXMF
 
-**Pure-Rust LXMF messaging and propagation for Reticulum.**
+**Rust LXMF messaging and propagation for Reticulum.**
 
 [![License: AGPL-3.0-or-later](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue.svg)](LICENSE)
 [![Rust 1.85+](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
