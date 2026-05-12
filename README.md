@@ -6,7 +6,7 @@
 
 [![License: AGPL-3.0-or-later](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue.svg)](LICENSE)
 [![Rust 1.85+](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
-[![LXMF 0.9.6](https://img.shields.io/badge/target-LXMF%200.9.6-success.svg)](https://github.com/markqvist/LXMF)
+[![LXMF 0.9.8](https://img.shields.io/badge/target-LXMF%200.9.8-success.svg)](https://github.com/markqvist/LXMF)
 [![Status](https://img.shields.io/badge/status-experimental-yellow.svg)](#feature-status)
 
 [LXMF Reference](https://github.com/markqvist/LXMF) |

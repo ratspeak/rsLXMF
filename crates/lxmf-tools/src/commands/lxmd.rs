@@ -1113,6 +1113,8 @@ impl LxmdRunner {
 
     fn drain_announce_events(&mut self) -> Vec<[u8; 16]> {
         let mut seen = Vec::new();
+        let delivery_name_hash = rns_identity::name_hash::name_hash(LXMF_APP_NAME);
+        let propagation_name_hash = rns_identity::name_hash::name_hash("lxmf.propagation");
         while let Ok(event) = self.announce_rx.try_recv() {
             seen.push(event.destination_hash);
             let dest_hex = hex::encode(event.destination_hash);
@@ -1122,13 +1124,36 @@ impl LxmdRunner {
                 hops = event.hops,
                 "received announce"
             );
-            // LXMF app_data is the display name.
-            if let Some(ref data) = event.app_data
-                && let Ok(name) = std::str::from_utf8(data)
-            {
-                tracing::info!(dest = %dest_hex, name = %name, "announce display name");
-            }
-            if let Some(ref data) = event.app_data
+
+            if event.name_hash == delivery_name_hash {
+                if let Some(ref data) = event.app_data
+                    && let Some((display_name, stamp_cost)) =
+                        lxmf_core::handlers::parse_announce_app_data(data)
+                {
+                    if let Some(name) = display_name {
+                        tracing::info!(dest = %dest_hex, name = %name, "announce display name");
+                    }
+                    if let Some(cost) = stamp_cost {
+                        self.router.set_stamp_cost(event.destination_hash, cost);
+                        tracing::debug!(
+                            dest = %dest_hex,
+                            stamp_cost = cost,
+                            "learned delivery stamp cost from announce"
+                        );
+                    }
+                }
+                let triggered = self
+                    .router
+                    .trigger_outbound_for_delivery_announce(event.destination_hash);
+                if triggered > 0 {
+                    tracing::debug!(
+                        dest = %dest_hex,
+                        triggered,
+                        "delivery announce made pending outbound messages eligible"
+                    );
+                }
+            } else if event.name_hash == propagation_name_hash
+                && let Some(ref data) = event.app_data
                 && let Some(pn) = lxmf_core::handlers::parse_pn_announce_data(data)
             {
                 self.router
@@ -1138,6 +1163,16 @@ impl LxmdRunner {
                     stamp_cost = pn.stamp_cost,
                     "learned propagation-node stamp cost from announce"
                 );
+                let triggered = self
+                    .router
+                    .trigger_outbound_for_propagation_node_announce(event.destination_hash, data);
+                if triggered > 0 {
+                    tracing::debug!(
+                        dest = %dest_hex,
+                        triggered,
+                        "propagation-node announce made pending propagated messages eligible"
+                    );
+                }
             }
             if let Some(pub_key) = event.public_key
                 && self.known_identities.get(&dest_hex) != Some(&pub_key)
@@ -2204,7 +2239,11 @@ pub(crate) async fn main() {
             tracing::error!(error = ?e, "failed to sign message");
             std::process::exit(1);
         }
-        runner.router.send(msg);
+        if let Err(e) = runner.router.try_send(msg) {
+            tracing::error!(error = %e, "failed to queue message");
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
 
         // Drain phase: tick until the message leaves the router queue.
         // 30 iterations absorbs one full DELIVERY_RETRY_WAIT (10s) backoff.

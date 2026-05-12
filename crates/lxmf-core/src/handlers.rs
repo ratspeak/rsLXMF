@@ -235,7 +235,8 @@ pub fn parse_announce_app_data(data: &[u8]) -> Option<(Option<String>, Option<u8
 
     let display_name = arr[0]
         .as_slice()
-        .and_then(|b| String::from_utf8(b.to_vec()).ok());
+        .and_then(|b| String::from_utf8(b.to_vec()).ok())
+        .map(|name| name.replace('\0', "").trim().to_string());
 
     let stamp_cost = arr[1].as_u64().map(|c| c as u8);
 
@@ -740,6 +741,15 @@ mod tests {
 
         let packed = get_announce_app_data(None, Some(12));
         assert_eq!(display_name_from_app_data(&packed), None);
+    }
+
+    #[test]
+    fn test_display_name_from_app_data_strips_null_bytes_and_whitespace() {
+        let packed = get_announce_app_data(Some(" \0Alice\0 "), Some(12));
+        assert_eq!(
+            display_name_from_app_data(&packed),
+            Some("Alice".to_string())
+        );
     }
 
     #[test]

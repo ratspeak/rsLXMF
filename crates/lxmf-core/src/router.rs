@@ -4,6 +4,7 @@
 //! all mutable state.
 
 use std::collections::HashMap;
+use std::fmt;
 
 use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot};
@@ -104,6 +105,31 @@ pub struct DeferredStampJob {
     handle: stamper::DeferredStampHandle,
     rx: oneshot::Receiver<stamper::DeferredStampResult>,
 }
+
+#[derive(Debug)]
+pub enum SendError {
+    MissingOutboundPropagationNode(LxMessage),
+}
+
+impl SendError {
+    pub fn message(&self) -> &LxMessage {
+        match self {
+            Self::MissingOutboundPropagationNode(message) => message,
+        }
+    }
+}
+
+impl fmt::Display for SendError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingOutboundPropagationNode(_) => f.write_str(
+                "attempt to send propagated message with no outbound propagation node configured",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SendError {}
 
 /// LXMF router — owns all mutable state under the actor pattern.
 pub struct LxmRouter {
@@ -218,7 +244,28 @@ impl LxmRouter {
             content_len = message.content.len(),
         ),
     )]
-    pub fn send(&mut self, mut message: LxMessage) {
+    pub fn send(&mut self, message: LxMessage) {
+        let _ = self.try_send(message);
+    }
+
+    /// Queue a message for outbound delivery and report immediate routing errors.
+    ///
+    /// Mirrors Python LXMF 0.9.8's explicit `IOError` when a caller attempts
+    /// `PROPAGATED` delivery without configuring an outbound propagation node.
+    /// The legacy [`send`](Self::send) wrapper preserves older Rust call-sites
+    /// while still marking the message failed and firing its callback.
+    pub fn try_send(&mut self, mut message: LxMessage) -> Result<(), SendError> {
+        if message.method == DeliveryMethod::Propagated && self.outbound_propagation_node.is_none()
+        {
+            message.progress = 0.0;
+            if message.state != MessageState::Rejected {
+                message.mark_failed();
+            } else {
+                message.notify_failed();
+            }
+            return Err(SendError::MissingOutboundPropagationNode(message));
+        }
+
         let now = now_f64();
         if message.outbound_ticket.is_none()
             && let Some(ticket) = self.ticket_store.find(&message.destination_hash, now)
@@ -247,7 +294,7 @@ impl LxmRouter {
                 if let Some(message_hash) = message.message_id.or(message.hash) {
                     message.state = MessageState::Outbound;
                     self.pending_deferred_stamps.insert(message_hash, message);
-                    return;
+                    return Ok(());
                 }
             } else {
                 message.get_stamp();
@@ -267,7 +314,9 @@ impl LxmRouter {
             }
         }
 
+        message.state = MessageState::Outbound;
         self.pending_outbound.push(message);
+        Ok(())
     }
 
     /// Process deferred outbound message stamp generation.
@@ -761,6 +810,57 @@ impl LxmRouter {
     /// message delivery.
     pub fn set_outbound_propagation_node(&mut self, destination_hash: Option<[u8; 16]>) {
         self.outbound_propagation_node = destination_hash;
+    }
+
+    /// Mark pending direct/opportunistic messages due after a destination announce.
+    ///
+    /// Python's delivery announce handler sets `next_delivery_attempt = time.time()`
+    /// and triggers outbound processing. Rust tracks the previous attempt time,
+    /// so setting it beyond the retry window makes the message eligible on the
+    /// next scheduler tick.
+    pub fn trigger_outbound_for_delivery_announce(&mut self, destination_hash: [u8; 16]) -> usize {
+        let due_now = now_f64() - DELIVERY_RETRY_WAIT as f64;
+        let mut triggered = 0;
+        for message in &mut self.pending_outbound {
+            if message.destination_hash == destination_hash
+                && matches!(
+                    message.method,
+                    DeliveryMethod::Direct | DeliveryMethod::Opportunistic
+                )
+            {
+                message.last_delivery_attempt = due_now;
+                triggered += 1;
+            }
+        }
+        triggered
+    }
+
+    /// Mark pending propagated messages due after the configured propagation node announces.
+    ///
+    /// Mirrors LXMF 0.9.8's propagation announce handler. The announce app_data
+    /// must be a valid propagation-node announce before any retry backoff is
+    /// cleared.
+    pub fn trigger_outbound_for_propagation_node_announce(
+        &mut self,
+        destination_hash: [u8; 16],
+        app_data: &[u8],
+    ) -> usize {
+        if self.outbound_propagation_node != Some(destination_hash) {
+            return 0;
+        }
+        if crate::handlers::parse_pn_announce_data(app_data).is_none() {
+            return 0;
+        }
+
+        let due_now = now_f64() - DELIVERY_RETRY_WAIT as f64;
+        let mut triggered = 0;
+        for message in &mut self.pending_outbound {
+            if message.method == DeliveryMethod::Propagated {
+                message.last_delivery_attempt = due_now;
+                triggered += 1;
+            }
+        }
+        triggered
     }
 
     pub fn set_autopeer(&mut self, enabled: bool) {
@@ -1670,6 +1770,24 @@ mod tests {
         );
         router.send(msg);
         assert_eq!(router.pending_outbound.len(), 1);
+        assert_eq!(router.pending_outbound[0].state, MessageState::Outbound);
+    }
+
+    #[test]
+    fn test_try_send_propagated_without_node_fails_immediately() {
+        let mut router = LxmRouter::new(RouterConfig::default());
+        let msg = LxMessage::new(
+            [0xAA; 16],
+            [0xBB; 16],
+            "Propagated",
+            "Content",
+            DeliveryMethod::Propagated,
+        );
+
+        let err = router.try_send(msg).unwrap_err();
+        assert!(matches!(err, SendError::MissingOutboundPropagationNode(_)));
+        assert_eq!(err.message().state, MessageState::Failed);
+        assert!(router.pending_outbound.is_empty());
     }
 
     #[test]
@@ -1798,11 +1916,87 @@ mod tests {
         );
         router.send(msg);
 
-        let actions = router.process_outbound();
-        let has_propagated = actions
-            .iter()
-            .any(|a| matches!(a, OutboundAction::DeliverPropagated { .. }));
-        assert!(!has_propagated);
+        assert!(
+            router.pending_outbound.is_empty(),
+            "propagated messages without an outbound node fail at queue time"
+        );
+    }
+
+    #[test]
+    fn test_delivery_announce_trigger_clears_direct_retry_backoff() {
+        let mut router = LxmRouter::new(RouterConfig::default());
+        let dest = [0xAA; 16];
+        let mut msg = LxMessage::new(
+            dest,
+            [0xBB; 16],
+            "Direct",
+            "Content",
+            DeliveryMethod::Direct,
+        );
+        msg.delivery_attempts = 1;
+        msg.last_delivery_attempt = now_f64();
+        router.send(msg);
+
+        assert!(router.process_outbound().is_empty());
+        assert_eq!(router.trigger_outbound_for_delivery_announce(dest), 1);
+        assert!(matches!(
+            router.process_outbound().as_slice(),
+            [OutboundAction::DeliverDirect { .. }]
+        ));
+    }
+
+    #[test]
+    fn test_propagation_node_announce_trigger_clears_propagated_retry_backoff() {
+        let mut router = LxmRouter::new(RouterConfig::default());
+        let node = [0xCC; 16];
+        router.set_outbound_propagation_node(Some(node));
+        let mut msg = LxMessage::new(
+            [0xAA; 16],
+            [0xBB; 16],
+            "Propagated",
+            "Content",
+            DeliveryMethod::Propagated,
+        );
+        msg.delivery_attempts = 1;
+        msg.last_delivery_attempt = now_f64();
+        router.send(msg);
+
+        assert!(router.process_outbound().is_empty());
+
+        let pn_data = crate::handlers::get_propagation_node_app_data(
+            &crate::handlers::PropagationNodeAnnounceData::new(true, 256, 10240, 16, 3, 18),
+        );
+        assert_eq!(
+            router.trigger_outbound_for_propagation_node_announce(node, &pn_data),
+            1
+        );
+        assert!(matches!(
+            router.process_outbound().as_slice(),
+            [OutboundAction::DeliverPropagated { .. }]
+        ));
+    }
+
+    #[test]
+    fn test_propagation_node_announce_trigger_requires_configured_valid_node() {
+        let mut router = LxmRouter::new(RouterConfig::default());
+        let node = [0xCC; 16];
+        router.set_outbound_propagation_node(Some(node));
+        router.send(LxMessage::new(
+            [0xAA; 16],
+            [0xBB; 16],
+            "Propagated",
+            "Content",
+            DeliveryMethod::Propagated,
+        ));
+
+        assert_eq!(
+            router.trigger_outbound_for_propagation_node_announce([0xDD; 16], b"not-msgpack"),
+            0
+        );
+        assert_eq!(
+            router.trigger_outbound_for_propagation_node_announce(node, b"not-msgpack"),
+            0
+        );
     }
 
     /// A queued message older than `MESSAGE_EXPIRY` must be flushed as
