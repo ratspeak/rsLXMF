@@ -25,6 +25,7 @@ use crate::peer::LxmPeer;
 use crate::propagation::hex_encode;
 use crate::propagation_node::{PropagationNode, PropagationNodeConfig};
 use crate::sync::OfferResponse;
+use crate::types::PropagationTransientId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncTaskState {
@@ -315,11 +316,11 @@ impl PropagationSyncTask {
                 self.state = SyncTaskState::Complete;
             }
             OfferResponse::WantSome(wanted_id_bytes) => {
-                let wanted_ids: Vec<[u8; 16]> = wanted_id_bytes
+                let wanted_ids: Vec<PropagationTransientId> = wanted_id_bytes
                     .iter()
                     .filter_map(|id| {
-                        if id.len() == 16 {
-                            let mut arr = [0u8; 16];
+                        if id.len() == 32 {
+                            let mut arr = [0u8; 32];
                             arr.copy_from_slice(id);
                             Some(arr)
                         } else {
@@ -335,7 +336,7 @@ impl PropagationSyncTask {
         }
     }
 
-    fn queue_messages_for_ids(&mut self, ids: &[[u8; 16]]) {
+    fn queue_messages_for_ids(&mut self, ids: &[PropagationTransientId]) {
         let results = self.propagation_node.message_get_request(ids);
         self.transfer_queue = results.into_iter().map(|(_tid, data)| data).collect();
 
@@ -958,7 +959,7 @@ mod tests {
         task.set_node([0xBB; 16]);
         task.state = SyncTaskState::AwaitingResponse;
 
-        let wanted = vec![vec![0x11; 16], vec![0x22; 16]];
+        let wanted = vec![vec![0x11; 32], vec![0x22; 32]];
         task.handle_offer_response(OfferResponse::WantSome(wanted));
         assert_eq!(task.state, SyncTaskState::Complete);
     }
@@ -982,7 +983,7 @@ mod tests {
             crate::constants::DeliveryMethod::Propagated,
         );
         msg.sign(&key).unwrap();
-        let tid = rns_crypto::sha::truncated_hash(&msg.hash.unwrap());
+        let tid = msg.transient_id.unwrap();
         task.accept_message(&msg);
 
         let wanted = vec![tid.to_vec()];

@@ -17,6 +17,7 @@ use std::path::Path;
 
 use crate::router::StampCostEntry;
 use crate::ticket::Ticket;
+use crate::types::PropagationTransientId;
 
 pub const STAMP_COSTS_FILE: &str = "outbound_stamp_costs";
 pub const TICKETS_FILE: &str = "available_tickets";
@@ -63,19 +64,25 @@ pub fn load_tickets(dir: &Path) -> io::Result<Vec<Ticket>> {
     Ok(read_mpk(&dir.join(TICKETS_FILE))?.unwrap_or_default())
 }
 
-pub fn save_local_deliveries(dir: &Path, ids: &HashMap<[u8; 16], f64>) -> io::Result<()> {
+pub fn save_local_deliveries(
+    dir: &Path,
+    ids: &HashMap<PropagationTransientId, f64>,
+) -> io::Result<()> {
     write_mpk(&dir.join(LOCAL_DELIVERIES_FILE), ids)
 }
 
-pub fn load_local_deliveries(dir: &Path) -> io::Result<HashMap<[u8; 16], f64>> {
+pub fn load_local_deliveries(dir: &Path) -> io::Result<HashMap<PropagationTransientId, f64>> {
     Ok(read_mpk(&dir.join(LOCAL_DELIVERIES_FILE))?.unwrap_or_default())
 }
 
-pub fn save_locally_processed(dir: &Path, ids: &HashMap<[u8; 16], f64>) -> io::Result<()> {
+pub fn save_locally_processed(
+    dir: &Path,
+    ids: &HashMap<PropagationTransientId, f64>,
+) -> io::Result<()> {
     write_mpk(&dir.join(LOCALLY_PROCESSED_FILE), ids)
 }
 
-pub fn load_locally_processed(dir: &Path) -> io::Result<HashMap<[u8; 16], f64>> {
+pub fn load_locally_processed(dir: &Path) -> io::Result<HashMap<PropagationTransientId, f64>> {
     Ok(read_mpk(&dir.join(LOCALLY_PROCESSED_FILE))?.unwrap_or_default())
 }
 
@@ -116,7 +123,7 @@ mod tests {
     fn local_deliveries_roundtrip() {
         let tmp = TempDir::new().unwrap();
         let mut ids = HashMap::new();
-        ids.insert([0x03; 16], 1_700_000_000.0);
+        ids.insert([0x03; 32], 1_700_000_000.0);
         save_local_deliveries(tmp.path(), &ids).unwrap();
         let loaded = load_local_deliveries(tmp.path()).unwrap();
         assert_eq!(loaded.len(), 1);

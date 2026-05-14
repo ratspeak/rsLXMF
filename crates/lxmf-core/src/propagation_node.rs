@@ -13,6 +13,7 @@ use crate::message::LxMessage;
 use crate::peer::LxmPeer;
 use crate::propagation::{PropagationEntry, PropagationStore, hex_encode};
 use crate::sync::{OfferResponse, SyncGet, SyncOffer, SyncSession};
+use crate::types::PropagationTransientId;
 
 #[derive(Debug, Clone)]
 pub struct PropagationNodeConfig {
@@ -105,7 +106,7 @@ impl PropagationNode {
             None => return false,
         };
 
-        let transient_id = rns_crypto::sha::truncated_hash(&hash);
+        let transient_id = message.transient_id.unwrap_or(hash);
         if self.store.contains(&transient_id) {
             return false;
         }
@@ -174,9 +175,7 @@ impl PropagationNode {
             return false;
         }
 
-        let full = rns_crypto::sha::full_hash(lxmf_data);
-        let mut transient_id = [0u8; 16];
-        transient_id.copy_from_slice(&full[..16]);
+        let transient_id = rns_crypto::sha::full_hash(lxmf_data);
         if self.store.contains(&transient_id) {
             return false;
         }
@@ -190,12 +189,9 @@ impl PropagationNode {
         let mut destination_hash = [0u8; 16];
         destination_hash.copy_from_slice(&lxmf_data[..DESTINATION_LENGTH]);
 
-        let mut message_hash = [0u8; 32];
-        message_hash.copy_from_slice(&full);
-
         let entry = PropagationEntry::new(
             transient_id,
-            message_hash,
+            transient_id,
             destination_hash,
             lxmf_data.len(),
             stamp_value,
@@ -320,7 +316,7 @@ impl PropagationNode {
         &self,
         _peer_hash: [u8; 16],
         peer_min_stamp_cost: Option<u8>,
-    ) -> Vec<[u8; 16]> {
+    ) -> Vec<PropagationTransientId> {
         match peer_min_stamp_cost {
             Some(min_cost) if min_cost > 0 => self
                 .store
@@ -333,7 +329,10 @@ impl PropagationNode {
     }
 
     /// Returns only messages the peer has not already received.
-    pub fn create_offer_filtered(&self, handled: &HashSet<[u8; 16]>) -> Vec<[u8; 16]> {
+    pub fn create_offer_filtered(
+        &self,
+        handled: &HashSet<PropagationTransientId>,
+    ) -> Vec<PropagationTransientId> {
         self.store
             .transient_ids()
             .into_iter()
@@ -349,7 +348,7 @@ impl PropagationNode {
         self.store.total_size()
     }
 
-    pub fn contains(&self, transient_id: &[u8; 16]) -> bool {
+    pub fn contains(&self, transient_id: &PropagationTransientId) -> bool {
         self.store.contains(transient_id)
     }
 
@@ -387,9 +386,9 @@ impl PropagationNode {
     pub fn offer_request(
         &mut self,
         _peer_hash: [u8; 16],
-        offered_ids: &[[u8; 16]],
-    ) -> Vec<[u8; 16]> {
-        let peer_has: HashSet<[u8; 16]> = offered_ids.iter().copied().collect();
+        offered_ids: &[PropagationTransientId],
+    ) -> Vec<PropagationTransientId> {
+        let peer_has: HashSet<PropagationTransientId> = offered_ids.iter().copied().collect();
 
         self.store
             .transient_ids()
@@ -411,7 +410,7 @@ impl PropagationNode {
         is_throttled: bool,
         access_allowed: bool,
         peering_key_valid: bool,
-        offered_ids: &[[u8; 16]],
+        offered_ids: &[PropagationTransientId],
     ) -> OfferResponse {
         if !identity_known {
             return OfferResponse::ErrorNoIdentity;
@@ -426,7 +425,7 @@ impl PropagationNode {
             return OfferResponse::ErrorInvalidKey;
         }
 
-        let wanted: Vec<[u8; 16]> = offered_ids
+        let wanted: Vec<PropagationTransientId> = offered_ids
             .iter()
             .filter(|id| !self.store.contains(id))
             .copied()
@@ -530,7 +529,7 @@ impl PropagationNode {
     }
 
     /// Expected wire format: `[peering_key_bytes, [transient_id_1, ...]]`.
-    fn decode_offer_request(data: &[u8]) -> Option<(Vec<u8>, Vec<[u8; 16]>)> {
+    fn decode_offer_request(data: &[u8]) -> Option<(Vec<u8>, Vec<PropagationTransientId>)> {
         let value: rmpv::Value = rmpv::decode::read_value(&mut &data[..]).ok()?;
         let arr = value.as_array()?;
         if arr.len() < 2 {
@@ -544,14 +543,9 @@ impl PropagationNode {
         for id_val in ids_array {
             if let Some(id_bytes) = id_val.as_slice() {
                 match id_bytes.len() {
-                    16 => {
-                        let mut tid = [0u8; 16];
-                        tid.copy_from_slice(id_bytes);
-                        offered_ids.push(tid);
-                    }
                     32 => {
-                        let mut tid = [0u8; 16];
-                        tid.copy_from_slice(&id_bytes[..16]);
+                        let mut tid = [0u8; 32];
+                        tid.copy_from_slice(id_bytes);
                         offered_ids.push(tid);
                     }
                     _ => {}
@@ -598,17 +592,12 @@ impl PropagationNode {
         let wants_is_nil = arr[0].is_nil();
         let haves_is_nil = arr[1].is_nil();
 
-        fn parse_store_id(value: &rmpv::Value) -> Option<[u8; 16]> {
+        fn parse_store_id(value: &rmpv::Value) -> Option<PropagationTransientId> {
             let id_bytes = value.as_slice()?;
             match id_bytes.len() {
-                16 => {
-                    let mut tid = [0u8; 16];
-                    tid.copy_from_slice(id_bytes);
-                    Some(tid)
-                }
                 32 => {
-                    let mut tid = [0u8; 16];
-                    tid.copy_from_slice(&id_bytes[..16]);
+                    let mut tid = [0u8; 32];
+                    tid.copy_from_slice(id_bytes);
                     Some(tid)
                 }
                 _ => None,
@@ -687,7 +676,10 @@ impl PropagationNode {
     /// Fetch raw packed message data for each requested transient ID. Python
     /// reference: LXMRouter.message_get_request_received(). Returns an empty
     /// vec when there is no disk storage configured.
-    pub fn message_get_request(&self, requested_ids: &[[u8; 16]]) -> Vec<([u8; 16], Vec<u8>)> {
+    pub fn message_get_request(
+        &self,
+        requested_ids: &[PropagationTransientId],
+    ) -> Vec<(PropagationTransientId, Vec<u8>)> {
         let dir = match &self.storage_path {
             Some(d) => d,
             None => return Vec::new(),
@@ -747,10 +739,10 @@ impl PropagationNode {
 
         let mut messages = Vec::new();
         for wanted_id_bytes in &get.wanted_ids {
-            if wanted_id_bytes.len() != 16 {
+            if wanted_id_bytes.len() != 32 {
                 continue;
             }
-            let mut tid = [0u8; 16];
+            let mut tid = [0u8; 32];
             tid.copy_from_slice(wanted_id_bytes);
 
             if let Some(ref dir) = self.storage_path
@@ -771,7 +763,11 @@ impl PropagationNode {
     /// the sync session. Python reference:
     /// LXMRouter.propagation_resource_concluded() (LXMRouter.py:2271) --
     /// `peer.queue_handled_message(transient_id)`.
-    pub fn mark_peer_handled(&mut self, peer_hash: &[u8; 16], transient_id: &[u8; 16]) {
+    pub fn mark_peer_handled(
+        &mut self,
+        peer_hash: &[u8; 16],
+        transient_id: &PropagationTransientId,
+    ) {
         if let Some(mut peer) = self.load_peer(peer_hash) {
             peer.add_handled_message(transient_id);
             let _ = self.save_peer(&peer);
@@ -841,6 +837,14 @@ mod tests {
         let mut msg = LxMessage::new(dest, src, title, content, DeliveryMethod::Propagated);
         msg.sign(&key).unwrap();
         msg
+    }
+
+    fn tid(byte: u8) -> PropagationTransientId {
+        [byte; 32]
+    }
+
+    fn id(byte: u8) -> Vec<u8> {
+        vec![byte; 32]
     }
 
     #[test]
@@ -917,7 +921,7 @@ mod tests {
         let msg1 = make_signed_message([0xBB; 16], [0xCC; 16], "Test", "msg1");
         let msg2 = make_signed_message([0xBB; 16], [0xCC; 16], "Test", "msg2");
 
-        let tid1 = rns_crypto::sha::truncated_hash(&msg1.hash.unwrap());
+        let tid1 = msg1.transient_id.unwrap();
         node.accept_message(&msg1);
         node.accept_message(&msg2);
 
@@ -1059,12 +1063,12 @@ mod tests {
         .unwrap();
 
         let mut peer = LxmPeer::new([0xBB; 16]);
-        peer.add_handled_message(&[0xCC; 16]);
+        peer.add_handled_message(&tid(0xCC));
         node.save_peer(&peer).unwrap();
 
         let loaded_peers = node.load_peers();
         assert_eq!(loaded_peers.len(), 1);
-        assert!(loaded_peers[0].has_handled(&[0xCC; 16]));
+        assert!(loaded_peers[0].has_handled(&tid(0xCC)));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1082,12 +1086,12 @@ mod tests {
         .unwrap();
 
         let mut peer1 = LxmPeer::new([0xBB; 16]);
-        peer1.add_handled_message(&[0x11; 16]);
+        peer1.add_handled_message(&tid(0x11));
         node.save_peer(&peer1).unwrap();
 
         let mut peer2 = LxmPeer::new([0xDD; 16]);
-        peer2.add_handled_message(&[0x22; 16]);
-        peer2.add_handled_message(&[0x33; 16]);
+        peer2.add_handled_message(&tid(0x22));
+        peer2.add_handled_message(&tid(0x33));
         node.save_peer(&peer2).unwrap();
 
         let loaded = node.load_peers();
@@ -1182,9 +1186,9 @@ mod tests {
         let msg2 = make_signed_message([0xBB; 16], [0xCC; 16], "Test", "msg2");
         let msg3 = make_signed_message([0xBB; 16], [0xCC; 16], "Test", "msg3");
 
-        let tid1 = rns_crypto::sha::truncated_hash(&msg1.hash.unwrap());
-        let tid2 = rns_crypto::sha::truncated_hash(&msg2.hash.unwrap());
-        let tid3 = rns_crypto::sha::truncated_hash(&msg3.hash.unwrap());
+        let tid1 = msg1.transient_id.unwrap();
+        let tid2 = msg2.transient_id.unwrap();
+        let tid3 = msg3.transient_id.unwrap();
 
         node.accept_message(&msg1);
         node.accept_message(&msg2);
@@ -1213,7 +1217,7 @@ mod tests {
         let mut node = PropagationNode::new(PropagationNodeConfig::default(), [0xAA; 16]);
 
         let msg = make_signed_message([0xBB; 16], [0xCC; 16], "Test", "content");
-        let tid = rns_crypto::sha::truncated_hash(&msg.hash.unwrap());
+        let tid = msg.transient_id.unwrap();
         node.accept_message(&msg);
 
         let missing = node.offer_request([0xDD; 16], &[tid]);
@@ -1233,7 +1237,7 @@ mod tests {
         .unwrap();
 
         let msg = make_signed_message([0xBB; 16], [0xCC; 16], "Test", "get request content");
-        let tid = rns_crypto::sha::truncated_hash(&msg.hash.unwrap());
+        let tid = msg.transient_id.unwrap();
         node.accept_message(&msg);
 
         let results = node.message_get_request(&[tid]);
@@ -1259,7 +1263,7 @@ mod tests {
         )
         .unwrap();
 
-        let results = node.message_get_request(&[[0xFF; 16]]);
+        let results = node.message_get_request(&[tid(0xFF)]);
         assert!(results.is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1269,7 +1273,7 @@ mod tests {
     fn test_message_get_request_no_storage() {
         let node = PropagationNode::new(PropagationNodeConfig::default(), [0xAA; 16]);
 
-        let results = node.message_get_request(&[[0xFF; 16]]);
+        let results = node.message_get_request(&[tid(0xFF)]);
         assert!(results.is_empty());
     }
 
@@ -1294,11 +1298,11 @@ mod tests {
         let mut node = PropagationNode::new(PropagationNodeConfig::default(), [0xAA; 16]);
 
         let msg1 = make_signed_message([0xBB; 16], [0xCC; 16], "Test", "has_this");
-        let tid1 = rns_crypto::sha::truncated_hash(&msg1.hash.unwrap());
+        let tid1 = msg1.transient_id.unwrap();
         node.accept_message(&msg1);
 
         let peer_hash = [0xDD; 16];
-        let tid2 = [0xEE; 16];
+        let tid2 = tid(0xEE);
         let offer = crate::sync::SyncOffer {
             peering_key: Vec::new(),
             transient_ids: vec![tid1.to_vec(), tid2.to_vec()],
@@ -1337,7 +1341,7 @@ mod tests {
         .unwrap();
 
         let msg = make_signed_message([0xBB; 16], [0xCC; 16], "Test", "sync get content");
-        let tid = rns_crypto::sha::truncated_hash(&msg.hash.unwrap());
+        let tid = msg.transient_id.unwrap();
         node.accept_message(&msg);
 
         let get = crate::sync::SyncGet {
@@ -1387,7 +1391,7 @@ mod tests {
     fn test_offer_request_checked_have_all() {
         let mut node = PropagationNode::new(PropagationNodeConfig::default(), [0xAA; 16]);
         let msg = make_signed_message([0xBB; 16], [0xCC; 16], "Test", "content");
-        let tid = rns_crypto::sha::truncated_hash(&msg.hash.unwrap());
+        let tid = msg.transient_id.unwrap();
         node.accept_message(&msg);
 
         let resp = node.offer_request_checked([0xDD; 16], true, false, true, true, &[tid]);
@@ -1404,7 +1408,7 @@ mod tests {
             false,
             true,
             true,
-            &[[0x11; 16], [0x22; 16]],
+            &[tid(0x11), tid(0x22)],
         );
         assert_eq!(resp, OfferResponse::WantAll);
     }
@@ -1413,15 +1417,15 @@ mod tests {
     fn test_offer_request_checked_want_some() {
         let mut node = PropagationNode::new(PropagationNodeConfig::default(), [0xAA; 16]);
         let msg = make_signed_message([0xBB; 16], [0xCC; 16], "Test", "content");
-        let tid = rns_crypto::sha::truncated_hash(&msg.hash.unwrap());
+        let stored_tid = msg.transient_id.unwrap();
         node.accept_message(&msg);
 
         let resp =
-            node.offer_request_checked([0xDD; 16], true, false, true, true, &[tid, [0x99; 16]]);
+            node.offer_request_checked([0xDD; 16], true, false, true, true, &[stored_tid, tid(0x99)]);
         match resp {
             OfferResponse::WantSome(ids) => {
                 assert_eq!(ids.len(), 1);
-                assert_eq!(ids[0], [0x99; 16].to_vec());
+                assert_eq!(ids[0], id(0x99));
             }
             _ => panic!("expected WantSome"),
         }
@@ -1445,7 +1449,7 @@ mod tests {
         let parsed = OfferResponse::from_msgpack(&encoded);
         assert_eq!(parsed, OfferResponse::ErrorThrottled);
 
-        let ids = vec![vec![0xAA; 16], vec![0xBB; 16]];
+        let ids = vec![id(0xAA), id(0xBB)];
         let encoded = PropagationNode::encode_offer_response(&OfferResponse::WantSome(ids.clone()));
         let parsed = OfferResponse::from_msgpack(&encoded);
         match parsed {
@@ -1465,8 +1469,8 @@ mod tests {
         let offer = Value::Array(vec![
             Value::Binary(vec![]),
             Value::Array(vec![
-                Value::Binary(vec![0x11; 16]),
-                Value::Binary(vec![0x22; 16]),
+                Value::Binary(id(0x11)),
+                Value::Binary(id(0x22)),
             ]),
         ]);
         let mut buf = Vec::new();
@@ -1507,8 +1511,8 @@ mod tests {
         let offer = Value::Array(vec![
             Value::Binary(vec![0xAA; 32]),
             Value::Array(vec![
-                Value::Binary(vec![0x11; 16]),
-                Value::Binary(vec![0x22; 16]),
+                Value::Binary(id(0x11)),
+                Value::Binary(id(0x22)),
             ]),
         ]);
         let mut buf = Vec::new();
@@ -1519,8 +1523,8 @@ mod tests {
         let (key, ids) = result.unwrap();
         assert_eq!(key, vec![0xAA; 32]);
         assert_eq!(ids.len(), 2);
-        assert_eq!(ids[0], [0x11; 16]);
-        assert_eq!(ids[1], [0x22; 16]);
+        assert_eq!(ids[0], tid(0x11));
+        assert_eq!(ids[1], tid(0x22));
     }
 
     #[test]
@@ -1531,16 +1535,15 @@ mod tests {
             Value::Array(vec![
                 Value::Binary(vec![0x11; 16]),
                 Value::Binary(vec![0x22; 8]),
-                Value::Binary(vec![0x33; 32]),
+                Value::Binary(id(0x33)),
             ]),
         ]);
         let mut buf = Vec::new();
         rmpv::encode::write_value(&mut buf, &offer).unwrap();
 
         let (_, ids) = PropagationNode::decode_offer_request(&buf).unwrap();
-        assert_eq!(ids.len(), 2);
-        assert_eq!(ids[0], [0x11; 16]);
-        assert_eq!(ids[1], [0x33; 16]);
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0], tid(0x33));
     }
 
     #[test]
@@ -1567,7 +1570,7 @@ mod tests {
         let response: rmpv::Value = rmpv::decode::read_value(&mut &response_bytes[..]).unwrap();
         let arr = response.as_array().unwrap();
         assert_eq!(arr.len(), 1);
-        assert_eq!(arr[0].as_slice().unwrap().len(), 16);
+        assert_eq!(arr[0].as_slice().unwrap().len(), 32);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1693,7 +1696,7 @@ mod tests {
         .unwrap();
 
         let msg = make_signed_message([0xBB; 16], [0xCC; 16], "Test", "purge content");
-        let tid = rns_crypto::sha::truncated_hash(&msg.hash.unwrap());
+        let tid = msg.transient_id.unwrap();
         node.accept_message(&msg);
         assert_eq!(node.message_count(), 1);
 
@@ -1724,7 +1727,7 @@ mod tests {
         .unwrap();
 
         let msg = make_signed_message([0xBB; 16], [0xCC; 16], "Test", "get data content");
-        let tid = rns_crypto::sha::truncated_hash(&msg.hash.unwrap());
+        let tid = msg.transient_id.unwrap();
         node.accept_message(&msg);
 
         use rmpv::Value;
@@ -1775,7 +1778,7 @@ mod tests {
         let mut node = PropagationNode::new(PropagationNodeConfig::default(), [0xAA; 16]);
 
         let entry1 = crate::propagation::PropagationEntry {
-            transient_id: [0x01; 16],
+            transient_id: tid(0x01),
             message_hash: [0x11; 32],
             destination_hash: [0xCC; 16],
             stored_at: 1000.0,
@@ -1784,7 +1787,7 @@ mod tests {
             collected: false,
         };
         let entry2 = crate::propagation::PropagationEntry {
-            transient_id: [0x02; 16],
+            transient_id: tid(0x02),
             message_hash: [0x22; 32],
             destination_hash: [0xCC; 16],
             stored_at: 1000.0,
@@ -1800,7 +1803,7 @@ mod tests {
 
         let filtered = node.create_offer([0xFF; 16], Some(10));
         assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0], [0x01; 16]);
+        assert_eq!(filtered[0], tid(0x01));
 
         let all2 = node.create_offer([0xFF; 16], Some(0));
         assert_eq!(all2.len(), 2);

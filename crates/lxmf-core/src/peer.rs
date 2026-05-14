@@ -5,6 +5,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::constants::*;
+use crate::types::PropagationTransientId;
 
 type StoredPeer = (
     Vec<u8>,
@@ -39,7 +40,7 @@ pub struct LxmPeer {
     pub propagation_transfer_limit: Option<f64>,
     /// Per-sync propagation limit in KB.
     pub propagation_sync_limit: Option<f64>,
-    pub currently_transferring_messages: Option<Vec<[u8; 16]>>,
+    pub currently_transferring_messages: Option<Vec<PropagationTransientId>>,
     pub link_alive: bool,
     pub created_at: f64,
     pub last_heard: f64,
@@ -61,7 +62,7 @@ pub struct LxmPeer {
     /// Static peers are operator-configured; autopeered peers come from announces.
     pub is_static: bool,
     /// Message hashes already handled by this peer, for sync filtering.
-    pub handled_messages: std::collections::HashSet<[u8; 16]>,
+    pub handled_messages: std::collections::HashSet<PropagationTransientId>,
 }
 
 impl LxmPeer {
@@ -162,11 +163,11 @@ impl LxmPeer {
         self.sync_backoff = 0.0;
     }
 
-    pub fn add_handled_message(&mut self, hash: &[u8; 16]) {
+    pub fn add_handled_message(&mut self, hash: &PropagationTransientId) {
         self.handled_messages.insert(*hash);
     }
 
-    pub fn has_handled(&self, hash: &[u8; 16]) -> bool {
+    pub fn has_handled(&self, hash: &PropagationTransientId) -> bool {
         self.handled_messages.contains(hash)
     }
 
@@ -218,8 +219,8 @@ impl LxmPeer {
         peer.handled_messages = handled_vec
             .into_iter()
             .filter_map(|v| {
-                if v.len() == 16 {
-                    let mut arr = [0u8; 16];
+                if v.len() == 32 {
+                    let mut arr = [0u8; 32];
                     arr.copy_from_slice(&v);
                     Some(arr)
                 } else {
@@ -440,6 +441,10 @@ fn now_f64() -> f64 {
 mod tests {
     use super::*;
 
+    fn tid(byte: u8) -> PropagationTransientId {
+        [byte; 32]
+    }
+
     #[test]
     fn test_new_peer() {
         let peer = LxmPeer::new([0xAA; 16]);
@@ -509,7 +514,7 @@ mod tests {
         let mut peer = LxmPeer::new([0; 16]);
         assert!(peer.currently_transferring_messages.is_none());
 
-        peer.currently_transferring_messages = Some(vec![[0xAA; 16], [0xBB; 16]]);
+        peer.currently_transferring_messages = Some(vec![tid(0xAA), tid(0xBB)]);
         assert_eq!(
             peer.currently_transferring_messages.as_ref().unwrap().len(),
             2
@@ -658,7 +663,7 @@ mod tests {
         let mut peer = LxmPeer::new([0xAA; 16]);
         peer.begin_sync();
         peer.link_established([0xBB; 16], Some(10.0));
-        peer.currently_transferring_messages = Some(vec![[0x01; 16], [0x02; 16]]);
+        peer.currently_transferring_messages = Some(vec![tid(0x01), tid(0x02)]);
 
         peer.link_closed();
 

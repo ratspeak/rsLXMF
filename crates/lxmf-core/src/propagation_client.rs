@@ -29,6 +29,7 @@ use tokio::sync::mpsc;
 
 use crate::constants::*;
 use crate::propagation::hex_encode;
+use crate::types::PropagationTransientId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PropagationClientState {
@@ -118,7 +119,7 @@ impl PropagationClient {
         self.delivery_limit = Some(limit_kb);
     }
 
-    pub fn add_local_message(&mut self, transient_id: [u8; 16]) {
+    pub fn add_local_message(&mut self, transient_id: PropagationTransientId) {
         self.local_messages.insert(transient_id.to_vec());
     }
 
@@ -693,7 +694,7 @@ impl PropagationClient {
             self.available_messages.clear();
             for item in arr {
                 if let Some(id_bytes) = item.as_slice()
-                    && matches!(id_bytes.len(), 16 | 32)
+                    && id_bytes.len() == 32
                 {
                     self.available_messages.push(id_bytes.to_vec());
                 }
@@ -1064,10 +1065,10 @@ mod tests {
         let (tx, _rx) = mpsc::channel(16);
         let mut client = PropagationClient::new(tx, None, None);
 
-        client.add_local_message([0xAA; 16]);
-        client.add_local_message([0xBB; 16]);
+        client.add_local_message([0xAA; 32]);
+        client.add_local_message([0xBB; 32]);
         assert_eq!(client.local_messages.len(), 2);
-        assert!(client.local_messages.contains(&vec![0xAA; 16]));
+        assert!(client.local_messages.contains(&vec![0xAA; 32]));
         client.add_local_message_id(vec![0xCC; 32]);
         assert!(client.local_messages.contains(&vec![0xCC; 32]));
     }

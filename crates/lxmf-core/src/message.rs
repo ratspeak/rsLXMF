@@ -12,7 +12,7 @@
 //! ```text
 //! encrypted_data     = destination.encrypt(packed[16..])
 //! lxmf_data          = packed[..16] + encrypted_data
-//! transient_id       = full_hash(lxmf_data)[..16]
+//! transient_id       = full_hash(lxmf_data)
 //! lxmf_data         += ?propagation_stamp
 //! propagation_packed = msgpack([timestamp, [lxmf_data]])
 //! ```
@@ -28,6 +28,7 @@ use rns_crypto::sha::{full_hash, sha256, truncated_hash};
 use serde::{Deserialize, Serialize};
 
 use crate::constants::*;
+use crate::types::PropagationTransientId;
 
 /// Shared handler invoked on per-message state transitions.
 pub type MessageCallback = Arc<dyn Fn(&LxMessage) + Send + Sync>;
@@ -88,8 +89,8 @@ pub struct LxMessage {
     pub hash: Option<[u8; 32]>,
     /// Alias for [`hash`](Self::hash) set after packing.
     pub message_id: Option<[u8; 32]>,
-    /// Truncated hash used by the propagation offer/get protocol.
-    pub transient_id: Option<[u8; 16]>,
+    /// Full hash used by the propagation offer/get protocol.
+    pub transient_id: Option<PropagationTransientId>,
     /// Destination-required stamp cost for outbound stamp generation.
     pub stamp_cost: Option<u8>,
     /// Outbound ticket for stamp bypass (16 bytes).
@@ -307,7 +308,7 @@ impl LxMessage {
     pub fn pack_propagated_encrypted<F>(
         &mut self,
         encrypt_fn: F,
-    ) -> Result<(Vec<u8>, [u8; 16]), MessageError>
+    ) -> Result<(Vec<u8>, PropagationTransientId), MessageError>
     where
         F: FnOnce(&[u8]) -> Result<Vec<u8>, MessageError>,
     {
@@ -325,7 +326,7 @@ impl LxMessage {
         &mut self,
         encrypt_fn: F,
         target_cost: u8,
-    ) -> Result<(Vec<u8>, [u8; 16], u32), MessageError>
+    ) -> Result<(Vec<u8>, PropagationTransientId, u32), MessageError>
     where
         F: FnOnce(&[u8]) -> Result<Vec<u8>, MessageError>,
     {
@@ -336,7 +337,7 @@ impl LxMessage {
         &mut self,
         encrypt_fn: F,
         propagation_stamp_cost: Option<u8>,
-    ) -> Result<(Vec<u8>, [u8; 16], u32), MessageError>
+    ) -> Result<(Vec<u8>, PropagationTransientId, u32), MessageError>
     where
         F: FnOnce(&[u8]) -> Result<Vec<u8>, MessageError>,
     {
@@ -349,9 +350,7 @@ impl LxMessage {
         lxmf_data.extend_from_slice(&encrypted_data);
 
         // transient_id is computed before the propagation stamp is appended.
-        let full = full_hash(&lxmf_data);
-        let mut tid = [0u8; 16];
-        tid.copy_from_slice(&full[..16]);
+        let tid = full_hash(&lxmf_data);
         self.transient_id = Some(tid);
 
         let mut stamp_value = 0;
@@ -359,7 +358,7 @@ impl LxMessage {
             && self.propagation_stamp.is_none()
         {
             let (stamp, value) = crate::stamper::generate_stamp_raw(
-                &full,
+                &tid,
                 target_cost,
                 crate::constants::STAMP_WORKBLOCK_EXPAND_ROUNDS_PN,
             )
@@ -373,7 +372,7 @@ impl LxMessage {
         if let Some(ref prop_stamp) = self.propagation_stamp {
             if stamp_value == 0 {
                 let workblock = crate::stamper::stamp_workblock_raw(
-                    &full,
+                    &tid,
                     crate::constants::STAMP_WORKBLOCK_EXPAND_ROUNDS_PN,
                 );
                 stamp_value = crate::stamper::stamp_value_raw(&workblock, prop_stamp);
@@ -414,16 +413,13 @@ impl LxMessage {
         Ok(wrapper)
     }
 
-    /// Compute `transient_id = full_hash(lxmf_data)[..16]` for a propagation blob.
+    /// Compute `transient_id = full_hash(lxmf_data)` for a propagation blob.
     ///
     /// The input must be `dest_hash + encrypted_data` without the propagation stamp; callers must
     /// strip the trailing 32-byte stamp first if present. Python computes the transient ID
     /// before the stamp is appended.
-    pub fn compute_propagation_transient_id(lxmf_data: &[u8]) -> [u8; 16] {
-        let full = full_hash(lxmf_data);
-        let mut tid = [0u8; 16];
-        tid.copy_from_slice(&full[..16]);
-        tid
+    pub fn compute_propagation_transient_id(lxmf_data: &[u8]) -> PropagationTransientId {
+        full_hash(lxmf_data)
     }
 
     /// Unpack a wire message: `dest_hash(16) + src_hash(16) + signature(64) + msgpack_payload`.
@@ -481,11 +477,9 @@ impl LxMessage {
             callbacks: MessageCallbacks::default(),
         };
 
-        // Default to truncated-message-hash transient_id for direct messages. Propagation
-        // callers should overwrite via [`compute_propagation_transient_id`].
-        let mut tid = [0u8; 16];
-        tid.copy_from_slice(&hash[..16]);
-        msg.transient_id = Some(tid);
+        // Default to the message hash for direct messages. Propagation callers
+        // overwrite via [`compute_propagation_transient_id`].
+        msg.transient_id = Some(hash);
 
         Ok(msg)
     }
@@ -608,9 +602,7 @@ impl LxMessage {
             Self::message_id_from_payload(&self.destination_hash, &self.source_hash, &payload);
         self.hash = Some(hash);
         self.message_id = Some(hash);
-        let mut tid = [0u8; 16];
-        tid.copy_from_slice(&hash[..16]);
-        self.transient_id = Some(tid);
+        self.transient_id = Some(hash);
         Ok(hash)
     }
 
@@ -634,6 +626,7 @@ impl LxMessage {
         self.signature = Some(signing_key.sign(&signed_data));
         self.hash = Some(message_hash);
         self.message_id = Some(message_hash);
+        self.transient_id = Some(message_hash);
         self.state = MessageState::Outbound;
         Ok(())
     }
@@ -661,6 +654,7 @@ impl LxMessage {
         self.signature = Some(signature);
         self.hash = Some(message_hash);
         self.message_id = Some(message_hash);
+        self.transient_id = Some(message_hash);
         self.state = MessageState::Outbound;
         Ok(())
     }
@@ -2003,7 +1997,7 @@ mod tests {
 
         assert!(!propagation_packed.is_empty());
         assert_eq!(msg.transient_id, Some(tid));
-        assert_ne!(tid, [0u8; 16]);
+        assert_ne!(tid, [0u8; 32]);
 
         let (ts, entries) = LxMessage::unpack_propagation_wrapper(&propagation_packed).unwrap();
         assert!(ts > 0.0);
@@ -2029,7 +2023,7 @@ mod tests {
     fn test_propagation_transient_id() {
         let lxmf_data = vec![0xAA; 100];
         let tid = LxMessage::compute_propagation_transient_id(&lxmf_data);
-        assert_eq!(tid.len(), 16);
+        assert_eq!(tid.len(), 32);
 
         let tid2 = LxMessage::compute_propagation_transient_id(&lxmf_data);
         assert_eq!(tid, tid2);
@@ -2046,7 +2040,7 @@ mod tests {
         let lxmf_data = vec![0x42; 200];
         let tid = LxMessage::compute_propagation_transient_id(&lxmf_data);
         let expected_full = full_hash(&lxmf_data);
-        assert_eq!(&tid[..], &expected_full[..16]);
+        assert_eq!(tid, expected_full);
     }
 
     #[test]

@@ -15,6 +15,7 @@ use crate::peer::LxmPeer;
 use crate::propagation::PropagationStore;
 use crate::stamper;
 use crate::ticket::{Ticket, TicketStore};
+use crate::types::PropagationTransientId;
 
 /// Router configuration.
 ///
@@ -684,13 +685,13 @@ impl LxmRouter {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs_f64();
-        let delivered: std::collections::HashMap<[u8; 16], f64> = self
+        let delivered: std::collections::HashMap<PropagationTransientId, f64> = self
             .propagation_store
             .locally_delivered_ids()
             .iter()
             .map(|id| (*id, now))
             .collect();
-        let processed: std::collections::HashMap<[u8; 16], f64> = self
+        let processed: std::collections::HashMap<PropagationTransientId, f64> = self
             .propagation_store
             .locally_processed_ids()
             .iter()
@@ -1695,7 +1696,7 @@ mod tests {
     fn test_save_and_load_state_roundtrip() {
         let tmp = tempfile::TempDir::new().unwrap();
         let dest_a = [0xAA; 16];
-        let transient_a = [0x11; 16];
+        let transient_a = [0x11; 32];
 
         let mut r1 = LxmRouter::new(RouterConfig::default());
         r1.set_stamp_cost(dest_a, 8);
@@ -2266,7 +2267,7 @@ mod tests {
         let mut router = LxmRouter::new(RouterConfig::default());
         let peer_hash = [0xAA; 16];
         let mut peer = LxmPeer::new(peer_hash);
-        peer.currently_transferring_messages = Some(vec![[0x01; 16], [0x02; 16]]);
+        peer.currently_transferring_messages = Some(vec![[0x01; 32], [0x02; 32]]);
         peer.state = PeerState::ResourceTransferring;
         router.add_peer(peer);
 

@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::constants::PeerError;
 use crate::propagation::PropagationStore;
+use crate::types::PropagationTransientId;
 
 pub const SYNC_MSG_OFFER: u16 = 0x0001;
 pub const SYNC_MSG_GET: u16 = 0x0002;
@@ -191,8 +192,8 @@ impl OfferResponse {
 pub struct SyncSession {
     pub peer_hash: [u8; 16],
     pub state: SyncState,
-    pub offered_ids: Vec<[u8; 16]>,
-    pub wanted_ids: Vec<[u8; 16]>,
+    pub offered_ids: Vec<PropagationTransientId>,
+    pub wanted_ids: Vec<PropagationTransientId>,
     pub transferred: usize,
 }
 
@@ -217,7 +218,11 @@ impl SyncSession {
         }
     }
 
-    pub fn prepare_offer(&mut self, our_ids: Vec<[u8; 16]>, peering_key: Vec<u8>) -> SyncOffer {
+    pub fn prepare_offer(
+        &mut self,
+        our_ids: Vec<PropagationTransientId>,
+        peering_key: Vec<u8>,
+    ) -> SyncOffer {
         self.offered_ids = our_ids.clone();
         self.state = SyncState::OfferSent;
         SyncOffer {
@@ -232,8 +237,8 @@ impl SyncSession {
             .transient_ids
             .iter()
             .filter(|id| {
-                if id.len() == 16 {
-                    let mut arr = [0u8; 16];
+                if id.len() == 32 {
+                    let mut arr = [0u8; 32];
                     arr.copy_from_slice(id);
                     !our_store.contains(&arr)
                 } else {
@@ -252,8 +257,8 @@ impl SyncSession {
             .wanted_ids
             .iter()
             .filter_map(|id| {
-                if id.len() == 16 {
-                    let mut arr = [0u8; 16];
+                if id.len() == 32 {
+                    let mut arr = [0u8; 32];
                     arr.copy_from_slice(id);
                     Some(arr)
                 } else {
@@ -286,11 +291,19 @@ mod tests {
     use super::*;
     use crate::propagation::{PropagationEntry, PropagationStore};
 
+    fn tid(byte: u8) -> PropagationTransientId {
+        [byte; 32]
+    }
+
+    fn id(byte: u8) -> Vec<u8> {
+        vec![byte; 32]
+    }
+
     #[test]
     fn test_sync_offer_pack_unpack() {
         let offer = SyncOffer {
             peering_key: vec![0xDD; 32],
-            transient_ids: vec![vec![0xAA; 16], vec![0xBB; 16], vec![0xCC; 16]],
+            transient_ids: vec![id(0xAA), id(0xBB), id(0xCC)],
         };
 
         let packed = offer.pack();
@@ -300,15 +313,15 @@ mod tests {
         unpacked.unpack(&packed).unwrap();
         assert_eq!(unpacked.peering_key, vec![0xDD; 32]);
         assert_eq!(unpacked.transient_ids.len(), 3);
-        assert_eq!(unpacked.transient_ids[0], vec![0xAA; 16]);
-        assert_eq!(unpacked.transient_ids[1], vec![0xBB; 16]);
-        assert_eq!(unpacked.transient_ids[2], vec![0xCC; 16]);
+        assert_eq!(unpacked.transient_ids[0], id(0xAA));
+        assert_eq!(unpacked.transient_ids[1], id(0xBB));
+        assert_eq!(unpacked.transient_ids[2], id(0xCC));
     }
 
     #[test]
     fn test_sync_get_pack_unpack() {
         let get = SyncGet {
-            wanted_ids: vec![vec![0x11; 16], vec![0x22; 16]],
+            wanted_ids: vec![id(0x11), id(0x22)],
         };
 
         let packed = get.pack();
@@ -317,8 +330,8 @@ mod tests {
         let mut unpacked = SyncGet::new();
         unpacked.unpack(&packed).unwrap();
         assert_eq!(unpacked.wanted_ids.len(), 2);
-        assert_eq!(unpacked.wanted_ids[0], vec![0x11; 16]);
-        assert_eq!(unpacked.wanted_ids[1], vec![0x22; 16]);
+        assert_eq!(unpacked.wanted_ids[0], id(0x11));
+        assert_eq!(unpacked.wanted_ids[1], id(0x22));
     }
 
     #[test]
@@ -339,7 +352,7 @@ mod tests {
         let mut session = SyncSession::new(peer_hash);
         assert_eq!(session.state, SyncState::Idle);
 
-        let ids = vec![[0x01; 16], [0x02; 16], [0x03; 16]];
+        let ids = vec![tid(0x01), tid(0x02), tid(0x03)];
         let offer = session.prepare_offer(ids.clone(), vec![0xFF; 32]);
         assert_eq!(session.state, SyncState::OfferSent);
         assert_eq!(offer.transient_ids.len(), 3);
@@ -352,18 +365,18 @@ mod tests {
         let mut session = SyncSession::new(peer_hash);
 
         let mut store = PropagationStore::new();
-        store.insert(PropagationEntry::new([0x01; 16], [0; 32], [0; 16], 100, 0));
+        store.insert(PropagationEntry::new(tid(0x01), [0; 32], [0; 16], 100, 0));
 
         let offer = SyncOffer {
             peering_key: vec![0xFF; 32],
-            transient_ids: vec![vec![0x01; 16], vec![0x02; 16], vec![0x03; 16]],
+            transient_ids: vec![id(0x01), id(0x02), id(0x03)],
         };
 
         let get = session.process_offer(&offer, &store);
         assert_eq!(session.state, SyncState::Receiving);
         assert_eq!(get.wanted_ids.len(), 2);
-        assert_eq!(get.wanted_ids[0], vec![0x02; 16]);
-        assert_eq!(get.wanted_ids[1], vec![0x03; 16]);
+        assert_eq!(get.wanted_ids[0], id(0x02));
+        assert_eq!(get.wanted_ids[1], id(0x03));
     }
 
     #[test]
@@ -373,7 +386,7 @@ mod tests {
         session.state = SyncState::OfferSent;
 
         let get = SyncGet {
-            wanted_ids: vec![vec![0x01; 16], vec![0x02; 16]],
+            wanted_ids: vec![id(0x01), id(0x02)],
         };
 
         session.process_get(&get);
@@ -442,7 +455,7 @@ mod tests {
 
         let offer = SyncOffer {
             peering_key: vec![0xFF; 32],
-            transient_ids: vec![vec![0x01; 16], vec![0x02; 16]],
+            transient_ids: vec![id(0x01), id(0x02)],
         };
 
         let get = session.process_offer(&offer, &store);
@@ -456,7 +469,7 @@ mod tests {
 
         let offer = SyncOffer {
             peering_key: vec![0xFF; 32],
-            transient_ids: vec![vec![0x01; 16], vec![0x02; 8], vec![0x03; 32]],
+            transient_ids: vec![vec![0x01; 16], vec![0x02; 8], id(0x03)],
         };
 
         let get = session.process_offer(&offer, &store);
@@ -468,7 +481,7 @@ mod tests {
         let mut session = SyncSession::new([0xCC; 16]);
 
         let get = SyncGet {
-            wanted_ids: vec![vec![0x01; 16], vec![0x02; 10]],
+            wanted_ids: vec![id(0x01), vec![0x02; 10]],
         };
 
         session.process_get(&get);
@@ -529,8 +542,8 @@ mod tests {
 
     #[test]
     fn test_offer_response_want_some() {
-        let id1 = vec![0xAA; 16];
-        let id2 = vec![0xBB; 16];
+        let id1 = id(0xAA);
+        let id2 = id(0xBB);
         let value = rmpv::Value::Array(vec![
             rmpv::Value::Binary(id1.clone()),
             rmpv::Value::Binary(id2.clone()),
