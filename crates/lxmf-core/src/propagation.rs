@@ -17,6 +17,10 @@ pub struct PropagationEntry {
     pub stamp_value: u8,
     pub size: usize,
     pub collected: bool,
+    /// Stored file contains `lxmf_data || propagation_stamp`.
+    ///
+    /// Client download strips the stamp; peer sync keeps it.
+    pub stamped: bool,
 }
 
 impl PropagationEntry {
@@ -35,7 +39,20 @@ impl PropagationEntry {
             stamp_value,
             size,
             collected: false,
+            stamped: false,
         }
+    }
+
+    pub fn new_stamped(
+        transient_id: PropagationTransientId,
+        message_hash: [u8; 32],
+        destination_hash: [u8; 16],
+        size: usize,
+        stamp_value: u8,
+    ) -> Self {
+        let mut entry = Self::new(transient_id, message_hash, destination_hash, size, stamp_value);
+        entry.stamped = true;
+        entry
     }
 
     /// Format: `{hex_transient_id}_{timestamp}_{stamp_value}`.
@@ -353,6 +370,7 @@ mod tests {
             stamp_value: 8,
             size: 500,
             collected: false,
+            stamped: false,
         };
         let fname = entry.filename();
         assert!(fname.starts_with(
@@ -549,6 +567,7 @@ mod tests {
             stamp_value: 0,
             size: 1000,
             collected: false,
+            stamped: false,
         };
         let w1 = store.compute_weight(&entry, now);
 

@@ -1290,8 +1290,12 @@ impl LxmdRunner {
         if let Ok(mut node) = pn.lock() {
             for entry in entries {
                 match lxmf_core::stamper::validate_pn_stamp(&entry, min_cost) {
-                    Some((_transient_id, lxmf_data, stamp_value, _stamp_data)) => {
-                        if node.accept_propagated_blob(&lxmf_data, stamp_value as u8) {
+                    Some((_transient_id, lxmf_data, stamp_value, stamp_data)) => {
+                        if node.accept_stamped_propagated_blob(
+                            &lxmf_data,
+                            &stamp_data,
+                            stamp_value as u8,
+                        ) {
                             accepted += 1;
                         }
                     }

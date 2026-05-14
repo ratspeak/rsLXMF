@@ -207,6 +207,62 @@ impl PropagationNode {
         self.store.insert(entry)
     }
 
+    /// Store a validated propagated LXMF blob with its propagation-node stamp.
+    ///
+    /// Canonical propagation-node storage mirrors upstream Python: keep
+    /// `lxmf_data || stamp` on disk so peer sync can forward proof-carrying
+    /// data. Client `/get` strips the final 32-byte stamp before returning
+    /// messages to recipients.
+    pub fn accept_stamped_propagated_blob(
+        &mut self,
+        lxmf_data: &[u8],
+        stamp_data: &[u8; 32],
+        stamp_value: u8,
+    ) -> bool {
+        if lxmf_data.len() < DESTINATION_LENGTH + 1 {
+            return false;
+        }
+        if self.config.min_stamp_cost > 0 && stamp_value < self.config.min_stamp_cost {
+            return false;
+        }
+
+        let transient_id = rns_crypto::sha::full_hash(lxmf_data);
+        if self.store.contains(&transient_id) {
+            return false;
+        }
+
+        let mut stored_data = Vec::with_capacity(lxmf_data.len() + stamp_data.len());
+        stored_data.extend_from_slice(lxmf_data);
+        stored_data.extend_from_slice(stamp_data);
+
+        if self.store.total_size() > self.config.max_storage {
+            return false;
+        }
+        if stored_data.len() > self.config.max_message_size {
+            return false;
+        }
+
+        let mut destination_hash = [0u8; 16];
+        destination_hash.copy_from_slice(&lxmf_data[..DESTINATION_LENGTH]);
+
+        let entry = PropagationEntry::new_stamped(
+            transient_id,
+            transient_id,
+            destination_hash,
+            stored_data.len(),
+            stamp_value,
+        );
+
+        if let Some(ref dir) = self.storage_path {
+            let path = dir.join(entry.filename());
+            if let Err(e) = std::fs::write(&path, &stored_data) {
+                tracing::warn!(error = %e, "failed to persist stamped propagated message");
+            }
+        }
+
+        self.store.insert(entry)
+    }
+
     fn load_from_disk(&mut self) -> std::io::Result<()> {
         let dir = match &self.storage_path {
             Some(d) => d,
@@ -253,12 +309,14 @@ impl PropagationNode {
                     destination_hash.copy_from_slice(&data[..DESTINATION_LENGTH]);
                 }
 
-                let mut pe = PropagationEntry::new(tid, message_hash, destination_hash, size, sv);
+                let mut pe =
+                    PropagationEntry::new_stamped(tid, message_hash, destination_hash, size, sv);
                 pe.stored_at = ts;
 
                 if let Ok(msg) = LxMessage::unpack(&data) {
                     pe.message_hash = msg.hash.unwrap_or([0u8; 32]);
                     pe.destination_hash = msg.destination_hash;
+                    pe.stamped = false;
                 }
 
                 self.store.insert(pe);
@@ -649,7 +707,12 @@ impl PropagationNode {
                                 break;
                             }
                             total_sent += data.len();
-                            messages.push(Value::Binary(data));
+                            let response_data = if entry.stamped && data.len() >= 32 {
+                                data[..data.len() - 32].to_vec()
+                            } else {
+                                data
+                            };
+                            messages.push(Value::Binary(response_data));
                         }
                     }
                 }
@@ -1650,6 +1713,90 @@ mod tests {
     }
 
     #[test]
+    fn test_stamped_propagated_blob_strips_only_for_client_download() {
+        let dir = std::env::temp_dir().join("lxmf_test_stamped_blob_get");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut node = PropagationNode::with_storage(
+            PropagationNodeConfig::default(),
+            [0xAA; 16],
+            dir.clone(),
+        )
+        .unwrap();
+
+        let mut lxmf_data = vec![0xBB; 16];
+        lxmf_data.extend_from_slice(&[0xCC; 128]);
+        let stamp = [0x5A; 32];
+        let full_id = rns_crypto::sha::full_hash(&lxmf_data);
+
+        assert!(node.accept_stamped_propagated_blob(&lxmf_data, &stamp, 0));
+
+        let peer_results = node.message_get_request(&[full_id]);
+        assert_eq!(peer_results.len(), 1);
+        let mut expected_stamped = lxmf_data.clone();
+        expected_stamped.extend_from_slice(&stamp);
+        assert_eq!(peer_results[0].1, expected_stamped);
+
+        use rmpv::Value;
+        let get_request = Value::Array(vec![
+            Value::Array(vec![Value::Binary(full_id.to_vec())]),
+            Value::Array(vec![]),
+        ]);
+        let mut get_buf = Vec::new();
+        rmpv::encode::write_value(&mut get_buf, &get_request).unwrap();
+        let get_response = node.handle_get_request(&get_buf, &[0xBB; 16]);
+        let get_value: Value = rmpv::decode::read_value(&mut &get_response[..]).unwrap();
+        let messages = get_value.as_array().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].as_slice().unwrap(), lxmf_data.as_slice());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_reloaded_stamped_blob_strips_for_client_download() {
+        let dir = std::env::temp_dir().join("lxmf_test_stamped_blob_reload_get");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut lxmf_data = vec![0xBB; 16];
+        lxmf_data.extend_from_slice(&[0xCC; 128]);
+        let stamp = [0x5A; 32];
+        let full_id = rns_crypto::sha::full_hash(&lxmf_data);
+
+        {
+            let mut node = PropagationNode::with_storage(
+                PropagationNodeConfig::default(),
+                [0xAA; 16],
+                dir.clone(),
+            )
+            .unwrap();
+            assert!(node.accept_stamped_propagated_blob(&lxmf_data, &stamp, 0));
+        }
+
+        let mut reloaded = PropagationNode::with_storage(
+            PropagationNodeConfig::default(),
+            [0xAA; 16],
+            dir.clone(),
+        )
+        .unwrap();
+
+        use rmpv::Value;
+        let get_request = Value::Array(vec![
+            Value::Array(vec![Value::Binary(full_id.to_vec())]),
+            Value::Array(vec![]),
+        ]);
+        let mut get_buf = Vec::new();
+        rmpv::encode::write_value(&mut get_buf, &get_request).unwrap();
+        let get_response = reloaded.handle_get_request(&get_buf, &[0xBB; 16]);
+        let get_value: Value = rmpv::decode::read_value(&mut &get_response[..]).unwrap();
+        let messages = get_value.as_array().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].as_slice().unwrap(), lxmf_data.as_slice());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_accept_propagated_blob_enforces_min_stamp_cost() {
         let config = PropagationNodeConfig {
             min_stamp_cost: 8,
@@ -1804,6 +1951,7 @@ mod tests {
             stamp_value: 20,
             size: 100,
             collected: false,
+            stamped: false,
         };
         let entry2 = crate::propagation::PropagationEntry {
             transient_id: tid(0x02),
@@ -1813,6 +1961,7 @@ mod tests {
             stamp_value: 5,
             size: 100,
             collected: false,
+            stamped: false,
         };
         node.store.insert(entry1);
         node.store.insert(entry2);
