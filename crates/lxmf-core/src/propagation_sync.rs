@@ -10,6 +10,7 @@
 //! 4. Transfer requested messages as a Resource.
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -43,7 +44,7 @@ pub struct PropagationSyncTask {
     event_tx: mpsc::Sender<DestinationEvent>,
     event_rx: mpsc::Receiver<DestinationEvent>,
     node_dest_hash: Option<[u8; 16]>,
-    pub propagation_node: PropagationNode,
+    pub propagation_node: Arc<Mutex<PropagationNode>>,
     link: Option<Link>,
     link_id: Option<[u8; 16]>,
     pub state: SyncTaskState,
@@ -64,7 +65,10 @@ impl PropagationSyncTask {
             event_tx,
             event_rx,
             node_dest_hash: None,
-            propagation_node: PropagationNode::new(PropagationNodeConfig::default(), dest_hash),
+            propagation_node: Arc::new(Mutex::new(PropagationNode::new(
+                PropagationNodeConfig::default(),
+                dest_hash,
+            ))),
             link: None,
             link_id: None,
             state: SyncTaskState::Idle,
@@ -90,11 +94,11 @@ impl PropagationSyncTask {
             event_tx,
             event_rx,
             node_dest_hash: None,
-            propagation_node: PropagationNode::with_storage(
+            propagation_node: Arc::new(Mutex::new(PropagationNode::with_storage(
                 PropagationNodeConfig::default(),
                 dest_hash,
                 storage_path,
-            )?,
+            )?)),
             link: None,
             link_id: None,
             state: SyncTaskState::Idle,
@@ -106,6 +110,32 @@ impl PropagationSyncTask {
             active_transfer: None,
             peer: None,
         })
+    }
+
+    /// Create a sync task backed by a propagation node shared with live
+    /// submissions and client retrieval handlers.
+    pub fn with_shared_node(
+        transport_tx: mpsc::Sender<TransportMessage>,
+        propagation_node: Arc<Mutex<PropagationNode>>,
+    ) -> Self {
+        let (event_tx, event_rx) = mpsc::channel(256);
+        Self {
+            transport_tx,
+            event_tx,
+            event_rx,
+            node_dest_hash: None,
+            propagation_node,
+            link: None,
+            link_id: None,
+            state: SyncTaskState::Idle,
+            last_sync: Instant::now(),
+            sync_interval: Duration::from_secs(300),
+            sync_started: None,
+            sync_timeout: Duration::from_secs(120),
+            transfer_queue: Vec::new(),
+            active_transfer: None,
+            peer: None,
+        }
     }
 
     pub fn set_node(&mut self, dest_hash: [u8; 16]) {
@@ -130,7 +160,10 @@ impl PropagationSyncTask {
     }
 
     pub fn accept_message(&mut self, msg: &crate::message::LxMessage) -> bool {
-        self.propagation_node.accept_message(msg)
+        self.propagation_node
+            .lock()
+            .map(|mut node| node.accept_message(msg))
+            .unwrap_or(false)
     }
 
     /// Drain inbound events from transport.
@@ -309,7 +342,11 @@ impl PropagationSyncTask {
 
         match response {
             OfferResponse::WantAll => {
-                let all_ids = self.propagation_node.create_offer(node_hash, None);
+                let all_ids = self
+                    .propagation_node
+                    .lock()
+                    .map(|node| node.create_offer(node_hash, None))
+                    .unwrap_or_default();
                 self.queue_messages_for_ids(&all_ids);
             }
             OfferResponse::HaveAll => {
@@ -337,7 +374,13 @@ impl PropagationSyncTask {
     }
 
     fn queue_messages_for_ids(&mut self, ids: &[PropagationTransientId]) {
-        let results = self.propagation_node.message_get_request(ids);
+        let results = match self.propagation_node.lock() {
+            Ok(node) => node.message_get_request(ids),
+            Err(_) => {
+                self.state = SyncTaskState::Failed;
+                return;
+            }
+        };
         self.transfer_queue = results.into_iter().map(|(_tid, data)| data).collect();
 
         if self.transfer_queue.is_empty() {
@@ -362,7 +405,7 @@ impl PropagationSyncTask {
                 if self.last_sync.elapsed() >= self.sync_interval
                     && let Some(node_hash) = self.node_dest_hash
                 {
-                    if self.propagation_node.message_count() > 0 {
+                    if self.message_count() > 0 {
                         self.start_sync(node_hash);
                     } else {
                         self.last_sync = Instant::now();
@@ -395,7 +438,13 @@ impl PropagationSyncTask {
         };
 
         // Wire: msgpack([peering_key, [transient_id_1, transient_id_2, ...]])
-        let offer = self.propagation_node.prepare_sync_offer(node_hash);
+        let offer = match self.propagation_node.lock() {
+            Ok(mut node) => node.prepare_sync_offer(node_hash),
+            Err(_) => {
+                self.state = SyncTaskState::Failed;
+                return;
+            }
+        };
         let offer_data = {
             use rmpv::Value;
             let ids: Vec<Value> = offer
@@ -641,7 +690,10 @@ impl PropagationSyncTask {
     }
 
     pub fn message_count(&self) -> usize {
-        self.propagation_node.message_count()
+        self.propagation_node
+            .lock()
+            .map(|node| node.message_count())
+            .unwrap_or(0)
     }
 
     pub fn peer(&self) -> Option<&LxmPeer> {
@@ -729,6 +781,39 @@ mod tests {
 
         assert!(task.accept_message(&msg));
         assert_eq!(task.message_count(), 1);
+    }
+
+    #[test]
+    fn test_shared_node_store_is_live() {
+        let (tx, mut rx) = mpsc::channel(64);
+        let shared_node = Arc::new(Mutex::new(PropagationNode::new(
+            PropagationNodeConfig::default(),
+            [0xAA; 16],
+        )));
+        let mut task = PropagationSyncTask::with_shared_node(tx, shared_node.clone());
+        task.set_node([0xBB; 16]);
+        make_sync_due(&mut task);
+
+        assert_eq!(task.message_count(), 0);
+
+        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
+        let mut msg = crate::message::LxMessage::new(
+            [0xBB; 16],
+            [0xCC; 16],
+            "Test",
+            "shared node content",
+            crate::constants::DeliveryMethod::Propagated,
+        );
+        msg.sign(&key).unwrap();
+        assert!(shared_node.lock().unwrap().accept_message(&msg));
+
+        assert_eq!(task.message_count(), 1);
+        task.tick();
+        assert_eq!(task.state, SyncTaskState::Establishing);
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            TransportMessage::RegisterDestination { .. }
+        ));
     }
 
     #[test]

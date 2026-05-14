@@ -674,11 +674,13 @@ impl LxmdRunner {
         };
 
         if runner.config.propagation_enabled {
-            let sync = lxmf_core::propagation_sync::PropagationSyncTask::new(
-                transport_tx.clone(),
-                runner.lxmf_dest_hash,
-            );
-            runner.propagation_sync = Some(sync);
+            if let Some(ref pn) = propagation_node {
+                let sync = lxmf_core::propagation_sync::PropagationSyncTask::with_shared_node(
+                    transport_tx.clone(),
+                    pn.clone(),
+                );
+                runner.propagation_sync = Some(sync);
+            }
             runner.propagation_node = propagation_node;
 
             tracing::info!("propagation sync server initialized");
