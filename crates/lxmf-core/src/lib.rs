@@ -47,6 +47,7 @@ pub mod router;
 pub mod stamper;
 pub mod sync;
 pub mod ticket;
+pub mod types;
 
 /// Encode an `rmpv::Value` into a byte buffer.
 ///
