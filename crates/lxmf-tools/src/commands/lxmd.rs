@@ -133,6 +133,10 @@ fn link_failure_retryable(reason: &str) -> bool {
     )
 }
 
+fn route_hops_for(route_hops: &HashMap<[u8; 16], u8>, dest_hash: [u8; 16]) -> u8 {
+    route_hops.get(&dest_hash).copied().unwrap_or(1).max(1)
+}
+
 fn create_control_announce_packet(
     identity: &Identity,
     control_dest_hash: [u8; 16],
@@ -265,6 +269,7 @@ struct LxmdRunner {
     ratchet_ring: RatchetRing,
     received_ratchets: HashMap<String, ReceivedRatchet>,
     known_identities: HashMap<String, [u8; 64]>,
+    route_hops: HashMap<[u8; 16], u8>,
     link_delivery: Option<lxmf_core::link_delivery::LinkDeliveryManager>,
     link_delivery_failures: Vec<String>,
     propagation_sync: Option<lxmf_core::propagation_sync::PropagationSyncTask>,
@@ -700,6 +705,7 @@ impl LxmdRunner {
             ratchet_ring,
             received_ratchets,
             known_identities,
+            route_hops: HashMap::new(),
             link_delivery: None,
             link_delivery_failures: Vec::new(),
             propagation_sync: None,
@@ -1207,6 +1213,8 @@ impl LxmdRunner {
                 hops = event.hops,
                 "received announce"
             );
+            self.route_hops
+                .insert(event.destination_hash, event.hops.max(1));
 
             if event.name_hash == delivery_name_hash {
                 if let Some(ref data) = event.app_data
@@ -1640,10 +1648,11 @@ impl LxmdRunner {
                                 self.router.send(message);
                                 continue;
                             }
+                            let hops = route_hops_for(&self.route_hops, prop_hash);
                             self.ensure_link_delivery();
                             if let Some(ref mut ld) = self.link_delivery {
-                                if let Err(err) =
-                                    ld.start_packed_delivery(message, prop_hash, 1, packed, false)
+                                if let Err(err) = ld
+                                    .start_packed_delivery(message, prop_hash, hops, packed, false)
                                 {
                                     let reason = err.error.to_string();
                                     tracing::warn!(
@@ -1722,9 +1731,10 @@ impl LxmdRunner {
                     dest = %dest_hex,
                     "routing Direct LXMF message over link delivery"
                 );
+                let hops = route_hops_for(&self.route_hops, dest_hash);
                 self.ensure_link_delivery();
                 if let Some(ref mut ld) = self.link_delivery {
-                    if let Err(err) = ld.start_delivery(message, dest_hash, 1) {
+                    if let Err(err) = ld.start_delivery(message, dest_hash, hops) {
                         let reason = err.error.to_string();
                         tracing::warn!(
                             error = %reason,
@@ -1819,9 +1829,10 @@ impl LxmdRunner {
                     self.router.send(message);
                     continue;
                 }
+                let hops = route_hops_for(&self.route_hops, dest_hash);
                 self.ensure_link_delivery();
                 if let Some(ref mut ld) = self.link_delivery {
-                    if let Err(err) = ld.start_delivery(message, dest_hash, 1) {
+                    if let Err(err) = ld.start_delivery(message, dest_hash, hops) {
                         let reason = err.error.to_string();
                         tracing::warn!(
                             error = %reason,
@@ -2605,5 +2616,19 @@ mod tests {
         assert!(link_failure_retryable("transport full"));
         assert!(link_failure_retryable("transport closed"));
         assert!(!link_failure_retryable("resource transfer failed"));
+    }
+
+    #[test]
+    fn route_hops_for_uses_cached_announce_hops_with_one_hop_floor() {
+        let dest = [0x77; 16];
+        let mut hops = HashMap::new();
+
+        assert_eq!(route_hops_for(&hops, dest), 1);
+
+        hops.insert(dest, 4);
+        assert_eq!(route_hops_for(&hops, dest), 4);
+
+        hops.insert(dest, 0);
+        assert_eq!(route_hops_for(&hops, dest), 1);
     }
 }
