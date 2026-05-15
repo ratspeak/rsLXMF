@@ -42,7 +42,9 @@ use rns_identity::identity::Identity;
 use rns_identity::ratchet::{
     RatchetRing, ReceivedRatchet, clean_received_ratchets_dir, purge_expired_ratchets_in_memory,
 };
-use rns_transport::messages::{AnnounceHandlerEvent, TransportMessage, TransportQuery};
+use rns_transport::messages::{
+    AnnounceHandlerEvent, TransportMessage, TransportQuery, TransportQueryResponse,
+};
 
 const LXMF_APP_NAME: &str = "lxmf.delivery";
 
@@ -1069,6 +1071,30 @@ impl LxmdRunner {
                     }
                     tracing::info!(peer = %hex::encode(peer_hash), "control: unpeered peer");
                 }
+            }
+        }
+    }
+
+    async fn refresh_route_hops_from_transport(&mut self) {
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        if let Err(e) = self.transport_tx.try_send(TransportMessage::Rpc {
+            query: TransportQuery::GetPathTable,
+            response_tx,
+        }) {
+            tracing::debug!(error = %e, "failed to request transport path table for LXMF routing");
+            return;
+        }
+
+        let Ok(Ok(TransportQueryResponse::PathTable(entries))) =
+            tokio::time::timeout(Duration::from_millis(100), response_rx).await
+        else {
+            return;
+        };
+
+        let now = now_f64();
+        for entry in entries {
+            if entry.expires > now {
+                self.route_hops.insert(entry.hash, entry.hops.max(1));
             }
         }
     }
@@ -2561,6 +2587,7 @@ pub(crate) async fn main() {
                     saw_dest_announce = true;
                 }
             }
+            runner.refresh_route_hops_from_transport().await;
             runner.drain_link_packets();
             have_key = runner.known_identities.contains_key(&dest_hex);
             if have_key && saw_dest_announce {
@@ -2618,6 +2645,7 @@ pub(crate) async fn main() {
         let mut drained = false;
         for _ in 0..30 {
             runner.drain_announce_events();
+            runner.refresh_route_hops_from_transport().await;
             runner.drain_link_packets();
             runner.tick();
             tokio::time::sleep(Duration::from_secs(1)).await;
@@ -2648,6 +2676,7 @@ pub(crate) async fn main() {
             let mut link_done = false;
             for _ in 0..args.send_timeout_secs {
                 runner.drain_announce_events();
+                runner.refresh_route_hops_from_transport().await;
                 runner.drain_link_packets();
                 runner.tick();
                 tokio::time::sleep(Duration::from_secs(1)).await;
@@ -2691,6 +2720,7 @@ pub(crate) async fn main() {
             _ = shutdown.wait() => break,
             _ = tick_timer.tick() => {
                 runner.drain_announce_events();
+                runner.refresh_route_hops_from_transport().await;
                 runner.drain_link_packets();
                 runner.tick();
             }
