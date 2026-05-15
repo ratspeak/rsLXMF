@@ -12,6 +12,7 @@ use tokio::sync::mpsc;
 
 use std::sync::{Arc, Mutex};
 
+use lxmf_core::constants::{DELIVERY_RETRY_WAIT, MAX_DELIVERY_ATTEMPTS, PATH_REQUEST_WAIT};
 use lxmf_core::message::LxMessage;
 use lxmf_core::propagation_node::{PropagationNode, PropagationNodeConfig};
 use lxmf_core::router::{LxmRouter, OutboundAction};
@@ -81,6 +82,55 @@ fn now_f64() -> f64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64()
+}
+
+fn mark_delivery_attempt(message: &mut LxMessage) -> u32 {
+    let now = now_f64();
+    message.delivery_attempts += 1;
+    message.last_delivery_attempt = now;
+    message.next_delivery_attempt = now + DELIVERY_RETRY_WAIT as f64;
+    message.delivery_attempts
+}
+
+fn requeue_after_path_request(
+    router: &mut LxmRouter,
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    mut message: LxMessage,
+    request_hash: [u8; 16],
+    reason: &str,
+    increment_attempt: bool,
+) {
+    let now = now_f64();
+    if increment_attempt {
+        message.delivery_attempts += 1;
+    }
+    message.last_delivery_attempt = now;
+    message.next_delivery_attempt = now + PATH_REQUEST_WAIT as f64;
+    if let Err(e) = transport_tx.try_send(TransportMessage::RequestPath {
+        destination_hash: request_hash,
+    }) {
+        tracing::warn!(
+            dest = %hex::encode(request_hash),
+            error = %e,
+            reason,
+            "failed to queue path request before LXMF retry"
+        );
+    }
+    tracing::warn!(
+        dest = %hex::encode(message.destination_hash),
+        request_dest = %hex::encode(request_hash),
+        attempts = message.delivery_attempts,
+        reason,
+        "re-queuing LXMF message after path request"
+    );
+    router.send(message);
+}
+
+fn link_failure_retryable(reason: &str) -> bool {
+    matches!(
+        reason,
+        "link establishment timeout" | "link closed" | "transport full" | "transport closed"
+    )
 }
 
 fn create_control_announce_packet(
@@ -983,13 +1033,44 @@ impl LxmdRunner {
                         }
                     }
                     lxmf_core::link_delivery::DeliveryResult::Failed {
-                        msg_hash, reason, ..
+                        msg_hash,
+                        dest_hash,
+                        message,
+                        reason,
+                        ..
                     } => {
-                        tracing::warn!(reason = %reason, "link delivery failed");
-                        if let Some(hash) = msg_hash {
-                            tracing::warn!(hash = %hex::encode(hash), "message delivery failed");
+                        tracing::warn!(
+                            dest = %hex::encode(dest_hash),
+                            reason = %reason,
+                            attempts = message.delivery_attempts,
+                            "link delivery failed"
+                        );
+                        if link_failure_retryable(&reason)
+                            && message.delivery_attempts <= MAX_DELIVERY_ATTEMPTS
+                        {
+                            if let Some(hash) = msg_hash {
+                                tracing::warn!(
+                                    hash = %hex::encode(hash),
+                                    "retrying message after link delivery failure"
+                                );
+                            }
+                            requeue_after_path_request(
+                                &mut self.router,
+                                &self.transport_tx,
+                                message,
+                                dest_hash,
+                                &reason,
+                                false,
+                            );
+                        } else {
+                            if let Some(hash) = msg_hash {
+                                tracing::warn!(
+                                    hash = %hex::encode(hash),
+                                    "message delivery failed"
+                                );
+                            }
+                            self.link_delivery_failures.push(reason);
                         }
-                        self.link_delivery_failures.push(reason);
                     }
                 }
             }
@@ -1526,17 +1607,19 @@ impl LxmdRunner {
                     let mut message = message;
                     let prop_hex = hex::encode(prop_hash);
                     if !self.known_identities.contains_key(&prop_hex) {
-                        message.delivery_attempts += 1;
-                        message.last_delivery_attempt = now_f64();
-                        let _ = self.transport_tx.try_send(TransportMessage::RequestPath {
-                            destination_hash: prop_hash,
-                        });
                         tracing::warn!(
                             prop = %prop_hex,
                             attempts = message.delivery_attempts,
                             "propagation node identity unknown, requesting path before link delivery"
                         );
-                        self.router.send(message);
+                        requeue_after_path_request(
+                            &mut self.router,
+                            &self.transport_tx,
+                            message,
+                            prop_hash,
+                            "propagation node identity unknown",
+                            true,
+                        );
                         continue;
                     }
                     tracing::info!(
@@ -1546,15 +1629,35 @@ impl LxmdRunner {
                     );
                     match self.pack_message_for_propagation(&mut message, prop_hash) {
                         Some(packed) => {
+                            let attempts = mark_delivery_attempt(&mut message);
+                            if attempts >= MAX_DELIVERY_ATTEMPTS {
+                                tracing::warn!(
+                                    prop = %prop_hex,
+                                    attempts,
+                                    max_attempts = MAX_DELIVERY_ATTEMPTS,
+                                    "propagated delivery attempt budget reached; deferring terminal failure"
+                                );
+                                self.router.send(message);
+                                continue;
+                            }
                             self.ensure_link_delivery();
                             if let Some(ref mut ld) = self.link_delivery {
                                 if let Err(err) =
                                     ld.start_packed_delivery(message, prop_hash, 1, packed, false)
                                 {
+                                    let reason = err.error.to_string();
                                     tracing::warn!(
-                                        error = %err,
+                                        error = %reason,
                                         prop = %hex::encode(prop_hash),
                                         "failed to start propagated link delivery"
+                                    );
+                                    requeue_after_path_request(
+                                        &mut self.router,
+                                        &self.transport_tx,
+                                        err.message,
+                                        prop_hash,
+                                        &reason,
+                                        false,
                                     );
                                 }
                             }
@@ -1588,20 +1691,33 @@ impl LxmdRunner {
             let dest_hex = hex::encode(dest_hash);
             if !is_opportunistic {
                 if !self.known_identities.contains_key(&dest_hex) {
-                    message.delivery_attempts += 1;
-                    message.last_delivery_attempt = now_f64();
-                    let _ = self.transport_tx.try_send(TransportMessage::RequestPath {
-                        destination_hash: dest_hash,
-                    });
                     tracing::warn!(
                         dest = %dest_hex,
                         attempts = message.delivery_attempts,
                         "destination key unknown, re-queuing direct link delivery"
                     );
-                    self.router.send(message);
+                    requeue_after_path_request(
+                        &mut self.router,
+                        &self.transport_tx,
+                        message,
+                        dest_hash,
+                        "destination identity unknown",
+                        true,
+                    );
                     continue;
                 }
 
+                let attempts = mark_delivery_attempt(&mut message);
+                if attempts >= MAX_DELIVERY_ATTEMPTS {
+                    tracing::warn!(
+                        dest = %dest_hex,
+                        attempts,
+                        max_attempts = MAX_DELIVERY_ATTEMPTS,
+                        "direct delivery attempt budget reached; deferring terminal failure"
+                    );
+                    self.router.send(message);
+                    continue;
+                }
                 tracing::info!(
                     dest = %dest_hex,
                     "routing Direct LXMF message over link delivery"
@@ -1609,10 +1725,19 @@ impl LxmdRunner {
                 self.ensure_link_delivery();
                 if let Some(ref mut ld) = self.link_delivery {
                     if let Err(err) = ld.start_delivery(message, dest_hash, 1) {
+                        let reason = err.error.to_string();
                         tracing::warn!(
-                            error = %err,
+                            error = %reason,
                             dest = %dest_hex,
                             "failed to start direct link delivery"
+                        );
+                        requeue_after_path_request(
+                            &mut self.router,
+                            &self.transport_tx,
+                            err.message,
+                            dest_hash,
+                            &reason,
+                            false,
                         );
                     }
                 }
@@ -1643,14 +1768,19 @@ impl LxmdRunner {
                 ct
             } else {
                 // Destination key unknown; re-queue for later.
-                message.delivery_attempts += 1;
-                message.last_delivery_attempt = now_f64();
                 tracing::warn!(
                     dest = %dest_hex,
                     attempts = message.delivery_attempts,
                     "destination key unknown, re-queuing"
                 );
-                self.router.send(message);
+                requeue_after_path_request(
+                    &mut self.router,
+                    &self.transport_tx,
+                    message,
+                    dest_hash,
+                    "opportunistic destination identity unknown",
+                    true,
+                );
                 continue;
             };
 
@@ -1678,13 +1808,33 @@ impl LxmdRunner {
                     packet_len = raw.len(),
                     "packet exceeds MTU; routing to link delivery"
                 );
+                let attempts = mark_delivery_attempt(&mut message);
+                if attempts >= MAX_DELIVERY_ATTEMPTS {
+                    tracing::warn!(
+                        dest = %dest_hex,
+                        attempts,
+                        max_attempts = MAX_DELIVERY_ATTEMPTS,
+                        "oversized direct delivery attempt budget reached; deferring terminal failure"
+                    );
+                    self.router.send(message);
+                    continue;
+                }
                 self.ensure_link_delivery();
                 if let Some(ref mut ld) = self.link_delivery {
                     if let Err(err) = ld.start_delivery(message, dest_hash, 1) {
+                        let reason = err.error.to_string();
                         tracing::warn!(
-                            error = %err,
+                            error = %reason,
                             dest = %dest_hex,
                             "failed to start oversized direct link delivery"
+                        );
+                        requeue_after_path_request(
+                            &mut self.router,
+                            &self.transport_tx,
+                            err.message,
+                            dest_hash,
+                            &reason,
+                            false,
                         );
                     }
                 }
@@ -2377,4 +2527,83 @@ pub(crate) async fn main() {
     }
     tracing::info!("Crypto state saved");
     tracing::info!("LXMF Daemon stopped");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lxmf_core::constants::DeliveryMethod;
+
+    #[test]
+    fn path_request_requeue_sets_path_wait_deadline() {
+        let mut router = LxmRouter::new(Default::default());
+        let (tx, mut rx) = mpsc::channel::<TransportMessage>(4);
+        let dest = [0x22; 16];
+        let source = [0x11; 16];
+        let message = LxMessage::new(dest, source, "retry", "hello", DeliveryMethod::Direct);
+        let before = now_f64();
+
+        requeue_after_path_request(&mut router, &tx, message, dest, "test path wait", true);
+
+        assert_eq!(router.pending_outbound.len(), 1);
+        let queued = &router.pending_outbound[0];
+        assert_eq!(queued.delivery_attempts, 1);
+        assert!(queued.last_delivery_attempt >= before);
+        assert!(
+            queued.next_delivery_attempt >= before + PATH_REQUEST_WAIT as f64 - 1.0
+                && queued.next_delivery_attempt <= now_f64() + PATH_REQUEST_WAIT as f64 + 1.0,
+            "path-request retry should wait about {PATH_REQUEST_WAIT}s"
+        );
+
+        match rx.try_recv().expect("path request") {
+            TransportMessage::RequestPath { destination_hash } => {
+                assert_eq!(destination_hash, dest);
+            }
+            other => panic!("expected RequestPath, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn path_request_requeue_can_preserve_attempt_count_after_link_start_failure() {
+        let mut router = LxmRouter::new(Default::default());
+        let (tx, _rx) = mpsc::channel::<TransportMessage>(4);
+        let dest = [0x44; 16];
+        let source = [0x33; 16];
+        let mut message = LxMessage::new(dest, source, "retry", "hello", DeliveryMethod::Direct);
+        message.delivery_attempts = 3;
+
+        requeue_after_path_request(&mut router, &tx, message, dest, "transport full", false);
+
+        assert_eq!(router.pending_outbound.len(), 1);
+        assert_eq!(router.pending_outbound[0].delivery_attempts, 3);
+        assert!(router.pending_outbound[0].next_delivery_attempt > now_f64());
+    }
+
+    #[test]
+    fn delivery_attempt_uses_delivery_retry_deadline() {
+        let dest = [0x66; 16];
+        let source = [0x55; 16];
+        let mut message = LxMessage::new(dest, source, "direct", "hello", DeliveryMethod::Direct);
+        let before = now_f64();
+
+        let attempts = mark_delivery_attempt(&mut message);
+
+        assert_eq!(attempts, 1);
+        assert_eq!(message.delivery_attempts, 1);
+        assert!(message.last_delivery_attempt >= before);
+        assert!(
+            message.next_delivery_attempt >= before + DELIVERY_RETRY_WAIT as f64 - 1.0
+                && message.next_delivery_attempt <= now_f64() + DELIVERY_RETRY_WAIT as f64 + 1.0,
+            "delivery retry should wait about {DELIVERY_RETRY_WAIT}s"
+        );
+    }
+
+    #[test]
+    fn link_failure_retry_policy_matches_pre_establishment_failures() {
+        assert!(link_failure_retryable("link establishment timeout"));
+        assert!(link_failure_retryable("link closed"));
+        assert!(link_failure_retryable("transport full"));
+        assert!(link_failure_retryable("transport closed"));
+        assert!(!link_failure_retryable("resource transfer failed"));
+    }
 }
