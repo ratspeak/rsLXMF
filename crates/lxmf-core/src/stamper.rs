@@ -14,8 +14,10 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use rand::RngCore;
 use rns_crypto::hkdf::hkdf_sha256;
 use rns_crypto::sha::sha256;
+use sha2::{Digest, Sha256};
 
 /// Parsed propagation-node stamp parts: `(stamp, lxm_data, value, workblock)`.
 pub type PropagationStampParts = ([u8; 32], Vec<u8>, u32, [u8; 32]);
@@ -99,11 +101,9 @@ pub fn stamp_valid(stamp: &[u8; 32], cost: u8, workblock: &[u8; 32]) -> bool {
 
 /// `stamp_value` counterpart for variable-length (HKDF-expanded) workblocks.
 pub fn stamp_value_raw(workblock: &[u8], stamp: &[u8; 32]) -> u32 {
-    let mut material = Vec::with_capacity(workblock.len() + 32);
-    material.extend_from_slice(workblock);
-    material.extend_from_slice(stamp);
-    let hash = sha256(&material);
-    leading_zero_bits(&hash)
+    let mut hasher = Sha256::new();
+    hasher.update(workblock);
+    raw_stamp_value_from_base(&hasher, stamp)
 }
 
 /// `stamp_valid` counterpart for variable-length (HKDF-expanded) workblocks.
@@ -125,9 +125,10 @@ pub fn generate_stamp(
     }
 
     let workblock = stamp_workblock(message_id, expand_rounds);
+    let mut rng = rand::thread_rng();
 
     loop {
-        let stamp: [u8; 32] = rand_bytes();
+        let stamp = rand_bytes_from(&mut rng);
         if stamp_valid(&stamp, cost, &workblock) {
             let value = stamp_value(&workblock, &stamp);
             return Some((stamp, value));
@@ -150,11 +151,14 @@ pub fn generate_stamp_raw(
     }
 
     let workblock = stamp_workblock_raw(material, expand_rounds);
+    let mut base_hasher = Sha256::new();
+    base_hasher.update(&workblock);
+    let mut rng = rand::thread_rng();
 
     loop {
-        let stamp: [u8; 32] = rand_bytes();
-        if stamp_valid_raw(&stamp, cost, &workblock) {
-            let value = stamp_value_raw(&workblock, &stamp);
+        let stamp = rand_bytes_from(&mut rng);
+        let value = raw_stamp_value_from_base(&base_hasher, &stamp);
+        if value >= cost as u32 {
             return Some((stamp, value));
         }
     }
@@ -172,9 +176,10 @@ pub fn generate_stamp_limited(
     }
 
     let workblock = stamp_workblock(message_id, expand_rounds);
+    let mut rng = rand::thread_rng();
 
     for _ in 0..max_iterations {
-        let stamp: [u8; 32] = rand_bytes();
+        let stamp = rand_bytes_from(&mut rng);
         if stamp_valid(&stamp, cost, &workblock) {
             return Some(stamp);
         }
@@ -229,10 +234,10 @@ pub fn validate_pn_stamp(transient_data: &[u8], target_cost: u8) -> Option<Propa
         crate::constants::STAMP_WORKBLOCK_EXPAND_ROUNDS_PN,
     );
 
-    if !stamp_valid_raw(&stamp, target_cost, &workblock) {
+    let value = stamp_value_raw(&workblock, &stamp);
+    if value < target_cost as u32 {
         return None;
     }
-    let value = stamp_value_raw(&workblock, &stamp);
     Some((transient_id, lxm_data.to_vec(), value, stamp))
 }
 
@@ -293,6 +298,7 @@ pub fn spawn_deferred_stamp(
         }
 
         let workblock = stamp_workblock(&message_id, expand_rounds);
+        let mut rng = rand::thread_rng();
 
         loop {
             if cancel_flag.load(Ordering::Relaxed) {
@@ -302,7 +308,7 @@ pub fn spawn_deferred_stamp(
 
             // Check cancellation every 1000 iterations.
             for _ in 0..1000 {
-                let stamp: [u8; 32] = rand_bytes();
+                let stamp = rand_bytes_from(&mut rng);
                 if stamp_valid(&stamp, cost, &workblock) {
                     let value = stamp_value(&workblock, &stamp);
                     let _ = tx.send(DeferredStampResult::Success { stamp, value });
@@ -316,11 +322,21 @@ pub fn spawn_deferred_stamp(
 }
 
 pub(crate) fn rand_bytes() -> [u8; 32] {
-    use rand::RngCore;
     let mut rng = rand::thread_rng();
+    rand_bytes_from(&mut rng)
+}
+
+fn rand_bytes_from(rng: &mut impl RngCore) -> [u8; 32] {
     let mut bytes = [0u8; 32];
     rng.fill_bytes(&mut bytes);
     bytes
+}
+
+fn raw_stamp_value_from_base(base_hasher: &Sha256, stamp: &[u8; 32]) -> u32 {
+    let mut hasher = base_hasher.clone();
+    hasher.update(stamp);
+    let hash = hasher.finalize();
+    leading_zero_bits(&hash)
 }
 
 #[cfg(test)]
@@ -567,6 +583,23 @@ mod tests {
         assert_eq!(extracted_stamp, stamp);
         assert_eq!(transient_id, rns_crypto::sha::full_hash(&lxm_data));
         let _ = value;
+    }
+
+    #[test]
+    fn test_raw_stamp_value_matches_direct_sha256_prefix_hash() {
+        let material = sha256(b"propagation transient id");
+        let workblock = stamp_workblock_raw(&material, STAMP_WORKBLOCK_EXPAND_ROUNDS_PN);
+        let stamp = [0x5Au8; 32];
+
+        let mut direct = Vec::with_capacity(workblock.len() + stamp.len());
+        direct.extend_from_slice(&workblock);
+        direct.extend_from_slice(&stamp);
+        let direct_hash = sha256(&direct);
+
+        assert_eq!(
+            stamp_value_raw(&workblock, &stamp),
+            leading_zero_bits(&direct_hash)
+        );
     }
 
     #[test]

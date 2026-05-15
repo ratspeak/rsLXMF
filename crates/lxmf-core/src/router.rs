@@ -1137,7 +1137,7 @@ impl LxmRouter {
                 continue;
             }
 
-            if msg.delivery_attempts > 0 && msg.last_delivery_attempt > 0.0 {
+            if msg.last_delivery_attempt > 0.0 {
                 let since_last = now - msg.last_delivery_attempt;
                 if since_last < DELIVERY_RETRY_WAIT as f64 {
                     i += 1;
@@ -2061,6 +2061,32 @@ mod tests {
             1,
             "message stays queued for the next tick"
         );
+    }
+
+    /// Waiting for route or metadata preconditions is not itself a failed
+    /// delivery attempt, but it still needs the same retry backoff to avoid
+    /// tight request-path loops.
+    #[test]
+    fn test_process_outbound_retry_backoff_uses_last_attempt_timestamp() {
+        let mut router = LxmRouter::new(RouterConfig::default());
+        let mut msg = LxMessage::new(
+            [0xAA; 16],
+            [0xBB; 16],
+            "Backoff",
+            "Content",
+            DeliveryMethod::Propagated,
+        );
+        msg.last_delivery_attempt = now_f64() - 1.0;
+        router.set_outbound_propagation_node(Some([0xCC; 16]));
+        router.send(msg);
+
+        let actions = router.process_outbound();
+        assert!(
+            actions.is_empty(),
+            "metadata waits should stay queued inside retry-wait window"
+        );
+        assert_eq!(router.pending_outbound.len(), 1);
+        assert_eq!(router.pending_outbound[0].delivery_attempts, 0);
     }
 
     /// The state machine contract: a Direct message picked up by
