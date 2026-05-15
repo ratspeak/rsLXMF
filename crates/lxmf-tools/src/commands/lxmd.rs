@@ -12,7 +12,9 @@ use tokio::sync::mpsc;
 
 use std::sync::{Arc, Mutex};
 
-use lxmf_core::constants::{DELIVERY_RETRY_WAIT, MAX_DELIVERY_ATTEMPTS, PATH_REQUEST_WAIT};
+use lxmf_core::constants::{
+    DELIVERY_RETRY_WAIT, DeliveryMethod, MAX_DELIVERY_ATTEMPTS, PATH_REQUEST_WAIT,
+};
 use lxmf_core::message::LxMessage;
 use lxmf_core::propagation_node::{PropagationNode, PropagationNodeConfig};
 use lxmf_core::router::{
@@ -1077,7 +1079,40 @@ impl LxmdRunner {
         self.drain_control_commands();
 
         self.router.process_deferred_stamps();
-        let actions = self.router.process_outbound();
+        let known_identities = self
+            .known_identities
+            .keys()
+            .cloned()
+            .collect::<HashSet<_>>();
+        let route_hops = self.route_hops.clone();
+        let direct_destinations = self
+            .router
+            .pending_outbound
+            .iter()
+            .filter(|message| message.method == DeliveryMethod::Direct)
+            .map(|message| message.destination_hash)
+            .collect::<HashSet<_>>();
+        let reusable_links = direct_destinations
+            .iter()
+            .copied()
+            .map(|dest| {
+                (
+                    dest,
+                    direct_reusable_link_state(self.link_delivery.as_ref(), dest),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let actions = self.router.process_outbound_with_direct(|message, _now| {
+            let dest = message.destination_hash;
+            DirectDeliveryPlanInput {
+                identity_known: known_identities.contains(&hex::encode(dest)),
+                route: direct_route_snapshot(&route_hops, dest),
+                reusable_link: reusable_links
+                    .get(&dest)
+                    .copied()
+                    .unwrap_or(DirectReusableLinkState::None),
+            }
+        });
         if !actions.is_empty() {
             self.execute_encrypted_actions(actions);
         }
@@ -1089,6 +1124,7 @@ impl LxmdRunner {
                 match result {
                     lxmf_core::link_delivery::DeliveryResult::Complete { msg_hash, .. } => {
                         if let Some(hash) = msg_hash {
+                            let _ = self.router.mark_outbound_delivered(&hash);
                             tracing::info!(hash = %hex::encode(hash), "link delivery complete");
                         }
                     }
@@ -1105,6 +1141,12 @@ impl LxmdRunner {
                             attempts = message.delivery_attempts,
                             "link delivery failed"
                         );
+                        let router_owned = msg_hash.is_some_and(|hash| {
+                            self.router
+                                .pending_outbound
+                                .iter()
+                                .any(|pending| pending.hash == Some(hash))
+                        });
                         if link_failure_retryable(&reason)
                             && message.delivery_attempts <= MAX_DELIVERY_ATTEMPTS
                         {
@@ -1114,16 +1156,28 @@ impl LxmdRunner {
                                     "retrying message after link delivery failure"
                                 );
                             }
-                            requeue_after_path_request(
-                                &mut self.router,
-                                &self.transport_tx,
-                                message,
-                                dest_hash,
-                                &reason,
-                                false,
-                            );
+                            if router_owned {
+                                queue_path_request(&self.transport_tx, dest_hash, false, &reason);
+                                if let Some(hash) = msg_hash {
+                                    let _ = self
+                                        .router
+                                        .defer_outbound_for_path_request(&hash, now_f64());
+                                }
+                            } else {
+                                requeue_after_path_request(
+                                    &mut self.router,
+                                    &self.transport_tx,
+                                    message,
+                                    dest_hash,
+                                    &reason,
+                                    false,
+                                );
+                            }
                         } else {
                             if let Some(hash) = msg_hash {
+                                if router_owned {
+                                    let _ = self.router.mark_outbound_failed(&hash);
+                                }
                                 tracing::warn!(
                                     hash = %hex::encode(hash),
                                     "message delivery failed"
@@ -1660,13 +1714,17 @@ impl LxmdRunner {
 
     fn execute_encrypted_actions(&mut self, actions: Vec<OutboundAction>) {
         for action in actions {
-            let (mut message, dest_hash, is_opportunistic) = match action {
-                OutboundAction::DeliverDirect { message, dest_hash }
-                | OutboundAction::PlanDirect {
-                    message, dest_hash, ..
-                } => (message, dest_hash, false),
+            let (mut message, dest_hash, is_opportunistic, direct_plan) = match action {
+                OutboundAction::DeliverDirect { message, dest_hash } => {
+                    (message, dest_hash, false, None)
+                }
+                OutboundAction::PlanDirect {
+                    message,
+                    dest_hash,
+                    plan,
+                } => (message, dest_hash, false, Some(plan)),
                 OutboundAction::DeliverOpportunistic { message, dest_hash } => {
-                    (message, dest_hash, true)
+                    (message, dest_hash, true, None)
                 }
                 OutboundAction::DeliverPropagated { message, prop_hash } => {
                     let mut message = message;
@@ -1756,18 +1814,21 @@ impl LxmdRunner {
 
             let dest_hex = hex::encode(dest_hash);
             if !is_opportunistic {
-                let plan = plan_direct_delivery(
-                    &mut message,
-                    DirectDeliveryPlanInput {
-                        identity_known: self.known_identities.contains_key(&dest_hex),
-                        route: direct_route_snapshot(&self.route_hops, dest_hash),
-                        reusable_link: direct_reusable_link_state(
-                            self.link_delivery.as_ref(),
-                            dest_hash,
-                        ),
-                    },
-                    now_f64(),
-                );
+                let router_owned = direct_plan.is_some();
+                let plan = direct_plan.unwrap_or_else(|| {
+                    plan_direct_delivery(
+                        &mut message,
+                        DirectDeliveryPlanInput {
+                            identity_known: self.known_identities.contains_key(&dest_hex),
+                            route: direct_route_snapshot(&self.route_hops, dest_hash),
+                            reusable_link: direct_reusable_link_state(
+                                self.link_delivery.as_ref(),
+                                dest_hash,
+                            ),
+                        },
+                        now_f64(),
+                    )
+                });
 
                 match plan {
                     DirectDeliveryPlan::RequestPath { drop_existing } => {
@@ -1783,7 +1844,9 @@ impl LxmdRunner {
                             drop_existing,
                             "direct delivery waiting for path"
                         );
-                        self.router.send(message);
+                        if !router_owned {
+                            self.router.send(message);
+                        }
                     }
                     DirectDeliveryPlan::DeferTerminalFailure => {
                         tracing::warn!(
@@ -1792,7 +1855,9 @@ impl LxmdRunner {
                             max_attempts = MAX_DELIVERY_ATTEMPTS,
                             "direct delivery attempt budget reached; deferring terminal failure"
                         );
-                        self.router.send(message);
+                        if !router_owned {
+                            self.router.send(message);
+                        }
                     }
                     DirectDeliveryPlan::WaitForReusableLink => {
                         tracing::debug!(
@@ -1800,7 +1865,9 @@ impl LxmdRunner {
                             attempts = message.delivery_attempts,
                             "direct delivery waiting for reusable Link"
                         );
-                        self.router.send(message);
+                        if !router_owned {
+                            self.router.send(message);
+                        }
                     }
                     DirectDeliveryPlan::UseReusableLink
                     | DirectDeliveryPlan::StartNewLink { .. } => {
@@ -1820,19 +1887,34 @@ impl LxmdRunner {
                                 ld.start_delivery_with_report(message, dest_hash, planned_hops)
                             {
                                 let reason = err.error.to_string();
+                                let returned_message = err.message;
                                 tracing::warn!(
                                     error = %reason,
                                     dest = %dest_hex,
                                     "failed to start direct link delivery"
                                 );
-                                requeue_after_path_request(
-                                    &mut self.router,
-                                    &self.transport_tx,
-                                    err.message,
-                                    dest_hash,
-                                    &reason,
-                                    false,
-                                );
+                                if router_owned {
+                                    queue_path_request(
+                                        &self.transport_tx,
+                                        dest_hash,
+                                        false,
+                                        &reason,
+                                    );
+                                    if let Some(hash) = returned_message.hash {
+                                        let _ = self
+                                            .router
+                                            .defer_outbound_for_path_request(&hash, now_f64());
+                                    }
+                                } else {
+                                    requeue_after_path_request(
+                                        &mut self.router,
+                                        &self.transport_tx,
+                                        returned_message,
+                                        dest_hash,
+                                        &reason,
+                                        false,
+                                    );
+                                }
                             }
                         }
                     }
