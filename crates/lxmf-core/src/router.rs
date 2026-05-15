@@ -818,11 +818,13 @@ impl LxmRouter {
     /// so setting it beyond the retry window makes the message eligible on the
     /// next scheduler tick.
     pub fn trigger_outbound_for_delivery_announce(&mut self, destination_hash: [u8; 16]) -> usize {
-        let due_now = now_f64() - DELIVERY_RETRY_WAIT as f64;
+        let now = now_f64();
+        let due_now = now - DELIVERY_RETRY_WAIT as f64;
         let mut triggered = 0;
         for message in &mut self.pending_outbound {
             if message.destination_hash == destination_hash {
                 message.last_delivery_attempt = due_now;
+                message.next_delivery_attempt = now;
                 triggered += 1;
             }
         }
@@ -846,11 +848,13 @@ impl LxmRouter {
             return 0;
         }
 
-        let due_now = now_f64() - DELIVERY_RETRY_WAIT as f64;
+        let now = now_f64();
+        let due_now = now - DELIVERY_RETRY_WAIT as f64;
         let mut triggered = 0;
         for message in &mut self.pending_outbound {
             if message.method == DeliveryMethod::Propagated {
                 message.last_delivery_attempt = due_now;
+                message.next_delivery_attempt = now;
                 triggered += 1;
             }
         }
@@ -1964,6 +1968,7 @@ mod tests {
         );
         msg.delivery_attempts = 1;
         msg.last_delivery_attempt = now_f64();
+        msg.next_delivery_attempt = now_f64() + PATH_REQUEST_WAIT as f64;
         router.send(msg);
 
         assert!(router.process_outbound().is_empty());
@@ -1989,6 +1994,7 @@ mod tests {
         );
         msg.delivery_attempts = 1;
         msg.last_delivery_attempt = now_f64();
+        msg.next_delivery_attempt = now_f64() + PATH_REQUEST_WAIT as f64;
         router.send(msg);
 
         assert!(router.process_outbound().is_empty());
@@ -2013,6 +2019,7 @@ mod tests {
         );
         msg.delivery_attempts = 1;
         msg.last_delivery_attempt = now_f64();
+        msg.next_delivery_attempt = now_f64() + PATH_REQUEST_WAIT as f64;
         router.send(msg);
 
         assert!(router.process_outbound().is_empty());
