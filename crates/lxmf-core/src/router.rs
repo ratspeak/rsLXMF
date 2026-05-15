@@ -10,7 +10,7 @@ use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::constants::*;
-use crate::message::LxMessage;
+use crate::message::{LxMessage, MessageError};
 use crate::peer::LxmPeer;
 use crate::propagation::PropagationStore;
 use crate::stamper;
@@ -1227,6 +1227,27 @@ impl LxmRouter {
     /// Direct and Propagated actions require a Reticulum link and are handled by
     /// `LinkDeliveryManager` / propagation helpers in the embedding runtime.
     pub fn execute_actions(&mut self, actions: Vec<OutboundAction>) {
+        self.execute_actions_with_encryptor(actions, |dest_hash, _plaintext| {
+            Err(MessageError::PackFailed(format!(
+                "no destination encryptor configured for opportunistic delivery to {}",
+                hex::encode(dest_hash)
+            )))
+        });
+    }
+
+    /// Send single-packet opportunistic actions with caller-supplied
+    /// destination encryption.
+    ///
+    /// Python encrypts Opportunistic LXMF packet payloads with the recipient
+    /// destination identity before handing bytes to Reticulum. Core cannot
+    /// infer destination keys, so embeddings must provide the encryptor.
+    pub fn execute_actions_with_encryptor<F>(
+        &mut self,
+        actions: Vec<OutboundAction>,
+        mut encrypt_fn: F,
+    ) where
+        F: FnMut([u8; 16], &[u8]) -> Result<Vec<u8>, MessageError>,
+    {
         let transport_tx = match &self.transport_tx {
             Some(tx) => tx.clone(),
             None => return,
@@ -1238,44 +1259,50 @@ impl LxmRouter {
                     mut message,
                     dest_hash,
                 } => {
-                    if let Ok(packed) = message.pack() {
-                        // Python LXMessage.__as_packet strips the destination
-                        // hash for Opportunistic delivery because the RNS
-                        // packet header already carries it.
-                        let packet_payload = if packed.len() > DESTINATION_LENGTH {
-                            &packed[DESTINATION_LENGTH..]
-                        } else {
-                            packed.as_slice()
-                        };
-                        let flags = rns_wire::flags::PacketFlags {
-                            header_type: rns_wire::flags::HeaderType::Header1,
-                            context_flag: false,
-                            transport_type: rns_wire::flags::TransportType::Broadcast,
-                            destination_type: rns_wire::flags::DestinationType::Single,
-                            packet_type: rns_wire::flags::PacketType::Data,
-                        };
-                        let header = rns_wire::header::PacketHeader {
-                            flags,
-                            hops: 0,
-                            transport_id: None,
-                            destination_hash: dest_hash,
-                            context: rns_wire::context::PacketContext::None,
-                        };
-                        let mut raw = header.pack();
-                        raw.extend_from_slice(packet_payload);
+                    match message
+                        .pack_opportunistic_encrypted(|plaintext| encrypt_fn(dest_hash, plaintext))
+                    {
+                        Ok(packet_payload) => {
+                            // Python LXMessage.__as_packet strips the destination
+                            // hash before encryption because the RNS packet
+                            // header already carries it.
+                            let flags = rns_wire::flags::PacketFlags {
+                                header_type: rns_wire::flags::HeaderType::Header1,
+                                context_flag: false,
+                                transport_type: rns_wire::flags::TransportType::Broadcast,
+                                destination_type: rns_wire::flags::DestinationType::Single,
+                                packet_type: rns_wire::flags::PacketType::Data,
+                            };
+                            let header = rns_wire::header::PacketHeader {
+                                flags,
+                                hops: 0,
+                                transport_id: None,
+                                destination_hash: dest_hash,
+                                context: rns_wire::context::PacketContext::None,
+                            };
+                            let mut raw = header.pack();
+                            raw.extend_from_slice(&packet_payload);
 
-                        if transport_tx
-                            .try_send(rns_transport::messages::TransportMessage::Outbound(
-                                rns_transport::messages::OutboundRequest {
-                                    raw: Bytes::from(raw),
-                                    destination_hash: dest_hash,
-                                },
-                            ))
-                            .is_ok()
-                            && message.state == MessageState::Sending
-                        {
-                            message.mark_sent();
-                            message.progress = 1.0;
+                            if transport_tx
+                                .try_send(rns_transport::messages::TransportMessage::Outbound(
+                                    rns_transport::messages::OutboundRequest {
+                                        raw: Bytes::from(raw),
+                                        destination_hash: dest_hash,
+                                    },
+                                ))
+                                .is_ok()
+                                && message.state == MessageState::Sending
+                            {
+                                message.mark_sent();
+                                message.progress = 1.0;
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                dest = %hex::encode(dest_hash),
+                                error = %err,
+                                "cannot execute opportunistic LXMF action"
+                            );
                         }
                     }
                 }
@@ -1302,6 +1329,27 @@ impl LxmRouter {
             self.execute_actions(actions);
         }
 
+        self.run_periodic_jobs();
+    }
+
+    /// Advance one scheduler tick using caller-supplied destination encryption
+    /// for Opportunistic packet actions.
+    pub fn tick_with_encryptor<F>(&mut self, encrypt_fn: F)
+    where
+        F: FnMut([u8; 16], &[u8]) -> Result<Vec<u8>, MessageError>,
+    {
+        self.processing_count += 1;
+
+        self.process_deferred_stamps();
+        let actions = self.process_outbound();
+        if !actions.is_empty() {
+            self.execute_actions_with_encryptor(actions, encrypt_fn);
+        }
+
+        self.run_periodic_jobs();
+    }
+
+    fn run_periodic_jobs(&mut self) {
         // Job cadences match the Python LXMRouter jobloop.
         if self.processing_count.is_multiple_of(JOB_TRANSIENT_INTERVAL) {
             self.propagation_store.clean_transient_caches();
@@ -2197,7 +2245,7 @@ mod tests {
         msg.sign(&signing_key).unwrap();
         router.send(msg);
 
-        router.tick();
+        router.tick_with_encryptor(|_dest, plaintext| Ok(plaintext.to_vec()));
 
         let received = rx.try_recv();
         assert!(received.is_ok(), "expected outbound packet from tick()");
@@ -2237,6 +2285,63 @@ mod tests {
         opportunistic.sign(&key).unwrap();
         let opportunistic_packed = opportunistic.pack().unwrap();
 
+        router.execute_actions_with_encryptor(
+            vec![
+                OutboundAction::DeliverDirect {
+                    message: direct,
+                    dest_hash,
+                },
+                OutboundAction::DeliverOpportunistic {
+                    message: opportunistic,
+                    dest_hash,
+                },
+            ],
+            |_dest, plaintext| {
+                let mut out = vec![0xEE];
+                out.extend_from_slice(plaintext);
+                Ok(out)
+            },
+        );
+
+        let opportunistic_raw = match rx.try_recv().expect("opportunistic outbound request") {
+            rns_transport::messages::TransportMessage::Outbound(req) => req.raw,
+            other => panic!("expected outbound request, got {other:?}"),
+        };
+        let (_, opportunistic_data_offset) =
+            rns_wire::header::PacketHeader::unpack(&opportunistic_raw).unwrap();
+        assert_eq!(
+            &opportunistic_raw[opportunistic_data_offset..],
+            [&[0xEE], &opportunistic_packed[DESTINATION_LENGTH..]].concat(),
+            "Opportunistic delivery encrypts the LXMF tail after the destination hash"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "Direct actions require LinkDeliveryManager and must not be sent as destination packets"
+        );
+    }
+
+    #[test]
+    fn test_execute_actions_without_encryptor_does_not_send_opportunistic_plaintext() {
+        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
+        let dest_hash = [0xAA; 16];
+        let src_hash = [0xBB; 16];
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        let mut router = LxmRouter::new(RouterConfig::default());
+        router.set_transport(tx);
+
+        let mut direct = LxMessage::new(dest_hash, src_hash, "Direct", "d", DeliveryMethod::Direct);
+        direct.sign(&key).unwrap();
+
+        let mut opportunistic = LxMessage::new(
+            dest_hash,
+            src_hash,
+            "Opp",
+            "o",
+            DeliveryMethod::Opportunistic,
+        );
+        opportunistic.sign(&key).unwrap();
+
         router.execute_actions(vec![
             OutboundAction::DeliverDirect {
                 message: direct,
@@ -2248,20 +2353,9 @@ mod tests {
             },
         ]);
 
-        let opportunistic_raw = match rx.try_recv().expect("opportunistic outbound request") {
-            rns_transport::messages::TransportMessage::Outbound(req) => req.raw,
-            other => panic!("expected outbound request, got {other:?}"),
-        };
-        let (_, opportunistic_data_offset) =
-            rns_wire::header::PacketHeader::unpack(&opportunistic_raw).unwrap();
-        assert_eq!(
-            &opportunistic_raw[opportunistic_data_offset..],
-            &opportunistic_packed[DESTINATION_LENGTH..],
-            "Opportunistic delivery omits the destination hash already present in the RNS header"
-        );
         assert!(
             rx.try_recv().is_err(),
-            "Direct actions require LinkDeliveryManager and must not be sent as destination packets"
+            "execute_actions without an encryptor must not send raw opportunistic payloads"
         );
     }
 
