@@ -411,12 +411,14 @@ impl PropagationRequestHandler {
 
         node.handle_offer_request(
             request_data,
-            peer_hash,
-            identity_known,
-            is_throttled,
-            access_allowed,
-            Some(&self.local_identity_hash),
-            remote_identity_hash,
+            crate::propagation_node::OfferRequestContext {
+                peer_hash,
+                identity_known,
+                is_throttled,
+                access_allowed,
+                local_identity_hash: Some(&self.local_identity_hash),
+                remote_identity_hash,
+            },
         )
     }
 

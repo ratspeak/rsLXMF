@@ -39,6 +39,16 @@ impl Default for PropagationNodeConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct OfferRequestContext<'a> {
+    pub peer_hash: [u8; 16],
+    pub identity_known: bool,
+    pub is_throttled: bool,
+    pub access_allowed: bool,
+    pub local_identity_hash: Option<&'a [u8; 16]>,
+    pub remote_identity_hash: Option<&'a [u8; 16]>,
+}
+
 pub struct PropagationNode {
     config: PropagationNodeConfig,
     store: PropagationStore,
@@ -530,18 +540,13 @@ impl PropagationNode {
     pub fn handle_offer_request(
         &mut self,
         request_data: &[u8],
-        peer_hash: [u8; 16],
-        identity_known: bool,
-        is_throttled: bool,
-        access_allowed: bool,
-        local_identity_hash: Option<&[u8; 16]>,
-        remote_identity_hash: Option<&[u8; 16]>,
+        ctx: OfferRequestContext<'_>,
     ) -> Vec<u8> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs_f64())
             .unwrap_or(0.0);
-        if let Some(&last_time) = self.last_offer_times.get(&peer_hash)
+        if let Some(&last_time) = self.last_offer_times.get(&ctx.peer_hash)
             && now - last_time < PN_STAMP_THROTTLE as f64
         {
             return Self::encode_offer_response(&OfferResponse::ErrorThrottled);
@@ -559,7 +564,7 @@ impl PropagationNode {
             self.config.peering_cost == 0
         } else if peering_key.len() == 32 {
             if let (Some(local_hash), Some(remote_hash)) =
-                (local_identity_hash, remote_identity_hash)
+                (ctx.local_identity_hash, ctx.remote_identity_hash)
             {
                 let mut key = [0u8; 32];
                 key.copy_from_slice(&peering_key);
@@ -575,15 +580,15 @@ impl PropagationNode {
         };
 
         let response = self.offer_request_checked(
-            peer_hash,
-            identity_known,
-            is_throttled,
-            access_allowed,
+            ctx.peer_hash,
+            ctx.identity_known,
+            ctx.is_throttled,
+            ctx.access_allowed,
             peering_key_valid,
             &offered_ids,
         );
 
-        self.last_offer_times.insert(peer_hash, now);
+        self.last_offer_times.insert(ctx.peer_hash, now);
 
         Self::encode_offer_response(&response)
     }
@@ -601,15 +606,12 @@ impl PropagationNode {
         let ids_array = arr[1].as_array()?;
         let mut offered_ids = Vec::with_capacity(ids_array.len());
         for id_val in ids_array {
-            if let Some(id_bytes) = id_val.as_slice() {
-                match id_bytes.len() {
-                    32 => {
-                        let mut tid = [0u8; 32];
-                        tid.copy_from_slice(id_bytes);
-                        offered_ids.push(tid);
-                    }
-                    _ => {}
-                }
+            if let Some(id_bytes) = id_val.as_slice()
+                && id_bytes.len() == 32
+            {
+                let mut tid = [0u8; 32];
+                tid.copy_from_slice(id_bytes);
+                offered_ids.push(tid);
             }
         }
 
@@ -923,6 +925,24 @@ mod tests {
         )
         .unwrap()
         .0
+    }
+
+    fn offer_ctx<'a>(
+        peer_hash: [u8; 16],
+        identity_known: bool,
+        is_throttled: bool,
+        access_allowed: bool,
+        local_identity_hash: Option<&'a [u8; 16]>,
+        remote_identity_hash: Option<&'a [u8; 16]>,
+    ) -> OfferRequestContext<'a> {
+        OfferRequestContext {
+            peer_hash,
+            identity_known,
+            is_throttled,
+            access_allowed,
+            local_identity_hash,
+            remote_identity_hash,
+        }
     }
 
     #[test]
@@ -1588,12 +1608,14 @@ mod tests {
 
         let response_bytes = node.handle_offer_request(
             &buf,
-            [0xDD; 16],
-            true,
-            false,
-            true,
-            Some(&local_identity),
-            Some(&remote_identity),
+            offer_ctx(
+                [0xDD; 16],
+                true,
+                false,
+                true,
+                Some(&local_identity),
+                Some(&remote_identity),
+            ),
         );
         let response = OfferResponse::from_msgpack(&response_bytes);
         assert_eq!(response, OfferResponse::WantAll);
@@ -1615,12 +1637,14 @@ mod tests {
 
         let response_bytes = node.handle_offer_request(
             &buf,
-            [0xDD; 16],
-            true,
-            false,
-            true,
-            Some(&local_identity),
-            Some(&remote_identity),
+            offer_ctx(
+                [0xDD; 16],
+                true,
+                false,
+                true,
+                Some(&local_identity),
+                Some(&remote_identity),
+            ),
         );
         let response = OfferResponse::from_msgpack(&response_bytes);
         assert_eq!(response, OfferResponse::ErrorInvalidKey);
@@ -1648,12 +1672,14 @@ mod tests {
 
         let response_bytes = node.handle_offer_request(
             &buf,
-            [0xDD; 16],
-            true,
-            false,
-            true,
-            Some(&local_identity),
-            Some(&remote_identity),
+            offer_ctx(
+                [0xDD; 16],
+                true,
+                false,
+                true,
+                Some(&local_identity),
+                Some(&remote_identity),
+            ),
         );
         let response = OfferResponse::from_msgpack(&response_bytes);
         assert_eq!(response, OfferResponse::ErrorInvalidKey);
@@ -1669,7 +1695,7 @@ mod tests {
         rmpv::encode::write_value(&mut buf, &offer).unwrap();
 
         let response_bytes =
-            node.handle_offer_request(&buf, [0xBB; 16], false, false, true, None, None);
+            node.handle_offer_request(&buf, offer_ctx([0xBB; 16], false, false, true, None, None));
         let response = OfferResponse::from_msgpack(&response_bytes);
         assert_eq!(response, OfferResponse::ErrorNoIdentity);
     }
@@ -1678,8 +1704,10 @@ mod tests {
     fn test_handle_offer_request_invalid_data() {
         let mut node = PropagationNode::new(PropagationNodeConfig::default(), [0xAA; 16]);
 
-        let response_bytes =
-            node.handle_offer_request(&[0xFF, 0xFF], [0xBB; 16], true, false, true, None, None);
+        let response_bytes = node.handle_offer_request(
+            &[0xFF, 0xFF],
+            offer_ctx([0xBB; 16], true, false, true, None, None),
+        );
         let response = OfferResponse::from_msgpack(&response_bytes);
         assert_eq!(response, OfferResponse::ErrorInvalidData);
     }
