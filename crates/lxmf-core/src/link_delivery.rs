@@ -6,10 +6,12 @@
 //! identity verification via link identification.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use rns_crypto::ed25519::{Ed25519PrivateKey, Ed25519PublicKey};
+use rns_link::constants::{ESTABLISHMENT_TIMEOUT_PER_HOP, KEEPALIVE_DEFAULT};
 use rns_link::link::{CloseReason, Link};
 use rns_protocol::resource::{
     MAX_EFFICIENT_SIZE, MultiSegmentOutbound, OutboundResource, OutboundTransfer, ResourceError,
@@ -18,6 +20,7 @@ use rns_protocol::resource::{
 use rns_transport::link_messages::DestinationEvent;
 use rns_transport::messages::{OutboundRequest, TransportMessage};
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
 
 use crate::constants::{DeliveryRepresentation, LXMF_OVERHEAD};
 use crate::message::LxMessage;
@@ -50,9 +53,52 @@ pub struct PendingDelivery {
     pub remaining_segments: Vec<OutboundResource>,
     /// Full packet hash of a single link-packet LXMF delivery awaiting LINKPROOF.
     pub packet_proof_hash: Option<[u8; 32]>,
+    /// Link establishment timeout. This intentionally excludes keepalive time:
+    /// an initiator that never receives LRPROOF should fail on the Link
+    /// establishment clock, not on the active-link inactivity clock.
+    pub establishment_timeout: Duration,
+    /// Full delivery timeout after the link has moved beyond establishment.
     pub timeout: Duration,
     pub msg_hash: Option<[u8; 32]>,
     pub failure_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkDeliveryStartError {
+    TransportFull,
+    TransportClosed,
+}
+
+impl fmt::Display for LinkDeliveryStartError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TransportFull => f.write_str("transport full"),
+            Self::TransportClosed => f.write_str("transport closed"),
+        }
+    }
+}
+
+impl std::error::Error for LinkDeliveryStartError {}
+
+#[derive(Debug)]
+pub struct LinkDeliveryStartFailure {
+    pub error: LinkDeliveryStartError,
+    pub message: LxMessage,
+}
+
+impl fmt::Display for LinkDeliveryStartFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+impl std::error::Error for LinkDeliveryStartFailure {}
+
+fn start_error_from_reserve(err: TrySendError<()>) -> LinkDeliveryStartError {
+    match err {
+        TrySendError::Full(_) => LinkDeliveryStartError::TransportFull,
+        TrySendError::Closed(_) => LinkDeliveryStartError::TransportClosed,
+    }
 }
 
 /// Driver for outbound link-based LXMF deliveries.
@@ -91,7 +137,7 @@ impl LinkDeliveryManager {
         message: LxMessage,
         dest_hash: [u8; 16],
         hops: u8,
-    ) -> [u8; 16] {
+    ) -> Result<[u8; 16], LinkDeliveryStartFailure> {
         self.start_delivery_inner(message, dest_hash, hops, None, true)
     }
 
@@ -106,7 +152,7 @@ impl LinkDeliveryManager {
         hops: u8,
         packed_payload: Vec<u8>,
         auto_compress: bool,
-    ) -> [u8; 16] {
+    ) -> Result<[u8; 16], LinkDeliveryStartFailure> {
         self.start_delivery_inner(
             message,
             dest_hash,
@@ -123,24 +169,47 @@ impl LinkDeliveryManager {
         hops: u8,
         packed_override: Option<Vec<u8>>,
         auto_compress: bool,
-    ) -> [u8; 16] {
+    ) -> Result<[u8; 16], LinkDeliveryStartFailure> {
         let msg_hash = message.hash;
         let (link, request_data) = Link::new_initiator(dest_hash, hops);
         let link_id = link.link_id;
+        let pending_count = self.pending.len();
+
+        let register_permit = match self.transport_tx.try_reserve() {
+            Ok(permit) => permit,
+            Err(err) => {
+                let error = start_error_from_reserve(err);
+                tracing::warn!(
+                    link_id = %hex_encode(&link_id),
+                    dest = %hex_encode(&dest_hash),
+                    hops = hops.max(1),
+                    pending_count,
+                    register_result = %error,
+                    outbound_result = "not_attempted",
+                    "failed to start link delivery"
+                );
+                return Err(LinkDeliveryStartFailure { error, message });
+            }
+        };
+
+        let outbound_permit = match self.transport_tx.try_reserve() {
+            Ok(permit) => permit,
+            Err(err) => {
+                let error = start_error_from_reserve(err);
+                tracing::warn!(
+                    link_id = %hex_encode(&link_id),
+                    dest = %hex_encode(&dest_hash),
+                    hops = hops.max(1),
+                    pending_count,
+                    register_result = "reserved",
+                    outbound_result = %error,
+                    "failed to start link delivery"
+                );
+                return Err(LinkDeliveryStartFailure { error, message });
+            }
+        };
 
         // Register the ephemeral link_id so proofs and data route back to us.
-        if let Err(e) = self
-            .transport_tx
-            .try_send(TransportMessage::RegisterDestination {
-                hash: link_id,
-                app_name: "lxmf.delivery.link".to_string(),
-                delivery_tx: Some(self.event_tx.clone()),
-            })
-        {
-            tracing::warn!(err = %e,
-                "failed to register link delivery destination; packets will not route back");
-        }
-
         let flags = rns_wire::flags::PacketFlags {
             header_type: rns_wire::flags::HeaderType::Header1,
             context_flag: false,
@@ -158,15 +227,20 @@ impl LinkDeliveryManager {
         let mut raw = header.pack();
         raw.extend_from_slice(&request_data);
 
-        let _ = self
-            .transport_tx
-            .try_send(TransportMessage::Outbound(OutboundRequest {
-                raw: Bytes::from(raw),
-                destination_hash: dest_hash,
-            }));
+        register_permit.send(TransportMessage::RegisterDestination {
+            hash: link_id,
+            app_name: "lxmf.delivery.link".to_string(),
+            delivery_tx: Some(self.event_tx.clone()),
+        });
+        outbound_permit.send(TransportMessage::Outbound(OutboundRequest {
+            raw: Bytes::from(raw),
+            destination_hash: dest_hash,
+        }));
 
-        // ESTABLISHMENT_TIMEOUT_PER_HOP(6s) * max(1, hops) + KEEPALIVE(360s).
-        let timeout_secs = 6.0 * (hops.max(1) as f64) + 360.0;
+        let establishment_timeout_secs = ESTABLISHMENT_TIMEOUT_PER_HOP * (hops.max(1) as f64);
+        // Full transfer timeout keeps the previous keepalive allowance once
+        // establishment has succeeded.
+        let timeout_secs = establishment_timeout_secs + KEEPALIVE_DEFAULT;
         self.pending.insert(
             link_id,
             PendingDelivery {
@@ -180,13 +254,26 @@ impl LinkDeliveryManager {
                 transfer: None,
                 remaining_segments: Vec::new(),
                 packet_proof_hash: None,
+                establishment_timeout: Duration::from_secs_f64(establishment_timeout_secs),
                 timeout: Duration::from_secs_f64(timeout_secs),
                 msg_hash,
                 failure_reason: None,
             },
         );
 
-        link_id
+        tracing::debug!(
+            link_id = %hex_encode(&link_id),
+            dest = %hex_encode(&dest_hash),
+            hops = hops.max(1),
+            pending_count,
+            register_result = "ok",
+            outbound_result = "ok",
+            establishment_timeout_secs,
+            delivery_timeout_secs = timeout_secs,
+            "link delivery started"
+        );
+
+        Ok(link_id)
     }
 
     /// Drain inbound transport events and dispatch by packet context.
@@ -223,19 +310,26 @@ impl LinkDeliveryManager {
                             let dest_hex =
                                 self.pending.get(&link_id).map(|d| hex_encode(&d.dest_hash));
 
-                            if let Some(dest_hex) = dest_hex
-                                && let Some(pub_key) = known_identities.get(&dest_hex)
-                            {
-                                let ed25519_bytes: [u8; 32] = pub_key[32..64]
-                                    .try_into()
-                                    .expect("known_identities values are [u8; 64]; slice [32..64] is always 32 bytes");
-                                if let Ok(verify_key) = Ed25519PublicKey::from_bytes(&ed25519_bytes)
-                                {
-                                    self.handle_link_proof(
-                                        &link_id,
-                                        data,
-                                        &verify_key,
-                                        &ed25519_bytes,
+                            if let Some(dest_hex) = dest_hex {
+                                if let Some(pub_key) = known_identities.get(&dest_hex) {
+                                    let ed25519_bytes: [u8; 32] = pub_key[32..64]
+                                        .try_into()
+                                        .expect("known_identities values are [u8; 64]; slice [32..64] is always 32 bytes");
+                                    if let Ok(verify_key) =
+                                        Ed25519PublicKey::from_bytes(&ed25519_bytes)
+                                    {
+                                        self.handle_link_proof(
+                                            &link_id,
+                                            data,
+                                            &verify_key,
+                                            &ed25519_bytes,
+                                        );
+                                    }
+                                } else {
+                                    tracing::warn!(
+                                        link_id = %hex_encode(&link_id),
+                                        dest = %dest_hex,
+                                        "LRPROOF received but destination identity key is not cached; ignoring proof"
                                     );
                                 }
                             }
@@ -257,20 +351,26 @@ impl LinkDeliveryManager {
                                 let dest_hex =
                                     self.pending.get(&link_id).map(|d| hex_encode(&d.dest_hash));
 
-                                if let Some(dest_hex) = dest_hex
-                                    && let Some(pub_key) = known_identities.get(&dest_hex)
-                                {
-                                    let ed25519_bytes: [u8; 32] = pub_key[32..64]
-                                        .try_into()
-                                        .expect("known_identities values are [u8; 64]; slice [32..64] is always 32 bytes");
-                                    if let Ok(verify_key) =
-                                        Ed25519PublicKey::from_bytes(&ed25519_bytes)
-                                    {
-                                        self.handle_link_proof(
-                                            &link_id,
-                                            data,
-                                            &verify_key,
-                                            &ed25519_bytes,
+                                if let Some(dest_hex) = dest_hex {
+                                    if let Some(pub_key) = known_identities.get(&dest_hex) {
+                                        let ed25519_bytes: [u8; 32] = pub_key[32..64]
+                                            .try_into()
+                                            .expect("known_identities values are [u8; 64]; slice [32..64] is always 32 bytes");
+                                        if let Ok(verify_key) =
+                                            Ed25519PublicKey::from_bytes(&ed25519_bytes)
+                                        {
+                                            self.handle_link_proof(
+                                                &link_id,
+                                                data,
+                                                &verify_key,
+                                                &ed25519_bytes,
+                                            );
+                                        }
+                                    } else {
+                                        tracing::warn!(
+                                            link_id = %hex_encode(&link_id),
+                                            dest = %dest_hex,
+                                            "LRPROOF received but destination identity key is not cached; ignoring proof"
                                         );
                                     }
                                 }
@@ -393,13 +493,40 @@ impl LinkDeliveryManager {
         let mut to_remove = Vec::new();
 
         for (link_id, delivery) in &mut self.pending {
-            if delivery.started_at.elapsed() > delivery.timeout {
+            let elapsed = delivery.started_at.elapsed();
+            let (timed_out, timeout, reason) = if delivery.state == DeliveryState::Establishing {
+                (
+                    elapsed > delivery.establishment_timeout,
+                    delivery.establishment_timeout,
+                    "link establishment timeout",
+                )
+            } else {
+                (
+                    elapsed > delivery.timeout,
+                    delivery.timeout,
+                    "delivery timeout",
+                )
+            };
+
+            if timed_out {
+                let state = delivery.state;
                 delivery.state = DeliveryState::Failed;
-                delivery.failure_reason = Some("delivery timeout".to_string());
+                delivery.failure_reason = Some(reason.to_string());
+                tracing::warn!(
+                    link_id = %hex_encode(link_id),
+                    dest = %hex_encode(&delivery.dest_hash),
+                    state = ?state,
+                    age_secs = elapsed.as_secs_f64(),
+                    timeout_secs = timeout.as_secs_f64(),
+                    reason,
+                    "link delivery timed out"
+                );
                 results.push(DeliveryResult::Failed {
                     link_id: *link_id,
                     msg_hash: delivery.msg_hash,
-                    reason: "delivery timeout".to_string(),
+                    dest_hash: delivery.dest_hash,
+                    message: delivery.message.clone(),
+                    reason: reason.to_string(),
                 });
                 to_remove.push(*link_id);
                 continue;
@@ -518,6 +645,8 @@ impl LinkDeliveryManager {
                                 results.push(DeliveryResult::Failed {
                                     link_id: *link_id,
                                     msg_hash: delivery.msg_hash,
+                                    dest_hash: delivery.dest_hash,
+                                    message: delivery.message.clone(),
                                     reason,
                                 });
                                 to_remove.push(*link_id);
@@ -540,6 +669,8 @@ impl LinkDeliveryManager {
                     results.push(DeliveryResult::Failed {
                         link_id: *link_id,
                         msg_hash: delivery.msg_hash,
+                        dest_hash: delivery.dest_hash,
+                        message: delivery.message.clone(),
                         reason,
                     });
                     to_remove.push(*link_id);
@@ -735,6 +866,8 @@ pub enum DeliveryResult {
     Failed {
         link_id: [u8; 16],
         msg_hash: Option<[u8; 32]>,
+        dest_hash: [u8; 16],
+        message: LxMessage,
         reason: String,
     },
 }
@@ -968,7 +1101,7 @@ mod tests {
         responder_key: &Ed25519PrivateKey,
         dest_hash: [u8; 16],
     ) -> ([u8; 16], Link) {
-        let link_id = mgr.start_delivery(msg, dest_hash, 1);
+        let link_id = mgr.start_delivery(msg, dest_hash, 1).unwrap();
 
         let request_raw = next_outbound(rx);
         let (request_header, request_offset) =
@@ -1043,7 +1176,7 @@ mod tests {
         );
         let dest_hash = [0xCC; 16];
 
-        let link_id = mgr.start_delivery(msg, dest_hash, 1);
+        let link_id = mgr.start_delivery(msg, dest_hash, 1).unwrap();
         assert_eq!(mgr.pending_count(), 1);
 
         let register = rx.try_recv();
@@ -1062,7 +1195,60 @@ mod tests {
     }
 
     #[test]
-    fn test_delivery_timeout_deregisters() {
+    fn test_start_delivery_does_not_partially_register_when_second_slot_unavailable() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let mut mgr = LinkDeliveryManager::new(tx, None, None);
+
+        let msg = LxMessage::new(
+            [0; 16],
+            [0; 16],
+            "Full",
+            "transport full",
+            crate::constants::DeliveryMethod::Direct,
+        );
+
+        let result = mgr.start_delivery(msg, [0xDD; 16], 1);
+        assert!(matches!(
+            result,
+            Err(LinkDeliveryStartFailure {
+                error: LinkDeliveryStartError::TransportFull,
+                ..
+            })
+        ));
+        assert_eq!(mgr.pending_count(), 0);
+        assert!(
+            rx.try_recv().is_err(),
+            "no RegisterDestination should be queued without a LinkRequest slot"
+        );
+    }
+
+    #[test]
+    fn test_start_delivery_closed_transport_fails_without_pending_delivery() {
+        let (tx, rx) = mpsc::channel(2);
+        drop(rx);
+        let mut mgr = LinkDeliveryManager::new(tx, None, None);
+
+        let msg = LxMessage::new(
+            [0; 16],
+            [0; 16],
+            "Closed",
+            "transport closed",
+            crate::constants::DeliveryMethod::Direct,
+        );
+
+        let result = mgr.start_delivery(msg, [0xDD; 16], 1);
+        assert!(matches!(
+            result,
+            Err(LinkDeliveryStartFailure {
+                error: LinkDeliveryStartError::TransportClosed,
+                ..
+            })
+        ));
+        assert_eq!(mgr.pending_count(), 0);
+    }
+
+    #[test]
+    fn test_establishment_timeout_deregisters() {
         let (tx, mut rx) = mpsc::channel(64);
         let mut mgr = LinkDeliveryManager::new(tx, None, None);
 
@@ -1073,12 +1259,12 @@ mod tests {
             "timeout test",
             crate::constants::DeliveryMethod::Direct,
         );
-        let link_id = mgr.start_delivery(msg, [0xDD; 16], 1);
+        let link_id = mgr.start_delivery(msg, [0xDD; 16], 1).unwrap();
 
         while rx.try_recv().is_ok() {}
 
         if let Some(delivery) = mgr.pending.get_mut(&link_id) {
-            delivery.timeout = Duration::ZERO;
+            delivery.establishment_timeout = Duration::ZERO;
         }
 
         let results = mgr.tick();
@@ -1087,6 +1273,10 @@ mod tests {
                 .iter()
                 .any(|r| matches!(r, DeliveryResult::Failed { .. }))
         );
+        assert!(results.iter().any(|r| matches!(
+            r,
+            DeliveryResult::Failed { reason, .. } if reason == "link establishment timeout"
+        )));
         assert_eq!(mgr.pending_count(), 0);
 
         let deregister = rx.try_recv();
@@ -1113,7 +1303,7 @@ mod tests {
         msg.sign(&key).unwrap();
         let expected_hash = msg.hash;
 
-        let link_id = mgr.start_delivery(msg, [0xCC; 16], 1);
+        let link_id = mgr.start_delivery(msg, [0xCC; 16], 1).unwrap();
         let delivery = mgr.pending.get(&link_id).unwrap();
         assert_eq!(delivery.msg_hash, expected_hash);
     }

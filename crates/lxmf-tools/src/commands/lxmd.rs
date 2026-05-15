@@ -1548,7 +1548,15 @@ impl LxmdRunner {
                         Some(packed) => {
                             self.ensure_link_delivery();
                             if let Some(ref mut ld) = self.link_delivery {
-                                ld.start_packed_delivery(message, prop_hash, 1, packed, false);
+                                if let Err(err) =
+                                    ld.start_packed_delivery(message, prop_hash, 1, packed, false)
+                                {
+                                    tracing::warn!(
+                                        error = %err,
+                                        prop = %hex::encode(prop_hash),
+                                        "failed to start propagated link delivery"
+                                    );
+                                }
                             }
                         }
                         None => {
@@ -1600,7 +1608,13 @@ impl LxmdRunner {
                 );
                 self.ensure_link_delivery();
                 if let Some(ref mut ld) = self.link_delivery {
-                    ld.start_delivery(message, dest_hash, 1);
+                    if let Err(err) = ld.start_delivery(message, dest_hash, 1) {
+                        tracing::warn!(
+                            error = %err,
+                            dest = %dest_hex,
+                            "failed to start direct link delivery"
+                        );
+                    }
                 }
                 continue;
             }
@@ -1666,7 +1680,13 @@ impl LxmdRunner {
                 );
                 self.ensure_link_delivery();
                 if let Some(ref mut ld) = self.link_delivery {
-                    ld.start_delivery(message, dest_hash, 1);
+                    if let Err(err) = ld.start_delivery(message, dest_hash, 1) {
+                        tracing::warn!(
+                            error = %err,
+                            dest = %dest_hex,
+                            "failed to start oversized direct link delivery"
+                        );
+                    }
                 }
                 continue;
             }
