@@ -165,6 +165,54 @@ pub struct LinkDeliveryStartFailure {
     pub message: LxMessage,
 }
 
+/// How a Direct delivery was attached to Link state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectLinkStartKind {
+    /// A new outbound Direct LinkRequest was queued.
+    NewDirect,
+    /// An existing active Link accepted the message immediately.
+    ReusedActiveDirect,
+    /// The message was queued behind a pending or busy reusable Link.
+    QueuedOnDirect,
+}
+
+/// Start result with enough detail for callers to surface upstream-like Direct
+/// delivery stages without reimplementing LinkDeliveryManager policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirectLinkStartReport {
+    pub link_id: [u8; 16],
+    pub dest_hash: [u8; 16],
+    pub kind: DirectLinkStartKind,
+    pub link_state: LinkState,
+    pub delivery_state: DeliveryState,
+    pub queued_deliveries: usize,
+    pub in_flight_deliveries: usize,
+}
+
+/// Snapshot of a reusable Direct Link session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirectLinkSnapshot {
+    pub link_id: [u8; 16],
+    pub dest_hash: [u8; 16],
+    pub link_state: LinkState,
+    pub delivery_state: DeliveryState,
+    pub queued_deliveries: usize,
+    pub in_flight_deliveries: usize,
+}
+
+/// Aggregate LinkDeliveryManager state for diagnostics and UI event mapping.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LinkDeliveryStats {
+    pub sessions: usize,
+    pub direct_sessions: usize,
+    pub one_shot_sessions: usize,
+    pub establishing_direct_sessions: usize,
+    pub active_direct_sessions: usize,
+    pub idle_direct_sessions: usize,
+    pub queued_deliveries: usize,
+    pub in_flight_deliveries: usize,
+}
+
 impl fmt::Display for LinkDeliveryStartFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.error.fmt(f)
@@ -220,6 +268,18 @@ impl LinkDeliveryManager {
         dest_hash: [u8; 16],
         hops: u8,
     ) -> Result<[u8; 16], LinkDeliveryStartFailure> {
+        self.start_delivery_with_report(message, dest_hash, hops)
+            .map(|report| report.link_id)
+    }
+
+    /// Start a Direct delivery and return whether it created, reused, or queued
+    /// on reusable Link state.
+    pub fn start_delivery_with_report(
+        &mut self,
+        message: LxMessage,
+        dest_hash: [u8; 16],
+        hops: u8,
+    ) -> Result<DirectLinkStartReport, LinkDeliveryStartFailure> {
         self.start_direct_delivery(message, dest_hash, hops)
     }
 
@@ -250,19 +310,21 @@ impl LinkDeliveryManager {
         message: LxMessage,
         dest_hash: [u8; 16],
         hops: u8,
-    ) -> Result<[u8; 16], LinkDeliveryStartFailure> {
+    ) -> Result<DirectLinkStartReport, LinkDeliveryStartFailure> {
         if let Some(link_id) = self.direct_links.get(&dest_hash).copied() {
             if let Some(delivery) = self.pending.get_mut(&link_id)
                 && delivery.reusable
             {
                 let state = delivery.state;
                 let link_state = delivery.link.state;
-                if state == DeliveryState::Idle && delivery.link.is_active() {
+                let kind = if state == DeliveryState::Idle && delivery.link.is_active() {
                     delivery.queue_delivery(message, None, true);
                     let _ = delivery.start_queued_delivery();
+                    DirectLinkStartKind::ReusedActiveDirect
                 } else {
                     delivery.queue_delivery(message, None, true);
-                }
+                    DirectLinkStartKind::QueuedOnDirect
+                };
                 tracing::debug!(
                     link_id = %hex_encode(&link_id),
                     dest = %hex_encode(&dest_hash),
@@ -272,13 +334,33 @@ impl LinkDeliveryManager {
                     pending_count = delivery.active_delivery_count(),
                     "reusing cached Direct link delivery session"
                 );
-                return Ok(link_id);
+                return Ok(DirectLinkStartReport {
+                    link_id,
+                    dest_hash,
+                    kind,
+                    link_state,
+                    delivery_state: delivery.state,
+                    queued_deliveries: delivery.queued.len(),
+                    in_flight_deliveries: usize::from(delivery.state != DeliveryState::Idle),
+                });
             }
 
             self.direct_links.remove(&dest_hash);
         }
 
-        self.start_delivery_inner(message, dest_hash, hops, None, true, true)
+        let link_id = self.start_delivery_inner(message, dest_hash, hops, None, true, true)?;
+        let snapshot = self.direct_link_snapshot(dest_hash);
+        Ok(DirectLinkStartReport {
+            link_id,
+            dest_hash,
+            kind: DirectLinkStartKind::NewDirect,
+            link_state: snapshot.map(|s| s.link_state).unwrap_or(LinkState::Pending),
+            delivery_state: snapshot
+                .map(|s| s.delivery_state)
+                .unwrap_or(DeliveryState::Establishing),
+            queued_deliveries: 0,
+            in_flight_deliveries: 1,
+        })
     }
 
     fn start_delivery_inner(
@@ -1049,6 +1131,53 @@ impl LinkDeliveryManager {
             .sum()
     }
 
+    pub fn delivery_link_available(&self, dest_hash: &[u8; 16]) -> bool {
+        self.direct_links
+            .get(dest_hash)
+            .and_then(|link_id| self.pending.get(link_id))
+            .is_some_and(|delivery| delivery.reusable && delivery.link.state != LinkState::Closed)
+    }
+
+    pub fn direct_link_snapshot(&self, dest_hash: [u8; 16]) -> Option<DirectLinkSnapshot> {
+        let link_id = *self.direct_links.get(&dest_hash)?;
+        let delivery = self.pending.get(&link_id)?;
+        Some(DirectLinkSnapshot {
+            link_id,
+            dest_hash,
+            link_state: delivery.link.state,
+            delivery_state: delivery.state,
+            queued_deliveries: delivery.queued.len(),
+            in_flight_deliveries: usize::from(delivery.state != DeliveryState::Idle),
+        })
+    }
+
+    pub fn stats(&self) -> LinkDeliveryStats {
+        let mut stats = LinkDeliveryStats {
+            sessions: self.pending.len(),
+            direct_sessions: self.pending.values().filter(|d| d.reusable).count(),
+            one_shot_sessions: self.pending.values().filter(|d| !d.reusable).count(),
+            ..LinkDeliveryStats::default()
+        };
+        for delivery in self.pending.values() {
+            stats.queued_deliveries += delivery.queued.len();
+            if delivery.state != DeliveryState::Idle {
+                stats.in_flight_deliveries += 1;
+            }
+            if delivery.reusable {
+                if delivery.state == DeliveryState::Establishing {
+                    stats.establishing_direct_sessions += 1;
+                }
+                if delivery.link.is_active() {
+                    stats.active_direct_sessions += 1;
+                }
+                if delivery.state == DeliveryState::Idle {
+                    stats.idle_direct_sessions += 1;
+                }
+            }
+        }
+        stats
+    }
+
     pub fn session_count(&self) -> usize {
         self.pending.len()
     }
@@ -1634,8 +1763,17 @@ mod tests {
         );
         let dest_hash = [0xCC; 16];
 
-        let link_id = mgr.start_delivery(msg, dest_hash, 1).unwrap();
+        let report = mgr.start_delivery_with_report(msg, dest_hash, 1).unwrap();
+        let link_id = report.link_id;
+        assert_eq!(report.kind, DirectLinkStartKind::NewDirect);
+        assert_eq!(report.dest_hash, dest_hash);
+        assert_eq!(report.delivery_state, DeliveryState::Establishing);
+        assert_eq!(report.queued_deliveries, 0);
+        assert_eq!(report.in_flight_deliveries, 1);
         assert_eq!(mgr.pending_count(), 1);
+        assert!(mgr.delivery_link_available(&dest_hash));
+        assert_eq!(mgr.stats().direct_sessions, 1);
+        assert_eq!(mgr.stats().one_shot_sessions, 0);
 
         let register = rx.try_recv();
         assert!(register.is_ok(), "RegisterDestination should be queued");
@@ -1674,10 +1812,18 @@ mod tests {
         );
 
         let link_id = mgr.start_delivery(first, dest_hash, 1).unwrap();
-        let reused_link_id = mgr.start_delivery(second, dest_hash, 1).unwrap();
-        assert_eq!(reused_link_id, link_id);
+        let report = mgr
+            .start_delivery_with_report(second, dest_hash, 1)
+            .unwrap();
+        assert_eq!(report.link_id, link_id);
+        assert_eq!(report.kind, DirectLinkStartKind::QueuedOnDirect);
+        assert_eq!(report.delivery_state, DeliveryState::Establishing);
+        assert_eq!(report.queued_deliveries, 1);
+        assert_eq!(report.in_flight_deliveries, 1);
         assert_eq!(mgr.pending_count(), 2);
         assert_eq!(mgr.session_count(), 1);
+        assert_eq!(mgr.stats().queued_deliveries, 1);
+        assert_eq!(mgr.stats().establishing_direct_sessions, 1);
 
         let register = rx.try_recv().unwrap();
         assert!(matches!(
@@ -1704,6 +1850,32 @@ mod tests {
         );
         assert_eq!(mgr.pending_count(), 0);
         assert_eq!(mgr.session_count(), 0);
+    }
+
+    #[test]
+    fn test_packed_delivery_is_one_shot_not_direct_session() {
+        let (tx, _rx) = mpsc::channel(64);
+        let mut mgr = LinkDeliveryManager::new(tx, None, None);
+        let dest_hash = [0xC1; 16];
+        let msg = LxMessage::new(
+            [0xAA; 16],
+            [0xBB; 16],
+            "Propagation",
+            "deposit",
+            crate::constants::DeliveryMethod::Propagated,
+        );
+
+        let link_id = mgr
+            .start_packed_delivery(msg, dest_hash, 1, b"packed propagation".to_vec(), false)
+            .unwrap();
+
+        assert_eq!(mgr.pending_count(), 1);
+        assert_eq!(mgr.session_count(), 1);
+        assert_eq!(mgr.stats().direct_sessions, 0);
+        assert_eq!(mgr.stats().one_shot_sessions, 1);
+        assert!(!mgr.delivery_link_available(&dest_hash));
+        assert!(mgr.direct_link_snapshot(dest_hash).is_none());
+        assert!(!mgr.pending.get(&link_id).unwrap().reusable);
     }
 
     #[test]
@@ -1748,12 +1920,23 @@ mod tests {
             crate::constants::DeliveryMethod::Direct,
         );
         second.sign(&sign_key).unwrap();
-        let reused_link_id = mgr.start_delivery(second, dest_hash, 1).unwrap();
-        assert_eq!(reused_link_id, link_id);
+        let report = mgr
+            .start_delivery_with_report(second, dest_hash, 1)
+            .unwrap();
+        assert_eq!(report.link_id, link_id);
+        assert_eq!(report.kind, DirectLinkStartKind::ReusedActiveDirect);
+        assert_eq!(report.link_state, LinkState::Active);
+        assert_eq!(report.delivery_state, DeliveryState::Identifying);
+        assert_eq!(report.queued_deliveries, 0);
+        assert_eq!(report.in_flight_deliveries, 1);
         assert!(
             rx.try_recv().is_err(),
             "reusing an idle Direct link must not emit a new LINKREQUEST"
         );
+        let snapshot = mgr.direct_link_snapshot(dest_hash).unwrap();
+        assert_eq!(snapshot.link_id, link_id);
+        assert_eq!(snapshot.delivery_state, DeliveryState::Identifying);
+        assert_eq!(mgr.stats().active_direct_sessions, 1);
 
         assert!(mgr.tick().is_empty());
         complete_next_link_packet(&mut mgr, &mut rx, link_id, &responder_link, &responder_key);
