@@ -252,6 +252,28 @@ impl fmt::Display for BackchannelSendError {
 
 impl std::error::Error for BackchannelSendError {}
 
+/// Whether a link-delivery failure should be treated like upstream LXMF's
+/// closed/pending Link path, where the message remains eligible for Direct
+/// rediscovery instead of being terminally failed.
+pub fn is_retryable_link_delivery_failure(reason: &str) -> bool {
+    matches!(
+        reason,
+        "link establishment timeout"
+            | "link closed"
+            | "transport full"
+            | "transport closed"
+            // Backchannel adapters discover these only after asking the
+            // embedding runtime to send over an externally-owned inbound Link.
+            // They are equivalent to Python seeing direct_link.status == CLOSED.
+            | "link not found"
+            | "link is not active"
+            | "link session keys are unavailable"
+            | "transport channel is full or closed"
+            | "backchannel send command timeout"
+            | "backchannel send command closed"
+    )
+}
+
 /// Command bridge used by embedders to send an LXMF payload over an inbound
 /// authenticated Link that is owned by their Reticulum runtime.
 pub struct BackchannelSendCommand {
@@ -461,6 +483,79 @@ impl LinkDeliveryManager {
 
     pub fn remove_backchannel(&mut self, dest_hash: &[u8; 16]) -> Option<[u8; 16]> {
         self.backchannel_links.remove(dest_hash)
+    }
+
+    /// Remove cached backchannel state for a closed Link and fail any
+    /// in-flight backchannel sends that were using it.
+    pub fn fail_backchannel_link(
+        &mut self,
+        link_id: [u8; 16],
+        reason: &str,
+    ) -> Vec<DeliveryResult> {
+        let mut results = Vec::new();
+        let removed_destinations: Vec<_> = self
+            .backchannel_links
+            .iter()
+            .filter_map(|(dest_hash, cached_link)| (*cached_link == link_id).then_some(*dest_hash))
+            .collect();
+        for dest_hash in &removed_destinations {
+            self.backchannel_links.remove(dest_hash);
+        }
+
+        let starts = std::mem::take(&mut self.pending_backchannel_starts);
+        for start in starts {
+            if start.link_id == link_id {
+                results.push(fail_backchannel_start(
+                    &mut self.delivery_events,
+                    start,
+                    reason.to_string(),
+                ));
+            } else {
+                self.pending_backchannel_starts.push(start);
+            }
+        }
+
+        let delivery_keys: Vec<_> = self
+            .pending_backchannel_deliveries
+            .iter()
+            .filter_map(|(key, delivery)| (delivery.link_id == link_id).then_some(*key))
+            .collect();
+        for key in delivery_keys {
+            if let Some(delivery) = self.pending_backchannel_deliveries.remove(&key) {
+                self.delivery_events.push_back(backchannel_delivery_event(
+                    BackchannelDeliveryEventInput {
+                        kind: LxmfDeliveryEventKind::Failed,
+                        message: &delivery.message,
+                        dest_hash: delivery.dest_hash,
+                        link_id: delivery.link_id,
+                        representation: delivery.representation,
+                        progress: Some(delivery.message.progress),
+                        reason: Some(reason.to_string()),
+                        link_state: LinkState::Closed,
+                        delivery_state: DeliveryState::Failed,
+                    },
+                ));
+                results.push(DeliveryResult::Failed {
+                    link_id: delivery.link_id,
+                    msg_hash: delivery.message.hash,
+                    dest_hash: delivery.dest_hash,
+                    message: delivery.message,
+                    reason: reason.to_string(),
+                });
+            }
+        }
+
+        if !removed_destinations.is_empty() || !results.is_empty() {
+            tracing::debug!(
+                link_id = %hex_encode(&link_id),
+                removed_backchannels = removed_destinations.len(),
+                failed_deliveries = results.len(),
+                reason,
+                "removed closed LXMF backchannel Link"
+            );
+        }
+
+        results
     }
 
     /// Start a direct delivery and return the tracking `link_id`.
@@ -2868,6 +2963,7 @@ mod tests {
                 && *hash == msg_hash
                 && *dest == dest_hash
                 && reason == "link is not active"
+                && is_retryable_link_delivery_failure(reason)
         )));
         assert!(!mgr.delivery_link_available(&dest_hash));
         let events = mgr.take_delivery_events();
@@ -2876,6 +2972,104 @@ mod tests {
                 .iter()
                 .any(|event| event.kind == LxmfDeliveryEventKind::Failed)
         );
+    }
+
+    #[test]
+    fn test_fail_backchannel_link_removes_cached_link() {
+        let (tx, _rx) = mpsc::channel(16);
+        let mut mgr = LinkDeliveryManager::new(tx, None, None);
+        let link_id = [0xEA; 16];
+        let first_dest = [0xD4; 16];
+        let second_dest = [0xD5; 16];
+        let other_dest = [0xD6; 16];
+        mgr.register_backchannel(first_dest, link_id);
+        mgr.register_backchannel(second_dest, link_id);
+        mgr.register_backchannel(other_dest, [0xEB; 16]);
+
+        let results = mgr.fail_backchannel_link(link_id, "link closed");
+
+        assert!(results.is_empty());
+        assert!(!mgr.delivery_link_available(&first_dest));
+        assert!(!mgr.delivery_link_available(&second_dest));
+        assert!(mgr.delivery_link_available(&other_dest));
+    }
+
+    #[test]
+    fn test_fail_backchannel_link_fails_pending_delivery() {
+        let (tx, _rx) = mpsc::channel(16);
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
+        let mut mgr = LinkDeliveryManager::new(tx, None, None);
+        mgr.set_backchannel_sender(cmd_tx);
+
+        let dest_hash = [0xD7; 16];
+        let link_id = [0xE7; 16];
+        let packet_hash = [0xF7; 32];
+        mgr.register_backchannel(dest_hash, link_id);
+
+        let sign_key = Ed25519PrivateKey::generate();
+        let mut msg = LxMessage::new(
+            [0xAA; 16],
+            [0xBB; 16],
+            "Backchannel",
+            "closed while awaiting proof",
+            crate::constants::DeliveryMethod::Direct,
+        );
+        msg.sign(&sign_key).unwrap();
+        let msg_hash = msg.hash;
+
+        mgr.start_backchannel_delivery(msg, dest_hash).unwrap();
+        let command = cmd_rx.try_recv().expect("backchannel send command");
+        assert!(
+            command
+                .result_tx
+                .send(Ok(BackchannelSendReceipt::Packet {
+                    link_id,
+                    packet_hash,
+                }))
+                .is_ok()
+        );
+        assert!(mgr.tick().is_empty());
+        assert_eq!(mgr.stats().pending_backchannel_deliveries, 1);
+
+        let results = mgr.fail_backchannel_link(link_id, "link closed");
+
+        assert!(matches!(
+            results.as_slice(),
+            [DeliveryResult::Failed {
+                link_id: id,
+                msg_hash: hash,
+                dest_hash: dest,
+                reason,
+                ..
+            }] if *id == link_id
+                && *hash == msg_hash
+                && *dest == dest_hash
+                && reason == "link closed"
+        ));
+        assert!(!mgr.delivery_link_available(&dest_hash));
+        assert_eq!(mgr.stats().pending_backchannel_deliveries, 0);
+    }
+
+    #[test]
+    fn test_retryable_link_delivery_failure_includes_stale_backchannels() {
+        assert!(is_retryable_link_delivery_failure(
+            "link establishment timeout"
+        ));
+        assert!(is_retryable_link_delivery_failure("link closed"));
+        assert!(is_retryable_link_delivery_failure("link not found"));
+        assert!(is_retryable_link_delivery_failure("link is not active"));
+        assert!(is_retryable_link_delivery_failure(
+            "link session keys are unavailable"
+        ));
+        assert!(is_retryable_link_delivery_failure(
+            "transport channel is full or closed"
+        ));
+        assert!(is_retryable_link_delivery_failure(
+            "backchannel send command timeout"
+        ));
+        assert!(!is_retryable_link_delivery_failure(
+            "resource transfer could not be started"
+        ));
     }
 
     #[test]

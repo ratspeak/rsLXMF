@@ -17,6 +17,7 @@ use lxmf_core::constants::{
 };
 use lxmf_core::link_delivery::{
     BackchannelSendCommand, BackchannelSendError, BackchannelSendReceipt, DeliveryResult,
+    is_retryable_link_delivery_failure,
 };
 use lxmf_core::message::LxMessage;
 use lxmf_core::propagation_node::{PropagationNode, PropagationNodeConfig};
@@ -161,10 +162,7 @@ fn requeue_after_path_request(
 }
 
 fn link_failure_retryable(reason: &str) -> bool {
-    matches!(
-        reason,
-        "link establishment timeout" | "link closed" | "transport full" | "transport closed"
-    )
+    is_retryable_link_delivery_failure(reason)
 }
 
 fn route_hops_for(route_hops: &HashMap<[u8; 16], u8>, dest_hash: [u8; 16]) -> u8 {
@@ -3090,6 +3088,8 @@ mod tests {
         assert!(link_failure_retryable("link closed"));
         assert!(link_failure_retryable("transport full"));
         assert!(link_failure_retryable("transport closed"));
+        assert!(link_failure_retryable("link is not active"));
+        assert!(link_failure_retryable("link not found"));
         assert!(!link_failure_retryable("resource transfer failed"));
     }
 
