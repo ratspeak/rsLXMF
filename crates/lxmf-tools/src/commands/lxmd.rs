@@ -15,6 +15,9 @@ use std::sync::{Arc, Mutex};
 use lxmf_core::constants::{
     DELIVERY_RETRY_WAIT, DeliveryMethod, MAX_DELIVERY_ATTEMPTS, PATH_REQUEST_WAIT,
 };
+use lxmf_core::link_delivery::{
+    BackchannelSendCommand, BackchannelSendError, BackchannelSendReceipt, DeliveryResult,
+};
 use lxmf_core::message::LxMessage;
 use lxmf_core::propagation_node::{PropagationNode, PropagationNodeConfig};
 use lxmf_core::router::{
@@ -182,16 +185,69 @@ fn direct_reusable_link_state(
     link_delivery: Option<&lxmf_core::link_delivery::LinkDeliveryManager>,
     dest_hash: [u8; 16],
 ) -> DirectReusableLinkState {
-    let Some(snapshot) = link_delivery.and_then(|ld| ld.direct_link_snapshot(dest_hash)) else {
+    let Some(link_delivery) = link_delivery else {
         return DirectReusableLinkState::None;
     };
 
-    match snapshot.delivery_state {
-        lxmf_core::link_delivery::DeliveryState::Idle => DirectReusableLinkState::Active,
-        lxmf_core::link_delivery::DeliveryState::Failed => {
-            DirectReusableLinkState::Closed { activated: false }
+    if let Some(snapshot) = link_delivery.direct_link_snapshot(dest_hash) {
+        return match snapshot.delivery_state {
+            lxmf_core::link_delivery::DeliveryState::Idle => DirectReusableLinkState::Active,
+            lxmf_core::link_delivery::DeliveryState::Failed => {
+                DirectReusableLinkState::Closed { activated: false }
+            }
+            _ => DirectReusableLinkState::Pending,
+        };
+    }
+
+    if let Some(snapshot) = link_delivery.backchannel_link_snapshot(dest_hash) {
+        if snapshot.queued_deliveries > 0 || snapshot.in_flight_deliveries > 0 {
+            DirectReusableLinkState::Pending
+        } else {
+            DirectReusableLinkState::Active
         }
-        _ => DirectReusableLinkState::Pending,
+    } else {
+        DirectReusableLinkState::None
+    }
+}
+
+fn backchannel_receipt_from_runtime(
+    receipt: rns_runtime::link_manager::LinkPayloadSendReceipt,
+) -> BackchannelSendReceipt {
+    match receipt {
+        rns_runtime::link_manager::LinkPayloadSendReceipt::Packet(receipt) => {
+            BackchannelSendReceipt::Packet {
+                link_id: receipt.link_id,
+                packet_hash: receipt.packet_hash,
+            }
+        }
+        rns_runtime::link_manager::LinkPayloadSendReceipt::Resource(receipt) => {
+            BackchannelSendReceipt::Resource {
+                link_id: receipt.link_id,
+                resource_hash: receipt.resource_hash,
+            }
+        }
+    }
+}
+
+fn backchannel_error_from_runtime(
+    err: rns_runtime::link_manager::LinkSendError,
+) -> BackchannelSendError {
+    match err {
+        rns_runtime::link_manager::LinkSendError::LinkNotFound => {
+            BackchannelSendError::LinkNotFound
+        }
+        rns_runtime::link_manager::LinkSendError::LinkNotActive => {
+            BackchannelSendError::LinkNotActive
+        }
+        rns_runtime::link_manager::LinkSendError::NoSessionKeys => {
+            BackchannelSendError::NoSessionKeys
+        }
+        rns_runtime::link_manager::LinkSendError::TransportUnavailable => {
+            BackchannelSendError::TransportUnavailable
+        }
+        rns_runtime::link_manager::LinkSendError::ResourceStartFailed => {
+            BackchannelSendError::ResourceStartFailed
+        }
     }
 }
 
@@ -329,6 +385,11 @@ struct LxmdRunner {
     known_identities: HashMap<String, [u8; 64]>,
     route_hops: HashMap<[u8; 16], u8>,
     link_delivery: Option<lxmf_core::link_delivery::LinkDeliveryManager>,
+    link_command_tx: mpsc::Sender<rns_runtime::link_manager::LinkManagerCommand>,
+    link_identified_rx: mpsc::Receiver<([u8; 16], [u8; 16])>,
+    link_packet_proof_rx: mpsc::Receiver<rns_runtime::link_manager::LinkPacketProof>,
+    link_resource_proof_rx: mpsc::Receiver<rns_runtime::link_manager::LinkResourceProof>,
+    backchannel_command_rx: Option<mpsc::Receiver<BackchannelSendCommand>>,
     link_delivery_failures: Vec<String>,
     propagation_sync: Option<lxmf_core::propagation_sync::PropagationSyncTask>,
     propagation_client: Option<lxmf_core::propagation_client::PropagationClient>,
@@ -471,6 +532,13 @@ impl LxmdRunner {
         let (prop_link_packet_tx, prop_link_packet_rx) = mpsc::channel::<(Vec<u8>, [u8; 16])>(256);
         let (prop_resource_tx, prop_resource_rx) = mpsc::channel::<(Vec<u8>, [u8; 16])>(256);
         let (inbound_raw_tx, inbound_raw_rx) = mpsc::channel::<Vec<u8>>(256);
+        let (link_command_tx, link_command_rx) =
+            mpsc::channel::<rns_runtime::link_manager::LinkManagerCommand>(256);
+        let (link_identified_tx, link_identified_rx) = mpsc::channel::<([u8; 16], [u8; 16])>(256);
+        let (link_packet_proof_tx, link_packet_proof_rx) =
+            mpsc::channel::<rns_runtime::link_manager::LinkPacketProof>(256);
+        let (link_resource_proof_tx, link_resource_proof_rx) =
+            mpsc::channel::<rns_runtime::link_manager::LinkResourceProof>(256);
 
         let signing_key = identity.get_signing_key();
         let mut link_mgr = rns_runtime::link_manager::LinkManager::with_destination(
@@ -484,6 +552,9 @@ impl LxmdRunner {
         link_mgr.set_link_packet_channel(link_packet_tx);
         link_mgr.set_resource_completed_channel(resource_tx);
         link_mgr.set_inbound_raw_channel(inbound_raw_tx);
+        link_mgr.set_link_identified_channel(link_identified_tx);
+        link_mgr.set_link_packet_proof_channel(link_packet_proof_tx);
+        link_mgr.set_outbound_resource_proof_channel(link_resource_proof_tx);
 
         let _ = transport_tx.try_send(TransportMessage::RegisterDestination {
             hash: lxmf_dest_hash,
@@ -493,7 +564,7 @@ impl LxmdRunner {
 
         // Spawn the LinkManager as a background task
         tokio::spawn(async move {
-            link_mgr.run().await;
+            link_mgr.run_with_commands(link_command_rx).await;
         });
 
         let control_state = Arc::new(Mutex::new(ControlSnapshot {
@@ -765,6 +836,11 @@ impl LxmdRunner {
             known_identities,
             route_hops: HashMap::new(),
             link_delivery: None,
+            link_command_tx,
+            link_identified_rx,
+            link_packet_proof_rx,
+            link_resource_proof_rx,
+            backchannel_command_rx: None,
             link_delivery_failures: Vec::new(),
             propagation_sync: None,
             propagation_client: None,
@@ -1075,6 +1151,180 @@ impl LxmdRunner {
         }
     }
 
+    fn drain_backchannel_events(&mut self) {
+        let mut identified = Vec::new();
+        while let Ok(item) = self.link_identified_rx.try_recv() {
+            identified.push(item);
+        }
+        for (link_id, identity_hash) in identified {
+            self.ensure_link_delivery();
+            let dest_hash =
+                Destination::hash_from_name_and_identity(LXMF_APP_NAME, Some(&identity_hash));
+            if let Some(ref mut ld) = self.link_delivery {
+                ld.register_backchannel(dest_hash, link_id);
+            }
+            tracing::info!(
+                link_id = %hex::encode(link_id),
+                identity = %hex::encode(identity_hash),
+                dest = %hex::encode(dest_hash),
+                "LXMF inbound Link identified; registered daemon backchannel"
+            );
+        }
+
+        let mut packet_proofs = Vec::new();
+        while let Ok(proof) = self.link_packet_proof_rx.try_recv() {
+            packet_proofs.push(proof);
+        }
+        for proof in packet_proofs {
+            if let Some(result) = self
+                .link_delivery
+                .as_mut()
+                .and_then(|ld| ld.handle_backchannel_packet_proof(proof.link_id, proof.packet_hash))
+            {
+                self.handle_link_delivery_result(result);
+            }
+        }
+
+        let mut resource_proofs = Vec::new();
+        while let Ok(proof) = self.link_resource_proof_rx.try_recv() {
+            resource_proofs.push(proof);
+        }
+        for proof in resource_proofs {
+            if let Some(result) = self.link_delivery.as_mut().and_then(|ld| {
+                ld.handle_backchannel_resource_proof(proof.link_id, proof.resource_hash)
+            }) {
+                self.handle_link_delivery_result(result);
+            }
+        }
+
+        self.drain_core_backchannel_send_commands();
+    }
+
+    fn drain_core_backchannel_send_commands(&mut self) {
+        let Some(rx) = self.backchannel_command_rx.as_mut() else {
+            return;
+        };
+        let command_tx = self.link_command_tx.clone();
+
+        while let Ok(command) = rx.try_recv() {
+            let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+            let link_id = command.link_id;
+            let link_command = rns_runtime::link_manager::LinkManagerCommand::SendLinkPayload {
+                link_id,
+                payload: command.payload,
+                auto_compress: command.auto_compress,
+                result_tx: Some(result_tx),
+            };
+            match command_tx.try_send(link_command) {
+                Ok(()) => {
+                    tokio::spawn(async move {
+                        let result = match result_rx.await {
+                            Ok(Ok(receipt)) => Ok(backchannel_receipt_from_runtime(receipt)),
+                            Ok(Err(err)) => Err(backchannel_error_from_runtime(err)),
+                            Err(_) => Err(BackchannelSendError::TransportUnavailable),
+                        };
+                        let _ = command.result_tx.send(result);
+                    });
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        link_id = %hex::encode(link_id),
+                        error = %err,
+                        "failed to queue LXMF daemon backchannel send command"
+                    );
+                    let _ = command
+                        .result_tx
+                        .send(Err(BackchannelSendError::TransportUnavailable));
+                }
+            }
+        }
+    }
+
+    fn handle_link_delivery_result(&mut self, result: DeliveryResult) {
+        match result {
+            DeliveryResult::Complete { msg_hash, .. } => {
+                if let Some(hash) = msg_hash {
+                    let _ = self.router.mark_outbound_delivered(&hash);
+                    tracing::info!(hash = %hex::encode(hash), "link delivery complete");
+                }
+            }
+            DeliveryResult::Rejected {
+                msg_hash,
+                dest_hash,
+                reason,
+                ..
+            } => {
+                tracing::warn!(
+                    dest = %hex::encode(dest_hash),
+                    reason = %reason,
+                    "link delivery rejected"
+                );
+                if let Some(hash) = msg_hash {
+                    let _ = self.router.mark_outbound_rejected(&hash);
+                }
+                self.link_delivery_failures.push(reason);
+            }
+            DeliveryResult::Failed {
+                msg_hash,
+                dest_hash,
+                message,
+                reason,
+                ..
+            } => {
+                tracing::warn!(
+                    dest = %hex::encode(dest_hash),
+                    reason = %reason,
+                    attempts = message.delivery_attempts,
+                    "link delivery failed"
+                );
+                let router_owned = msg_hash.is_some_and(|hash| {
+                    self.router
+                        .pending_outbound
+                        .iter()
+                        .any(|pending| pending.hash == Some(hash))
+                });
+                if link_failure_retryable(&reason)
+                    && message.delivery_attempts <= MAX_DELIVERY_ATTEMPTS
+                {
+                    if let Some(hash) = msg_hash {
+                        tracing::warn!(
+                            hash = %hex::encode(hash),
+                            "retrying message after link delivery failure"
+                        );
+                    }
+                    if router_owned {
+                        queue_path_request(&self.transport_tx, dest_hash, false, &reason);
+                        if let Some(hash) = msg_hash {
+                            let _ = self
+                                .router
+                                .defer_outbound_for_path_request(&hash, now_f64());
+                        }
+                    } else {
+                        requeue_after_path_request(
+                            &mut self.router,
+                            &self.transport_tx,
+                            message,
+                            dest_hash,
+                            &reason,
+                            false,
+                        );
+                    }
+                } else {
+                    if let Some(hash) = msg_hash {
+                        if router_owned {
+                            let _ = self.router.mark_outbound_failed(&hash);
+                        }
+                        tracing::warn!(
+                            hash = %hex::encode(hash),
+                            "message delivery failed"
+                        );
+                    }
+                    self.link_delivery_failures.push(reason);
+                }
+            }
+        }
+    }
+
     async fn refresh_route_hops_from_transport(&mut self) {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         if let Err(e) = self.transport_tx.try_send(TransportMessage::Rpc {
@@ -1103,6 +1353,7 @@ impl LxmdRunner {
         let now = now_f64();
 
         self.drain_control_commands();
+        self.drain_backchannel_events();
 
         self.router.process_deferred_stamps();
         let known_identities = self
@@ -1141,94 +1392,14 @@ impl LxmdRunner {
         });
         if !actions.is_empty() {
             self.execute_encrypted_actions(actions);
+            self.drain_core_backchannel_send_commands();
         }
 
         if let Some(ref mut ld) = self.link_delivery {
             ld.drain_events(&self.known_identities);
             let results = ld.tick();
             for result in results {
-                match result {
-                    lxmf_core::link_delivery::DeliveryResult::Complete { msg_hash, .. } => {
-                        if let Some(hash) = msg_hash {
-                            let _ = self.router.mark_outbound_delivered(&hash);
-                            tracing::info!(hash = %hex::encode(hash), "link delivery complete");
-                        }
-                    }
-                    lxmf_core::link_delivery::DeliveryResult::Rejected {
-                        msg_hash,
-                        dest_hash,
-                        reason,
-                        ..
-                    } => {
-                        tracing::warn!(
-                            dest = %hex::encode(dest_hash),
-                            reason = %reason,
-                            "link delivery rejected"
-                        );
-                        if let Some(hash) = msg_hash {
-                            let _ = self.router.mark_outbound_rejected(&hash);
-                        }
-                        self.link_delivery_failures.push(reason);
-                    }
-                    lxmf_core::link_delivery::DeliveryResult::Failed {
-                        msg_hash,
-                        dest_hash,
-                        message,
-                        reason,
-                        ..
-                    } => {
-                        tracing::warn!(
-                            dest = %hex::encode(dest_hash),
-                            reason = %reason,
-                            attempts = message.delivery_attempts,
-                            "link delivery failed"
-                        );
-                        let router_owned = msg_hash.is_some_and(|hash| {
-                            self.router
-                                .pending_outbound
-                                .iter()
-                                .any(|pending| pending.hash == Some(hash))
-                        });
-                        if link_failure_retryable(&reason)
-                            && message.delivery_attempts <= MAX_DELIVERY_ATTEMPTS
-                        {
-                            if let Some(hash) = msg_hash {
-                                tracing::warn!(
-                                    hash = %hex::encode(hash),
-                                    "retrying message after link delivery failure"
-                                );
-                            }
-                            if router_owned {
-                                queue_path_request(&self.transport_tx, dest_hash, false, &reason);
-                                if let Some(hash) = msg_hash {
-                                    let _ = self
-                                        .router
-                                        .defer_outbound_for_path_request(&hash, now_f64());
-                                }
-                            } else {
-                                requeue_after_path_request(
-                                    &mut self.router,
-                                    &self.transport_tx,
-                                    message,
-                                    dest_hash,
-                                    &reason,
-                                    false,
-                                );
-                            }
-                        } else {
-                            if let Some(hash) = msg_hash {
-                                if router_owned {
-                                    let _ = self.router.mark_outbound_failed(&hash);
-                                }
-                                tracing::warn!(
-                                    hash = %hex::encode(hash),
-                                    "message delivery failed"
-                                );
-                            }
-                            self.link_delivery_failures.push(reason);
-                        }
-                    }
-                }
+                self.handle_link_delivery_result(result);
             }
         }
 
@@ -1925,6 +2096,49 @@ impl LxmdRunner {
                         );
                         self.ensure_link_delivery();
                         if let Some(ref mut ld) = self.link_delivery {
+                            if matches!(plan, DirectDeliveryPlan::UseReusableLink)
+                                && ld.direct_link_snapshot(dest_hash).is_none()
+                                && ld.backchannel_link_snapshot(dest_hash).is_some()
+                            {
+                                match ld.start_backchannel_delivery(message, dest_hash) {
+                                    Ok(_) => {}
+                                    Err(err) => {
+                                        let reason = err.error.to_string();
+                                        let returned_message = err.message;
+                                        tracing::warn!(
+                                            error = %reason,
+                                            dest = %dest_hex,
+                                            "failed to start daemon backchannel delivery"
+                                        );
+                                        if router_owned {
+                                            queue_path_request(
+                                                &self.transport_tx,
+                                                dest_hash,
+                                                false,
+                                                &reason,
+                                            );
+                                            if let Some(hash) = returned_message.hash {
+                                                let _ =
+                                                    self.router.defer_outbound_for_path_request(
+                                                        &hash,
+                                                        now_f64(),
+                                                    );
+                                            }
+                                        } else {
+                                            requeue_after_path_request(
+                                                &mut self.router,
+                                                &self.transport_tx,
+                                                returned_message,
+                                                dest_hash,
+                                                &reason,
+                                                false,
+                                            );
+                                        }
+                                    }
+                                }
+                                continue;
+                            }
+
                             if let Err(err) =
                                 ld.start_delivery_with_report(message, dest_hash, planned_hops)
                             {
@@ -2112,6 +2326,19 @@ impl LxmdRunner {
                 Some(self.identity.get_public_key()),
                 self.identity.get_signing_key(),
             ));
+        }
+        self.ensure_backchannel_sender();
+    }
+
+    fn ensure_backchannel_sender(&mut self) {
+        if self.backchannel_command_rx.is_some() || self.link_delivery.is_none() {
+            return;
+        }
+
+        let (tx, rx) = mpsc::channel(256);
+        if let Some(ref mut ld) = self.link_delivery {
+            ld.set_backchannel_sender(tx);
+            self.backchannel_command_rx = Some(rx);
         }
     }
 
@@ -2892,5 +3119,24 @@ mod tests {
         let snapshot = direct_route_snapshot(&hops, dest).expect("route snapshot");
         assert_eq!(snapshot.destination_hash, dest);
         assert_eq!(snapshot.hops, 5);
+    }
+
+    #[test]
+    fn direct_reusable_link_state_uses_registered_backchannel() {
+        let (tx, _rx) = mpsc::channel(8);
+        let mut manager = lxmf_core::link_delivery::LinkDeliveryManager::new(tx, None, None);
+        let dest = [0x43; 16];
+        let link_id = [0x44; 16];
+
+        manager.register_backchannel(dest, link_id);
+
+        assert_eq!(
+            direct_reusable_link_state(Some(&manager), dest),
+            DirectReusableLinkState::Active
+        );
+        assert_eq!(
+            direct_reusable_link_state(Some(&manager), [0x45; 16]),
+            DirectReusableLinkState::None
+        );
     }
 }
