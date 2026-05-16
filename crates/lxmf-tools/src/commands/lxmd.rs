@@ -1978,25 +1978,24 @@ impl LxmdRunner {
                             }
                             let hops = route_hops_for(&self.route_hops, prop_hash);
                             self.ensure_link_delivery();
-                            if let Some(ref mut ld) = self.link_delivery {
-                                if let Err(err) = ld
+                            if let Some(ref mut ld) = self.link_delivery
+                                && let Err(err) = ld
                                     .start_packed_delivery(message, prop_hash, hops, packed, false)
-                                {
-                                    let reason = err.error.to_string();
-                                    tracing::warn!(
-                                        error = %reason,
-                                        prop = %hex::encode(prop_hash),
-                                        "failed to start propagated link delivery"
-                                    );
-                                    requeue_after_path_request(
-                                        &mut self.router,
-                                        &self.transport_tx,
-                                        err.message,
-                                        prop_hash,
-                                        &reason,
-                                        false,
-                                    );
-                                }
+                            {
+                                let reason = err.error.to_string();
+                                tracing::warn!(
+                                    error = %reason,
+                                    prop = %hex::encode(prop_hash),
+                                    "failed to start propagated link delivery"
+                                );
+                                requeue_after_path_request(
+                                    &mut self.router,
+                                    &self.transport_tx,
+                                    *err.message,
+                                    prop_hash,
+                                    &reason,
+                                    false,
+                                );
                             }
                         }
                         None => {
@@ -2104,7 +2103,7 @@ impl LxmdRunner {
                                     Ok(_) => {}
                                     Err(err) => {
                                         let reason = err.error.to_string();
-                                        let returned_message = err.message;
+                                        let returned_message = *err.message;
                                         tracing::warn!(
                                             error = %reason,
                                             dest = %dest_hex,
@@ -2143,7 +2142,7 @@ impl LxmdRunner {
                                 ld.start_delivery_with_report(message, dest_hash, planned_hops)
                             {
                                 let reason = err.error.to_string();
-                                let returned_message = err.message;
+                                let returned_message = *err.message;
                                 tracing::warn!(
                                     error = %reason,
                                     dest = %dest_hex,
@@ -2268,23 +2267,23 @@ impl LxmdRunner {
                 }
                 let hops = route_hops_for(&self.route_hops, dest_hash);
                 self.ensure_link_delivery();
-                if let Some(ref mut ld) = self.link_delivery {
-                    if let Err(err) = ld.start_delivery(message, dest_hash, hops) {
-                        let reason = err.error.to_string();
-                        tracing::warn!(
-                            error = %reason,
-                            dest = %dest_hex,
-                            "failed to start oversized direct link delivery"
-                        );
-                        requeue_after_path_request(
-                            &mut self.router,
-                            &self.transport_tx,
-                            err.message,
-                            dest_hash,
-                            &reason,
-                            false,
-                        );
-                    }
+                if let Some(ref mut ld) = self.link_delivery
+                    && let Err(err) = ld.start_delivery(message, dest_hash, hops)
+                {
+                    let reason = err.error.to_string();
+                    tracing::warn!(
+                        error = %reason,
+                        dest = %dest_hex,
+                        "failed to start oversized direct link delivery"
+                    );
+                    requeue_after_path_request(
+                        &mut self.router,
+                        &self.transport_tx,
+                        *err.message,
+                        dest_hash,
+                        &reason,
+                        false,
+                    );
                 }
                 continue;
             }

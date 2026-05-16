@@ -187,7 +187,7 @@ impl std::error::Error for LinkDeliveryStartError {}
 #[derive(Debug)]
 pub struct LinkDeliveryStartFailure {
     pub error: LinkDeliveryStartError,
-    pub message: LxMessage,
+    pub message: Box<LxMessage>,
 }
 
 /// How a Direct delivery was attached to Link state.
@@ -287,7 +287,7 @@ impl std::error::Error for BackchannelStartError {}
 #[derive(Debug)]
 pub struct BackchannelStartFailure {
     pub error: BackchannelStartError,
-    pub message: LxMessage,
+    pub message: Box<LxMessage>,
 }
 
 impl fmt::Display for BackchannelStartFailure {
@@ -516,13 +516,13 @@ impl LinkDeliveryManager {
         let Some(link_id) = self.backchannel_links.get(&dest_hash).copied() else {
             return Err(BackchannelStartFailure {
                 error: BackchannelStartError::NoBackchannel,
-                message,
+                message: Box::new(message),
             });
         };
         let Some(command_tx) = self.backchannel_tx.as_ref() else {
             return Err(BackchannelStartFailure {
                 error: BackchannelStartError::SenderUnavailable,
-                message,
+                message: Box::new(message),
             });
         };
 
@@ -536,7 +536,7 @@ impl LinkDeliveryManager {
                 );
                 return Err(BackchannelStartFailure {
                     error: BackchannelStartError::PackFailed,
-                    message,
+                    message: Box::new(message),
                 });
             }
         };
@@ -600,7 +600,10 @@ impl LinkDeliveryManager {
                     error = %error,
                     "failed to queue LXMF backchannel send command"
                 );
-                Err(BackchannelStartFailure { error, message })
+                Err(BackchannelStartFailure {
+                    error,
+                    message: Box::new(message),
+                })
             }
         }
     }
@@ -738,7 +741,10 @@ impl LinkDeliveryManager {
                     outbound_result = "not_attempted",
                     "failed to start link delivery"
                 );
-                return Err(LinkDeliveryStartFailure { error, message });
+                return Err(LinkDeliveryStartFailure {
+                    error,
+                    message: Box::new(message),
+                });
             }
         };
 
@@ -755,7 +761,10 @@ impl LinkDeliveryManager {
                     outbound_result = %error,
                     "failed to start link delivery"
                 );
-                return Err(LinkDeliveryStartFailure { error, message });
+                return Err(LinkDeliveryStartFailure {
+                    error,
+                    message: Box::new(message),
+                });
             }
         };
 
@@ -1480,15 +1489,17 @@ impl LinkDeliveryManager {
                         ),
                     };
                     self.delivery_events.push_back(backchannel_delivery_event(
-                        kind,
-                        &start.message,
-                        start.dest_hash,
-                        start.link_id,
-                        representation,
-                        Some(progress),
-                        None,
-                        LinkState::Active,
-                        DeliveryState::AwaitingProof,
+                        BackchannelDeliveryEventInput {
+                            kind,
+                            message: &start.message,
+                            dest_hash: start.dest_hash,
+                            link_id: start.link_id,
+                            representation,
+                            progress: Some(progress),
+                            reason: None,
+                            link_state: LinkState::Active,
+                            delivery_state: DeliveryState::AwaitingProof,
+                        },
                     ));
                     self.pending_backchannel_deliveries.insert(
                         key,
@@ -1559,15 +1570,17 @@ impl LinkDeliveryManager {
                 self.backchannel_links.remove(&delivery.dest_hash);
                 let reason = "backchannel delivery timeout".to_string();
                 self.delivery_events.push_back(backchannel_delivery_event(
-                    LxmfDeliveryEventKind::Failed,
-                    &delivery.message,
-                    delivery.dest_hash,
-                    delivery.link_id,
-                    delivery.representation,
-                    Some(delivery.message.progress),
-                    Some(reason.clone()),
-                    LinkState::Closed,
-                    DeliveryState::Failed,
+                    BackchannelDeliveryEventInput {
+                        kind: LxmfDeliveryEventKind::Failed,
+                        message: &delivery.message,
+                        dest_hash: delivery.dest_hash,
+                        link_id: delivery.link_id,
+                        representation: delivery.representation,
+                        progress: Some(delivery.message.progress),
+                        reason: Some(reason.clone()),
+                        link_state: LinkState::Closed,
+                        delivery_state: DeliveryState::Failed,
+                    },
                 ));
                 results.push(DeliveryResult::Failed {
                     link_id: delivery.link_id,
@@ -1783,17 +1796,18 @@ impl LinkDeliveryManager {
         key: BackchannelProofKey,
     ) -> Option<DeliveryResult> {
         let delivery = self.pending_backchannel_deliveries.remove(&key)?;
-        self.delivery_events.push_back(backchannel_delivery_event(
-            LxmfDeliveryEventKind::Delivered,
-            &delivery.message,
-            delivery.dest_hash,
-            delivery.link_id,
-            delivery.representation,
-            Some(1.0),
-            None,
-            LinkState::Active,
-            DeliveryState::Complete,
-        ));
+        self.delivery_events
+            .push_back(backchannel_delivery_event(BackchannelDeliveryEventInput {
+                kind: LxmfDeliveryEventKind::Delivered,
+                message: &delivery.message,
+                dest_hash: delivery.dest_hash,
+                link_id: delivery.link_id,
+                representation: delivery.representation,
+                progress: Some(1.0),
+                reason: None,
+                link_state: LinkState::Active,
+                delivery_state: DeliveryState::Complete,
+            }));
         tracing::info!(
             link_id = %hex_encode(&delivery.link_id),
             dest = %hex_encode(&delivery.dest_hash),
@@ -1952,9 +1966,9 @@ fn queued_delivery_event(
     }
 }
 
-fn backchannel_delivery_event(
+struct BackchannelDeliveryEventInput<'a> {
     kind: LxmfDeliveryEventKind,
-    message: &LxMessage,
+    message: &'a LxMessage,
     dest_hash: [u8; 16],
     link_id: [u8; 16],
     representation: DeliveryRepresentation,
@@ -1962,24 +1976,26 @@ fn backchannel_delivery_event(
     reason: Option<String>,
     link_state: LinkState,
     delivery_state: DeliveryState,
-) -> LxmfDeliveryEvent {
+}
+
+fn backchannel_delivery_event(input: BackchannelDeliveryEventInput<'_>) -> LxmfDeliveryEvent {
     LxmfDeliveryEvent {
-        kind,
+        kind: input.kind,
         method: LxmfDeliveryEventMethod::Direct,
-        link_id,
-        dest_hash,
-        msg_hash: message.hash,
-        attempts: message.delivery_attempts,
-        progress,
-        representation,
-        link_state,
-        delivery_state,
+        link_id: input.link_id,
+        dest_hash: input.dest_hash,
+        msg_hash: input.message.hash,
+        attempts: input.message.delivery_attempts,
+        progress: input.progress,
+        representation: input.representation,
+        link_state: input.link_state,
+        delivery_state: input.delivery_state,
         queued_deliveries: 0,
         in_flight_deliveries: usize::from(matches!(
-            delivery_state,
+            input.delivery_state,
             DeliveryState::Transferring | DeliveryState::AwaitingProof
         )),
-        reason,
+        reason: input.reason,
     }
 }
 
@@ -1988,17 +2004,17 @@ fn fail_backchannel_start(
     start: PendingBackchannelStart,
     reason: String,
 ) -> DeliveryResult {
-    events.push_back(backchannel_delivery_event(
-        LxmfDeliveryEventKind::Failed,
-        &start.message,
-        start.dest_hash,
-        start.link_id,
-        DeliveryRepresentation::Unknown,
-        Some(start.message.progress),
-        Some(reason.clone()),
-        LinkState::Closed,
-        DeliveryState::Failed,
-    ));
+    events.push_back(backchannel_delivery_event(BackchannelDeliveryEventInput {
+        kind: LxmfDeliveryEventKind::Failed,
+        message: &start.message,
+        dest_hash: start.dest_hash,
+        link_id: start.link_id,
+        representation: DeliveryRepresentation::Unknown,
+        progress: Some(start.message.progress),
+        reason: Some(reason.clone()),
+        link_state: LinkState::Closed,
+        delivery_state: DeliveryState::Failed,
+    }));
     DeliveryResult::Failed {
         link_id: start.link_id,
         msg_hash: start.message.hash,
