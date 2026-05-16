@@ -1829,6 +1829,111 @@ impl LinkDeliveryManager {
             + self.pending_backchannel_deliveries.len()
     }
 
+    pub fn fail_delivery_by_message_hash(
+        &mut self,
+        msg_hash: [u8; 32],
+        reason: &str,
+    ) -> Vec<DeliveryResult> {
+        let mut results = Vec::new();
+        let mut remove_direct_session = None;
+
+        for (link_id, delivery) in &mut self.pending {
+            if delivery.msg_hash == Some(msg_hash) {
+                push_failed_delivery_and_queue(
+                    &mut results,
+                    &mut self.delivery_events,
+                    *link_id,
+                    delivery,
+                    reason,
+                );
+                remove_direct_session = Some((*link_id, delivery.dest_hash));
+                break;
+            }
+
+            if let Some(pos) = delivery
+                .queued
+                .iter()
+                .position(|queued| queued.msg_hash == Some(msg_hash))
+            {
+                if let Some(queued) = delivery.queued.remove(pos) {
+                    self.delivery_events.push_back(queued_delivery_event(
+                        LxmfDeliveryEventKind::Failed,
+                        *link_id,
+                        delivery.dest_hash,
+                        &queued,
+                        Some(reason.to_string()),
+                    ));
+                    results.push(DeliveryResult::Failed {
+                        link_id: *link_id,
+                        msg_hash: queued.msg_hash,
+                        dest_hash: delivery.dest_hash,
+                        message: queued.message,
+                        reason: reason.to_string(),
+                    });
+                }
+                break;
+            }
+        }
+
+        if let Some((link_id, dest_hash)) = remove_direct_session {
+            self.pending.remove(&link_id);
+            if self.direct_links.get(&dest_hash) == Some(&link_id) {
+                self.direct_links.remove(&dest_hash);
+            }
+        }
+
+        if !results.is_empty() {
+            return results;
+        }
+
+        if let Some(pos) = self
+            .pending_backchannel_starts
+            .iter()
+            .position(|start| start.message.hash == Some(msg_hash))
+        {
+            let start = self.pending_backchannel_starts.remove(pos);
+            self.backchannel_links.remove(&start.dest_hash);
+            results.push(fail_backchannel_start(
+                &mut self.delivery_events,
+                start,
+                reason.to_string(),
+            ));
+            return results;
+        }
+
+        let pending_key = self
+            .pending_backchannel_deliveries
+            .iter()
+            .find_map(|(key, delivery)| (delivery.message.hash == Some(msg_hash)).then_some(*key));
+        if let Some(key) = pending_key
+            && let Some(delivery) = self.pending_backchannel_deliveries.remove(&key)
+        {
+            self.backchannel_links.remove(&delivery.dest_hash);
+            self.delivery_events.push_back(backchannel_delivery_event(
+                BackchannelDeliveryEventInput {
+                    kind: LxmfDeliveryEventKind::Failed,
+                    message: &delivery.message,
+                    dest_hash: delivery.dest_hash,
+                    link_id: delivery.link_id,
+                    representation: delivery.representation,
+                    progress: Some(delivery.message.progress),
+                    reason: Some(reason.to_string()),
+                    link_state: LinkState::Closed,
+                    delivery_state: DeliveryState::Failed,
+                },
+            ));
+            results.push(DeliveryResult::Failed {
+                link_id: delivery.link_id,
+                msg_hash: delivery.message.hash,
+                dest_hash: delivery.dest_hash,
+                message: delivery.message,
+                reason: reason.to_string(),
+            });
+        }
+
+        results
+    }
+
     pub fn take_delivery_events(&mut self) -> Vec<LxmfDeliveryEvent> {
         self.delivery_events.drain(..).collect()
     }
@@ -2771,6 +2876,94 @@ mod tests {
                 .iter()
                 .any(|event| event.kind == LxmfDeliveryEventKind::Failed)
         );
+    }
+
+    #[test]
+    fn test_fail_delivery_by_message_hash_aborts_direct_session() {
+        let (tx, _rx) = mpsc::channel(64);
+        let mut mgr = LinkDeliveryManager::new(tx, None, None);
+        let dest_hash = [0xD3; 16];
+        let sign_key = Ed25519PrivateKey::generate();
+        let mut msg = LxMessage::new(
+            [0xAA; 16],
+            [0xBB; 16],
+            "Direct",
+            "stale reusable delivery",
+            crate::constants::DeliveryMethod::Direct,
+        );
+        msg.sign(&sign_key).unwrap();
+        let msg_hash = msg.hash.unwrap();
+
+        let link_id = mgr.start_delivery(msg, dest_hash, 1).unwrap();
+        if let Some(delivery) = mgr.pending.get_mut(&link_id) {
+            delivery.state = DeliveryState::AwaitingProof;
+        }
+
+        let results = mgr.fail_delivery_by_message_hash(msg_hash, "direct fallback timeout");
+        assert_eq!(results.len(), 1);
+        assert!(matches!(
+            &results[0],
+            DeliveryResult::Failed {
+                link_id: id,
+                msg_hash: Some(hash),
+                dest_hash: dest,
+                reason,
+                ..
+            } if *id == link_id
+                && *hash == msg_hash
+                && *dest == dest_hash
+                && reason == "direct fallback timeout"
+        ));
+        assert_eq!(mgr.pending_count(), 0);
+        assert!(!mgr.delivery_link_available(&dest_hash));
+        let events = mgr.take_delivery_events();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == LxmfDeliveryEventKind::Failed)
+        );
+    }
+
+    #[test]
+    fn test_fail_delivery_by_message_hash_aborts_backchannel_start() {
+        let (tx, _rx) = mpsc::channel(16);
+        let (cmd_tx, _cmd_rx) = mpsc::channel(16);
+        let mut mgr = LinkDeliveryManager::new(tx, None, None);
+        mgr.set_backchannel_sender(cmd_tx);
+
+        let dest_hash = [0xD4; 16];
+        let link_id = [0xE4; 16];
+        let sign_key = Ed25519PrivateKey::generate();
+        let mut msg = LxMessage::new(
+            [0xAA; 16],
+            [0xBB; 16],
+            "Backchannel",
+            "stale backchannel delivery",
+            crate::constants::DeliveryMethod::Direct,
+        );
+        msg.sign(&sign_key).unwrap();
+        let msg_hash = msg.hash.unwrap();
+
+        mgr.register_backchannel(dest_hash, link_id);
+        mgr.start_backchannel_delivery(msg, dest_hash).unwrap();
+
+        let results = mgr.fail_delivery_by_message_hash(msg_hash, "direct fallback timeout");
+        assert_eq!(results.len(), 1);
+        assert!(matches!(
+            &results[0],
+            DeliveryResult::Failed {
+                link_id: id,
+                msg_hash: Some(hash),
+                dest_hash: dest,
+                reason,
+                ..
+            } if *id == link_id
+                && *hash == msg_hash
+                && *dest == dest_hash
+                && reason == "direct fallback timeout"
+        ));
+        assert_eq!(mgr.pending_count(), 0);
+        assert!(!mgr.delivery_link_available(&dest_hash));
     }
 
     #[test]
