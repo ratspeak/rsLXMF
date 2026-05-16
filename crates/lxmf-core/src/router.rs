@@ -297,6 +297,12 @@ pub struct LxmRouter {
     pub unpeered_propagation_rx_bytes: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectOutboundHandling {
+    EmitLegacyAction,
+    LeavePending,
+}
+
 /// Callback invoked when a message is delivered locally.
 pub type DeliveryCallback = Box<dyn Fn(&LxMessage) + Send>;
 
@@ -1302,6 +1308,17 @@ impl LxmRouter {
         fields(pending_count = self.pending_outbound.len()),
     )]
     pub fn process_outbound(&mut self) -> Vec<OutboundAction> {
+        self.process_outbound_inner(DirectOutboundHandling::EmitLegacyAction)
+    }
+
+    fn process_outbound_without_direct(&mut self) -> Vec<OutboundAction> {
+        self.process_outbound_inner(DirectOutboundHandling::LeavePending)
+    }
+
+    fn process_outbound_inner(
+        &mut self,
+        direct_handling: DirectOutboundHandling,
+    ) -> Vec<OutboundAction> {
         if !self.config.ext.processing_outbound {
             return Vec::new();
         }
@@ -1361,15 +1378,22 @@ impl LxmRouter {
             //   Direct / Propagated -> Sending (multi-step).
             match msg.method {
                 DeliveryMethod::Direct => {
-                    let mut msg = self.pending_outbound.remove(i);
-                    msg.mark_sending();
-                    let dest_hash = msg.destination_hash;
-                    actions.push(OutboundAction::DeliverDirect {
-                        message: msg,
-                        dest_hash,
-                    });
-                    processed += 1;
-                    // The next element has shifted into index i, so do not advance.
+                    match direct_handling {
+                        DirectOutboundHandling::EmitLegacyAction => {
+                            let mut msg = self.pending_outbound.remove(i);
+                            msg.mark_sending();
+                            let dest_hash = msg.destination_hash;
+                            actions.push(OutboundAction::DeliverDirect {
+                                message: msg,
+                                dest_hash,
+                            });
+                            processed += 1;
+                            // The next element has shifted into index i, so do not advance.
+                        }
+                        DirectOutboundHandling::LeavePending => {
+                            i += 1;
+                        }
+                    }
                 }
                 DeliveryMethod::Propagated => {
                     if let Some(peer_hash) = self.outbound_propagation_node {
@@ -1669,7 +1693,7 @@ impl LxmRouter {
         self.processing_count += 1;
 
         self.process_deferred_stamps();
-        let actions = self.process_outbound();
+        let actions = self.process_outbound_without_direct();
         if !actions.is_empty() {
             self.execute_actions(actions);
         }
@@ -1686,7 +1710,7 @@ impl LxmRouter {
         self.processing_count += 1;
 
         self.process_deferred_stamps();
-        let actions = self.process_outbound();
+        let actions = self.process_outbound_without_direct();
         if !actions.is_empty() {
             self.execute_actions_with_encryptor(actions, encrypt_fn);
         }
@@ -3224,6 +3248,16 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "Direct delivery requires LinkDeliveryManager, not router.execute_actions"
+        );
+        assert_eq!(
+            router.pending_outbound.len(),
+            1,
+            "core tick must leave Direct messages queued for LinkDeliveryManager"
+        );
+        assert_eq!(
+            router.pending_outbound[0].state,
+            MessageState::Outbound,
+            "core tick without a Direct adapter must not claim link sending started"
         );
     }
 }
