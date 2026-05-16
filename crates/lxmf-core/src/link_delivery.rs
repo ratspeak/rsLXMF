@@ -19,8 +19,8 @@ use rns_protocol::resource::{
 };
 use rns_transport::link_messages::DestinationEvent;
 use rns_transport::messages::{OutboundRequest, TransportMessage};
-use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::constants::{DeliveryRepresentation, LXMF_OVERHEAD};
 use crate::message::LxMessage;
@@ -29,6 +29,8 @@ use crate::propagation::hex_encode;
 /// Upstream LXMF keeps reusable Direct links open for ten minutes of data
 /// inactivity before tearing them down (`LXMRouter.LINK_MAX_INACTIVITY`).
 const LINK_MAX_INACTIVITY: Duration = Duration::from_secs(600);
+const BACKCHANNEL_SEND_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+const BACKCHANNEL_DELIVERY_TIMEOUT: Duration = Duration::from_secs(360);
 
 /// State of a link-based delivery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,6 +145,28 @@ impl PendingDelivery {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum BackchannelProofKey {
+    Packet([u8; 16], [u8; 32]),
+    Resource([u8; 16], [u8; 32]),
+}
+
+struct PendingBackchannelStart {
+    receiver: oneshot::Receiver<Result<BackchannelSendReceipt, BackchannelSendError>>,
+    message: LxMessage,
+    dest_hash: [u8; 16],
+    link_id: [u8; 16],
+    requested_at: Instant,
+}
+
+struct PendingBackchannelDelivery {
+    message: LxMessage,
+    dest_hash: [u8; 16],
+    link_id: [u8; 16],
+    representation: DeliveryRepresentation,
+    started_at: Instant,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkDeliveryStartError {
     TransportFull,
@@ -190,6 +214,99 @@ pub struct DirectLinkStartReport {
     pub in_flight_deliveries: usize,
 }
 
+/// A proof-tracked send over an already-authenticated inbound delivery Link.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackchannelSendReceipt {
+    Packet {
+        link_id: [u8; 16],
+        packet_hash: [u8; 32],
+    },
+    Resource {
+        link_id: [u8; 16],
+        resource_hash: [u8; 32],
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackchannelSendError {
+    LinkNotFound,
+    LinkNotActive,
+    NoSessionKeys,
+    TransportUnavailable,
+    ResourceStartFailed,
+    Other(String),
+}
+
+impl fmt::Display for BackchannelSendError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LinkNotFound => f.write_str("link not found"),
+            Self::LinkNotActive => f.write_str("link is not active"),
+            Self::NoSessionKeys => f.write_str("link session keys are unavailable"),
+            Self::TransportUnavailable => f.write_str("transport channel is full or closed"),
+            Self::ResourceStartFailed => f.write_str("resource transfer could not be started"),
+            Self::Other(reason) => f.write_str(reason),
+        }
+    }
+}
+
+impl std::error::Error for BackchannelSendError {}
+
+/// Command bridge used by embedders to send an LXMF payload over an inbound
+/// authenticated Link that is owned by their Reticulum runtime.
+pub struct BackchannelSendCommand {
+    pub link_id: [u8; 16],
+    pub payload: Vec<u8>,
+    pub auto_compress: bool,
+    pub result_tx: oneshot::Sender<Result<BackchannelSendReceipt, BackchannelSendError>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackchannelStartError {
+    NoBackchannel,
+    SenderUnavailable,
+    CommandFull,
+    CommandClosed,
+    PackFailed,
+}
+
+impl fmt::Display for BackchannelStartError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoBackchannel => f.write_str("backchannel link not found"),
+            Self::SenderUnavailable => f.write_str("backchannel sender unavailable"),
+            Self::CommandFull => f.write_str("backchannel command channel full"),
+            Self::CommandClosed => f.write_str("backchannel command channel closed"),
+            Self::PackFailed => f.write_str("failed to pack LXMF payload"),
+        }
+    }
+}
+
+impl std::error::Error for BackchannelStartError {}
+
+#[derive(Debug)]
+pub struct BackchannelStartFailure {
+    pub error: BackchannelStartError,
+    pub message: LxMessage,
+}
+
+impl fmt::Display for BackchannelStartFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+impl std::error::Error for BackchannelStartFailure {}
+
+/// Start result for a reusable inbound backchannel Link.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackchannelStartReport {
+    pub link_id: [u8; 16],
+    pub dest_hash: [u8; 16],
+    pub queued_deliveries: usize,
+    pub in_flight_deliveries: usize,
+}
+
 /// Which link-delivery path emitted an event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LxmfDeliveryEventMethod {
@@ -204,6 +321,7 @@ pub enum LxmfDeliveryEventKind {
     LinkEstablished,
     DirectLinkPending,
     DirectLinkReused,
+    BackchannelLinkReused,
     TransferStarted,
     TransferProgress,
     AwaitingProof,
@@ -241,17 +359,28 @@ pub struct DirectLinkSnapshot {
     pub in_flight_deliveries: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackchannelLinkSnapshot {
+    pub link_id: [u8; 16],
+    pub dest_hash: [u8; 16],
+    pub queued_deliveries: usize,
+    pub in_flight_deliveries: usize,
+}
+
 /// Aggregate LinkDeliveryManager state for diagnostics and UI event mapping.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LinkDeliveryStats {
     pub sessions: usize,
     pub direct_sessions: usize,
     pub one_shot_sessions: usize,
+    pub backchannel_sessions: usize,
     pub establishing_direct_sessions: usize,
     pub active_direct_sessions: usize,
     pub idle_direct_sessions: usize,
     pub queued_deliveries: usize,
     pub in_flight_deliveries: usize,
+    pub pending_backchannel_starts: usize,
+    pub pending_backchannel_deliveries: usize,
 }
 
 impl fmt::Display for LinkDeliveryStartFailure {
@@ -277,7 +406,12 @@ pub struct LinkDeliveryManager {
     transport_tx: mpsc::Sender<TransportMessage>,
     /// Reusable upstream-style Direct links keyed by LXMF delivery destination hash.
     direct_links: HashMap<[u8; 16], [u8; 16]>,
+    /// Reusable upstream-style inbound backchannels keyed by remote LXMF delivery destination hash.
+    backchannel_links: HashMap<[u8; 16], [u8; 16]>,
     pending: HashMap<[u8; 16], PendingDelivery>,
+    backchannel_tx: Option<mpsc::Sender<BackchannelSendCommand>>,
+    pending_backchannel_starts: Vec<PendingBackchannelStart>,
+    pending_backchannel_deliveries: HashMap<BackchannelProofKey, PendingBackchannelDelivery>,
     identity_pub: Option<[u8; 64]>,
     identity_key: Option<Ed25519PrivateKey>,
     event_tx: mpsc::Sender<DestinationEvent>,
@@ -295,13 +429,38 @@ impl LinkDeliveryManager {
         Self {
             transport_tx,
             direct_links: HashMap::new(),
+            backchannel_links: HashMap::new(),
             pending: HashMap::new(),
+            backchannel_tx: None,
+            pending_backchannel_starts: Vec::new(),
+            pending_backchannel_deliveries: HashMap::new(),
             identity_pub,
             identity_key,
             event_tx,
             event_rx,
             delivery_events: VecDeque::new(),
         }
+    }
+
+    /// Install the adapter used to send LXMF payloads over inbound
+    /// authenticated backchannel Links owned by the embedding runtime.
+    pub fn set_backchannel_sender(&mut self, tx: mpsc::Sender<BackchannelSendCommand>) {
+        self.backchannel_tx = Some(tx);
+    }
+
+    /// Register an inbound authenticated Link as a reusable backchannel for a
+    /// remote LXMF delivery destination.
+    pub fn register_backchannel(&mut self, dest_hash: [u8; 16], link_id: [u8; 16]) {
+        self.backchannel_links.insert(dest_hash, link_id);
+        tracing::info!(
+            link_id = %hex_encode(&link_id),
+            dest = %hex_encode(&dest_hash),
+            "registered LXMF delivery backchannel"
+        );
+    }
+
+    pub fn remove_backchannel(&mut self, dest_hash: &[u8; 16]) -> Option<[u8; 16]> {
+        self.backchannel_links.remove(dest_hash)
     }
 
     /// Start a direct delivery and return the tracking `link_id`.
@@ -346,6 +505,104 @@ impl LinkDeliveryManager {
             auto_compress,
             false,
         )
+    }
+
+    /// Start a Direct delivery over a registered inbound backchannel Link.
+    pub fn start_backchannel_delivery(
+        &mut self,
+        message: LxMessage,
+        dest_hash: [u8; 16],
+    ) -> Result<BackchannelStartReport, BackchannelStartFailure> {
+        let Some(link_id) = self.backchannel_links.get(&dest_hash).copied() else {
+            return Err(BackchannelStartFailure {
+                error: BackchannelStartError::NoBackchannel,
+                message,
+            });
+        };
+        let Some(command_tx) = self.backchannel_tx.as_ref() else {
+            return Err(BackchannelStartFailure {
+                error: BackchannelStartError::SenderUnavailable,
+                message,
+            });
+        };
+
+        let payload = match message.pack() {
+            Ok(payload) => payload,
+            Err(error) => {
+                tracing::warn!(
+                    dest = %hex_encode(&dest_hash),
+                    error = ?error,
+                    "failed to pack LXMF for backchannel delivery"
+                );
+                return Err(BackchannelStartFailure {
+                    error: BackchannelStartError::PackFailed,
+                    message,
+                });
+            }
+        };
+        let auto_compress = message.auto_compress;
+        let msg_hash = message.hash;
+        let attempts = message.delivery_attempts;
+        let (result_tx, result_rx) = oneshot::channel();
+        let command = BackchannelSendCommand {
+            link_id,
+            payload,
+            auto_compress,
+            result_tx,
+        };
+
+        match command_tx.try_send(command) {
+            Ok(()) => {
+                tracing::info!(
+                    link_id = %hex_encode(&link_id),
+                    dest = %hex_encode(&dest_hash),
+                    "routing Direct LXMF message over authenticated backchannel Link"
+                );
+                self.delivery_events.push_back(LxmfDeliveryEvent {
+                    kind: LxmfDeliveryEventKind::BackchannelLinkReused,
+                    method: LxmfDeliveryEventMethod::Direct,
+                    link_id,
+                    dest_hash,
+                    msg_hash,
+                    attempts,
+                    progress: Some(0.05),
+                    representation: DeliveryRepresentation::Unknown,
+                    link_state: LinkState::Active,
+                    delivery_state: DeliveryState::Transferring,
+                    queued_deliveries: self.pending_backchannel_starts.len(),
+                    in_flight_deliveries: self.pending_backchannel_deliveries.len() + 1,
+                    reason: None,
+                });
+                self.pending_backchannel_starts
+                    .push(PendingBackchannelStart {
+                        receiver: result_rx,
+                        message,
+                        dest_hash,
+                        link_id,
+                        requested_at: Instant::now(),
+                    });
+                Ok(BackchannelStartReport {
+                    link_id,
+                    dest_hash,
+                    queued_deliveries: self.pending_backchannel_starts.len(),
+                    in_flight_deliveries: self.pending_backchannel_deliveries.len() + 1,
+                })
+            }
+            Err(err) => {
+                self.backchannel_links.remove(&dest_hash);
+                let error = match err {
+                    TrySendError::Full(_) => BackchannelStartError::CommandFull,
+                    TrySendError::Closed(_) => BackchannelStartError::CommandClosed,
+                };
+                tracing::warn!(
+                    link_id = %hex_encode(&link_id),
+                    dest = %hex_encode(&dest_hash),
+                    error = %error,
+                    "failed to queue LXMF backchannel send command"
+                );
+                Err(BackchannelStartFailure { error, message })
+            }
+        }
     }
 
     fn start_direct_delivery(
@@ -794,7 +1051,7 @@ impl LinkDeliveryManager {
 
     /// Drive pending deliveries forward; call periodically after [`Self::drain_events`].
     pub fn tick(&mut self) -> Vec<DeliveryResult> {
-        let mut results = Vec::new();
+        let mut results = self.tick_backchannels();
         let mut to_remove = Vec::new();
 
         for (link_id, delivery) in &mut self.pending {
@@ -1194,6 +1451,137 @@ impl LinkDeliveryManager {
         results
     }
 
+    fn tick_backchannels(&mut self) -> Vec<DeliveryResult> {
+        let mut results = Vec::new();
+
+        let starts = std::mem::take(&mut self.pending_backchannel_starts);
+        let mut still_waiting = Vec::new();
+        for mut start in starts {
+            match start.receiver.try_recv() {
+                Ok(Ok(receipt)) => {
+                    let (key, representation, progress, kind) = match receipt {
+                        BackchannelSendReceipt::Packet {
+                            link_id,
+                            packet_hash,
+                        } => (
+                            BackchannelProofKey::Packet(link_id, packet_hash),
+                            DeliveryRepresentation::Packet,
+                            0.50,
+                            LxmfDeliveryEventKind::AwaitingProof,
+                        ),
+                        BackchannelSendReceipt::Resource {
+                            link_id,
+                            resource_hash,
+                        } => (
+                            BackchannelProofKey::Resource(link_id, resource_hash),
+                            DeliveryRepresentation::Resource,
+                            0.10,
+                            LxmfDeliveryEventKind::TransferStarted,
+                        ),
+                    };
+                    self.delivery_events.push_back(backchannel_delivery_event(
+                        kind,
+                        &start.message,
+                        start.dest_hash,
+                        start.link_id,
+                        representation,
+                        Some(progress),
+                        None,
+                        LinkState::Active,
+                        DeliveryState::AwaitingProof,
+                    ));
+                    self.pending_backchannel_deliveries.insert(
+                        key,
+                        PendingBackchannelDelivery {
+                            message: start.message,
+                            dest_hash: start.dest_hash,
+                            link_id: start.link_id,
+                            representation,
+                            started_at: Instant::now(),
+                        },
+                    );
+                }
+                Ok(Err(err)) => {
+                    let reason = err.to_string();
+                    self.backchannel_links.remove(&start.dest_hash);
+                    tracing::warn!(
+                        link_id = %hex_encode(&start.link_id),
+                        dest = %hex_encode(&start.dest_hash),
+                        reason = %reason,
+                        "LXMF backchannel send failed"
+                    );
+                    results.push(fail_backchannel_start(
+                        &mut self.delivery_events,
+                        start,
+                        reason,
+                    ));
+                }
+                Err(oneshot::error::TryRecvError::Empty) => {
+                    if start.requested_at.elapsed() > BACKCHANNEL_SEND_COMMAND_TIMEOUT {
+                        let reason = "backchannel send command timeout".to_string();
+                        self.backchannel_links.remove(&start.dest_hash);
+                        tracing::warn!(
+                            link_id = %hex_encode(&start.link_id),
+                            dest = %hex_encode(&start.dest_hash),
+                            "LXMF backchannel send command timed out"
+                        );
+                        results.push(fail_backchannel_start(
+                            &mut self.delivery_events,
+                            start,
+                            reason,
+                        ));
+                    } else {
+                        still_waiting.push(start);
+                    }
+                }
+                Err(oneshot::error::TryRecvError::Closed) => {
+                    let reason = "backchannel send command closed".to_string();
+                    self.backchannel_links.remove(&start.dest_hash);
+                    results.push(fail_backchannel_start(
+                        &mut self.delivery_events,
+                        start,
+                        reason,
+                    ));
+                }
+            }
+        }
+        self.pending_backchannel_starts = still_waiting;
+
+        let expired: Vec<_> = self
+            .pending_backchannel_deliveries
+            .iter()
+            .filter_map(|(key, delivery)| {
+                (delivery.started_at.elapsed() > BACKCHANNEL_DELIVERY_TIMEOUT).then_some(*key)
+            })
+            .collect();
+        for key in expired {
+            if let Some(delivery) = self.pending_backchannel_deliveries.remove(&key) {
+                self.backchannel_links.remove(&delivery.dest_hash);
+                let reason = "backchannel delivery timeout".to_string();
+                self.delivery_events.push_back(backchannel_delivery_event(
+                    LxmfDeliveryEventKind::Failed,
+                    &delivery.message,
+                    delivery.dest_hash,
+                    delivery.link_id,
+                    delivery.representation,
+                    Some(delivery.message.progress),
+                    Some(reason.clone()),
+                    LinkState::Closed,
+                    DeliveryState::Failed,
+                ));
+                results.push(DeliveryResult::Failed {
+                    link_id: delivery.link_id,
+                    msg_hash: delivery.message.hash,
+                    dest_hash: delivery.dest_hash,
+                    message: delivery.message,
+                    reason,
+                });
+            }
+        }
+
+        results
+    }
+
     pub fn handle_hmu(&mut self, link_id: &[u8; 16], hmu_data: &[u8]) {
         let event = if let Some(delivery) = self.pending.get_mut(link_id)
             && let Some(ref mut transfer) = delivery.transfer
@@ -1374,11 +1762,57 @@ impl LinkDeliveryManager {
         false
     }
 
+    pub fn handle_backchannel_packet_proof(
+        &mut self,
+        link_id: [u8; 16],
+        packet_hash: [u8; 32],
+    ) -> Option<DeliveryResult> {
+        self.complete_backchannel_delivery(BackchannelProofKey::Packet(link_id, packet_hash))
+    }
+
+    pub fn handle_backchannel_resource_proof(
+        &mut self,
+        link_id: [u8; 16],
+        resource_hash: [u8; 32],
+    ) -> Option<DeliveryResult> {
+        self.complete_backchannel_delivery(BackchannelProofKey::Resource(link_id, resource_hash))
+    }
+
+    fn complete_backchannel_delivery(
+        &mut self,
+        key: BackchannelProofKey,
+    ) -> Option<DeliveryResult> {
+        let delivery = self.pending_backchannel_deliveries.remove(&key)?;
+        self.delivery_events.push_back(backchannel_delivery_event(
+            LxmfDeliveryEventKind::Delivered,
+            &delivery.message,
+            delivery.dest_hash,
+            delivery.link_id,
+            delivery.representation,
+            Some(1.0),
+            None,
+            LinkState::Active,
+            DeliveryState::Complete,
+        ));
+        tracing::info!(
+            link_id = %hex_encode(&delivery.link_id),
+            dest = %hex_encode(&delivery.dest_hash),
+            age_secs = delivery.started_at.elapsed().as_secs_f64(),
+            "LXMF backchannel delivery proved"
+        );
+        Some(DeliveryResult::Complete {
+            link_id: delivery.link_id,
+            msg_hash: delivery.message.hash,
+        })
+    }
+
     pub fn pending_count(&self) -> usize {
         self.pending
             .values()
             .map(PendingDelivery::active_delivery_count)
-            .sum()
+            .sum::<usize>()
+            + self.pending_backchannel_starts.len()
+            + self.pending_backchannel_deliveries.len()
     }
 
     pub fn take_delivery_events(&mut self) -> Vec<LxmfDeliveryEvent> {
@@ -1390,6 +1824,7 @@ impl LinkDeliveryManager {
             .get(dest_hash)
             .and_then(|link_id| self.pending.get(link_id))
             .is_some_and(|delivery| delivery.reusable && delivery.link.state != LinkState::Closed)
+            || self.backchannel_links.contains_key(dest_hash)
     }
 
     pub fn direct_link_snapshot(&self, dest_hash: [u8; 16]) -> Option<DirectLinkSnapshot> {
@@ -1405,11 +1840,37 @@ impl LinkDeliveryManager {
         })
     }
 
+    pub fn backchannel_link_snapshot(
+        &self,
+        dest_hash: [u8; 16],
+    ) -> Option<BackchannelLinkSnapshot> {
+        let link_id = *self.backchannel_links.get(&dest_hash)?;
+        let queued_deliveries = self
+            .pending_backchannel_starts
+            .iter()
+            .filter(|start| start.dest_hash == dest_hash)
+            .count();
+        let in_flight_deliveries = self
+            .pending_backchannel_deliveries
+            .values()
+            .filter(|delivery| delivery.dest_hash == dest_hash)
+            .count();
+        Some(BackchannelLinkSnapshot {
+            link_id,
+            dest_hash,
+            queued_deliveries,
+            in_flight_deliveries,
+        })
+    }
+
     pub fn stats(&self) -> LinkDeliveryStats {
         let mut stats = LinkDeliveryStats {
             sessions: self.pending.len(),
             direct_sessions: self.pending.values().filter(|d| d.reusable).count(),
             one_shot_sessions: self.pending.values().filter(|d| !d.reusable).count(),
+            backchannel_sessions: self.backchannel_links.len(),
+            pending_backchannel_starts: self.pending_backchannel_starts.len(),
+            pending_backchannel_deliveries: self.pending_backchannel_deliveries.len(),
             ..LinkDeliveryStats::default()
         };
         for delivery in self.pending.values() {
@@ -1429,6 +1890,8 @@ impl LinkDeliveryManager {
                 }
             }
         }
+        stats.queued_deliveries += self.pending_backchannel_starts.len();
+        stats.in_flight_deliveries += self.pending_backchannel_deliveries.len();
         stats
     }
 
@@ -1485,6 +1948,62 @@ fn queued_delivery_event(
         delivery_state: DeliveryState::Failed,
         queued_deliveries: 0,
         in_flight_deliveries: 0,
+        reason,
+    }
+}
+
+fn backchannel_delivery_event(
+    kind: LxmfDeliveryEventKind,
+    message: &LxMessage,
+    dest_hash: [u8; 16],
+    link_id: [u8; 16],
+    representation: DeliveryRepresentation,
+    progress: Option<f64>,
+    reason: Option<String>,
+    link_state: LinkState,
+    delivery_state: DeliveryState,
+) -> LxmfDeliveryEvent {
+    LxmfDeliveryEvent {
+        kind,
+        method: LxmfDeliveryEventMethod::Direct,
+        link_id,
+        dest_hash,
+        msg_hash: message.hash,
+        attempts: message.delivery_attempts,
+        progress,
+        representation,
+        link_state,
+        delivery_state,
+        queued_deliveries: 0,
+        in_flight_deliveries: usize::from(matches!(
+            delivery_state,
+            DeliveryState::Transferring | DeliveryState::AwaitingProof
+        )),
+        reason,
+    }
+}
+
+fn fail_backchannel_start(
+    events: &mut VecDeque<LxmfDeliveryEvent>,
+    start: PendingBackchannelStart,
+    reason: String,
+) -> DeliveryResult {
+    events.push_back(backchannel_delivery_event(
+        LxmfDeliveryEventKind::Failed,
+        &start.message,
+        start.dest_hash,
+        start.link_id,
+        DeliveryRepresentation::Unknown,
+        Some(start.message.progress),
+        Some(reason.clone()),
+        LinkState::Closed,
+        DeliveryState::Failed,
+    ));
+    DeliveryResult::Failed {
+        link_id: start.link_id,
+        msg_hash: start.message.hash,
+        dest_hash: start.dest_hash,
+        message: start.message,
         reason,
     }
 }
@@ -2105,6 +2624,137 @@ mod tests {
         let (tx, _rx) = mpsc::channel(16);
         let mgr = LinkDeliveryManager::new(tx, None, None);
         assert_eq!(mgr.pending_count(), 0);
+    }
+
+    #[test]
+    fn test_backchannel_delivery_uses_registered_link_and_packet_proof() {
+        let (tx, _rx) = mpsc::channel(16);
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
+        let mut mgr = LinkDeliveryManager::new(tx, None, None);
+        mgr.set_backchannel_sender(cmd_tx);
+
+        let dest_hash = [0xD1; 16];
+        let link_id = [0xE1; 16];
+        let packet_hash = [0xF1; 32];
+        mgr.register_backchannel(dest_hash, link_id);
+        assert!(mgr.delivery_link_available(&dest_hash));
+        assert_eq!(
+            mgr.backchannel_link_snapshot(dest_hash).unwrap().link_id,
+            link_id
+        );
+
+        let sign_key = Ed25519PrivateKey::generate();
+        let mut msg = LxMessage::new(
+            [0xAA; 16],
+            [0xBB; 16],
+            "Backchannel",
+            "packet proof",
+            crate::constants::DeliveryMethod::Direct,
+        );
+        msg.sign(&sign_key).unwrap();
+        let msg_hash = msg.hash;
+
+        let report = mgr.start_backchannel_delivery(msg, dest_hash).unwrap();
+        assert_eq!(report.link_id, link_id);
+        assert_eq!(mgr.pending_count(), 1);
+        let events = mgr.take_delivery_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, LxmfDeliveryEventKind::BackchannelLinkReused);
+        assert_eq!(events[0].progress, Some(0.05));
+
+        let command = cmd_rx.try_recv().expect("backchannel send command");
+        assert_eq!(command.link_id, link_id);
+        assert!(!command.payload.is_empty());
+        assert!(
+            command
+                .result_tx
+                .send(Ok(BackchannelSendReceipt::Packet {
+                    link_id,
+                    packet_hash,
+                }))
+                .is_ok()
+        );
+
+        assert!(mgr.tick().is_empty());
+        let events = mgr.take_delivery_events();
+        assert!(events.iter().any(|event| {
+            event.kind == LxmfDeliveryEventKind::AwaitingProof
+                && event.progress == Some(0.50)
+                && event.representation == DeliveryRepresentation::Packet
+        }));
+        assert_eq!(mgr.pending_count(), 1);
+        assert_eq!(mgr.stats().pending_backchannel_deliveries, 1);
+
+        let result = mgr
+            .handle_backchannel_packet_proof(link_id, packet_hash)
+            .expect("packet proof completes backchannel delivery");
+        assert!(matches!(
+            result,
+            DeliveryResult::Complete {
+                link_id: id,
+                msg_hash: hash,
+            } if id == link_id && hash == msg_hash
+        ));
+        let events = mgr.take_delivery_events();
+        assert!(events.iter().any(|event| {
+            event.kind == LxmfDeliveryEventKind::Delivered && event.progress == Some(1.0)
+        }));
+        assert_eq!(mgr.pending_count(), 0);
+        assert_eq!(mgr.stats().backchannel_sessions, 1);
+    }
+
+    #[test]
+    fn test_backchannel_send_error_removes_link_and_fails_message() {
+        let (tx, _rx) = mpsc::channel(16);
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
+        let mut mgr = LinkDeliveryManager::new(tx, None, None);
+        mgr.set_backchannel_sender(cmd_tx);
+
+        let dest_hash = [0xD2; 16];
+        let link_id = [0xE2; 16];
+        mgr.register_backchannel(dest_hash, link_id);
+
+        let sign_key = Ed25519PrivateKey::generate();
+        let mut msg = LxMessage::new(
+            [0xAA; 16],
+            [0xBB; 16],
+            "Backchannel",
+            "send failure",
+            crate::constants::DeliveryMethod::Direct,
+        );
+        msg.sign(&sign_key).unwrap();
+        let msg_hash = msg.hash;
+
+        mgr.start_backchannel_delivery(msg, dest_hash).unwrap();
+        let command = cmd_rx.try_recv().expect("backchannel send command");
+        assert!(
+            command
+                .result_tx
+                .send(Err(BackchannelSendError::LinkNotActive))
+                .is_ok()
+        );
+
+        let results = mgr.tick();
+        assert!(results.iter().any(|result| matches!(
+            result,
+            DeliveryResult::Failed {
+                link_id: id,
+                msg_hash: hash,
+                dest_hash: dest,
+                reason,
+                ..
+            } if *id == link_id
+                && *hash == msg_hash
+                && *dest == dest_hash
+                && reason == "link is not active"
+        )));
+        assert!(!mgr.delivery_link_available(&dest_hash));
+        let events = mgr.take_delivery_events();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == LxmfDeliveryEventKind::Failed)
+        );
     }
 
     #[test]
