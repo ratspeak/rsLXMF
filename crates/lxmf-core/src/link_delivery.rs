@@ -1461,8 +1461,19 @@ impl LinkDeliveryManager {
                                 break;
                             };
                             let action = transfer.tick();
+                            let reports_resource_progress =
+                                matches!(&action, TransferAction::SendPart(_, _));
                             match dispatch_action(link_id, delivery, &self.transport_tx, action) {
-                                ActionOutcome::Continue => continue,
+                                ActionOutcome::Continue => {
+                                    if reports_resource_progress {
+                                        maybe_push_resource_progress_event(
+                                            &mut self.delivery_events,
+                                            *link_id,
+                                            delivery,
+                                        );
+                                    }
+                                    continue;
+                                }
                                 ActionOutcome::Break => break,
                                 ActionOutcome::Complete => {
                                     delivery.message.progress = 1.0;
@@ -1801,15 +1812,17 @@ impl LinkDeliveryManager {
         {
             transfer.handle_hmu(hmu_data);
             let progress = delivery_resource_progress(delivery);
-            if let Some(progress) = progress {
+            if let Some(progress) = progress
+                && should_update_resource_progress(delivery.message.progress, progress)
+            {
                 delivery.message.progress = progress;
             }
-            progress.map(|progress| {
+            progress.map(|_| {
                 delivery_event(
                     LxmfDeliveryEventKind::TransferProgress,
                     *link_id,
                     delivery,
-                    Some(progress),
+                    Some(delivery.message.progress),
                     None,
                 )
             })
@@ -1849,15 +1862,17 @@ impl LinkDeliveryManager {
                 }
             }
             let progress = delivery_resource_progress(delivery);
-            if let Some(progress) = progress {
+            if let Some(progress) = progress
+                && should_update_resource_progress(delivery.message.progress, progress)
+            {
                 delivery.message.progress = progress;
             }
-            progress.map(|progress| {
+            progress.map(|_| {
                 delivery_event(
                     LxmfDeliveryEventKind::TransferProgress,
                     *link_id,
                     delivery,
-                    Some(progress),
+                    Some(delivery.message.progress),
                     None,
                 )
             })
@@ -2475,7 +2490,7 @@ fn delivery_resource_progress(delivery: &PendingDelivery) -> Option<f64> {
     let total_segments = transfer.resource.total_segments.max(1);
     let completed_segments = transfer.resource.segment_index.saturating_sub(1);
     let aggregate = (completed_segments as f64 + transfer.progress()) / total_segments as f64;
-    Some((0.10 + aggregate * 0.90).clamp(0.10, 1.0))
+    Some((0.10 + aggregate * 0.90).clamp(0.10, 0.99))
 }
 
 fn delivery_resource_proof_progress(delivery: &PendingDelivery) -> Option<f64> {
@@ -2484,6 +2499,31 @@ fn delivery_resource_proof_progress(delivery: &PendingDelivery) -> Option<f64> {
     let completed_segments = transfer.resource.segment_index.min(total_segments);
     let aggregate = completed_segments as f64 / total_segments as f64;
     Some((0.10 + aggregate * 0.90).clamp(0.10, 1.0))
+}
+
+fn should_update_resource_progress(current: f64, next: f64) -> bool {
+    next > current && ((next * 100.0).floor() > (current * 100.0).floor() || next >= 0.99)
+}
+
+fn maybe_push_resource_progress_event(
+    events: &mut VecDeque<LxmfDeliveryEvent>,
+    link_id: [u8; 16],
+    delivery: &mut PendingDelivery,
+) {
+    let Some(progress) = delivery_resource_progress(delivery) else {
+        return;
+    };
+    if !should_update_resource_progress(delivery.message.progress, progress) {
+        return;
+    }
+    delivery.message.progress = progress;
+    events.push_back(delivery_event(
+        LxmfDeliveryEventKind::TransferProgress,
+        link_id,
+        delivery,
+        Some(progress),
+        None,
+    ));
 }
 
 fn finish_reusable_delivery(
