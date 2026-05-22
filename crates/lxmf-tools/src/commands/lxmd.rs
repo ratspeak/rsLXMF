@@ -1447,18 +1447,18 @@ impl LxmdRunner {
                     client.start_download();
                     self.last_propagation_check = now;
                     tracing::debug!("auto-triggered propagation download");
-                } else if let Some(node) = self.router.outbound_propagation_node {
-                    if queue_unknown_propagation_node_path_request(
+                } else if let Some(node) = self.router.outbound_propagation_node
+                    && queue_unknown_propagation_node_path_request(
                         &self.transport_tx,
                         node,
                         &mut self.last_propagation_check,
                         now,
-                    ) {
-                        tracing::debug!(
-                            node = %hex::encode(node),
-                            "propagation node identity unknown; requesting path before download"
-                        );
-                    }
+                    )
+                {
+                    tracing::debug!(
+                        node = %hex::encode(node),
+                        "propagation node identity unknown; requesting path before download"
+                    );
                 }
             }
         }
