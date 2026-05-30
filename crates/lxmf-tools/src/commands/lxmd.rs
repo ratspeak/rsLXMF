@@ -4,7 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use clap::Parser;
@@ -46,6 +46,7 @@ use rns_identity::identity::Identity;
 use rns_identity::ratchet::{
     RatchetRing, ReceivedRatchet, clean_received_ratchets_dir, purge_expired_ratchets_in_memory,
 };
+use rns_runtime::lifecycle::ShutdownSignal;
 use rns_transport::messages::{
     AnnounceHandlerEvent, TransportMessage, TransportQuery, TransportQueryResponse,
 };
@@ -93,6 +94,13 @@ fn now_f64() -> f64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64()
+}
+
+async fn sleep_or_shutdown(shutdown: &ShutdownSignal, duration: Duration) -> bool {
+    tokio::select! {
+        _ = shutdown.wait() => true,
+        _ = tokio::time::sleep(duration) => false,
+    }
 }
 
 fn mark_delivery_attempt(message: &mut LxMessage) -> u32 {
@@ -2758,16 +2766,29 @@ pub(crate) async fn main() {
         tracing::info!("Waiting for interfaces to come online before announcing...");
         let mut announced = false;
         for _ in 0..30 {
+            if shutdown.is_triggered() {
+                break;
+            }
+            let poll_started = Instant::now();
             let (otx, orx) = tokio::sync::oneshot::channel();
-            let _ = runner
-                .transport_tx
-                .send(TransportMessage::Rpc {
+            tokio::select! {
+                _ = shutdown.wait() => break,
+                result = runner.transport_tx.send(TransportMessage::Rpc {
                     query: rns_transport::messages::TransportQuery::GetInterfaceStats,
                     response_tx: otx,
-                })
-                .await;
-            if let Ok(rns_transport::messages::TransportQueryResponse::InterfaceStats(stats)) =
-                orx.await
+                }) => {
+                    if result.is_err() {
+                        break;
+                    }
+                }
+            }
+
+            let stats_result = tokio::select! {
+                _ = shutdown.wait() => break,
+                result = tokio::time::timeout(Duration::from_secs(1), orx) => result,
+            };
+            if let Ok(Ok(rns_transport::messages::TransportQueryResponse::InterfaceStats(stats))) =
+                stats_result
             {
                 let any_online = stats
                     .iter()
@@ -2784,16 +2805,26 @@ pub(crate) async fn main() {
                     break;
                 }
             }
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            let elapsed = poll_started.elapsed();
+            if elapsed < Duration::from_secs(1)
+                && sleep_or_shutdown(&shutdown, Duration::from_secs(1) - elapsed).await
+            {
+                break;
+            }
         }
-        if !announced {
+        if shutdown.is_triggered() {
+            tracing::info!("Startup announce cancelled by shutdown");
+        } else if !announced {
             tracing::warn!("No online interface detected after 30s, announcing anyway");
             let _ = runner.send_announce().await;
             runner.last_peer_announce = now_f64();
         }
     }
 
-    if daemon_config.node_announce_at_start && daemon_config.propagation_enabled {
+    if !shutdown.is_triggered()
+        && daemon_config.node_announce_at_start
+        && daemon_config.propagation_enabled
+    {
         match runner.send_propagation_announce().await {
             Ok(()) => {
                 tracing::info!("Startup propagation announce sent");
@@ -2813,7 +2844,9 @@ pub(crate) async fn main() {
         tracing::info!("On-inbound command: {}", cmd);
     }
 
-    if let Some(ref send_args) = args.send {
+    if !shutdown.is_triggered()
+        && let Some(ref send_args) = args.send
+    {
         let dest_hex = normalize_hash_hex(&send_args[0]);
         let content = match args.send_file.as_ref() {
             Some(path) => match std::fs::read_to_string(path) {
@@ -2860,7 +2893,10 @@ pub(crate) async fn main() {
             if have_key && saw_dest_announce {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            if sleep_or_shutdown(&shutdown, Duration::from_millis(500)).await {
+                tracing::info!("message send interrupted by shutdown");
+                return;
+            }
         }
         if !have_key {
             tracing::warn!(
@@ -2915,7 +2951,10 @@ pub(crate) async fn main() {
             runner.refresh_route_hops_from_transport().await;
             runner.drain_link_packets();
             runner.tick();
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            if sleep_or_shutdown(&shutdown, Duration::from_secs(1)).await {
+                tracing::info!("message send interrupted by shutdown");
+                return;
+            }
 
             let stats = runner.router.stats();
             if stats.pending_outbound == 0 && stats.pending_deferred_stamps == 0 {
@@ -2946,7 +2985,10 @@ pub(crate) async fn main() {
                 runner.refresh_route_hops_from_transport().await;
                 runner.drain_link_packets();
                 runner.tick();
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                if sleep_or_shutdown(&shutdown, Duration::from_secs(1)).await {
+                    tracing::info!("message send interrupted by shutdown");
+                    return;
+                }
 
                 if runner
                     .link_delivery
@@ -2977,7 +3019,9 @@ pub(crate) async fn main() {
         std::process::exit(0);
     }
 
-    tracing::info!("LXMF Daemon running. Press Ctrl+C to stop.");
+    if !shutdown.is_triggered() {
+        tracing::info!("LXMF Daemon running. Press Ctrl+C to stop.");
+    }
 
     // Event-driven for inbound, periodic for outbound and maintenance.
     let mut tick_timer = tokio::time::interval(Duration::from_secs(4));

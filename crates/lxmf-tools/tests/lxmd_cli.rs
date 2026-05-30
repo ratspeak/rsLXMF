@@ -1,6 +1,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::process::{Child, Stdio};
 use std::process::{Command, Output};
+#[cfg(unix)]
+use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 struct TestDir {
@@ -55,6 +59,20 @@ fn write_rust_identity(path: &Path) {
         .expect("write Rust identity");
 }
 
+#[cfg(unix)]
+fn wait_with_timeout(child: &mut Child, timeout: Duration) -> Option<std::process::ExitStatus> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait().expect("poll lxmd-rs child") {
+            return Some(status);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 #[test]
 fn help_lists_cli_surface_without_starting_runtime() {
     let output = lxmd(&["--help"]);
@@ -74,6 +92,94 @@ fn help_lists_cli_surface_without_starting_runtime() {
     assert!(text.contains("-s, --service"));
     assert!(text.contains("--send <DEST_HASH> <CONTENT>"));
     assert!(text.contains("[possible values: opportunistic, direct, propagated]"));
+}
+
+#[cfg(unix)]
+#[test]
+fn ctrl_c_exits_during_startup_announce_wait() {
+    let lxmf_dir = TestDir::new("lxmf-ctrlc");
+    let rns_dir = TestDir::new("rns-ctrlc");
+    fs::write(
+        lxmf_dir.path().join("config"),
+        "\
+[lxmf]
+display_name = Test
+announce_at_start = yes
+
+[propagation]
+enable_node = no
+",
+    )
+    .expect("write LXMF config");
+    fs::write(
+        rns_dir.path().join("config"),
+        "\
+[reticulum]
+share_instance = No
+enable_transport = No
+respond_to_probes = No
+panic_on_interface_error = No
+discover_interfaces = No
+
+[interfaces]
+",
+    )
+    .expect("write no-interface Reticulum config");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_lxmd-rs"))
+        .arg("--config")
+        .arg(lxmf_dir.path())
+        .arg("--rnsconfig")
+        .arg(rns_dir.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("lxmd-rs subprocess should start");
+
+    let identity_path = lxmf_dir.path().join("identity");
+    let startup_deadline = Instant::now() + Duration::from_secs(5);
+    while !identity_path.exists() {
+        if let Some(status) = child.try_wait().expect("poll lxmd-rs startup") {
+            let output = child.wait_with_output().expect("collect lxmd-rs output");
+            panic!(
+                "lxmd-rs exited before startup announce wait ({status}):\n{}",
+                combined_output(&output)
+            );
+        }
+        assert!(
+            Instant::now() < startup_deadline,
+            "lxmd-rs did not reach startup announce wait"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    let signal_status = Command::new("kill")
+        .arg("-INT")
+        .arg(child.id().to_string())
+        .status()
+        .expect("send SIGINT to lxmd-rs");
+    assert!(signal_status.success(), "kill -INT should succeed");
+
+    if wait_with_timeout(&mut child, Duration::from_secs(3)).is_none() {
+        let _ = child.kill();
+        let output = child.wait_with_output().expect("collect lxmd-rs output");
+        panic!(
+            "lxmd-rs did not exit after Ctrl+C during startup announce wait:\n{}",
+            combined_output(&output)
+        );
+    }
+
+    let output = child.wait_with_output().expect("collect lxmd-rs output");
+    assert!(
+        output.status.success(),
+        "expected clean shutdown after Ctrl+C, got:\n{}",
+        combined_output(&output)
+    );
+    assert!(
+        combined_output(&output).contains("Startup announce cancelled by shutdown"),
+        "expected startup announce cancellation log, got:\n{}",
+        combined_output(&output)
+    );
 }
 
 #[test]
