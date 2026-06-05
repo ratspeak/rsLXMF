@@ -1561,7 +1561,6 @@ impl LxmdRunner {
         while let Ok(event) = self.announce_rx.try_recv() {
             seen.push(event.destination_hash);
             let dest_hex = hex::encode(event.destination_hash);
-            let mut crypto_dirty = false;
             tracing::info!(
                 dest = %dest_hex,
                 hops = event.hops,
@@ -1623,17 +1622,12 @@ impl LxmdRunner {
                 && self.known_identities.get(&dest_hex) != Some(&pub_key)
             {
                 self.known_identities.insert(dest_hex.clone(), pub_key);
-                crypto_dirty = true;
                 tracing::debug!(dest = %dest_hex, "learned identity key from announce");
             }
             if let Some(ratchet_key) = event.ratchet {
                 self.received_ratchets
                     .insert(dest_hex.clone(), ReceivedRatchet::new(ratchet_key));
-                crypto_dirty = true;
                 tracing::debug!(dest = %dest_hex, "learned ratchet from announce");
-            }
-            if crypto_dirty {
-                self.save_crypto_state();
             }
         }
         seen
