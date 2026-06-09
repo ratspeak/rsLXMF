@@ -936,7 +936,7 @@ mod tests {
             let mut peering_id = Vec::with_capacity(32);
             peering_id.extend_from_slice(&local_identity);
             peering_id.extend_from_slice(&peer_hash);
-            crate::stamper::generate_stamp_raw(
+            crate::stamper::generate_stamp(
                 &peering_id,
                 cost,
                 crate::constants::STAMP_WORKBLOCK_EXPAND_ROUNDS_PEERING,

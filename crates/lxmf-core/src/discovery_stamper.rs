@@ -13,15 +13,11 @@
 //! (RNS/Discovery.py:220), where `stamp_workblock` is the
 //! HKDF-expanded construction: one HKDF expand per round, each round
 //! producing 256 bytes, total `expand_rounds * 256` bytes.
-//!
-//! The matching Rust primitive is [`crate::stamper::stamp_workblock_raw`]
-//! (the plain `stamp_workblock` in `lxmf-core` uses an iterative
-//! SHA-256 workblock for a *different* path and is **not** wire
-//! compatible with Python's discovery stamps).
+//! [`crate::stamper::stamp_workblock`] is the same construction.
 //!
 use rns_transport::discovery::DiscoveryStamper;
 
-use crate::stamper::{stamp_valid_raw, stamp_value_raw, stamp_workblock_raw};
+use crate::stamper::{stamp_valid, stamp_value, stamp_workblock};
 
 /// Python `RNS.Discovery.InterfaceAnnouncer.WORKBLOCK_EXPAND_ROUNDS`,
 /// the expand-round count discovery uses when building its workblock.
@@ -75,11 +71,11 @@ impl DiscoveryStamper for LxmfDiscoveryStamper {
             return Some(vec![0u8; 32]);
         }
 
-        let workblock = stamp_workblock_raw(infohash, DISCOVERY_WORKBLOCK_EXPAND_ROUNDS);
+        let workblock = stamp_workblock(infohash, DISCOVERY_WORKBLOCK_EXPAND_ROUNDS);
 
         for _ in 0..self.effective_max_iterations() {
             let candidate = crate::stamper::rand_bytes();
-            if stamp_valid_raw(&candidate, target_value, &workblock) {
+            if stamp_valid(&candidate, target_value, &workblock) {
                 return Some(candidate.to_vec());
             }
         }
@@ -92,8 +88,8 @@ impl DiscoveryStamper for LxmfDiscoveryStamper {
         }
         let mut stamp_arr = [0u8; 32];
         stamp_arr.copy_from_slice(stamp);
-        let workblock = stamp_workblock_raw(infohash, DISCOVERY_WORKBLOCK_EXPAND_ROUNDS);
-        let v = stamp_value_raw(&workblock, &stamp_arr);
+        let workblock = stamp_workblock(infohash, DISCOVERY_WORKBLOCK_EXPAND_ROUNDS);
+        let v = stamp_value(&workblock, &stamp_arr);
         v.min(u8::MAX as u32) as u8
     }
 
@@ -106,8 +102,8 @@ impl DiscoveryStamper for LxmfDiscoveryStamper {
         }
         let mut stamp_arr = [0u8; 32];
         stamp_arr.copy_from_slice(stamp);
-        let workblock = stamp_workblock_raw(infohash, DISCOVERY_WORKBLOCK_EXPAND_ROUNDS);
-        stamp_valid_raw(&stamp_arr, required_value, &workblock)
+        let workblock = stamp_workblock(infohash, DISCOVERY_WORKBLOCK_EXPAND_ROUNDS);
+        stamp_valid(&stamp_arr, required_value, &workblock)
     }
 }
 
@@ -123,10 +119,10 @@ pub fn generate_discovery_stamp(
     if target_value == 0 {
         return Some([0u8; 32]);
     }
-    let workblock = stamp_workblock_raw(infohash, DISCOVERY_WORKBLOCK_EXPAND_ROUNDS);
+    let workblock = stamp_workblock(infohash, DISCOVERY_WORKBLOCK_EXPAND_ROUNDS);
     for _ in 0..max_iterations {
         let candidate = crate::stamper::rand_bytes();
-        if stamp_valid_raw(&candidate, target_value, &workblock) {
+        if stamp_valid(&candidate, target_value, &workblock) {
             return Some(candidate);
         }
     }

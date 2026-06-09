@@ -291,15 +291,15 @@ impl LxmPeer {
         key_material.extend_from_slice(peer_identity_hash);
         key_material.extend_from_slice(our_identity_hash);
 
-        let workblock = crate::stamper::stamp_workblock_raw(
+        let workblock = crate::stamper::stamp_workblock(
             &key_material,
             crate::constants::STAMP_WORKBLOCK_EXPAND_ROUNDS_PEERING,
         );
 
         loop {
             let stamp: [u8; 32] = crate::stamper::rand_bytes();
-            if crate::stamper::stamp_valid_raw(&stamp, self.peering_cost, &workblock) {
-                let value = crate::stamper::stamp_value_raw(&workblock, &stamp);
+            if crate::stamper::stamp_valid(&stamp, self.peering_cost, &workblock) {
+                let value = crate::stamper::stamp_value(&workblock, &stamp);
                 self.peering_key = Some((stamp, value));
                 return true;
             }

@@ -383,7 +383,7 @@ impl LxMessage {
         if let Some(target_cost) = propagation_stamp_cost
             && self.propagation_stamp.is_none()
         {
-            let (stamp, value) = crate::stamper::generate_stamp_raw(
+            let (stamp, value) = crate::stamper::generate_stamp(
                 &tid,
                 target_cost,
                 crate::constants::STAMP_WORKBLOCK_EXPAND_ROUNDS_PN,
@@ -397,11 +397,11 @@ impl LxMessage {
 
         if let Some(ref prop_stamp) = self.propagation_stamp {
             if stamp_value == 0 {
-                let workblock = crate::stamper::stamp_workblock_raw(
+                let workblock = crate::stamper::stamp_workblock(
                     &tid,
                     crate::constants::STAMP_WORKBLOCK_EXPAND_ROUNDS_PN,
                 );
-                stamp_value = crate::stamper::stamp_value_raw(&workblock, prop_stamp);
+                stamp_value = crate::stamper::stamp_value(&workblock, prop_stamp);
             }
             lxmf_data.extend_from_slice(prop_stamp);
         }
@@ -815,7 +815,7 @@ impl LxMessage {
         };
         let workblock = crate::stamper::stamp_workblock(&message_id, STAMP_WORKBLOCK_EXPAND_ROUNDS);
         if crate::stamper::stamp_valid(stamp, target_cost, &workblock) {
-            self.stamp_value = Some(crate::stamper::stamp_value(stamp, &workblock) as u16);
+            self.stamp_value = Some(crate::stamper::stamp_value(&workblock, stamp) as u16);
             return true;
         }
 

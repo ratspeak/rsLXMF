@@ -138,12 +138,12 @@ impl PropagationNode {
         // PN expand rounds. Matches Python LXStamper.validate_pn_stamp().
         let sv = if let Some(ref stamp) = message.stamp {
             let transient_id_full = rns_crypto::sha::full_hash(&packed);
-            let workblock = crate::stamper::stamp_workblock_raw(
+            let workblock = crate::stamper::stamp_workblock(
                 &transient_id_full,
                 crate::constants::STAMP_WORKBLOCK_EXPAND_ROUNDS_PN,
             );
             if let Ok(stamp) = <&[u8; 32]>::try_from(stamp.as_slice()) {
-                crate::stamper::stamp_value_raw(&workblock, stamp) as u8
+                crate::stamper::stamp_value(&workblock, stamp) as u8
             } else {
                 0
             }
@@ -918,7 +918,7 @@ mod tests {
         let mut peering_id = Vec::with_capacity(32);
         peering_id.extend_from_slice(local_identity);
         peering_id.extend_from_slice(remote_identity);
-        crate::stamper::generate_stamp_raw(
+        crate::stamper::generate_stamp(
             &peering_id,
             cost,
             crate::constants::STAMP_WORKBLOCK_EXPAND_ROUNDS_PEERING,

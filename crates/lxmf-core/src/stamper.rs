@@ -2,11 +2,11 @@
 //!
 //! Python reference: LXMF/LXStamper.py.
 //!
-//! Two workblock constructions are used:
-//! - `stamp_workblock_raw`: HKDF-expand on arbitrary material. Matches Python
-//!   exactly for peering keys and PN stamps.
-//! - `stamp_workblock`: iterative SHA-256 on a 32-byte message_id (simplified
-//!   construction used internally for message stamps; cheaper and deterministic).
+//! A single workblock construction is used for all stamp kinds (message,
+//! propagation-node, peering), matching Python `LXStamper.stamp_workblock`:
+//! per-round HKDF expansion concatenated into a `expand_rounds * 256` byte
+//! workblock. Only the expand-round count differs per kind (see
+//! `STAMP_WORKBLOCK_EXPAND_ROUNDS{,_PN,_PEERING}` in constants.rs).
 //!
 //! Validity check: `SHA-256(workblock || stamp)` must have >= `cost` leading
 //! zero bits. Matches Python's `int.from_bytes(result) <= (1 << (256-cost))`.
@@ -19,7 +19,7 @@ use rns_crypto::hkdf::hkdf_sha256;
 use rns_crypto::sha::sha256;
 use sha2::{Digest, Sha256};
 
-/// Parsed propagation-node stamp parts: `(stamp, lxm_data, value, workblock)`.
+/// Parsed propagation-node stamp parts: `(transient_id, lxm_data, value, stamp)`.
 pub type PropagationStampParts = ([u8; 32], Vec<u8>, u32, [u8; 32]);
 
 /// Matches Python `LXStamper.stamp_workblock(material, expand_rounds)`:
@@ -29,7 +29,7 @@ pub type PropagationStampParts = ([u8; 32], Vec<u8>, u32, [u8; 32]);
 ///   workblock += HKDF(length=256, derive_from=material, salt=salt, context=None)
 ///
 /// Produces `expand_rounds * 256` bytes.
-pub fn stamp_workblock_raw(material: &[u8], expand_rounds: usize) -> Vec<u8> {
+pub fn stamp_workblock(material: &[u8], expand_rounds: usize) -> Vec<u8> {
     let mut workblock = Vec::with_capacity(expand_rounds * 256);
 
     for n in 0..expand_rounds {
@@ -53,23 +53,6 @@ fn pack_msgpack_uint(n: usize) -> Vec<u8> {
     crate::encode_value(&value)
 }
 
-/// `workblock = SHA-256^(expand_rounds)(message_id)`.
-///
-/// Non-32-byte inputs are first hashed to produce a 32-byte starting point.
-pub fn stamp_workblock(message_id: &[u8], expand_rounds: usize) -> [u8; 32] {
-    let mut current = if message_id.len() == 32 {
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(message_id);
-        arr
-    } else {
-        sha256(message_id)
-    };
-    for _ in 0..expand_rounds {
-        current = sha256(&current);
-    }
-    current
-}
-
 fn leading_zero_bits(data: &[u8]) -> u32 {
     let mut count = 0u32;
     for &byte in data {
@@ -84,80 +67,33 @@ fn leading_zero_bits(data: &[u8]) -> u32 {
 }
 
 /// Leading zero bits of `SHA-256(workblock || stamp)`. Matches Python `stamp_value()`.
-pub fn stamp_value(workblock: &[u8; 32], stamp: &[u8; 32]) -> u32 {
-    let mut material = [0u8; 64];
-    material[..32].copy_from_slice(workblock);
-    material[32..].copy_from_slice(stamp);
-    let hash = sha256(&material);
-    leading_zero_bits(&hash)
+pub fn stamp_value(workblock: &[u8], stamp: &[u8; 32]) -> u32 {
+    let mut hasher = Sha256::new();
+    hasher.update(workblock);
+    stamp_value_from_base(&hasher, stamp)
 }
 
-pub fn stamp_valid(stamp: &[u8; 32], cost: u8, workblock: &[u8; 32]) -> bool {
+pub fn stamp_valid(stamp: &[u8; 32], cost: u8, workblock: &[u8]) -> bool {
     if cost == 0 {
         return true;
     }
     stamp_value(workblock, stamp) >= cost as u32
 }
 
-/// `stamp_value` counterpart for variable-length (HKDF-expanded) workblocks.
-pub fn stamp_value_raw(workblock: &[u8], stamp: &[u8; 32]) -> u32 {
-    let mut hasher = Sha256::new();
-    hasher.update(workblock);
-    raw_stamp_value_from_base(&hasher, stamp)
-}
-
-/// `stamp_valid` counterpart for variable-length (HKDF-expanded) workblocks.
-pub fn stamp_valid_raw(stamp: &[u8; 32], cost: u8, workblock: &[u8]) -> bool {
-    if cost == 0 {
-        return true;
-    }
-    stamp_value_raw(workblock, stamp) >= cost as u32
-}
-
 /// Single-threaded brute-force stamp search. Blocks until a valid stamp is found.
-pub fn generate_stamp(
-    message_id: &[u8; 32],
-    cost: u8,
-    expand_rounds: usize,
-) -> Option<([u8; 32], u32)> {
+pub fn generate_stamp(material: &[u8], cost: u8, expand_rounds: usize) -> Option<([u8; 32], u32)> {
     if cost == 0 {
         return Some(([0u8; 32], 0));
     }
 
-    let workblock = stamp_workblock(message_id, expand_rounds);
-    let mut rng = rand::thread_rng();
-
-    loop {
-        let stamp = rand_bytes_from(&mut rng);
-        if stamp_valid(&stamp, cost, &workblock) {
-            let value = stamp_value(&workblock, &stamp);
-            return Some((stamp, value));
-        }
-    }
-}
-
-/// Generate a stamp using the Python-compatible variable-length workblock.
-///
-/// This is used for propagation-node stamps and peering keys, where the
-/// workblock material is arbitrary bytes instead of the regular 32-byte LXMF
-/// message id.
-pub fn generate_stamp_raw(
-    material: &[u8],
-    cost: u8,
-    expand_rounds: usize,
-) -> Option<([u8; 32], u32)> {
-    if cost == 0 {
-        return Some(([0u8; 32], 0));
-    }
-
-    let workblock = stamp_workblock_raw(material, expand_rounds);
+    let workblock = stamp_workblock(material, expand_rounds);
     let mut base_hasher = Sha256::new();
     base_hasher.update(&workblock);
     let mut rng = rand::thread_rng();
 
     loop {
         let stamp = rand_bytes_from(&mut rng);
-        let value = raw_stamp_value_from_base(&base_hasher, &stamp);
+        let value = stamp_value_from_base(&base_hasher, &stamp);
         if value >= cost as u32 {
             return Some((stamp, value));
         }
@@ -166,7 +102,7 @@ pub fn generate_stamp_raw(
 
 /// Stamp search with a configurable iteration limit (for tests).
 pub fn generate_stamp_limited(
-    message_id: &[u8; 32],
+    material: &[u8],
     cost: u8,
     expand_rounds: usize,
     max_iterations: u64,
@@ -175,12 +111,14 @@ pub fn generate_stamp_limited(
         return Some([0u8; 32]);
     }
 
-    let workblock = stamp_workblock(message_id, expand_rounds);
+    let workblock = stamp_workblock(material, expand_rounds);
+    let mut base_hasher = Sha256::new();
+    base_hasher.update(&workblock);
     let mut rng = rand::thread_rng();
 
     for _ in 0..max_iterations {
         let stamp = rand_bytes_from(&mut rng);
-        if stamp_valid(&stamp, cost, &workblock) {
+        if stamp_value_from_base(&base_hasher, &stamp) >= cost as u32 {
             return Some(stamp);
         }
     }
@@ -203,11 +141,11 @@ pub fn validate_stamp(
 /// `peering_id` = self_identity_hash || remote_identity_hash (32 bytes typical).
 /// Uses `STAMP_WORKBLOCK_EXPAND_ROUNDS_PEERING` for workblock generation.
 pub fn validate_peering_key(peering_id: &[u8], peering_key: &[u8; 32], target_cost: u8) -> bool {
-    let workblock = stamp_workblock_raw(
+    let workblock = stamp_workblock(
         peering_id,
         crate::constants::STAMP_WORKBLOCK_EXPAND_ROUNDS_PEERING,
     );
-    stamp_valid_raw(peering_key, target_cost, &workblock)
+    stamp_valid(peering_key, target_cost, &workblock)
 }
 
 /// Python reference: LXStamper.py:53-65 (`validate_pn_stamp`).
@@ -229,12 +167,12 @@ pub fn validate_pn_stamp(transient_data: &[u8], target_cost: u8) -> Option<Propa
     stamp.copy_from_slice(stamp_bytes);
 
     let transient_id = rns_crypto::sha::full_hash(lxm_data);
-    let workblock = stamp_workblock_raw(
+    let workblock = stamp_workblock(
         &transient_id,
         crate::constants::STAMP_WORKBLOCK_EXPAND_ROUNDS_PN,
     );
 
-    let value = stamp_value_raw(&workblock, &stamp);
+    let value = stamp_value(&workblock, &stamp);
     if value < target_cost as u32 {
         return None;
     }
@@ -298,6 +236,8 @@ pub fn spawn_deferred_stamp(
         }
 
         let workblock = stamp_workblock(&message_id, expand_rounds);
+        let mut base_hasher = Sha256::new();
+        base_hasher.update(&workblock);
         let mut rng = rand::thread_rng();
 
         loop {
@@ -309,8 +249,8 @@ pub fn spawn_deferred_stamp(
             // Check cancellation every 1000 iterations.
             for _ in 0..1000 {
                 let stamp = rand_bytes_from(&mut rng);
-                if stamp_valid(&stamp, cost, &workblock) {
-                    let value = stamp_value(&workblock, &stamp);
+                let value = stamp_value_from_base(&base_hasher, &stamp);
+                if value >= cost as u32 {
                     let _ = tx.send(DeferredStampResult::Success { stamp, value });
                     return;
                 }
@@ -332,7 +272,7 @@ fn rand_bytes_from(rng: &mut impl RngCore) -> [u8; 32] {
     bytes
 }
 
-fn raw_stamp_value_from_base(base_hasher: &Sha256, stamp: &[u8; 32]) -> u32 {
+fn stamp_value_from_base(base_hasher: &Sha256, stamp: &[u8; 32]) -> u32 {
     let mut hasher = base_hasher.clone();
     hasher.update(stamp);
     let hash = hasher.finalize();
@@ -347,9 +287,10 @@ mod tests {
     #[test]
     fn test_workblock_deterministic() {
         let id = sha256(b"test message id");
-        let wb1 = stamp_workblock(&id, STAMP_WORKBLOCK_EXPAND_ROUNDS);
-        let wb2 = stamp_workblock(&id, STAMP_WORKBLOCK_EXPAND_ROUNDS);
+        let wb1 = stamp_workblock(&id, 10);
+        let wb2 = stamp_workblock(&id, 10);
         assert_eq!(wb1, wb2);
+        assert_eq!(wb1.len(), 10 * 256);
     }
 
     #[test]
@@ -358,6 +299,15 @@ mod tests {
         let wb1 = stamp_workblock(&id, 10);
         let wb2 = stamp_workblock(&id, 20);
         assert_ne!(wb1, wb2);
+    }
+
+    /// Workblock for the default message expand rounds matches the Python
+    /// construction's size: 3000 rounds * 256 bytes.
+    #[test]
+    fn test_workblock_message_rounds_size() {
+        let id = sha256(b"size check");
+        let wb = stamp_workblock(&id, STAMP_WORKBLOCK_EXPAND_ROUNDS);
+        assert_eq!(wb.len(), STAMP_WORKBLOCK_EXPAND_ROUNDS * 256);
     }
 
     #[test]
@@ -417,13 +367,6 @@ mod tests {
     }
 
     #[test]
-    fn test_stamp_value() {
-        let workblock = [0u8; 32];
-        let stamp = [0u8; 32];
-        let _value = stamp_value(&workblock, &stamp);
-    }
-
-    #[test]
     fn test_stamp_value_consistency() {
         let id = sha256(b"consistency test");
         let cost = 4;
@@ -436,18 +379,43 @@ mod tests {
     }
 
     #[test]
-    fn test_workblock_handles_short_input() {
-        let short_input = b"short";
-        let wb = stamp_workblock(short_input, 10);
-        assert_ne!(wb, [0u8; 32]);
+    fn test_workblock_arbitrary_length_input() {
+        let short_material = b"short";
+        let wb = stamp_workblock(short_material, 5);
+        assert_eq!(wb.len(), 5 * 256);
+
+        let wb2 = stamp_workblock(short_material, 5);
+        assert_eq!(wb, wb2);
+
+        let wb3 = stamp_workblock(b"other", 5);
+        assert_ne!(wb, wb3);
     }
 
     #[test]
     fn test_different_expand_round_constants() {
         let id = sha256(b"test expand rounds");
-        let wb_default = stamp_workblock(&id, STAMP_WORKBLOCK_EXPAND_ROUNDS);
         let wb_pn = stamp_workblock(&id, STAMP_WORKBLOCK_EXPAND_ROUNDS_PN);
-        assert_ne!(wb_default, wb_pn);
+        let wb_peering = stamp_workblock(
+            &id,
+            crate::constants::STAMP_WORKBLOCK_EXPAND_ROUNDS_PEERING,
+        );
+        // Workblocks are prefix-stable per construction; only length differs.
+        assert_eq!(wb_pn[..wb_peering.len()], wb_peering[..]);
+        assert_eq!(wb_pn.len(), STAMP_WORKBLOCK_EXPAND_ROUNDS_PN * 256);
+        assert_eq!(
+            wb_peering.len(),
+            crate::constants::STAMP_WORKBLOCK_EXPAND_ROUNDS_PEERING * 256
+        );
+    }
+
+    /// The first 256-byte chunk of the workblock is identical regardless of
+    /// total round count — Python builds it incrementally the same way.
+    #[test]
+    fn test_workblock_prefix_stability() {
+        let id = sha256(b"prefix stability");
+        let wb_small = stamp_workblock(&id, 2);
+        let wb_large = stamp_workblock(&id, 5);
+        assert_eq!(wb_small[..], wb_large[..2 * 256]);
     }
 
     #[test]
@@ -509,33 +477,11 @@ mod tests {
     }
 
     #[test]
-    fn test_stamp_workblock_raw_deterministic() {
-        let id = sha256(b"test workblock raw");
-        let wb1 = stamp_workblock_raw(&id, 10);
-        let wb2 = stamp_workblock_raw(&id, 10);
-        assert_eq!(wb1, wb2);
-        assert_eq!(wb1.len(), 10 * 256);
-    }
-
-    #[test]
-    fn test_stamp_workblock_raw_arbitrary_length() {
-        let short_material = b"short";
-        let wb = stamp_workblock_raw(short_material, 5);
-        assert_eq!(wb.len(), 5 * 256);
-
-        let wb2 = stamp_workblock_raw(short_material, 5);
-        assert_eq!(wb, wb2);
-
-        let wb3 = stamp_workblock_raw(b"other", 5);
-        assert_ne!(wb, wb3);
-    }
-
-    #[test]
-    fn test_stamp_workblock_raw_peering_id_length() {
+    fn test_workblock_peering_id_length() {
         let mut peering_id = Vec::with_capacity(32);
         peering_id.extend_from_slice(&[0xAA; 16]);
         peering_id.extend_from_slice(&[0xBB; 16]);
-        let wb = stamp_workblock_raw(
+        let wb = stamp_workblock(
             &peering_id,
             crate::constants::STAMP_WORKBLOCK_EXPAND_ROUNDS_PEERING,
         );
@@ -586,9 +532,9 @@ mod tests {
     }
 
     #[test]
-    fn test_raw_stamp_value_matches_direct_sha256_prefix_hash() {
+    fn test_stamp_value_matches_direct_sha256_of_workblock_and_stamp() {
         let material = sha256(b"propagation transient id");
-        let workblock = stamp_workblock_raw(&material, STAMP_WORKBLOCK_EXPAND_ROUNDS_PN);
+        let workblock = stamp_workblock(&material, STAMP_WORKBLOCK_EXPAND_ROUNDS_PN);
         let stamp = [0x5Au8; 32];
 
         let mut direct = Vec::with_capacity(workblock.len() + stamp.len());
@@ -597,7 +543,7 @@ mod tests {
         let direct_hash = sha256(&direct);
 
         assert_eq!(
-            stamp_value_raw(&workblock, &stamp),
+            stamp_value(&workblock, &stamp),
             leading_zero_bits(&direct_hash)
         );
     }
