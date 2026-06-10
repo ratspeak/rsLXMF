@@ -284,8 +284,18 @@ impl PropagationNode {
         }
 
         let mut loaded = 0;
+        let mut quarantined = 0;
         for entry in std::fs::read_dir(dir)? {
-            let entry = entry?;
+            // One unreadable directory entry or file must not abort the whole
+            // store load — quarantine it and keep loading the rest.
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::warn!(error = %e, "skipping unreadable messagestore entry");
+                    quarantined += 1;
+                    continue;
+                }
+            };
             let path = entry.path();
             if !path.is_file() {
                 continue;
@@ -296,12 +306,27 @@ impl PropagationNode {
                 None => continue,
             };
 
-            if filename.ends_with(".peer") || filename.ends_with(".msgpack") {
+            if filename.ends_with(".peer")
+                || filename.ends_with(".msgpack")
+                || filename.ends_with(".corrupt")
+            {
                 continue;
             }
 
             if let Some((tid, ts, sv)) = PropagationEntry::parse_filename(&filename) {
-                let data = std::fs::read(&path)?;
+                let data = match std::fs::read(&path) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        tracing::warn!(
+                            file = %path.display(),
+                            error = %e,
+                            "quarantining unreadable propagation message"
+                        );
+                        let _ = std::fs::rename(&path, path.with_extension("corrupt"));
+                        quarantined += 1;
+                        continue;
+                    }
+                };
                 let size = data.len();
 
                 if self.store.contains(&tid) {
@@ -334,8 +359,8 @@ impl PropagationNode {
             }
         }
 
-        if loaded > 0 {
-            tracing::info!(loaded, "loaded propagation messages from disk");
+        if loaded > 0 || quarantined > 0 {
+            tracing::info!(loaded, quarantined, "loaded propagation messages from disk");
         }
 
         Ok(())
@@ -1166,6 +1191,59 @@ mod tests {
         // ...and purge it.
         node.handle_get_request(&encode_req(None, Some(&[tid_a])), &client_a);
         assert!(node.store.get(&tid_a).is_none(), "own purge must work");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T1-15: one unreadable file in the messagestore must not abort the
+    /// whole store load — it is quarantined (renamed `.corrupt`) and the
+    /// remaining entries load.
+    #[cfg(unix)]
+    #[test]
+    fn test_disk_load_quarantines_unreadable_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join("lxmf_test_prop_quarantine");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        {
+            let mut node = PropagationNode::with_storage(
+                PropagationNodeConfig::default(),
+                [0xAA; 16],
+                dir.clone(),
+            )
+            .unwrap();
+            let msg_a = make_signed_message([0xCC; 16], [0xBB; 16], "Test", "loads fine");
+            let msg_b = make_signed_message([0xDD; 16], [0xBB; 16], "Test", "will corrupt");
+            assert!(node.accept_message(&msg_a));
+            assert!(node.accept_message(&msg_b));
+        }
+
+        // Make one stored file unreadable (read() will fail, parse_filename
+        // still succeeds — the load must skip + quarantine it).
+        let victim = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| p.is_file() && !p.to_string_lossy().ends_with(".msgpack"))
+            .expect("expected a stored message file");
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let node = PropagationNode::with_storage(
+            PropagationNodeConfig::default(),
+            [0xAA; 16],
+            dir.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            node.message_count(),
+            1,
+            "remaining entry must load despite the unreadable file"
+        );
+        assert!(
+            victim.with_extension("corrupt").exists(),
+            "unreadable file must be quarantined"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

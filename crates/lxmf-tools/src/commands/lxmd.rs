@@ -692,9 +692,11 @@ impl LxmdRunner {
 
             // TODO(hardware-identity): route propagation link signing through the
             // backend-aware Identity path before supporting hardware-backed lxmd.
-            let prop_signing_key = identity.get_signing_key().unwrap_or_else(|| {
-                panic!("Identity must have signing key for propagation link management")
-            });
+            let prop_signing_key = identity.get_signing_key().ok_or(
+                "identity has no signing key; propagation link management requires a \
+                 locally stored signing key (hardware-backed identities are not yet \
+                 supported by lxmd)",
+            )?;
             let mut prop_link_mgr = rns_runtime::link_manager::LinkManager::with_destination(
                 transport_tx.clone(),
                 prop_delivery_rx,
@@ -779,9 +781,11 @@ impl LxmdRunner {
 
             // TODO(hardware-identity): route control link signing through the
             // backend-aware Identity path before supporting hardware-backed lxmd.
-            let control_signing_key = identity.get_signing_key().unwrap_or_else(|| {
-                panic!("Identity must have signing key for control link management")
-            });
+            let control_signing_key = identity.get_signing_key().ok_or(
+                "identity has no signing key; control link management requires a \
+                 locally stored signing key (hardware-backed identities are not yet \
+                 supported by lxmd)",
+            )?;
             let mut control_link_mgr = rns_runtime::link_manager::LinkManager::with_destination(
                 transport_tx.clone(),
                 control_delivery_rx,
@@ -2789,7 +2793,7 @@ pub(crate) async fn main() {
         Ok(r) => r,
         Err(e) => {
             tracing::error!("Failed to initialize LXMF daemon: {e}");
-            return;
+            std::process::exit(1);
         }
     };
 
