@@ -833,15 +833,13 @@ impl LxMessage {
             None => return false,
         };
 
+        // A missing stamp can never match a ticket hash or a PoW workblock,
+        // so it is always invalid (Python `validate_stamp`: the ticket loop
+        // compares `self.stamp == hash`, which is False when stamp is None,
+        // then `if self.stamp == None: return False`).
         let stamp = match self.stamp.as_deref() {
             Some(s) => s,
-            None => {
-                // Check tickets even without a stamp — tickets generate stamps
-                if tickets.is_none() {
-                    return false;
-                }
-                return false;
-            }
+            None => return false,
         };
 
         // Ticket-based stamps take precedence over PoW.

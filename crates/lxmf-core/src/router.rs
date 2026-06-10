@@ -47,8 +47,6 @@ pub struct RouterConfigExt {
     pub processing_outbound: bool,
     /// Maximum outbound messages to process per tick (`None` = unlimited).
     pub processing_limit: Option<usize>,
-    /// Maximum message size in bytes (`None` = unlimited).
-    pub max_message_size: Option<usize>,
     pub enforce_ratchets: bool,
     pub enforce_stamps: bool,
     pub retain_synced_on_node: bool,
@@ -71,7 +69,6 @@ impl Default for RouterConfigExt {
             max_peering_cost: MAX_PEERING_COST,
             processing_outbound: true,
             processing_limit: None,
-            max_message_size: None,
             enforce_ratchets: false,
             enforce_stamps: false,
             retain_synced_on_node: false,
@@ -1850,7 +1847,6 @@ mod tests {
         assert!(config.ext.processing_outbound);
         assert!(config.ext.defer_stamp_generation);
         assert!(config.ext.processing_limit.is_none());
-        assert!(config.ext.max_message_size.is_none());
         assert!(!config.ext.enforce_ratchets);
         assert!(!config.ext.enforce_stamps);
     }
