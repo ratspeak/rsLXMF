@@ -1778,13 +1778,17 @@ impl LxmdRunner {
             return;
         };
 
-        let (_remote_timebase, entries) = match LxMessage::unpack_propagation_wrapper(data) {
-            Ok(parsed) => parsed,
-            Err(e) => {
-                tracing::warn!("failed to unpack propagation wrapper: {e}");
-                return;
-            }
-        };
+        // Bounded against the configured propagation limit: rejects wrappers
+        // stuffed with junk entries before any per-entry workblock is built.
+        let max_transfer_bytes = self.config.propagation_limit_kb.saturating_mul(1024);
+        let (_remote_timebase, entries) =
+            match LxMessage::unpack_propagation_wrapper_bounded(data, max_transfer_bytes) {
+                Ok(parsed) => parsed,
+                Err(e) => {
+                    tracing::warn!("failed to unpack propagation wrapper: {e}");
+                    return;
+                }
+            };
 
         let min_cost = self
             .config

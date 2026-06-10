@@ -439,6 +439,54 @@ impl LxMessage {
         Ok(wrapper)
     }
 
+    /// Smallest possible valid propagation entry: anything at or below
+    /// `LXMF_OVERHEAD + STAMP_SIZE` cannot carry a message (Python
+    /// `LXStamper.validate_pn_stamp` rejects it before building a workblock).
+    pub const MIN_PROPAGATION_ENTRY_SIZE: usize =
+        crate::constants::LXMF_OVERHEAD + crate::constants::STAMP_SIZE + 1;
+
+    /// [`Self::unpack_propagation_wrapper`] with ingest bounds applied before
+    /// any per-entry stamp validation can be reached. `max_transfer_bytes` is
+    /// the receiving node's configured propagation/transfer limit. Each stamp
+    /// validation builds a ~256 KB workblock, so a wrapper stuffed with junk
+    /// entries is a CPU-amplification vector — under-floor entries and
+    /// transfers whose entry count couldn't possibly be legitimate are
+    /// rejected cheaply here instead.
+    pub fn unpack_propagation_wrapper_bounded(
+        data: &[u8],
+        max_transfer_bytes: usize,
+    ) -> Result<(f64, Vec<Vec<u8>>), MessageError> {
+        if data.len() > max_transfer_bytes {
+            return Err(MessageError::UnpackFailed(format!(
+                "propagation wrapper: {} bytes exceeds transfer limit {}",
+                data.len(),
+                max_transfer_bytes
+            )));
+        }
+
+        let (timestamp, entries) = Self::unpack_propagation_wrapper(data)?;
+
+        let max_entries = max_transfer_bytes / Self::MIN_PROPAGATION_ENTRY_SIZE;
+        if entries.len() > max_entries {
+            return Err(MessageError::UnpackFailed(format!(
+                "propagation wrapper: {} entries exceeds maximum {} for transfer limit",
+                entries.len(),
+                max_entries
+            )));
+        }
+        if let Some(undersized) = entries
+            .iter()
+            .position(|e| e.len() < Self::MIN_PROPAGATION_ENTRY_SIZE)
+        {
+            return Err(MessageError::UnpackFailed(format!(
+                "propagation wrapper: entry {} below minimum message size",
+                undersized
+            )));
+        }
+
+        Ok((timestamp, entries))
+    }
+
     /// Compute `transient_id = full_hash(lxmf_data)` for a propagation blob.
     ///
     /// The input must be `dest_hash + encrypted_data` without the propagation stamp; callers must
@@ -2048,6 +2096,39 @@ mod tests {
 
         let lxmf_data = &entries[0];
         assert_eq!(&lxmf_data[..16], &[0xAA; 16]);
+    }
+
+    /// T0-7: the bounded wrapper decode must reject CPU-amplification shapes
+    /// (junk-stuffed entry lists) cheaply, before per-entry stamp validation
+    /// could build any ~256 KB workblocks; legitimate transfers still pass.
+    #[test]
+    fn test_unpack_propagation_wrapper_bounded() {
+        let entry_floor = LxMessage::MIN_PROPAGATION_ENTRY_SIZE;
+        let limit = 16 * 1024;
+
+        // Hostile: thousands of tiny entries in a small blob.
+        let junk: Vec<Vec<u8>> = (0..2000).map(|_| vec![0xAB; 3]).collect();
+        let hostile = rmp_serde::to_vec(&(1000.0f64, junk)).unwrap();
+        assert!(hostile.len() <= limit, "test blob must fit the limit");
+        assert!(LxMessage::unpack_propagation_wrapper_bounded(&hostile, limit).is_err());
+
+        // Hostile: a single under-floor entry hidden among valid-sized ones.
+        let mixed: Vec<Vec<u8>> = vec![vec![0xAB; entry_floor], vec![0xAB; entry_floor - 1]];
+        let mixed_blob = rmp_serde::to_vec(&(1000.0f64, mixed)).unwrap();
+        assert!(LxMessage::unpack_propagation_wrapper_bounded(&mixed_blob, limit).is_err());
+
+        // Hostile: blob bigger than the configured transfer limit.
+        let oversize: Vec<Vec<u8>> = vec![vec![0xAB; 2 * limit]];
+        let oversize_blob = rmp_serde::to_vec(&(1000.0f64, oversize)).unwrap();
+        assert!(LxMessage::unpack_propagation_wrapper_bounded(&oversize_blob, limit).is_err());
+
+        // Legitimate multi-entry sync passes and round-trips.
+        let good: Vec<Vec<u8>> = (0..8).map(|i| vec![i as u8; entry_floor + 64]).collect();
+        let good_blob = rmp_serde::to_vec(&(1000.0f64, good.clone())).unwrap();
+        let (ts, entries) =
+            LxMessage::unpack_propagation_wrapper_bounded(&good_blob, limit).unwrap();
+        assert_eq!(ts, 1000.0);
+        assert_eq!(entries, good);
     }
 
     #[test]
