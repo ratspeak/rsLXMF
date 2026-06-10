@@ -80,24 +80,40 @@ pub fn stamp_valid(stamp: &[u8; 32], cost: u8, workblock: &[u8]) -> bool {
     stamp_value(workblock, stamp) >= cost as u32
 }
 
-/// Single-threaded brute-force stamp search. Blocks until a valid stamp is found.
+/// Give-up bound for stamp searches: 64× the expected `2^cost` work, so the
+/// failure probability for an honest cost is ~e^-64 while a hostile cost can
+/// no longer pin a thread forever. Costs ≥ 58 (cap would overflow u64) are
+/// unsatisfiable on real hardware and fail immediately. Python has no cap and
+/// blocks until success — deliberate divergence, see fix-registry.
+pub fn stamp_iteration_cap(cost: u8) -> Option<u64> {
+    if cost >= 58 {
+        return None;
+    }
+    Some(64u64 << cost)
+}
+
+/// Single-threaded brute-force stamp search. Bounded by
+/// [`stamp_iteration_cap`]; returns `None` when the cap is exhausted or the
+/// cost is unsatisfiable.
 pub fn generate_stamp(material: &[u8], cost: u8, expand_rounds: usize) -> Option<([u8; 32], u32)> {
     if cost == 0 {
         return Some(([0u8; 32], 0));
     }
+    let max_iterations = stamp_iteration_cap(cost)?;
 
     let workblock = stamp_workblock(material, expand_rounds);
     let mut base_hasher = Sha256::new();
     base_hasher.update(&workblock);
     let mut rng = rand::thread_rng();
 
-    loop {
+    for _ in 0..max_iterations {
         let stamp = rand_bytes_from(&mut rng);
         let value = stamp_value_from_base(&base_hasher, &stamp);
         if value >= cost as u32 {
             return Some((stamp, value));
         }
     }
+    None
 }
 
 /// Stamp search with a configurable iteration limit (for tests).
@@ -333,6 +349,23 @@ mod tests {
         let (stamp, value) = generate_stamp(&id, 0, 20).unwrap();
         assert_eq!(stamp, [0u8; 32]);
         assert_eq!(value, 0);
+    }
+
+    /// T0-4: the stamp search is bounded — an unsatisfiable (hostile) cost
+    /// returns `None` immediately instead of pinning the thread forever.
+    #[test]
+    fn test_generate_stamp_capped_for_hostile_cost() {
+        assert_eq!(stamp_iteration_cap(1), Some(128));
+        assert_eq!(stamp_iteration_cap(26), Some(64u64 << 26));
+        assert!(stamp_iteration_cap(57).is_some());
+        assert_eq!(stamp_iteration_cap(58), None);
+        assert_eq!(stamp_iteration_cap(255), None);
+
+        let id = sha256(b"hostile cost");
+        // Cost 255 must fail fast (cap is None — no workblock spin at all).
+        assert!(generate_stamp(&id, 255, 20).is_none());
+        // Sane costs still succeed.
+        assert!(generate_stamp(&id, 4, 20).is_some());
     }
 
     #[test]

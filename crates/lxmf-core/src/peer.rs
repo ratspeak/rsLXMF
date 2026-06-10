@@ -291,18 +291,18 @@ impl LxmPeer {
         key_material.extend_from_slice(peer_identity_hash);
         key_material.extend_from_slice(our_identity_hash);
 
-        let workblock = crate::stamper::stamp_workblock(
+        // Bounded search (stamper::stamp_iteration_cap): an announce-supplied
+        // hostile peering_cost can no longer pin this thread forever.
+        match crate::stamper::generate_stamp(
             &key_material,
+            self.peering_cost,
             crate::constants::STAMP_WORKBLOCK_EXPAND_ROUNDS_PEERING,
-        );
-
-        loop {
-            let stamp: [u8; 32] = crate::stamper::rand_bytes();
-            if crate::stamper::stamp_valid(&stamp, self.peering_cost, &workblock) {
-                let value = crate::stamper::stamp_value(&workblock, &stamp);
+        ) {
+            Some((stamp, value)) => {
                 self.peering_key = Some((stamp, value));
-                return true;
+                true
             }
+            None => false,
         }
     }
 
@@ -465,6 +465,20 @@ mod tests {
         // cost < flex must saturate at 0.
         peer.stamp_cost = Some(2);
         assert_eq!(peer.minimum_accepted_stamp_cost(), 0);
+    }
+
+    /// T0-4: an absurd announce-supplied peering cost must fail the bounded
+    /// key search instead of spinning forever; sane costs still succeed.
+    #[test]
+    fn test_generate_peering_key_capped() {
+        let mut peer = LxmPeer::new([0xAA; 16]);
+        peer.peering_cost = 255;
+        assert!(!peer.generate_peering_key(&[0xBB; 16], &[0xCC; 16]));
+        assert!(peer.peering_key.is_none());
+
+        peer.peering_cost = 4;
+        assert!(peer.generate_peering_key(&[0xBB; 16], &[0xCC; 16]));
+        assert!(peer.peering_key.is_some());
     }
 
     #[test]

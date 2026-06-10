@@ -949,6 +949,15 @@ impl LxmRouter {
         if !self.config.autopeer {
             return false;
         }
+        // Python LXMRouter.peer() (LXMRouter.py:1896-1901): a peering cost
+        // above our accepted maximum refuses the peering — and breaks an
+        // existing one — before any PoW could be attempted.
+        if peering_cost.unwrap_or(0) > self.config.ext.max_peering_cost {
+            if self.peers.contains_key(&destination_hash) {
+                self.unpeer(&destination_hash);
+            }
+            return false;
+        }
         if self.peers.contains_key(&destination_hash) {
             return false;
         }
@@ -3035,6 +3044,38 @@ mod tests {
             peering_cost: None,
             hops: Some(10),
         }));
+    }
+
+    /// T0-4: peering cost above `max_peering_cost` refuses peering, and an
+    /// existing peering breaks when the peer raises its cost beyond the cap
+    /// (Python LXMRouter.py:1896-1901).
+    #[test]
+    fn test_autopeer_enforces_max_peering_cost() {
+        let mut router = LxmRouter::new(RouterConfig::default());
+        let max = router.config.ext.max_peering_cost;
+
+        let candidate = |cost: Option<u8>| AutopeerCandidate {
+            destination_hash: [0xAA; 16],
+            timebase: 1000.0,
+            transfer_limit: Some(256.0),
+            sync_limit: None,
+            stamp_cost: Some(16),
+            stamp_flexibility: Some(3),
+            peering_cost: cost,
+            hops: Some(2),
+        };
+
+        // Over-cost announce: refused outright.
+        assert!(!router.autopeer(candidate(Some(max + 1))));
+        assert!(router.peers.is_empty());
+
+        // At-cost announce: accepted.
+        assert!(router.autopeer(candidate(Some(max))));
+        assert_eq!(router.peers.len(), 1);
+
+        // Existing peer raising its cost beyond the cap: peering breaks.
+        assert!(!router.autopeer(candidate(Some(max + 1))));
+        assert!(router.peers.is_empty(), "over-cost announce must unpeer");
     }
 
     #[test]
