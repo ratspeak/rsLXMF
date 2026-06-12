@@ -291,6 +291,9 @@ pub struct LxmRouter {
     pub throttled_peers: HashMap<[u8; 16], f64>,
     pub propagation_start_time: Option<f64>,
     pub processing_count: u64,
+    /// Wall-clock gate for `run_jobs_tick`, decoupling jobloop cadence from
+    /// the embedder's loop rate.
+    last_jobs_tick: f64,
     pub outbound_propagation_node: Option<[u8; 16]>,
     /// Progress in the range 0.0..=1.0.
     pub propagation_transfer_progress: f64,
@@ -351,6 +354,7 @@ impl LxmRouter {
             throttled_peers: HashMap::new(),
             propagation_start_time: None,
             processing_count: 0,
+            last_jobs_tick: 0.0,
             outbound_propagation_node: None,
             propagation_transfer_progress: 0.0,
             client_propagation_messages_received: 0,
@@ -1740,6 +1744,23 @@ impl LxmRouter {
         self.run_periodic_jobs();
     }
 
+    /// Drive the periodic job machinery for embedders that process outbound
+    /// themselves via `process_outbound_with_direct` instead of calling
+    /// [`Self::tick`]. Without this the jobloop counters never advance and
+    /// transient-cache cleaning, store culls, and peer rotation never run.
+    /// Time-gated to Python's `PROCESSING_INTERVAL` so callers may invoke it
+    /// every loop pass regardless of their tick rate (lxmd: 4 s, Ratspeak:
+    /// 500 ms) without skewing the jobloop cadences.
+    pub fn run_jobs_tick(&mut self) {
+        let now = now_f64();
+        if now - self.last_jobs_tick < PROCESSING_INTERVAL as f64 * 0.9 {
+            return;
+        }
+        self.last_jobs_tick = now;
+        self.processing_count += 1;
+        self.run_periodic_jobs();
+    }
+
     fn run_periodic_jobs(&mut self) {
         // Job cadences match the Python LXMRouter jobloop.
         if self.processing_count.is_multiple_of(JOB_TRANSIENT_INTERVAL) {
@@ -1869,6 +1890,43 @@ mod tests {
         assert!(router.pending_outbound.is_empty());
         assert!(router.peers.is_empty());
         assert!(router.propagation_store.is_empty());
+    }
+
+    #[test]
+    fn run_jobs_tick_gates_on_processing_interval() {
+        let mut router = LxmRouter::new(RouterConfig::default());
+        router.run_jobs_tick();
+        assert_eq!(router.processing_count, 1);
+        // Second call inside the PROCESSING_INTERVAL window must not advance
+        // the jobloop — embedders may call this at arbitrary loop rates.
+        router.run_jobs_tick();
+        assert_eq!(router.processing_count, 1);
+        // Backdating the gate simulates the interval elapsing.
+        router.last_jobs_tick = now_f64() - PROCESSING_INTERVAL as f64;
+        router.run_jobs_tick();
+        assert_eq!(router.processing_count, 2);
+    }
+
+    #[test]
+    fn run_jobs_tick_cleans_transient_caches_at_job_interval() {
+        let mut router = LxmRouter::new(RouterConfig::default());
+        let ancient = 1.0; // far older than MESSAGE_EXPIRY * 6
+        let mut delivered = std::collections::HashMap::new();
+        delivered.insert([0xAB; 32], ancient);
+        router.propagation_store.replace_locally_delivered(delivered);
+
+        // Land exactly on the transient-cache job multiple.
+        router.processing_count = JOB_TRANSIENT_INTERVAL - 1;
+        router.last_jobs_tick = now_f64() - PROCESSING_INTERVAL as f64;
+        router.run_jobs_tick();
+
+        assert!(
+            !router
+                .propagation_store
+                .locally_delivered_ids()
+                .contains_key(&[0xAB; 32]),
+            "expired dedup id must be aged out by the jobloop"
+        );
     }
 
     #[test]

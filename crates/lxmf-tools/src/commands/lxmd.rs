@@ -378,6 +378,10 @@ fn create_propagation_announce_packet_for(
 /// then oldest-ratchet entries. Evicted keys re-learn from the next announce.
 const KNOWN_IDENTITIES_SOFT_CAP: usize = 10_000;
 
+/// Full path-table resync cadence for `route_hops`. Announce events keep the
+/// map fresh in between; this only re-baselines and prunes expired paths.
+const ROUTE_HOPS_REFRESH_SECS: f64 = 300.0;
+
 fn prune_known_identities(
     known_identities: &mut HashMap<String, [u8; 64]>,
     received_ratchets: &HashMap<String, ReceivedRatchet>,
@@ -484,6 +488,7 @@ struct LxmdRunner {
     last_crypto_save: f64,
     last_cull: f64,
     last_ratchet_clean: f64,
+    last_route_refresh: f64,
     received_ratchets_dir: PathBuf,
     control_state: Arc<Mutex<ControlSnapshot>>,
     control_command_rx: mpsc::Receiver<ControlCommand>,
@@ -942,6 +947,7 @@ impl LxmdRunner {
             last_crypto_save: now,
             last_cull: now,
             last_ratchet_clean: now,
+            last_route_refresh: 0.0,
             received_ratchets_dir: received_dir,
             control_state,
             control_command_rx,
@@ -1409,7 +1415,16 @@ impl LxmdRunner {
         }
     }
 
+    /// Resync `route_hops` from the transport path table: boot seed plus a
+    /// slow re-baseline that prunes destinations whose paths expired.
+    /// Freshness between resyncs comes from announce events
+    /// (`drain_announce_events`), so dumping the full table every tick was
+    /// pure clone churn. Gated internally; call sites stay per-tick.
     async fn refresh_route_hops_from_transport(&mut self) {
+        let now = now_f64();
+        if now - self.last_route_refresh < ROUTE_HOPS_REFRESH_SECS && !self.route_hops.is_empty() {
+            return;
+        }
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         if let Err(e) = self.transport_tx.try_send(TransportMessage::Rpc {
             query: TransportQuery::GetPathTable,
@@ -1425,12 +1440,17 @@ impl LxmdRunner {
             return;
         };
 
-        let now = now_f64();
+        // Replace wholesale on success only — a failed query must not leave
+        // routing blind, and replacement (vs insert) is what evicts dests
+        // whose transport paths have expired.
+        let mut fresh: HashMap<[u8; 16], u8> = HashMap::with_capacity(entries.len());
         for entry in entries {
             if entry.expires > now {
-                self.route_hops.insert(entry.hash, entry.hops.max(1));
+                fresh.insert(entry.hash, entry.hops.max(1));
             }
         }
+        self.route_hops = fresh;
+        self.last_route_refresh = now;
     }
 
     fn tick(&mut self) {
@@ -1478,6 +1498,10 @@ impl LxmdRunner {
             self.execute_encrypted_actions(actions);
             self.drain_core_backchannel_send_commands();
         }
+        // Advance the router jobloop counters (transient-cache cleaning, store
+        // cull, peer rotation at Python cadences). `process_outbound_with_direct`
+        // does not drive these.
+        self.router.run_jobs_tick();
 
         if let Some(ref mut ld) = self.link_delivery {
             ld.drain_events(&self.known_identities);
@@ -1579,8 +1603,15 @@ impl LxmdRunner {
 
         if now - self.last_cull > 300.0 {
             self.router.cull_stamp_costs();
-            self.router.cull_propagation();
-            self.router.rotate_peers();
+            // Store cull + peer rotation now run via `run_jobs_tick` at Python
+            // jobloop cadences. The propagation node's own store (separate
+            // from the router's) ages out expired messages and enforces the
+            // weight cap here — previously this never ran.
+            if let Some(ref pn) = self.propagation_node
+                && let Ok(mut node) = pn.lock()
+            {
+                node.tick();
+            }
             self.last_cull = now;
         }
 
