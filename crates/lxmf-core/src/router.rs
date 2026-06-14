@@ -1913,7 +1913,9 @@ mod tests {
         let ancient = 1.0; // far older than MESSAGE_EXPIRY * 6
         let mut delivered = std::collections::HashMap::new();
         delivered.insert([0xAB; 32], ancient);
-        router.propagation_store.replace_locally_delivered(delivered);
+        router
+            .propagation_store
+            .replace_locally_delivered(delivered);
 
         // Land exactly on the transient-cache job multiple.
         router.processing_count = JOB_TRANSIENT_INTERVAL - 1;

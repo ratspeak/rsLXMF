@@ -1019,8 +1019,7 @@ impl PropagationNode {
     /// through on every sync — grow with total propagated volume forever.
     /// Files converge lazily: the next `mark_peer_handled` saves the pruned set.
     fn prune_handled_against_store(&self, peer: &mut LxmPeer) {
-        peer.handled_messages
-            .retain(|id| self.store.contains(id));
+        peer.handled_messages.retain(|id| self.store.contains(id));
     }
 }
 
