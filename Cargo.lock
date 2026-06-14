@@ -643,7 +643,7 @@ checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 
 [[package]]
 name = "lxmf-core"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "base64",
  "bytes",
@@ -668,7 +668,7 @@ dependencies = [
 
 [[package]]
 name = "lxmf-tools"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "base64",
  "bytes",
@@ -1049,7 +1049,7 @@ dependencies = [
 
 [[package]]
 name = "rns-crypto"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "aes",
  "cbc",
@@ -1067,7 +1067,7 @@ dependencies = [
 
 [[package]]
 name = "rns-identity"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "hex",
  "rand 0.8.5",
@@ -1083,7 +1083,7 @@ dependencies = [
 
 [[package]]
 name = "rns-interface"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "bytes",
  "hex",
@@ -1109,7 +1109,7 @@ dependencies = [
 
 [[package]]
 name = "rns-link"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "hex",
  "rand 0.8.5",
@@ -1124,7 +1124,7 @@ dependencies = [
 
 [[package]]
 name = "rns-protocol"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "bzip2",
  "hex",
@@ -1140,7 +1140,7 @@ dependencies = [
 
 [[package]]
 name = "rns-runtime"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "bytes",
  "hex",
@@ -1166,7 +1166,7 @@ dependencies = [
 
 [[package]]
 name = "rns-transport"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "bytes",
  "hex",
@@ -1185,7 +1185,7 @@ dependencies = [
 
 [[package]]
 name = "rns-wire"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "rns-crypto",
  "sha2",

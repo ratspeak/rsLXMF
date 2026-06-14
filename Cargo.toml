@@ -6,25 +6,25 @@ members = [
 ]
 
 [workspace.package]
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 rust-version = "1.85"
 
 [workspace.dependencies]
 # Reticulum crates from a sibling rsReticulum checkout during development.
-rns-crypto = { path = "../rsReticulum/crates/rns-crypto", version = "1.0.0" }
-rns-wire = { path = "../rsReticulum/crates/rns-wire", version = "1.0.0" }
-rns-identity = { path = "../rsReticulum/crates/rns-identity", version = "1.0.0" }
-rns-link = { path = "../rsReticulum/crates/rns-link", version = "1.0.0" }
-rns-protocol = { path = "../rsReticulum/crates/rns-protocol", version = "1.0.0" }
-rns-transport = { path = "../rsReticulum/crates/rns-transport", version = "1.0.0" }
-rns-runtime = { path = "../rsReticulum/crates/rns-runtime", version = "1.0.0" }
-rns-interface = { path = "../rsReticulum/crates/rns-interface", version = "1.0.0" }
+rns-crypto = { path = "../rsReticulum/crates/rns-crypto", version = "1.0.1" }
+rns-wire = { path = "../rsReticulum/crates/rns-wire", version = "1.0.1" }
+rns-identity = { path = "../rsReticulum/crates/rns-identity", version = "1.0.1" }
+rns-link = { path = "../rsReticulum/crates/rns-link", version = "1.0.1" }
+rns-protocol = { path = "../rsReticulum/crates/rns-protocol", version = "1.0.1" }
+rns-transport = { path = "../rsReticulum/crates/rns-transport", version = "1.0.1" }
+rns-runtime = { path = "../rsReticulum/crates/rns-runtime", version = "1.0.1" }
+rns-interface = { path = "../rsReticulum/crates/rns-interface", version = "1.0.1" }
 
 # Workspace LXMF crates
-lxmf-core = { path = "crates/lxmf-core", version = "1.0.0" }
-lxmf-tools = { path = "crates/lxmf-tools", version = "1.0.0" }
+lxmf-core = { path = "crates/lxmf-core", version = "1.0.1" }
+lxmf-tools = { path = "crates/lxmf-tools", version = "1.0.1" }
 
 # Encoding
 base64 = "0.22"
