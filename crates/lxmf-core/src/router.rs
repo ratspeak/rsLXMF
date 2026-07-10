@@ -699,9 +699,9 @@ impl LxmRouter {
             .add(Ticket::new(token, destination_hash, expires));
     }
 
-    /// Returns the token of the most-recently-added valid ticket for `destination_hash`.
+    /// Returns the token of the first valid ticket for `destination_hash`.
     ///
-    /// Python reference: `LXMRouter.get_outbound_ticket` — LXMRouter.py:1115-1123.
+    /// Python reference: `LXMRouter.get_outbound_ticket` — LXMRouter.py:1058-1064.
     pub fn get_outbound_ticket(&self, destination_hash: &[u8; 16]) -> Option<[u8; 16]> {
         let now = now_f64();
         self.ticket_store
@@ -903,6 +903,11 @@ impl LxmRouter {
             .replace_locally_delivered(persist::load_local_deliveries(state_dir)?);
         self.propagation_store
             .replace_locally_processed(persist::load_locally_processed(state_dir)?);
+        // Python cleans tickets and stamp costs at load (LXMRouter.py:258-284).
+        let now = now_f64();
+        self.ticket_store.cull(now);
+        self.outbound_stamp_costs
+            .retain(|_, e| now - e.recorded_at < STAMP_COST_EXPIRY as f64);
         Ok(())
     }
 
@@ -1173,7 +1178,10 @@ impl LxmRouter {
         destination_hash: &[u8; 16],
     ) -> bool {
         let now = now_f64();
-        if let Some(ticket) = self.ticket_store.find(destination_hash, now) {
+        for ticket in self.ticket_store.all() {
+            if &ticket.destination_hash != destination_hash || !ticket.is_valid(now) {
+                continue;
+            }
             let mut material = Vec::with_capacity(16 + 32);
             material.extend_from_slice(&ticket.token);
             material.extend_from_slice(message_id);
@@ -2438,6 +2446,24 @@ mod tests {
         // remember_ticket adds another entry for the same dest.
         router.remember_ticket(dest, [0x55; 16], now_f64() + 1000.0);
         assert_eq!(router.get_inbound_tickets().len(), 2);
+    }
+
+    #[test]
+    fn test_validate_stamp_checks_all_tickets() {
+        let mut router = LxmRouter::new(RouterConfig::default());
+        let dest = [0xAA; 16];
+        let expires = now_f64() + 1000.0;
+        router.remember_ticket(dest, [0x01; 16], expires);
+        router.remember_ticket(dest, [0x02; 16], expires);
+
+        // Stamp derived from the SECOND ticket must still validate.
+        let message_id = [0x33u8; 32];
+        let mut material = Vec::with_capacity(16 + 32);
+        material.extend_from_slice(&[0x02; 16]);
+        material.extend_from_slice(&message_id);
+        let stamp = rns_crypto::sha::truncated_hash(&material);
+
+        assert!(router.validate_stamp_with_tickets(&message_id, stamp.as_ref(), 16, &dest));
     }
 
     #[test]

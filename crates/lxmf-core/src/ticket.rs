@@ -1,7 +1,8 @@
 //! LXMF Ticket system: bypass PoW with pre-shared 16-byte tokens.
 //!
 //! Trusted peers may exchange tickets that bypass stamp requirements for a
-//! fixed expiry window. Tickets are single-use and renewable before expiry.
+//! fixed expiry window. Tickets are reusable until expiry and renewed once
+//! within `TICKET_RENEW` of expiring.
 
 use serde::{Deserialize, Serialize};
 
@@ -33,10 +34,6 @@ impl Ticket {
     pub fn should_renew(&self, now: f64) -> bool {
         self.is_valid(now) && (self.expires - now) < TICKET_RENEW as f64
     }
-
-    pub fn use_ticket(&mut self) {
-        self.used = true;
-    }
 }
 
 #[derive(Debug, Default)]
@@ -57,17 +54,6 @@ impl TicketStore {
         self.tickets
             .iter()
             .find(|t| &t.destination_hash == destination_hash && t.is_valid(now))
-    }
-
-    /// Find and mark a ticket as used. Returns the token on success.
-    pub fn use_for(&mut self, destination_hash: &[u8; 16], now: f64) -> Option<[u8; 16]> {
-        for ticket in &mut self.tickets {
-            if &ticket.destination_hash == destination_hash && ticket.is_valid(now) {
-                ticket.use_ticket();
-                return Some(ticket.token);
-            }
-        }
-        None
     }
 
     /// Drop expired and used tickets (past TICKET_GRACE).
@@ -104,9 +90,11 @@ mod tests {
 
     #[test]
     fn test_ticket_used() {
+        // `used` survives only for persisted-state compat; is_valid must
+        // still reject such entries.
         let mut ticket = Ticket::new([0xAA; 16], [0xBB; 16], 1000.0);
         assert!(ticket.is_valid(500.0));
-        ticket.use_ticket();
+        ticket.used = true;
         assert!(!ticket.is_valid(500.0));
     }
 
@@ -133,20 +121,6 @@ mod tests {
 
         let found = store.find(&dest, 500.0);
         assert!(found.is_some());
-    }
-
-    #[test]
-    fn test_ticket_store_use() {
-        let mut store = TicketStore::new();
-        let dest = [0xBB; 16];
-
-        store.add(Ticket::new([0x01; 16], dest, 1000.0));
-
-        let token = store.use_for(&dest, 500.0);
-        assert_eq!(token, Some([0x01; 16]));
-
-        let token = store.use_for(&dest, 500.0);
-        assert!(token.is_none());
     }
 
     #[test]

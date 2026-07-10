@@ -130,10 +130,13 @@ impl LxmPeer {
         peer
     }
 
-    /// Effective minimum stamp cost this peer will accept.
+    /// Effective minimum stamp cost this peer will accept, using the peer's
+    /// announced flexibility when known (Python `LXMPeer.sync`: cost - flex).
     pub fn minimum_accepted_stamp_cost(&self) -> u8 {
         match self.stamp_cost {
-            Some(cost) => cost.saturating_sub(PROPAGATION_COST_FLEX),
+            Some(cost) => {
+                cost.saturating_sub(self.stamp_cost_flexibility.unwrap_or(PROPAGATION_COST_FLEX))
+            }
             None => 0,
         }
     }
@@ -465,6 +468,13 @@ mod tests {
         // cost < flex must saturate at 0.
         peer.stamp_cost = Some(2);
         assert_eq!(peer.minimum_accepted_stamp_cost(), 0);
+
+        // Announced flexibility overrides the default.
+        peer.stamp_cost = Some(16);
+        peer.stamp_cost_flexibility = Some(5);
+        assert_eq!(peer.minimum_accepted_stamp_cost(), 11);
+        peer.stamp_cost_flexibility = Some(0);
+        assert_eq!(peer.minimum_accepted_stamp_cost(), 16);
     }
 
     /// T0-4: an absurd announce-supplied peering cost must fail the bounded
