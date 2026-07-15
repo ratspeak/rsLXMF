@@ -445,13 +445,15 @@ mod tests {
 
     #[test]
     fn delivery_announce_app_data_matches_python_msgpack() {
+        // Python 1.0.1: msgpack([display_name, stamp_cost, [SF_COMPRESSION]])
+        // — LXMRouter.py:999-1001.
         assert_eq!(
             hex::encode(delivery_announce_app_data(Some("Test"), Some(16))),
-            "92c4045465737410"
+            "93c40454657374109100"
         );
         assert_eq!(
             hex::encode(delivery_announce_app_data(None, None)),
-            "92c0c0"
+            "93c0c09100"
         );
     }
 

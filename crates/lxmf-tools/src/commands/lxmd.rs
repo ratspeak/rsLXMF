@@ -382,6 +382,18 @@ const KNOWN_IDENTITIES_SOFT_CAP: usize = 10_000;
 /// map fresh in between; this only re-baselines and prunes expired paths.
 const ROUTE_HOPS_REFRESH_SECS: f64 = 300.0;
 
+/// Resolve a destination hash to its identity hash via the learned identity
+/// keys — the lxmd equivalent of `RNS.Identity.recall` (LXMessage.py:776).
+/// Identity hash = truncated hash of the 64-byte announce public key.
+fn recall_identity_hash(
+    known_identities: &HashMap<String, [u8; 64]>,
+    dest_hash: &[u8; 16],
+) -> Option<[u8; 16]> {
+    known_identities
+        .get(&hex::encode(dest_hash))
+        .map(|pub_key| rns_crypto::sha::truncated_hash(pub_key))
+}
+
 fn prune_known_identities(
     known_identities: &mut HashMap<String, [u8; 64]>,
     received_ratchets: &HashMap<String, ReceivedRatchet>,
@@ -460,6 +472,9 @@ struct LxmdRunner {
     received_ratchets: HashMap<String, ReceivedRatchet>,
     known_identities: HashMap<String, [u8; 64]>,
     route_hops: HashMap<[u8; 16], u8>,
+    /// Transport blackhole table snapshot, refreshed per tick. Used to drop
+    /// inbound LXMs from blackholed identities (LXMRouter.py:1739-1741).
+    blackholed_identities: HashSet<[u8; 16]>,
     link_delivery: Option<lxmf_core::link_delivery::LinkDeliveryManager>,
     link_command_tx: mpsc::Sender<rns_runtime::link_manager::LinkManagerCommand>,
     link_identified_rx: mpsc::Receiver<([u8; 16], [u8; 16])>,
@@ -924,6 +939,7 @@ impl LxmdRunner {
             received_ratchets,
             known_identities,
             route_hops: HashMap::new(),
+            blackholed_identities: HashSet::new(),
             link_delivery: None,
             link_command_tx,
             link_identified_rx,
@@ -1453,6 +1469,39 @@ impl LxmdRunner {
         self.last_route_refresh = now;
     }
 
+    /// Snapshot the transport blackhole table. Ungated: the table is tiny and
+    /// the per-tick roundtrip keeps drops close to Python's live
+    /// `Reticulum.is_blackholed` query (LXMessage.py:803-805). Fail-open: on
+    /// query failure the previous snapshot stays in effect.
+    async fn refresh_blackholed_identities_from_transport(&mut self) {
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        if let Err(e) = self.transport_tx.try_send(TransportMessage::Rpc {
+            query: TransportQuery::GetBlackholedIdentities,
+            response_tx,
+        }) {
+            tracing::warn!(error = %e, "could not determine message source blackhole status");
+            return;
+        }
+
+        let Ok(Ok(TransportQueryResponse::BlackholeList(entries))) =
+            tokio::time::timeout(Duration::from_millis(100), response_rx).await
+        else {
+            return;
+        };
+
+        self.blackholed_identities = entries.into_iter().map(|e| e.identity_hash).collect();
+    }
+
+    /// True when the source destination resolves to a blackholed identity.
+    /// Unknown identities are never dropped, mirroring Python's recall-gated
+    /// check (LXMessage.py:804 only runs with a recalled source identity).
+    fn source_blackholed(&self, source_hash: &[u8; 16]) -> bool {
+        match recall_identity_hash(&self.known_identities, source_hash) {
+            Some(identity_hash) => self.blackholed_identities.contains(&identity_hash),
+            None => false,
+        }
+    }
+
     fn tick(&mut self) {
         let now = now_f64();
 
@@ -1794,13 +1843,22 @@ impl LxmdRunner {
         };
 
         match LxMessage::unpack(&unpack_data) {
-            Ok(msg) => {
+            Ok(mut msg) => {
                 tracing::info!(
                     from = %hex::encode(msg.source_hash),
                     title = %msg.title,
                     len = msg.content.len(),
                     "inbound LXMF message via link"
                 );
+                msg.source_blackholed = self.source_blackholed(&msg.source_hash);
+                if msg.source_blackholed {
+                    // LXMRouter.py:1739-1741.
+                    tracing::debug!(
+                        from = %hex::encode(msg.source_hash),
+                        "Dropping LXM from blackholed identity"
+                    );
+                    return;
+                }
                 if self.should_reject_for_stamp(&msg) {
                     return;
                 }
@@ -1884,6 +1942,15 @@ impl LxmdRunner {
                     len = msg.content.len(),
                     "propagation: downloaded message"
                 );
+                msg.source_blackholed = self.source_blackholed(&msg.source_hash);
+                if msg.source_blackholed {
+                    // LXMRouter.py:1739-1741.
+                    tracing::debug!(
+                        from = %hex::encode(msg.source_hash),
+                        "Dropping LXM from blackholed identity"
+                    );
+                    return;
+                }
                 self.handle_inbound_message(msg);
             }
             Err(e) => {
@@ -1926,13 +1993,23 @@ impl LxmdRunner {
         };
 
         match LxMessage::unpack(&unpack_data) {
-            Ok(msg) => {
+            Ok(mut msg) => {
                 tracing::info!(
                     from = %hex::encode(msg.source_hash),
                     title = %msg.title,
                     len = msg.content.len(),
                     "inbound LXMF message received"
                 );
+
+                msg.source_blackholed = self.source_blackholed(&msg.source_hash);
+                if msg.source_blackholed {
+                    // LXMRouter.py:1739-1741.
+                    tracing::debug!(
+                        from = %hex::encode(msg.source_hash),
+                        "Dropping LXM from blackholed identity"
+                    );
+                    return;
+                }
 
                 // Reject on stamp failure BEFORE sending the delivery proof.
                 if self.should_reject_for_stamp(&msg) {
@@ -2029,12 +2106,13 @@ impl LxmdRunner {
 
         // Pack synchronously (CPU-bound, no IO) and offload the disk write
         // to the blocking pool so a slow disk doesn't stall the lxmd runner
-        // task between inbound messages.
+        // task between inbound messages. Atomic tmp+rename write so readers
+        // never see a partial file (LXMessage.py:674-696).
         match msg.pack() {
             Ok(packed) => {
                 let write_path = msg_path.clone();
                 tokio::task::spawn_blocking(move || {
-                    if let Err(e) = std::fs::write(&write_path, &packed) {
+                    if let Err(e) = lxmf_core::persist::write_file_atomic(&write_path, &packed) {
                         tracing::error!("failed to write message to {}: {e}", write_path.display());
                     } else {
                         tracing::info!("message saved to {}", write_path.display());
@@ -3137,6 +3215,7 @@ pub(crate) async fn main() {
             _ = tick_timer.tick() => {
                 runner.drain_announce_events();
                 runner.refresh_route_hops_from_transport().await;
+                runner.refresh_blackholed_identities_from_transport().await;
                 runner.drain_link_packets();
                 runner.tick();
             }
@@ -3171,6 +3250,32 @@ pub(crate) async fn main() {
 mod tests {
     use super::*;
     use lxmf_core::constants::DeliveryMethod;
+
+    /// Blackhole gating mirrors LXMessage.py:804: only a recallable source
+    /// identity can be matched against the blackhole table; unknown sources
+    /// never drop.
+    #[test]
+    fn recall_identity_hash_resolves_known_destinations_only() {
+        let identity = Identity::new();
+        let dest_hash =
+            Destination::hash_from_name_and_identity(LXMF_APP_NAME, Some(&identity.hash));
+        let pub_key = identity.get_public_key();
+
+        let mut known: HashMap<String, [u8; 64]> = HashMap::new();
+        assert_eq!(recall_identity_hash(&known, &dest_hash), None);
+
+        known.insert(hex::encode(dest_hash), pub_key);
+        assert_eq!(
+            recall_identity_hash(&known, &dest_hash),
+            Some(identity.hash)
+        );
+
+        let mut blackholed: HashSet<[u8; 16]> = HashSet::new();
+        blackholed.insert(identity.hash);
+        let resolved = recall_identity_hash(&known, &dest_hash).unwrap();
+        assert!(blackholed.contains(&resolved));
+        assert_eq!(recall_identity_hash(&known, &[0xEE; 16]), None);
+    }
 
     /// Cap eviction prefers entries without a live ratchet, then oldest
     /// ratchets; under the cap nothing is touched.

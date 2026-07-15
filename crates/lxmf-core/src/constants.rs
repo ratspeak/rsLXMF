@@ -9,6 +9,7 @@ pub const FIELD_ICON_APPEARANCE: u8 = 0x04;
 pub const FIELD_FILE_ATTACHMENTS: u8 = 0x05;
 pub const FIELD_IMAGE: u8 = 0x06;
 pub const FIELD_AUDIO: u8 = 0x07;
+/// Bytes, full thread ID hash.
 pub const FIELD_THREAD: u8 = 0x08;
 pub const FIELD_COMMANDS: u8 = 0x09;
 pub const FIELD_RESULTS: u8 = 0x0A;
@@ -17,6 +18,22 @@ pub const FIELD_TICKET: u8 = 0x0C;
 pub const FIELD_EVENT: u8 = 0x0D;
 pub const FIELD_RNR_REFS: u8 = 0x0E;
 pub const FIELD_RENDERER: u8 = 0x0F;
+/// Bytes, full `LXMessage` hash. Python reference: LXMF.py:23.
+pub const FIELD_REPLY_TO: u8 = 0x30;
+/// Bytes, quoted content in UTF-8 encoding. Python reference: LXMF.py:24.
+pub const FIELD_REPLY_QUOTE: u8 = 0x31;
+/// Dict keyed by [`REACTION_TO`] / [`REACTION_CONTENT`]. Python reference: LXMF.py:25.
+pub const FIELD_REACTION: u8 = 0x40;
+/// Dict keyed by [`COMMENT_FOR`]. Python reference: LXMF.py:26.
+pub const FIELD_COMMENT: u8 = 0x41;
+/// Dict keyed by [`CONTINUATION_OF`]. Python reference: LXMF.py:27.
+pub const FIELD_CONTINUATION: u8 = 0x42;
+
+// Unallocated fields between 0x00 and 0x80, both included, should be
+// considered reserved for future extensibility. For experimental and
+// unstable features, it is recommended to use fields above 0xFF.
+// Python reference: LXMF.py:29-32.
+
 pub const FIELD_CUSTOM_TYPE: u8 = 0xFB;
 pub const FIELD_CUSTOM_DATA: u8 = 0xFC;
 pub const FIELD_CUSTOM_META: u8 = 0xFD;
@@ -48,6 +65,27 @@ pub const RENDERER_PLAIN: u8 = 0x00;
 pub const RENDERER_MICRON: u8 = 0x01;
 pub const RENDERER_MARKDOWN: u8 = 0x02;
 pub const RENDERER_BBCODE: u8 = 0x03;
+
+// Clients choose how to handle reaction content, if at all. While reactions
+// are typically a single unicode emoji or similar, the exact implementation
+// and sanitization is left up to the client. FIELD_REACTION dict keys —
+// Python reference: LXMF.py:104-110.
+/// Bytes, full `LXMessage` hash.
+pub const REACTION_TO: u8 = 0x00;
+/// Bytes, the reaction content in UTF-8 encoding.
+pub const REACTION_CONTENT: u8 = 0x01;
+
+// Comment content is carried as the normal LXM content, so clients that do
+// not support comments display them as normal messages. FIELD_COMMENT dict
+// key — Python reference: LXMF.py:112-118.
+/// Bytes, full `LXMessage` hash.
+pub const COMMENT_FOR: u8 = 0x00;
+
+// Continuation content is carried as the normal LXM content, so clients that
+// do not support continuations display them as normal messages.
+// FIELD_CONTINUATION dict key — Python reference: LXMF.py:120-126.
+/// Bytes, full `LXMessage` hash.
+pub const CONTINUATION_OF: u8 = 0x00;
 
 pub const PN_META_VERSION: u8 = 0x00;
 pub const PN_META_NAME: u8 = 0x01;
@@ -340,5 +378,19 @@ mod tests {
     fn test_peer_constants_match_python() {
         assert_eq!(MAX_UNREACHABLE, 14 * 24 * 60 * 60);
         assert_eq!(SYNC_BACKOFF_STEP, 12 * 60);
+    }
+
+    #[test]
+    fn test_field_standards_match_python_101() {
+        // LXMF.py:23-27 field allocations plus dict-key constants (LXMF.py:104-126).
+        assert_eq!(FIELD_REPLY_TO, 0x30);
+        assert_eq!(FIELD_REPLY_QUOTE, 0x31);
+        assert_eq!(FIELD_REACTION, 0x40);
+        assert_eq!(FIELD_COMMENT, 0x41);
+        assert_eq!(FIELD_CONTINUATION, 0x42);
+        assert_eq!(REACTION_TO, 0x00);
+        assert_eq!(REACTION_CONTENT, 0x01);
+        assert_eq!(COMMENT_FOR, 0x00);
+        assert_eq!(CONTINUATION_OF, 0x00);
     }
 }

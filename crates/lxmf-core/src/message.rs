@@ -112,6 +112,14 @@ pub struct LxMessage {
     pub wire_payload: Option<Vec<u8>>,
     pub transport_encryption: Option<String>,
     pub incoming: bool,
+    /// True when the source identity is blackholed at the transport layer.
+    ///
+    /// Python sets this during `unpack_from_bytes` via `Reticulum.is_blackholed`
+    /// (LXMessage.py:172, 803-805); `LXMRouter.lxmf_delivery` then drops such
+    /// messages before processing (LXMRouter.py:1739-1741). Rust unpacking has
+    /// no transport access, so embedders set it from the blackhole query
+    /// surface before processing.
+    pub source_blackholed: bool,
     /// Delivery progress in `0.0..=1.0`.
     pub progress: f64,
     /// Whether the direct-delivery resource should be bz2-compressed by the RNS layer.
@@ -169,6 +177,7 @@ impl LxMessage {
             transport_encryption: None,
             wire_payload: None,
             incoming: false,
+            source_blackholed: false,
             progress: 0.0,
             auto_compress: true,
             callbacks: MessageCallbacks::default(),
@@ -177,12 +186,14 @@ impl LxMessage {
 
     /// Update [`auto_compress`](Self::auto_compress) based on a peer's cached announce app_data.
     ///
-    /// Matches Python `LXMessage.determine_compression_support` — LXMessage.py:507-514.
-    /// Legacy (pre-0.9.6) peers that omit the feature list will have compression disabled.
+    /// Matches Python `LXMessage.determine_compression_support` — LXMessage.py:510-513.
+    /// Fail-open: no cached app_data and legacy peers without a feature list
+    /// default to compression enabled; only an explicit feature list omitting
+    /// `SF_COMPRESSION` disables it.
     pub fn determine_compression_support(&mut self, peer_app_data: Option<&[u8]>) {
         self.auto_compress = peer_app_data
             .map(crate::handlers::compression_support_from_app_data)
-            .unwrap_or(false);
+            .unwrap_or(true);
     }
 
     /// Register a callback fired when this message transitions to `Delivered`.
@@ -547,6 +558,7 @@ impl LxMessage {
             transport_encryption: None,
             wire_payload: Some(payload_data.to_vec()),
             incoming: true,
+            source_blackholed: false,
             progress: 0.0,
             auto_compress: true,
             callbacks: MessageCallbacks::default(),
@@ -1040,13 +1052,20 @@ impl LxMessage {
     }
 
     /// Write the message to `directory_path`, named by the message hash.
+    ///
+    /// Writes are atomic (unique tmp file + fsync + rename) so concurrent
+    /// readers never observe a partial file — Python `write_to_directory`,
+    /// LXMessage.py:674-696 (1.0.1). Python additionally serializes the write
+    /// under a per-message persist lock; in Rust concurrent persists of one
+    /// message are already exclusive-borrow serialized or hit unique tmp
+    /// files, with the rename as the atomic last-writer-wins step.
     pub fn write_to_directory(&self, directory_path: &str) -> Result<String, MessageError> {
         let hash = self.hash.ok_or(MessageError::NotSigned)?;
         let file_name = rns_crypto::hex_encode(&hash);
         let file_path = format!("{directory_path}/{file_name}");
 
         let container_data = self.pack_container()?;
-        std::fs::write(&file_path, container_data)
+        crate::persist::write_file_atomic(std::path::Path::new(&file_path), &container_data)
             .map_err(|e| MessageError::PackFailed(format!("write failed: {e}")))?;
 
         Ok(file_path)
@@ -1500,15 +1519,54 @@ mod tests {
         msg.determine_compression_support(Some(&supported));
         assert!(msg.auto_compress);
 
-        // Python LXMF 0.9.6 2-element announce has no feature list.
-        let python_096 = crate::handlers::get_announce_app_data(Some("Peer"), Some(8));
-        msg.determine_compression_support(Some(&python_096));
+        // Explicit feature list omitting SF_COMPRESSION disables compression.
+        let no_compression = {
+            use rmpv::Value;
+            let arr = Value::Array(vec![
+                Value::Binary(b"Peer".to_vec()),
+                Value::from(8u64),
+                Value::Array(vec![]),
+            ]);
+            crate::encode_value(&arr)
+        };
+        msg.determine_compression_support(Some(&no_compression));
         assert!(!msg.auto_compress);
 
-        // No peer data at all — auto_compress off (no announce == unknown).
-        msg.auto_compress = true;
+        // Legacy <=0.9.8 2-element announce has no feature list — fail-open
+        // (Python compression_support_from_app_data returns True, LXMF.py:160).
+        let python_098 = {
+            use rmpv::Value;
+            let arr = Value::Array(vec![Value::Binary(b"Peer".to_vec()), Value::from(8u64)]);
+            crate::encode_value(&arr)
+        };
+        msg.determine_compression_support(Some(&python_098));
+        assert!(msg.auto_compress);
+
+        // No peer data at all — defaults to compression on (LXMessage.py:513).
+        msg.auto_compress = false;
         msg.determine_compression_support(None);
-        assert!(!msg.auto_compress);
+        assert!(msg.auto_compress);
+    }
+
+    #[test]
+    fn test_source_blackholed_defaults_false() {
+        // LXMessage.py:172 — source_blackholed initialises false; embedders
+        // flip it from the transport blackhole tables after unpacking.
+        let msg = LxMessage::new([0xAA; 16], [0xBB; 16], "t", "c", DeliveryMethod::Direct);
+        assert!(!msg.source_blackholed);
+
+        let mut outbound = LxMessage::new(
+            [0xAA; 16],
+            [0xBB; 16],
+            "Title",
+            "Content",
+            DeliveryMethod::Direct,
+        );
+        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
+        outbound.sign(&key).unwrap();
+        let packed = outbound.pack().unwrap();
+        let unpacked = LxMessage::unpack(&packed).unwrap();
+        assert!(!unpacked.source_blackholed);
     }
 
     #[test]

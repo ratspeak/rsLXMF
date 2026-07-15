@@ -210,11 +210,13 @@ pub fn pn_stamp_cost_from_app_data(data: &[u8]) -> Option<u8> {
     parse_pn_announce_data(data).map(|p| p.stamp_cost)
 }
 
-/// Encode delivery-announce `app_data` as msgpack `[display_name, stamp_cost]`.
+/// Encode delivery-announce `app_data` as msgpack
+/// `[display_name, stamp_cost, supported_functionality]` where the feature
+/// list advertises [`SF_COMPRESSION`](crate::constants::SF_COMPRESSION).
 ///
 /// `stamp_cost` must be in `1..=254`; out-of-range or `None` values are encoded as nil.
 ///
-/// Python reference: `get_announce_app_data` — LXMRouter.py:985-1000.
+/// Python reference: `get_announce_app_data` — LXMRouter.py:985-1001 (1.0.1).
 pub fn get_announce_app_data(display_name: Option<&str>, stamp_cost: Option<u8>) -> Vec<u8> {
     use rmpv::Value;
 
@@ -228,15 +230,18 @@ pub fn get_announce_app_data(display_name: Option<&str>, stamp_cost: Option<u8>)
         _ => Value::Nil,
     };
 
-    let peer_data = Value::Array(vec![name_val, cost_val]);
+    let supported_functionality =
+        Value::Array(vec![Value::from(crate::constants::SF_COMPRESSION as u64)]);
+
+    let peer_data = Value::Array(vec![name_val, cost_val, supported_functionality]);
 
     crate::encode_value(&peer_data)
 }
 
 /// Parse delivery-announce `app_data`, returning `(display_name, stamp_cost)`.
 ///
-/// Accepts both Python LXMF 0.9.6's 2-element form and the optional 3-element
-/// feature-list form used by newer/extended peers.
+/// Accepts both Python LXMF <=0.9.8's 2-element form and the 3-element
+/// feature-list form emitted from 1.0.1 (and extended peers).
 pub fn parse_announce_app_data(data: &[u8]) -> Option<(Option<String>, Option<u8>)> {
     let value: rmpv::Value = rmpv::decode::read_value(&mut &data[..]).ok()?;
     let arr = value.as_array()?;
@@ -300,11 +305,13 @@ pub fn compression_support_state_from_app_data(data: &[u8]) -> CompressionSuppor
 
 /// Check whether a peer advertises `SF_COMPRESSION` support in its delivery-announce `app_data`.
 ///
-/// Returns `false` for legacy 2-element app_data or when the feature list is missing/empty.
+/// Fail-open like Python: legacy 2-element app_data, malformed data, and
+/// non-list feature entries all count as supported; only an explicit feature
+/// list that omits `SF_COMPRESSION` disables compression.
 ///
 /// Python reference: `compression_support_from_app_data` — LXMF.py:154-164.
 pub fn compression_support_from_app_data(data: &[u8]) -> bool {
-    compression_support_state_from_app_data(data) == CompressionSupport::Supported
+    compression_support_state_from_app_data(data) != CompressionSupport::Unsupported
 }
 
 /// Extract the advertised name from propagation-node announce data.
@@ -735,6 +742,16 @@ mod tests {
     }
 
     #[test]
+    fn test_delivery_announce_data_matches_python_101_bytes() {
+        // Python 1.0.1 oracle: msgpack([b"Test", 16, [SF_COMPRESSION]]) — LXMRouter.py:999-1001.
+        assert_eq!(
+            hex::encode(get_announce_app_data(Some("Test"), Some(16))),
+            "93c40454657374109100"
+        );
+        assert_eq!(hex::encode(get_announce_app_data(None, None)), "93c0c09100");
+    }
+
+    #[test]
     fn test_delivery_announce_data_no_name() {
         let packed = get_announce_app_data(None, Some(8));
         let (name, cost) = parse_announce_app_data(&packed).unwrap();
@@ -798,12 +815,18 @@ mod tests {
 
     #[test]
     fn test_compression_support_from_app_data() {
-        let python_096 = get_announce_app_data(Some("Alice"), Some(12));
+        // Legacy <=0.9.8 2-element app_data: unknown state, fail-open true
+        // (Python returns True for len < 3 — LXMF.py:161).
+        let python_098 = {
+            use rmpv::Value;
+            let arr = Value::Array(vec![Value::Binary(b"Alice".to_vec()), Value::from(12u64)]);
+            crate::encode_value(&arr)
+        };
         assert_eq!(
-            compression_support_state_from_app_data(&python_096),
+            compression_support_state_from_app_data(&python_098),
             CompressionSupport::Unknown
         );
-        assert!(!compression_support_from_app_data(&python_096));
+        assert!(compression_support_from_app_data(&python_098));
 
         let supported = {
             use rmpv::Value;
@@ -854,9 +877,19 @@ mod tests {
         );
         assert!(!compression_support_from_app_data(&empty_features));
 
+        // Malformed data: unknown state, fail-open true (Python treats the
+        // original non-msgpack announce format as supported — LXMF.py:167).
         assert_eq!(
             compression_support_state_from_app_data(&[0xc1]),
             CompressionSupport::Unknown
+        );
+        assert!(compression_support_from_app_data(&[0xc1]));
+
+        // Our own 1.0.1 emission round-trips as explicitly supported.
+        let own = get_announce_app_data(Some("Alice"), Some(12));
+        assert_eq!(
+            compression_support_state_from_app_data(&own),
+            CompressionSupport::Supported
         );
     }
 
