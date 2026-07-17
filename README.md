@@ -6,7 +6,7 @@
 
 [![License: AGPL-3.0-or-later](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue.svg)](LICENSE)
 [![Rust 1.85+](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
-[![LXMF 0.9.8](https://img.shields.io/badge/target-LXMF%200.9.8-success.svg)](https://github.com/markqvist/LXMF)
+[![LXMF 1.0.1](https://img.shields.io/badge/target-LXMF%201.0.1-success.svg)](https://github.com/markqvist/LXMF)
 [![Status](https://img.shields.io/badge/status-experimental-yellow.svg)](#feature-status)
 
 [LXMF Reference](https://github.com/markqvist/LXMF) |
@@ -307,8 +307,8 @@ application envelopes.
 
 | Area | Current behavior |
 | --- | --- |
-| Message format | Signed LXMF envelopes, custom field maps, propagation wrappers, `.lxm` containers, and paper URI encode/decode. |
-| Delivery | Opportunistic, Direct, Propagated, callbacks, failure callbacks, cancellation, progress state, and opportunistic-to-direct downgrade. |
+| Message format | Signed LXMF envelopes, custom field maps, standard reply/reaction/comment fields, propagation wrappers, `.lxm` containers, and paper URI encode/decode. |
+| Delivery | Opportunistic, Direct, Propagated, callbacks, failure callbacks, cancellation, progress state, opportunistic-to-direct downgrade, and compression signalling in delivery announces. |
 | Propagation | Disk-backed store, deposit, retrieve, peer sync, autopeer/static peers, weighted culling, duplicate checks, size checks, and stamp checks. |
 | Stamps and tickets | Soft/hard stamp validation, HKDF-expanded workblocks, cached destination stamp costs, propagation tickets, and restart-safe ticket persistence. |
 | Control | `--status`, `--peers`, `--sync`, and `--break` over the propagation-control link. |
