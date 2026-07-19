@@ -264,7 +264,7 @@ Supported sections:
 | Section | Keys |
 | --- | --- |
 | `[lxmf]` | `display_name`, `announce_at_start`, `announce_interval`, `delivery_transfer_max_accepted_size`, `stamp_cost`, `on_inbound` |
-| `[propagation]` | `enable_node`, `node_name`, `auth_required`, `announce_at_start`, `announce_interval`, `autopeer`, `autopeer_maxdepth`, `message_storage_limit`, `propagation_message_max_accepted_size`, `propagation_sync_max_accepted_size`, `propagation_stamp_cost_target`, `propagation_stamp_cost_flexibility`, `peering_cost`, `remote_peering_cost_max`, `max_peers`, `static_peers`, `prioritise_destinations`, `control_allowed`, `from_static_only`, `outbound_node`, `propagation_stamp_cost`, `propagation_limit`, `enforce_ratchets`, `enforce_stamps` |
+| `[propagation]` | `enable_node`, `node_name`, `auth_required`, `announce_at_start`, `announce_interval`, `autopeer`, `autopeer_maxdepth`, `message_storage_limit`, `propagation_message_max_accepted_size`, `propagation_sync_max_accepted_size`, `propagation_stamp_cost_target`, `propagation_stamp_cost_flexibility`, `peering_cost`, `remote_peering_cost_max`, `max_peers`, `static_peers`, `prioritise_destinations`, `control_allowed`, `from_static_only`, `outbound_node`, `propagation_stamp_cost`, `propagation_limit`, `enforce_stamps` |
 | `[control]` | `auth_required`, `allowed` |
 | `[logging]` | `loglevel` |
 

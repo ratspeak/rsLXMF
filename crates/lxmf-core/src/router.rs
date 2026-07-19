@@ -47,7 +47,6 @@ pub struct RouterConfigExt {
     pub processing_outbound: bool,
     /// Maximum outbound messages to process per tick (`None` = unlimited).
     pub processing_limit: Option<usize>,
-    pub enforce_ratchets: bool,
     pub enforce_stamps: bool,
     pub retain_synced_on_node: bool,
     pub auth_required: bool,
@@ -69,7 +68,6 @@ impl Default for RouterConfigExt {
             max_peering_cost: MAX_PEERING_COST,
             processing_outbound: true,
             processing_limit: None,
-            enforce_ratchets: false,
             enforce_stamps: false,
             retain_synced_on_node: false,
             auth_required: false,
@@ -1111,10 +1109,6 @@ impl LxmRouter {
         self.config.propagation_stamp_flex = flex;
     }
 
-    pub fn set_enforce_ratchets(&mut self, enforce: bool) {
-        self.config.ext.enforce_ratchets = enforce;
-    }
-
     pub fn set_enforce_stamps(&mut self, enforce: bool) {
         self.config.ext.enforce_stamps = enforce;
     }
@@ -1949,7 +1943,6 @@ mod tests {
         assert!(config.ext.processing_outbound);
         assert!(config.ext.defer_stamp_generation);
         assert!(config.ext.processing_limit.is_none());
-        assert!(!config.ext.enforce_ratchets);
         assert!(!config.ext.enforce_stamps);
     }
 

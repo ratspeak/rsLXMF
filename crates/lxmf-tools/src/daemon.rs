@@ -161,7 +161,6 @@ pub struct DaemonConfig {
     pub control_allowed: Vec<String>,
     pub static_peers: Vec<String>,
     pub prioritise_destinations: Vec<String>,
-    pub enforce_ratchets: bool,
     pub enforce_stamps: bool,
     pub message_storage_limit: Option<usize>,
     pub from_static_only: bool,
@@ -196,7 +195,6 @@ impl Default for DaemonConfig {
             control_allowed: Vec::new(),
             static_peers: Vec::new(),
             prioritise_destinations: Vec::new(),
-            enforce_ratchets: false,
             enforce_stamps: false,
             message_storage_limit: Some(500_000_000),
             from_static_only: false,
@@ -221,7 +219,6 @@ impl DaemonConfig {
                 autopeer_maxdepth: self.autopeer_maxdepth,
                 peering_cost: self.peering_cost,
                 max_peering_cost: self.max_peering_cost,
-                enforce_ratchets: self.enforce_ratchets,
                 enforce_stamps: self.enforce_stamps,
                 auth_required: self.auth_required,
                 message_storage_limit: self.message_storage_limit,
@@ -301,7 +298,6 @@ impl DaemonConfig {
             {
                 dc.propagation_limit_kb = limit as usize;
             }
-            dc.enforce_ratchets = sec.get_bool_or("enforce_ratchets", false);
             dc.enforce_stamps = sec.get_bool_or("enforce_stamps", false);
         }
 
@@ -653,5 +649,20 @@ propagation_stamp_cost = 19
 
         assert_eq!(dc.propagation_stamp_cost, 19);
         assert_eq!(dc.to_router_config().propagation_stamp_cost, 19);
+    }
+
+    /// Python lxmd exposes no enforce_ratchets option; the key must parse as a no-op.
+    #[test]
+    fn test_enforce_ratchets_key_ignored_matching_python_lxmd() {
+        let input = r#"
+[propagation]
+enforce_ratchets = yes
+enforce_stamps = yes
+"#;
+        let config = rns_runtime::config::Config::parse(input).unwrap();
+        let dc = DaemonConfig::from_config(&config);
+
+        assert!(dc.enforce_stamps);
+        assert!(dc.to_router_config().ext.enforce_stamps);
     }
 }

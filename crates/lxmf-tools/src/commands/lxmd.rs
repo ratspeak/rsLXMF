@@ -1048,9 +1048,6 @@ impl LxmdRunner {
             self.router.set_stamp_cost(self.lxmf_dest_hash, cost);
         }
 
-        if self.config.enforce_ratchets {
-            self.router.set_enforce_ratchets(true);
-        }
         if self.config.enforce_stamps {
             self.router.set_enforce_stamps(true);
         }
