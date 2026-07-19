@@ -1048,10 +1048,6 @@ impl LxmdRunner {
             self.router.set_stamp_cost(self.lxmf_dest_hash, cost);
         }
 
-        if self.config.enforce_stamps {
-            self.router.set_enforce_stamps(true);
-        }
-
         for configured in &self.config.control_allowed {
             match parse_destination_hash(configured) {
                 Ok(hash) => self.router.allow_control(hash),
@@ -1946,6 +1942,10 @@ impl LxmdRunner {
                         from = %hex::encode(msg.source_hash),
                         "Dropping LXM from blackholed identity"
                     );
+                    return;
+                }
+                // LXMRouter.py:1773-1775: enforcement covers propagated deliveries too.
+                if self.should_reject_for_stamp(&msg) {
                     return;
                 }
                 self.handle_inbound_message(msg);
@@ -3460,6 +3460,49 @@ mod tests {
         let snapshot = direct_route_snapshot(&hops, dest).expect("route snapshot");
         assert_eq!(snapshot.destination_hash, dest);
         assert_eq!(snapshot.hops, 5);
+    }
+
+    /// Pins LXMRouter.py:1773-1775: stamp enforcement covers PROPAGATED
+    /// deliveries, not just link-delivered messages.
+    #[tokio::test]
+    async fn propagation_downloaded_data_respects_stamp_enforcement() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp = std::env::temp_dir().join(format!(
+            "lxmd-prop-stamp-gate-{}-{unique}",
+            std::process::id()
+        ));
+        let (tx, _rx) = mpsc::channel::<TransportMessage>(64);
+        let config = DaemonConfig {
+            enforce_stamps: true,
+            stamp_cost: Some(8),
+            ..Default::default()
+        };
+        let mut runner = LxmdRunner::new(config, &temp, tx).expect("runner");
+
+        let dest = [0xAB; 16];
+        assert_ne!(dest, runner.lxmf_dest_hash);
+        let mut msg = LxMessage::new(dest, [0xCD; 16], "t", "hello", DeliveryMethod::Propagated);
+        msg.signature = Some([0u8; 64]);
+        let data = msg.pack().expect("pack");
+        let hash = LxMessage::unpack(&data).expect("unpack").hash.expect("hash");
+        let msg_path = runner.messages_dir.join(format!("{}.lxm", hex::encode(hash)));
+
+        runner.handle_propagation_downloaded_data(&data);
+        // Grace period: an (incorrectly) accepted message would be written on the blocking pool.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!msg_path.exists(), "unstamped propagated message must be rejected");
+
+        runner.config.enforce_stamps = false;
+        runner.handle_propagation_downloaded_data(&data);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !msg_path.exists() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(msg_path.exists(), "message must be stored once enforcement is off");
+        let _ = std::fs::remove_dir_all(&temp);
     }
 
     #[test]

@@ -219,7 +219,6 @@ impl DaemonConfig {
                 autopeer_maxdepth: self.autopeer_maxdepth,
                 peering_cost: self.peering_cost,
                 max_peering_cost: self.max_peering_cost,
-                enforce_stamps: self.enforce_stamps,
                 auth_required: self.auth_required,
                 message_storage_limit: self.message_storage_limit,
                 name: self.node_name.clone(),
@@ -663,6 +662,5 @@ enforce_stamps = yes
         let dc = DaemonConfig::from_config(&config);
 
         assert!(dc.enforce_stamps);
-        assert!(dc.to_router_config().ext.enforce_stamps);
     }
 }

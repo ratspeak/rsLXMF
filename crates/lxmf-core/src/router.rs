@@ -47,7 +47,6 @@ pub struct RouterConfigExt {
     pub processing_outbound: bool,
     /// Maximum outbound messages to process per tick (`None` = unlimited).
     pub processing_limit: Option<usize>,
-    pub enforce_stamps: bool,
     pub retain_synced_on_node: bool,
     pub auth_required: bool,
     /// Generate outbound message PoW stamps through the router deferred-stamp queue.
@@ -68,7 +67,6 @@ impl Default for RouterConfigExt {
             max_peering_cost: MAX_PEERING_COST,
             processing_outbound: true,
             processing_limit: None,
-            enforce_stamps: false,
             retain_synced_on_node: false,
             auth_required: false,
             defer_stamp_generation: true,
@@ -1109,10 +1107,6 @@ impl LxmRouter {
         self.config.propagation_stamp_flex = flex;
     }
 
-    pub fn set_enforce_stamps(&mut self, enforce: bool) {
-        self.config.ext.enforce_stamps = enforce;
-    }
-
     /// Build propagation-node announce app_data (msgpack).
     ///
     /// Python reference: LXMRouter.get_propagation_node_app_data — LXMRouter.py:306-318.
@@ -1943,7 +1937,6 @@ mod tests {
         assert!(config.ext.processing_outbound);
         assert!(config.ext.defer_stamp_generation);
         assert!(config.ext.processing_limit.is_none());
-        assert!(!config.ext.enforce_stamps);
     }
 
     #[test]
