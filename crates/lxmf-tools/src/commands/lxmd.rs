@@ -3487,13 +3487,21 @@ mod tests {
         let mut msg = LxMessage::new(dest, [0xCD; 16], "t", "hello", DeliveryMethod::Propagated);
         msg.signature = Some([0u8; 64]);
         let data = msg.pack().expect("pack");
-        let hash = LxMessage::unpack(&data).expect("unpack").hash.expect("hash");
-        let msg_path = runner.messages_dir.join(format!("{}.lxm", hex::encode(hash)));
+        let hash = LxMessage::unpack(&data)
+            .expect("unpack")
+            .hash
+            .expect("hash");
+        let msg_path = runner
+            .messages_dir
+            .join(format!("{}.lxm", hex::encode(hash)));
 
         runner.handle_propagation_downloaded_data(&data);
         // Grace period: an (incorrectly) accepted message would be written on the blocking pool.
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        assert!(!msg_path.exists(), "unstamped propagated message must be rejected");
+        assert!(
+            !msg_path.exists(),
+            "unstamped propagated message must be rejected"
+        );
 
         runner.config.enforce_stamps = false;
         runner.handle_propagation_downloaded_data(&data);
@@ -3501,7 +3509,10 @@ mod tests {
         while !msg_path.exists() && std::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-        assert!(msg_path.exists(), "message must be stored once enforcement is off");
+        assert!(
+            msg_path.exists(),
+            "message must be stored once enforcement is off"
+        );
         let _ = std::fs::remove_dir_all(&temp);
     }
 
