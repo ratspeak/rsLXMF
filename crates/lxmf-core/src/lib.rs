@@ -12,6 +12,7 @@
 //! | Module                | What it does                                       |
 //! | --------------------- | -------------------------------------------------- |
 //! | [`message`]           | Message object: fields, packing, stamp, encryption |
+//! | [`delivery_ratchet`]  | Durable delivery-announce ratchet transaction      |
 //! | [`router`]            | Actor-driven routing and delivery state machine    |
 //! | [`peer`]              | Propagation-peer state and sync bookkeeping        |
 //! | [`propagation`]       | On-disk store-and-forward message pool             |
@@ -41,6 +42,7 @@ pub(crate) fn now_f64() -> f64 {
 }
 
 pub mod constants;
+pub mod delivery_ratchet;
 pub mod discovery_stamper;
 pub mod handlers;
 pub mod link_delivery;

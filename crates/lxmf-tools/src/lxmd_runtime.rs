@@ -18,6 +18,7 @@ pub struct LxmdPaths {
     pub propagation_store_dir: PathBuf,
     pub ratchets_dir: PathBuf,
     pub ratchet_ring_path: PathBuf,
+    pub ratchet_control_path: PathBuf,
     pub received_ratchets_dir: PathBuf,
     pub known_identities_path: PathBuf,
     pub legacy_lxmf_dir: PathBuf,
@@ -38,6 +39,7 @@ impl LxmdPaths {
         let propagation_store_dir = lxmf_storage_dir.join("messagestore");
         let ratchets_dir = lxmf_storage_dir.join("ratchets");
         let ratchet_ring_path = ratchets_dir.join("ring");
+        let ratchet_control_path = ratchets_dir.join("ring.control");
         let received_ratchets_dir = ratchets_dir.join("received");
         let known_identities_path = ratchets_dir.join("known_identities");
 
@@ -57,6 +59,7 @@ impl LxmdPaths {
             propagation_store_dir,
             ratchets_dir,
             ratchet_ring_path,
+            ratchet_control_path,
             received_ratchets_dir,
             known_identities_path,
             legacy_lxmf_dir,
@@ -332,6 +335,10 @@ mod tests {
         assert_eq!(
             paths.ratchet_ring_path,
             PathBuf::from("/tmp/lxmd-config/storage/lxmf/ratchets/ring")
+        );
+        assert_eq!(
+            paths.ratchet_control_path,
+            PathBuf::from("/tmp/lxmd-config/storage/lxmf/ratchets/ring.control")
         );
         assert_eq!(
             paths.received_ratchets_dir,

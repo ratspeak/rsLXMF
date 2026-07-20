@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use lxmf_core::constants::{
     DELIVERY_RETRY_WAIT, DeliveryMethod, MAX_DELIVERY_ATTEMPTS, PATH_REQUEST_WAIT,
 };
+use lxmf_core::delivery_ratchet::{DELIVERY_APP_NAME, DeliveryAnnounceKind, DeliveryRatchetState};
 use lxmf_core::link_delivery::{
     BackchannelSendCommand, BackchannelSendError, BackchannelSendReceipt, DeliveryResult,
     is_retryable_link_delivery_failure,
@@ -44,14 +45,12 @@ use rns_identity::announce::AnnounceData;
 use rns_identity::destination::Destination;
 use rns_identity::identity::Identity;
 use rns_identity::ratchet::{
-    RatchetRing, ReceivedRatchet, clean_received_ratchets_dir, purge_expired_ratchets_in_memory,
+    ReceivedRatchet, clean_received_ratchets_dir, purge_expired_ratchets_in_memory,
 };
 use rns_runtime::lifecycle::ShutdownSignal;
 use rns_transport::messages::{
     AnnounceHandlerEvent, TransportMessage, TransportQuery, TransportQueryResponse,
 };
-
-const LXMF_APP_NAME: &str = "lxmf.delivery";
 
 #[derive(Debug, Clone, Default)]
 struct ControlSnapshot {
@@ -327,7 +326,6 @@ fn create_propagation_announce_packet_for(
     identity: &Identity,
     propagation_dest_hash: [u8; 16],
     config: &DaemonConfig,
-    ratchet_ref: Option<&[u8; 32]>,
 ) -> Result<Vec<u8>, String> {
     let mut pn_data = lxmf_core::handlers::PropagationNodeAnnounceData::new(
         config.propagation_enabled && !config.from_static_only,
@@ -346,7 +344,7 @@ fn create_propagation_announce_packet_for(
         identity,
         "lxmf.propagation",
         Some(app_data.as_slice()),
-        ratchet_ref,
+        None,
     )
     .map_err(|e| format!("Failed to create propagation announce: {e}"))?;
 
@@ -354,7 +352,7 @@ fn create_propagation_announce_packet_for(
 
     let flags = rns_wire::flags::PacketFlags {
         header_type: rns_wire::flags::HeaderType::Header1,
-        context_flag: ratchet_ref.is_some(),
+        context_flag: false,
         transport_type: rns_wire::flags::TransportType::Broadcast,
         destination_type: rns_wire::flags::DestinationType::Single,
         packet_type: rns_wire::flags::PacketType::Announce,
@@ -440,7 +438,7 @@ fn send_propagation_announce_try(
     propagation_dest_hash: [u8; 16],
     config: &DaemonConfig,
 ) {
-    match create_propagation_announce_packet_for(identity, propagation_dest_hash, config, None) {
+    match create_propagation_announce_packet_for(identity, propagation_dest_hash, config) {
         Ok(raw) => {
             let _ = tx.try_send(TransportMessage::Outbound(
                 rns_transport::messages::OutboundRequest {
@@ -468,7 +466,7 @@ struct LxmdRunner {
     data_dir: PathBuf,
     messages_dir: PathBuf,
     ratchets_dir: PathBuf,
-    ratchet_ring: RatchetRing,
+    delivery_ratchets: DeliveryRatchetState,
     received_ratchets: HashMap<String, ReceivedRatchet>,
     known_identities: HashMap<String, [u8; 64]>,
     route_hops: HashMap<[u8; 16], u8>,
@@ -532,7 +530,7 @@ impl LxmdRunner {
         let identity_hash = hex::encode(identity.hash);
 
         let lxmf_dest_hash =
-            Destination::hash_from_name_and_identity(LXMF_APP_NAME, Some(&identity.hash));
+            Destination::hash_from_name_and_identity(DELIVERY_APP_NAME, Some(&identity.hash));
         let propagation_dest_hash =
             Destination::hash_from_name_and_identity("lxmf.propagation", Some(&identity.hash));
         let control_dest_hash =
@@ -546,29 +544,14 @@ impl LxmdRunner {
 
         let ratchet_dir = paths.ratchets_dir.clone();
         std::fs::create_dir_all(&ratchet_dir)?;
-        let ring_path = paths.ratchet_ring_path.clone();
-        let mut ratchet_ring = if ring_path.exists() {
-            RatchetRing::load(&ring_path)
-                .map(|(ring, _sig)| ring)
-                .unwrap_or_else(|e| {
-                    tracing::warn!("Failed to load ratchet ring: {e}, creating new");
-                    RatchetRing::new()
-                })
-        } else {
-            RatchetRing::new()
-        };
-        if ratchet_ring.is_empty() {
-            ratchet_ring.rotate();
-            let sig = identity
-                .sign(
-                    ratchet_ring
-                        .current_public_key()
-                        .unwrap_or([0u8; 32])
-                        .as_ref(),
-                )
-                .unwrap_or([0u8; 64]);
-            let _ = ratchet_ring.save(&ring_path, &sig);
-        }
+        let wall_now = now_f64() as u64;
+        let delivery_ratchets = DeliveryRatchetState::load_or_initialize(
+            &identity,
+            lxmf_dest_hash,
+            paths.ratchet_ring_path.clone(),
+            paths.ratchet_control_path.clone(),
+            wall_now,
+        )?;
 
         // Mirrors Python `Identity._clean_ratchets()`: sweep the directory at
         // startup so stale entries don't survive a restart.
@@ -608,7 +591,7 @@ impl LxmdRunner {
         }
 
         tracing::info!(
-            ratchet_keys = ratchet_ring.len(),
+            ratchet_keys = delivery_ratchets.ring().len(),
             received_ratchets = received_ratchets.len(),
             known_identities = known_identities.len(),
             "Crypto state loaded"
@@ -637,7 +620,7 @@ impl LxmdRunner {
             transport_tx.clone(),
             delivery_rx,
             &identity,
-            LXMF_APP_NAME,
+            DELIVERY_APP_NAME,
             signing_key,
         );
         link_mgr.set_link_packet_channel(link_packet_tx);
@@ -649,7 +632,7 @@ impl LxmdRunner {
 
         let _ = transport_tx.try_send(TransportMessage::RegisterDestination {
             hash: lxmf_dest_hash,
-            app_name: LXMF_APP_NAME.to_string(),
+            app_name: DELIVERY_APP_NAME.to_string(),
             delivery_tx: Some(delivery_tx),
         });
 
@@ -744,7 +727,7 @@ impl LxmdRunner {
                 let client_dest_hash = remote_identity_hash
                     .map(|identity_hash| {
                         Destination::hash_from_name_and_identity(
-                            LXMF_APP_NAME,
+                            DELIVERY_APP_NAME,
                             Some(&identity_hash),
                         )
                     })
@@ -909,7 +892,7 @@ impl LxmdRunner {
 
         let (announce_tx, announce_rx) = mpsc::channel(256);
         let _ = transport_tx.try_send(TransportMessage::RegisterAnnounceHandler {
-            aspect_filter: Some(LXMF_APP_NAME.to_string()),
+            aspect_filter: Some(DELIVERY_APP_NAME.to_string()),
             receive_path_responses: true,
             callback_tx: announce_tx.clone(),
         });
@@ -935,7 +918,7 @@ impl LxmdRunner {
             data_dir: paths.router_state_dir,
             messages_dir,
             ratchets_dir: paths.ratchets_dir,
-            ratchet_ring,
+            delivery_ratchets,
             received_ratchets,
             known_identities,
             route_hops: HashMap::new(),
@@ -1117,61 +1100,25 @@ impl LxmdRunner {
     }
 
     fn create_announce_packet(&mut self) -> Result<Vec<u8>, String> {
-        if self.ratchet_ring.needs_rotation() {
-            self.ratchet_ring.rotate();
-            self.save_crypto_state();
-        }
-
-        let ratchet_pub = self.ratchet_ring.current_public_key();
-        let ratchet_ref = ratchet_pub.as_ref();
-
         let app_data =
             delivery_announce_app_data(self.config.display_name.as_deref(), self.config.stamp_cost);
-
-        let announce = AnnounceData::create(
-            &self.identity,
-            LXMF_APP_NAME,
-            Some(app_data.as_slice()),
-            ratchet_ref,
-        )
-        .map_err(|e| format!("Failed to create announce: {e}"))?;
-
-        let payload = announce.pack();
-
-        let flags = rns_wire::flags::PacketFlags {
-            header_type: rns_wire::flags::HeaderType::Header1,
-            context_flag: ratchet_ref.is_some(),
-            transport_type: rns_wire::flags::TransportType::Broadcast,
-            destination_type: rns_wire::flags::DestinationType::Single,
-            packet_type: rns_wire::flags::PacketType::Announce,
-        };
-        let header = rns_wire::header::PacketHeader {
-            flags,
-            hops: 0,
-            transport_id: None,
-            destination_hash: self.lxmf_dest_hash,
-            context: rns_wire::context::PacketContext::None,
-        };
-
-        let mut raw = header.pack();
-        raw.extend_from_slice(&payload);
-        Ok(raw)
+        let now = now_f64();
+        self.delivery_ratchets
+            .create_announce(
+                &self.identity,
+                &app_data,
+                now as u64,
+                now,
+                DeliveryAnnounceKind::Broadcast,
+            )
+            .map_err(|error| error.to_string())
     }
 
     fn create_propagation_announce_packet(&mut self) -> Result<Vec<u8>, String> {
-        if self.ratchet_ring.needs_rotation() {
-            self.ratchet_ring.rotate();
-            self.save_crypto_state();
-        }
-
-        let ratchet_pub = self.ratchet_ring.current_public_key();
-        let ratchet_ref = ratchet_pub.as_ref();
-
         create_propagation_announce_packet_for(
             &self.identity,
             self.propagation_dest_hash,
             &self.config,
-            ratchet_ref,
         )
     }
 
@@ -1258,7 +1205,7 @@ impl LxmdRunner {
         for (link_id, identity_hash) in identified {
             self.ensure_link_delivery();
             let dest_hash =
-                Destination::hash_from_name_and_identity(LXMF_APP_NAME, Some(&identity_hash));
+                Destination::hash_from_name_and_identity(DELIVERY_APP_NAME, Some(&identity_hash));
             if let Some(ref mut ld) = self.link_delivery {
                 ld.register_backchannel(dest_hash, link_id);
             }
@@ -1687,7 +1634,7 @@ impl LxmdRunner {
 
     fn drain_announce_events(&mut self) -> Vec<[u8; 16]> {
         let mut seen = Vec::new();
-        let delivery_name_hash = rns_identity::name_hash::name_hash(LXMF_APP_NAME);
+        let delivery_name_hash = rns_identity::name_hash::name_hash(DELIVERY_APP_NAME);
         let propagation_name_hash = rns_identity::name_hash::name_hash("lxmf.propagation");
         while let Ok(event) = self.announce_rx.try_recv() {
             seen.push(event.destination_hash);
@@ -2597,7 +2544,7 @@ impl LxmdRunner {
     }
 
     fn decrypt_inbound(&self, ciphertext: &[u8]) -> Option<Vec<u8>> {
-        let prv_keys = self.ratchet_ring.private_keys();
+        let prv_keys = self.delivery_ratchets.ring().private_keys();
         let refs: Vec<&[u8; 32]> = prv_keys.iter().collect();
         let ratchets = if refs.is_empty() {
             None
@@ -2638,19 +2585,7 @@ impl LxmdRunner {
         let ratchet_dir = self.ratchets_dir.clone();
         std::fs::create_dir_all(&ratchet_dir).ok();
 
-        let ring_path = ratchet_dir.join("ring");
-        let sig = self
-            .identity
-            .sign(
-                self.ratchet_ring
-                    .current_public_key()
-                    .unwrap_or([0u8; 32])
-                    .as_ref(),
-            )
-            .unwrap_or([0u8; 64]);
-        if let Err(e) = self.ratchet_ring.save(&ring_path, &sig) {
-            tracing::warn!("Failed to save ratchet ring: {e}");
-        }
+        self.delivery_ratchets.save(&self.identity);
 
         let received_dir = ratchet_dir.join("received");
         std::fs::create_dir_all(&received_dir).ok();
@@ -3248,6 +3183,28 @@ mod tests {
     use super::*;
     use lxmf_core::constants::DeliveryMethod;
 
+    fn unpack_announce(raw: &[u8]) -> (rns_wire::header::PacketHeader, AnnounceData) {
+        let (header, header_len) = rns_wire::header::PacketHeader::unpack(raw).unwrap();
+        let announce = AnnounceData::unpack(&raw[header_len..], header.flags.context_flag).unwrap();
+        (header, announce)
+    }
+
+    #[test]
+    fn propagation_announce_is_never_ratcheted() {
+        let identity = Identity::new();
+        let destination =
+            Destination::hash_from_name_and_identity("lxmf.propagation", Some(&identity.hash));
+        let raw = create_propagation_announce_packet_for(
+            &identity,
+            destination,
+            &DaemonConfig::default(),
+        )
+        .unwrap();
+        let (header, announce) = unpack_announce(&raw);
+        assert!(!header.flags.context_flag);
+        assert_eq!(announce.ratchet, None);
+    }
+
     /// Blackhole gating mirrors LXMessage.py:804: only a recallable source
     /// identity can be matched against the blackhole table; unknown sources
     /// never drop.
@@ -3255,7 +3212,7 @@ mod tests {
     fn recall_identity_hash_resolves_known_destinations_only() {
         let identity = Identity::new();
         let dest_hash =
-            Destination::hash_from_name_and_identity(LXMF_APP_NAME, Some(&identity.hash));
+            Destination::hash_from_name_and_identity(DELIVERY_APP_NAME, Some(&identity.hash));
         let pub_key = identity.get_public_key();
 
         let mut known: HashMap<String, [u8; 64]> = HashMap::new();
