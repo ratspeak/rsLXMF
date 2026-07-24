@@ -2345,6 +2345,7 @@ impl LxmdRunner {
             }
 
             let msg_hash = message.hash;
+            let destination_public_key = self.known_identities.get(&dest_hex).copied();
             let mut missing_identity = false;
             let payload = match message.pack_opportunistic_encrypted(|plaintext| {
                 self.encrypt_for_destination(&dest_hex, plaintext)
@@ -2388,6 +2389,13 @@ impl LxmdRunner {
                     );
                     continue;
                 }
+            };
+            let Some(destination_public_key) = destination_public_key else {
+                tracing::error!(
+                    dest = %dest_hex,
+                    "opportunistic encryption succeeded without a retained destination identity"
+                );
+                continue;
             };
 
             let flags = rns_wire::flags::PacketFlags {
@@ -2465,6 +2473,8 @@ impl LxmdRunner {
                             .try_send(TransportMessage::RegisterReceipt {
                                 truncated_hash: trunc,
                                 full_hash: full,
+                                destination_hash: dest_hash,
+                                destination_public_key,
                                 msg_id: hex::encode(hash),
                                 timeout: Some(Duration::from_secs(15)),
                             });
