@@ -2,6 +2,9 @@
 //!
 //! Python reference: LXMF/Utilities/lxmd.py.
 
+#[path = "lxmd_pn.rs"]
+mod lxmd_pn;
+
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -52,6 +55,10 @@ use rns_transport::messages::{
     AnnounceHandlerEvent, TransportMessage, TransportQuery, TransportQueryResponse,
 };
 
+use self::lxmd_pn::{
+    PnInboundRuntime, PnValidationJob, PnValidationOutcome, PnValidationToken, logical_resource_id,
+};
+
 #[derive(Debug, Clone, Default)]
 struct ControlSnapshot {
     allowed_control: Vec<[u8; 16]>,
@@ -63,6 +70,137 @@ struct ControlSnapshot {
 enum ControlCommand {
     Sync([u8; 16]),
     Unpeer([u8; 16]),
+}
+
+#[derive(Debug)]
+struct ValidatedPnEntry {
+    lxmf_data: Vec<u8>,
+    stamp_value: u32,
+    stamp_data: [u8; 32],
+}
+
+#[derive(Debug)]
+struct PnValidationWorkerResult {
+    token: PnValidationToken,
+    link_id: [u8; 16],
+    outcome: PnValidationOutcome,
+    entries: Vec<ValidatedPnEntry>,
+    rejected: usize,
+}
+
+fn validate_pn_resource_job(
+    job: PnValidationJob,
+    max_transfer_bytes: usize,
+    min_cost: u8,
+) -> PnValidationWorkerResult {
+    let token = job.token();
+    let link_id = job.link_id();
+    let allow_multiple = job.allow_multiple();
+    let data = job.into_data();
+
+    let (_, entries) =
+        match LxMessage::unpack_propagation_wrapper_bounded(&data, max_transfer_bytes) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                tracing::warn!(
+                    link_id = %hex::encode(link_id),
+                    "failed to unpack propagation Resource: {error}"
+                );
+                return PnValidationWorkerResult {
+                    token,
+                    link_id,
+                    outcome: PnValidationOutcome::Failed,
+                    entries: Vec::new(),
+                    rejected: 0,
+                };
+            }
+        };
+
+    if !allow_multiple && entries.len() > 1 {
+        return PnValidationWorkerResult {
+            token,
+            link_id,
+            outcome: PnValidationOutcome::UnauthorizedMultiple,
+            entries: Vec::new(),
+            rejected: entries.len(),
+        };
+    }
+
+    let mut validated = Vec::with_capacity(entries.len());
+    let mut rejected = 0usize;
+    for entry in entries {
+        match lxmf_core::stamper::validate_pn_stamp(&entry, min_cost) {
+            Some((_transient_id, lxmf_data, stamp_value, stamp_data)) => {
+                validated.push(ValidatedPnEntry {
+                    lxmf_data,
+                    stamp_value,
+                    stamp_data,
+                });
+            }
+            None => rejected += 1,
+        }
+    }
+
+    PnValidationWorkerResult {
+        token,
+        link_id,
+        outcome: if rejected == 0 {
+            PnValidationOutcome::Valid
+        } else {
+            PnValidationOutcome::InvalidStamp
+        },
+        entries: validated,
+        rejected,
+    }
+}
+
+fn handle_pn_offer_request(
+    runtime: &Arc<Mutex<PnInboundRuntime>>,
+    node: &Arc<Mutex<PropagationNode>>,
+    local_identity_hash: [u8; 16],
+    link_id: [u8; 16],
+    remote_identity_hash: Option<[u8; 16]>,
+    data: &[u8],
+) -> Option<Vec<u8>> {
+    let candidate = runtime
+        .lock()
+        .ok()?
+        .preflight_offer(link_id, remote_identity_hash);
+    let candidate = match candidate {
+        Ok(candidate) => candidate,
+        Err(response) => return Some(PropagationNode::encode_offer_response(&response)),
+    };
+
+    let evaluation = match node.lock() {
+        Ok(node) => node.evaluate_offer_request(data, &local_identity_hash, &candidate),
+        Err(_) => {
+            if let Ok(mut runtime) = runtime.lock() {
+                runtime.discard_offer(candidate);
+            }
+            return None;
+        }
+    };
+
+    match evaluation {
+        Ok(evaluation) => {
+            let response = match runtime.lock() {
+                Ok(mut runtime) => match runtime.commit_offer(candidate, &evaluation) {
+                    Ok(()) => evaluation.into_wire_response(),
+                    Err(response) => response,
+                },
+                Err(_) => return None,
+            };
+            Some(PropagationNode::encode_offer_response(&response))
+        }
+        Err(error) => {
+            if let Ok(mut runtime) = runtime.lock() {
+                runtime.discard_offer(candidate);
+            }
+            Some(PropagationNode::encode_offer_response(
+                &error.wire_response(),
+            ))
+        }
+    }
 }
 
 fn setup_logging(verbose: u8, quiet: u8, service: bool) {
@@ -483,6 +621,8 @@ struct LxmdRunner {
     propagation_sync: Option<lxmf_core::propagation_sync::PropagationSyncTask>,
     propagation_client: Option<lxmf_core::propagation_client::PropagationClient>,
     propagation_node: Option<Arc<Mutex<PropagationNode>>>,
+    propagation_admission: Option<Arc<Mutex<PnInboundRuntime>>>,
+    prop_link_command_tx: Option<mpsc::Sender<rns_runtime::link_manager::LinkManagerCommand>>,
     transport_tx: mpsc::Sender<TransportMessage>,
     /// Plaintext application data decoded by the LinkManager.
     link_packet_rx: mpsc::Receiver<(Vec<u8>, [u8; 16])>,
@@ -490,8 +630,13 @@ struct LxmdRunner {
     resource_rx: mpsc::Receiver<(Vec<u8>, [u8; 16])>,
     /// Plaintext propagation-wrapper packets decoded by the propagation LinkManager.
     prop_link_packet_rx: mpsc::Receiver<(Vec<u8>, [u8; 16])>,
-    /// Completed propagation-wrapper resources from the propagation LinkManager.
-    prop_resource_rx: mpsc::Receiver<(Vec<u8>, [u8; 16])>,
+    /// Ordered, lossless lifecycle and completion stream from the propagation LinkManager.
+    prop_accounting_rx:
+        mpsc::UnboundedReceiver<rns_runtime::link_manager::LinkManagerAccountingEvent>,
+    /// Stamp-validation results returned from blocking workers.
+    prop_validation_rx: mpsc::Receiver<PnValidationWorkerResult>,
+    /// Retained sender used to dispatch bounded validation results.
+    prop_validation_tx: mpsc::Sender<PnValidationWorkerResult>,
     /// Non-link inbound packets; still encrypted, need destination-level decrypt.
     inbound_raw_rx: mpsc::Receiver<Vec<u8>>,
     announce_rx: mpsc::Receiver<AnnounceHandlerEvent>,
@@ -605,7 +750,10 @@ impl LxmdRunner {
         let (link_packet_tx, link_packet_rx) = mpsc::channel::<(Vec<u8>, [u8; 16])>(256);
         let (resource_tx, resource_rx) = mpsc::channel::<(Vec<u8>, [u8; 16])>(256);
         let (prop_link_packet_tx, prop_link_packet_rx) = mpsc::channel::<(Vec<u8>, [u8; 16])>(256);
-        let (prop_resource_tx, prop_resource_rx) = mpsc::channel::<(Vec<u8>, [u8; 16])>(256);
+        let (prop_accounting_tx, prop_accounting_rx) =
+            mpsc::unbounded_channel::<rns_runtime::link_manager::LinkManagerAccountingEvent>();
+        let (prop_validation_tx, prop_validation_rx) =
+            mpsc::channel::<PnValidationWorkerResult>(256);
         let (inbound_raw_tx, inbound_raw_rx) = mpsc::channel::<Vec<u8>>(256);
         let (link_command_tx, link_command_rx) =
             mpsc::channel::<rns_runtime::link_manager::LinkManagerCommand>(256);
@@ -648,6 +796,8 @@ impl LxmdRunner {
         }));
         let (control_command_tx, control_command_rx) = mpsc::channel::<ControlCommand>(256);
 
+        let mut propagation_admission = None;
+        let mut prop_link_command_tx = None;
         let propagation_node: Option<Arc<Mutex<PropagationNode>>> = if config.propagation_enabled {
             let (prop_delivery_tx, prop_delivery_rx) = mpsc::channel(256);
             let _ = transport_tx.try_send(TransportMessage::RegisterDestination {
@@ -695,6 +845,18 @@ impl LxmdRunner {
                 }
             };
 
+            let static_peer_hashes = config
+                .static_peers
+                .iter()
+                .filter_map(|peer| parse_destination_hash(peer).ok())
+                .collect::<Vec<_>>();
+            let pn_admission = Arc::new(Mutex::new(PnInboundRuntime::new(
+                config.to_inbound_admission_config(),
+                static_peer_hashes,
+                config.sync_limit_kb.saturating_mul(1000),
+            )));
+            propagation_admission = Some(pn_admission.clone());
+
             // TODO(hardware-identity): route propagation link signing through the
             // backend-aware Identity path before supporting hardware-backed lxmd.
             let prop_signing_key = identity.get_signing_key().ok_or(
@@ -710,7 +872,8 @@ impl LxmdRunner {
                 Some(prop_signing_key),
             );
             prop_link_mgr.set_link_packet_channel(prop_link_packet_tx);
-            prop_link_mgr.set_resource_completed_channel(prop_resource_tx);
+            prop_link_mgr.set_accounting_event_channel(prop_accounting_tx);
+            prop_link_mgr.set_resource_strategy(rns_runtime::prelude::ResourceStrategy::AcceptApp);
 
             let pn_for_handler = pn.clone();
             let offer_path_hash = rns_crypto::sha::truncated_hash(
@@ -719,29 +882,69 @@ impl LxmdRunner {
             let get_path_hash =
                 rns_crypto::sha::truncated_hash(lxmf_core::constants::MESSAGE_GET_PATH.as_bytes());
             let link_identities = prop_link_mgr.link_identities_handle();
+            let accept_link_identities = link_identities.clone();
+            let admission_for_resources = pn_admission.clone();
+            prop_link_mgr.set_resource_accept_handler(move |link_id, advertisement| {
+                let remote_identity_hash = accept_link_identities
+                    .lock()
+                    .ok()
+                    .and_then(|identities| identities.get(&link_id).copied());
+                let resource_id = logical_resource_id(
+                    advertisement.resource_hash,
+                    advertisement.original_hash,
+                    advertisement.flags.split,
+                    advertisement.total_segments,
+                );
+                admission_for_resources
+                    .lock()
+                    .map(|mut admission| {
+                        admission.accept_resource(
+                            link_id,
+                            resource_id,
+                            advertisement.data_size,
+                            remote_identity_hash,
+                        )
+                    })
+                    .unwrap_or(false)
+            });
+
             let local_identity_hash = identity.hash;
+            let admission_for_handler = pn_admission.clone();
             prop_link_mgr.set_request_handler(move |link_id, path_hash, data| {
                 let remote_identity_hash = link_identities
                     .lock()
                     .ok()
                     .and_then(|ids| ids.get(&link_id).copied());
                 let remote_identity_ref = remote_identity_hash.as_ref();
-                let client_dest_hash = remote_identity_hash
-                    .map(|identity_hash| {
-                        Destination::hash_from_name_and_identity(
-                            DELIVERY_APP_NAME,
-                            Some(&identity_hash),
-                        )
-                    })
-                    .unwrap_or([0; 16]);
-                let handler =
-                    lxmf_core::handlers::PropagationRequestHandler::new(local_identity_hash);
                 if path_hash == offer_path_hash {
                     tracing::info!("propagation: handling offer request");
-                    let mut node = pn_for_handler.lock().ok()?;
-                    Some(handler.handle_offer_request(remote_identity_ref, &data, &mut node))
+                    handle_pn_offer_request(
+                        &admission_for_handler,
+                        &pn_for_handler,
+                        local_identity_hash,
+                        link_id,
+                        remote_identity_hash,
+                        &data,
+                    )
                 } else if path_hash == get_path_hash {
+                    if admission_for_handler
+                        .lock()
+                        .map(|admission| admission.is_link_quarantined(&link_id))
+                        .unwrap_or(true)
+                    {
+                        return None;
+                    }
                     tracing::info!("propagation: handling get request");
+                    let client_dest_hash = remote_identity_hash
+                        .map(|identity_hash| {
+                            Destination::hash_from_name_and_identity(
+                                DELIVERY_APP_NAME,
+                                Some(&identity_hash),
+                            )
+                        })
+                        .unwrap_or([0; 16]);
+                    let handler =
+                        lxmf_core::handlers::PropagationRequestHandler::new(local_identity_hash);
                     let action = {
                         let mut node = pn_for_handler.lock().ok()?;
                         handler.handle_message_get_request(
@@ -778,8 +981,11 @@ impl LxmdRunner {
                 }
             });
 
+            let (pn_link_command_tx, pn_link_command_rx) =
+                mpsc::channel::<rns_runtime::link_manager::LinkManagerCommand>(256);
+            prop_link_command_tx = Some(pn_link_command_tx);
             tokio::spawn(async move {
-                prop_link_mgr.run().await;
+                prop_link_mgr.run_with_commands(pn_link_command_rx).await;
             });
 
             let (control_delivery_tx, control_delivery_rx) = mpsc::channel(256);
@@ -935,11 +1141,15 @@ impl LxmdRunner {
             propagation_sync: None,
             propagation_client: None,
             propagation_node: None,
+            propagation_admission,
+            prop_link_command_tx,
             transport_tx: transport_tx.clone(),
             link_packet_rx,
             resource_rx,
             prop_link_packet_rx,
-            prop_resource_rx,
+            prop_accounting_rx,
+            prop_validation_rx,
+            prop_validation_tx,
             inbound_raw_rx,
             announce_rx,
             last_peer_announce: 0.0,
@@ -1190,6 +1400,11 @@ impl LxmdRunner {
                 }
                 ControlCommand::Unpeer(peer_hash) => {
                     self.router.unpeer(&peer_hash);
+                    if let Some(ref admission) = self.propagation_admission
+                        && let Ok(mut admission) = admission.lock()
+                    {
+                        admission.remove_static_peer(&peer_hash);
+                    }
                     if let Err(e) = self.router.save_state(&self.data_dir) {
                         tracing::warn!("Failed to save router state after control unpeer: {e}");
                     }
@@ -1756,16 +1971,15 @@ impl LxmdRunner {
                 len = data.len(),
                 "received propagation packet via link"
             );
-            self.handle_propagation_transfer_data(&data);
+            self.handle_propagation_transfer_data(link_id, &data);
         }
 
-        while let Ok((data, link_id)) = self.prop_resource_rx.try_recv() {
-            tracing::info!(
-                link_id = %hex::encode(link_id),
-                len = data.len(),
-                "propagation resource transfer completed"
-            );
-            self.handle_propagation_transfer_data(&data);
+        while let Ok(event) = self.prop_accounting_rx.try_recv() {
+            self.handle_propagation_accounting_event(event);
+        }
+
+        while let Ok(result) = self.prop_validation_rx.try_recv() {
+            self.handle_propagation_validation_result(result);
         }
     }
 
@@ -1812,7 +2026,133 @@ impl LxmdRunner {
         }
     }
 
-    fn handle_propagation_transfer_data(&mut self, data: &[u8]) {
+    fn handle_propagation_accounting_event(
+        &mut self,
+        event: rns_runtime::link_manager::LinkManagerAccountingEvent,
+    ) {
+        let validation_job = self
+            .propagation_admission
+            .as_ref()
+            .and_then(|admission| admission.lock().ok()?.handle_accounting_event(event));
+        if let Some(job) = validation_job {
+            self.spawn_propagation_validation(job);
+        }
+    }
+
+    fn spawn_propagation_validation(&self, job: PnValidationJob) {
+        let token = job.token();
+        let link_id = job.link_id();
+        let max_transfer_bytes = self.config.sync_limit_kb.saturating_mul(1000);
+        let min_cost = self
+            .config
+            .propagation_stamp_cost
+            .saturating_sub(self.config.propagation_stamp_flex);
+        let result_tx = self.prop_validation_tx.clone();
+
+        tokio::spawn(async move {
+            let result = match tokio::task::spawn_blocking(move || {
+                validate_pn_resource_job(job, max_transfer_bytes, min_cost)
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(error) => {
+                    tracing::warn!(
+                        link_id = %hex::encode(link_id),
+                        "propagation validation worker failed: {error}"
+                    );
+                    PnValidationWorkerResult {
+                        token,
+                        link_id,
+                        outcome: PnValidationOutcome::Failed,
+                        entries: Vec::new(),
+                        rejected: 0,
+                    }
+                }
+            };
+
+            if result_tx.send(result).await.is_err() {
+                tracing::debug!("propagation validation receiver closed");
+            }
+        });
+    }
+
+    fn handle_propagation_validation_result(&mut self, result: PnValidationWorkerResult) {
+        let claim = self.propagation_admission.as_ref().and_then(|admission| {
+            admission
+                .lock()
+                .ok()?
+                .conclude_validation(result.token, result.link_id, result.outcome)
+        });
+        let Some(claim) = claim else {
+            tracing::debug!(
+                link_id = %hex::encode(result.link_id),
+                "ignoring stale or duplicate propagation validation result"
+            );
+            return;
+        };
+
+        let mut accepted = 0usize;
+        if let Some(ref node) = self.propagation_node
+            && let Ok(mut node) = node.lock()
+        {
+            for entry in result.entries {
+                let stamp_value = u8::try_from(entry.stamp_value).unwrap_or(u8::MAX);
+                if node.accept_stamped_propagated_blob(
+                    &entry.lxmf_data,
+                    &entry.stamp_data,
+                    stamp_value,
+                ) {
+                    accepted += 1;
+                }
+            }
+        }
+
+        tracing::info!(
+            link_id = %hex::encode(claim.link_id()),
+            accepted,
+            rejected = result.rejected,
+            outcome = ?claim.outcome(),
+            "processed inbound propagation Resource"
+        );
+
+        if claim.should_close_link()
+            && let Some(command_tx) = self.prop_link_command_tx.clone()
+        {
+            let link_id = claim.link_id();
+            tokio::spawn(async move {
+                if command_tx
+                    .send(rns_runtime::link_manager::LinkManagerCommand::CloseLink {
+                        link_id,
+                        reason: rns_runtime::prelude::CloseReason::DestinationClosed,
+                        send_teardown: true,
+                    })
+                    .await
+                    .is_err()
+                {
+                    tracing::debug!(
+                        link_id = %hex::encode(link_id),
+                        "propagation Link already closed before validation teardown"
+                    );
+                }
+            });
+        }
+    }
+
+    fn handle_propagation_transfer_data(&mut self, link_id: [u8; 16], data: &[u8]) {
+        if self
+            .propagation_admission
+            .as_ref()
+            .is_some_and(|admission| {
+                admission
+                    .lock()
+                    .map(|admission| admission.is_link_quarantined(&link_id))
+                    .unwrap_or(true)
+            })
+        {
+            return;
+        }
+
         let Some(ref pn) = self.propagation_node else {
             tracing::debug!("received propagation data but node storage is disabled");
             return;
@@ -3170,12 +3510,16 @@ pub(crate) async fn main() {
                 runner.handle_link_delivered_data(&plaintext);
                 runner.drain_link_packets();
             }
-            Some((data, _link_id)) = runner.prop_link_packet_rx.recv() => {
-                runner.handle_propagation_transfer_data(&data);
+            Some((data, link_id)) = runner.prop_link_packet_rx.recv() => {
+                runner.handle_propagation_transfer_data(link_id, &data);
                 runner.drain_link_packets();
             }
-            Some((data, _link_id)) = runner.prop_resource_rx.recv() => {
-                runner.handle_propagation_transfer_data(&data);
+            Some(event) = runner.prop_accounting_rx.recv() => {
+                runner.handle_propagation_accounting_event(event);
+                runner.drain_link_packets();
+            }
+            Some(result) = runner.prop_validation_rx.recv() => {
+                runner.handle_propagation_validation_result(result);
                 runner.drain_link_packets();
             }
         }
@@ -3502,5 +3846,148 @@ mod tests {
             direct_reusable_link_state(Some(&manager), [0x45; 16]),
             DirectReusableLinkState::None
         );
+    }
+
+    fn pn_test_entry(stamp_byte: u8) -> Vec<u8> {
+        let mut entry =
+            vec![0x42; LxMessage::MIN_PROPAGATION_ENTRY_SIZE - lxmf_core::constants::STAMP_SIZE];
+        entry.extend_from_slice(&[stamp_byte; lxmf_core::constants::STAMP_SIZE]);
+        entry
+    }
+
+    fn pn_test_wrapper(entries: Vec<Vec<u8>>) -> Vec<u8> {
+        let value = rmpv::Value::Array(vec![
+            rmpv::Value::from(0.0f64),
+            rmpv::Value::Array(entries.into_iter().map(rmpv::Value::Binary).collect()),
+        ]);
+        let mut encoded = Vec::new();
+        rmpv::encode::write_value(&mut encoded, &value).expect("propagation wrapper");
+        encoded
+    }
+
+    fn pn_test_offer(transient_ids: Vec<[u8; 32]>) -> Vec<u8> {
+        let value = rmpv::Value::Array(vec![
+            rmpv::Value::Binary(Vec::new()),
+            rmpv::Value::Array(
+                transient_ids
+                    .into_iter()
+                    .map(|id| rmpv::Value::Binary(id.to_vec()))
+                    .collect(),
+            ),
+        ]);
+        let mut encoded = Vec::new();
+        rmpv::encode::write_value(&mut encoded, &value).expect("offer request");
+        encoded
+    }
+
+    #[test]
+    fn pn_offer_handler_uses_one_persistent_admission_owner() {
+        let local_identity = [0x11; 16];
+        let remote_identity = [0x22; 16];
+        let link_id = [0x33; 16];
+        let runtime = Arc::new(Mutex::new(PnInboundRuntime::new(
+            lxmf_core::propagation_admission::PnInboundAdmissionConfig::default(),
+            [],
+            1_000,
+        )));
+        let node = Arc::new(Mutex::new(PropagationNode::new(
+            PropagationNodeConfig {
+                peering_cost: 0,
+                ..PropagationNodeConfig::default()
+            },
+            local_identity,
+        )));
+        let offer = pn_test_offer(vec![[0x44; 32]]);
+
+        let response = handle_pn_offer_request(
+            &runtime,
+            &node,
+            local_identity,
+            link_id,
+            Some(remote_identity),
+            &offer,
+        )
+        .unwrap();
+        assert_eq!(
+            response,
+            PropagationNode::encode_offer_response(&lxmf_core::sync::OfferResponse::WantAll)
+        );
+
+        let repeated = handle_pn_offer_request(
+            &runtime,
+            &node,
+            local_identity,
+            link_id,
+            Some(remote_identity),
+            &offer,
+        )
+        .unwrap();
+        assert_eq!(
+            repeated,
+            PropagationNode::encode_offer_response(&lxmf_core::sync::OfferResponse::ErrorThrottled)
+        );
+    }
+
+    #[test]
+    fn pn_validation_worker_enforces_client_batch_authorization() {
+        let wrapper = pn_test_wrapper(vec![pn_test_entry(0), pn_test_entry(1)]);
+        let result = validate_pn_resource_job(
+            PnValidationJob::for_test(wrapper.clone(), false),
+            wrapper.len(),
+            0,
+        );
+        assert_eq!(result.outcome, PnValidationOutcome::UnauthorizedMultiple);
+        assert!(result.entries.is_empty());
+        assert_eq!(result.rejected, 2);
+
+        let result = validate_pn_resource_job(
+            PnValidationJob::for_test(wrapper.clone(), true),
+            wrapper.len(),
+            0,
+        );
+        assert_eq!(result.outcome, PnValidationOutcome::Valid);
+        assert_eq!(result.entries.len(), 2);
+        assert_eq!(result.rejected, 0);
+    }
+
+    #[test]
+    fn pn_validation_worker_preserves_valid_siblings_in_invalid_batch() {
+        let mut valid = None;
+        let mut invalid = None;
+        for stamp_byte in 0u8..=u8::MAX {
+            let entry = pn_test_entry(stamp_byte);
+            if lxmf_core::stamper::validate_pn_stamp(&entry, 1).is_some() {
+                valid.get_or_insert(entry);
+            } else {
+                invalid.get_or_insert(entry);
+            }
+            if valid.is_some() && invalid.is_some() {
+                break;
+            }
+        }
+        let wrapper = pn_test_wrapper(vec![valid.unwrap(), invalid.unwrap()]);
+        let result = validate_pn_resource_job(
+            PnValidationJob::for_test(wrapper.clone(), true),
+            wrapper.len(),
+            1,
+        );
+        assert_eq!(result.outcome, PnValidationOutcome::InvalidStamp);
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(result.rejected, 1);
+    }
+
+    #[test]
+    fn pn_validation_worker_fails_malformed_or_oversized_wrapper() {
+        let malformed = vec![0xc1];
+        let result = validate_pn_resource_job(PnValidationJob::for_test(malformed, true), 100, 0);
+        assert_eq!(result.outcome, PnValidationOutcome::Failed);
+
+        let wrapper = pn_test_wrapper(vec![pn_test_entry(0)]);
+        let result = validate_pn_resource_job(
+            PnValidationJob::for_test(wrapper.clone(), true),
+            wrapper.len() - 1,
+            0,
+        );
+        assert_eq!(result.outcome, PnValidationOutcome::Failed);
     }
 }
