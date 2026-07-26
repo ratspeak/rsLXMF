@@ -146,6 +146,14 @@ pub enum PnValidationResult {
     Failed,
 }
 
+/// Why an invalid-stamp throttle could not be installed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PnThrottleInstallError {
+    /// An all-zero destination is an unknown-peer sentinel, not a known
+    /// derived `lxmf.propagation` destination.
+    UnknownPeerDestination,
+}
+
 /// State-machine operation used in typed transition errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PnTransitionOperation {
@@ -369,19 +377,10 @@ impl PnInboundAdmission {
     ) -> Result<(), PnOfferRejection> {
         self.expire_throttles(now);
 
-        if self.throttle_deadlines.contains_key(peer_destination_hash) {
-            return Err(PnOfferRejection::InvalidStampThrottle);
-        }
-
         let is_static = self.static_peers.contains(peer_destination_hash);
-        if self.config.from_static_only && !is_static {
-            return Err(PnOfferRejection::NoAccess);
-        }
-
-        if self.records.contains_key(link_id) {
-            return Err(PnOfferRejection::LinkAlreadyTracked);
-        }
-
+        // Match LXMF's observable policy precedence. Static peers bypass only
+        // the sequential-validation and inbound-cap gates when configured to;
+        // they never bypass a peer throttle or static-only access policy.
         let bypass_limits = is_static && !self.config.static_sequential;
         if !bypass_limits && self.config.sequential_validation && self.validation_count() != 0 {
             return Err(PnOfferRejection::SequentialValidationActive);
@@ -389,6 +388,20 @@ impl PnInboundAdmission {
 
         if !bypass_limits && self.inbound_sync_count() >= self.config.max_inbound_syncs {
             return Err(PnOfferRejection::InboundSyncLimit);
+        }
+
+        if self.throttle_deadlines.contains_key(peer_destination_hash) {
+            return Err(PnOfferRejection::InvalidStampThrottle);
+        }
+
+        if self.config.from_static_only && !is_static {
+            return Err(PnOfferRejection::NoAccess);
+        }
+
+        // This Rust-specific lifecycle guard follows the upstream policy
+        // gates so their rejection precedence remains observable.
+        if self.records.contains_key(link_id) {
+            return Err(PnOfferRejection::LinkAlreadyTracked);
         }
 
         Ok(())
@@ -493,13 +506,38 @@ impl PnInboundAdmission {
             .remove(link_id)
             .expect("record existence checked above");
         if result == PnValidationResult::InvalidStamp {
-            self.throttle_deadlines.insert(
-                record.peer_destination_hash,
-                now.saturating_add(PN_INVALID_STAMP_THROTTLE),
-            );
+            // A record's destination was derived from an identified peer at
+            // preflight. Ignore only the reserved all-zero unknown sentinel.
+            let _ = self.install_invalid_stamp_throttle(record.peer_destination_hash, now);
         }
 
         Ok(PnCleanupResult::Removed(PnInboundState::Validating))
+    }
+
+    /// Install the standard throttle after invalid stamp validation for a
+    /// known peer, including an unsolicited Resource with no offer record.
+    ///
+    /// `peer_destination_hash` must be the peer's already-derived
+    /// `lxmf.propagation` SINGLE destination hash. The all-zero value is
+    /// rejected so callers cannot accidentally turn an unknown identity into
+    /// shared throttle state. `now` must use the same monotonic origin as the
+    /// other admission calls.
+    pub fn install_invalid_stamp_throttle(
+        &mut self,
+        peer_destination_hash: [u8; 16],
+        now: Duration,
+    ) -> Result<Duration, PnThrottleInstallError> {
+        if peer_destination_hash == [0; 16] {
+            return Err(PnThrottleInstallError::UnknownPeerDestination);
+        }
+
+        let requested_deadline = now.saturating_add(PN_INVALID_STAMP_THROTTLE);
+        let deadline = self
+            .throttle_deadlines
+            .entry(peer_destination_hash)
+            .and_modify(|deadline| *deadline = (*deadline).max(requested_deadline))
+            .or_insert(requested_deadline);
+        Ok(*deadline)
     }
 
     /// Release an accepted offer after its Resource advertisement is rejected.
@@ -838,6 +876,79 @@ mod tests {
             ),
             PnOfferAdmission::Accepted
         );
+    }
+
+    #[test]
+    fn offer_policy_gates_follow_upstream_precedence() {
+        let blocked_identity = identity(9);
+        let blocked_destination = PnInboundAdmission::peer_destination_hash(&blocked_identity);
+
+        // Sequential validation wins over a full cap, an invalid-stamp
+        // throttle, and static-only access rejection.
+        let mut sequential = PnInboundAdmission::new(PnInboundAdmissionConfig {
+            max_inbound_syncs: 1,
+            from_static_only: true,
+            ..PnInboundAdmissionConfig::default()
+        });
+        let active_identity = identity(1);
+        sequential.add_static_peer(PnInboundAdmission::peer_destination_hash(&active_identity));
+        admit(
+            &mut sequential,
+            link(1),
+            active_identity,
+            PnOfferResponse::WantAll,
+        );
+        start_validation(&mut sequential, &link(1));
+        sequential
+            .install_invalid_stamp_throttle(blocked_destination, TEST_NOW)
+            .unwrap();
+        assert!(matches!(
+            sequential.preflight_offer(link(2), Some(blocked_identity), TEST_NOW),
+            Err(PnOfferRejection::SequentialValidationActive)
+        ));
+
+        // With sequential validation disabled, the full cap wins over the
+        // same peer throttle and static-only access rejection.
+        let mut capped = PnInboundAdmission::new(PnInboundAdmissionConfig {
+            sequential_validation: false,
+            max_inbound_syncs: 1,
+            from_static_only: true,
+            ..PnInboundAdmissionConfig::default()
+        });
+        capped.add_static_peer(PnInboundAdmission::peer_destination_hash(&active_identity));
+        admit(
+            &mut capped,
+            link(3),
+            active_identity,
+            PnOfferResponse::WantAll,
+        );
+        capped.resource_started(&link(3)).unwrap();
+        capped
+            .install_invalid_stamp_throttle(blocked_destination, TEST_NOW)
+            .unwrap();
+        assert!(matches!(
+            capped.preflight_offer(link(4), Some(blocked_identity), TEST_NOW),
+            Err(PnOfferRejection::InboundSyncLimit)
+        ));
+
+        // With capacity available, an active throttle wins over static-only
+        // access rejection. Once it expires, access is the remaining gate.
+        let mut throttled = PnInboundAdmission::new(PnInboundAdmissionConfig {
+            sequential_validation: false,
+            from_static_only: true,
+            ..PnInboundAdmissionConfig::default()
+        });
+        let deadline = throttled
+            .install_invalid_stamp_throttle(blocked_destination, TEST_NOW)
+            .unwrap();
+        assert!(matches!(
+            throttled.preflight_offer(link(5), Some(blocked_identity), TEST_NOW),
+            Err(PnOfferRejection::InvalidStampThrottle)
+        ));
+        assert!(matches!(
+            throttled.preflight_offer(link(5), Some(blocked_identity), deadline),
+            Err(PnOfferRejection::NoAccess)
+        ));
     }
 
     #[test]
@@ -1379,6 +1490,57 @@ mod tests {
         assert_eq!(
             admission.commit_validated_offer(expired, PnOfferResponse::HaveAll, deadline),
             PnOfferAdmission::HaveAll
+        );
+        assert_eq!(admission.throttle_count(), 0);
+    }
+
+    #[test]
+    fn unsolicited_invalid_stamp_throttle_is_expiring_and_peer_scoped() {
+        let mut admission = PnInboundAdmission::default();
+        let bad_identity = identity(0xA1);
+        let bad_destination = PnInboundAdmission::peer_destination_hash(&bad_identity);
+        let other_identity = identity(0xB2);
+
+        assert_eq!(
+            admission.install_invalid_stamp_throttle([0; 16], TEST_NOW),
+            Err(PnThrottleInstallError::UnknownPeerDestination)
+        );
+        assert_eq!(admission.throttle_count(), 0);
+
+        let deadline = admission
+            .install_invalid_stamp_throttle(bad_destination, TEST_NOW)
+            .unwrap();
+        assert_eq!(deadline, TEST_NOW.saturating_add(PN_INVALID_STAMP_THROTTLE));
+        assert_eq!(
+            admission
+                .install_invalid_stamp_throttle(
+                    bad_destination,
+                    TEST_NOW.saturating_sub(Duration::from_secs(1)),
+                )
+                .unwrap(),
+            deadline,
+            "an out-of-order timestamp cannot shorten a live throttle"
+        );
+        assert_eq!(admission.throttle_count(), 1);
+        assert!(matches!(
+            admission.preflight_offer(link(1), Some(bad_identity), TEST_NOW),
+            Err(PnOfferRejection::InvalidStampThrottle)
+        ));
+
+        let other = admission
+            .preflight_offer(link(2), Some(other_identity), TEST_NOW)
+            .expect("an unsolicited peer throttle is isolated to that peer");
+        assert_eq!(
+            admission.discard_candidate(other),
+            PnCandidateDiscardResult::Discarded
+        );
+
+        let expired = admission
+            .preflight_offer(link(1), Some(bad_identity), deadline)
+            .expect("throttle expires at its monotonic deadline");
+        assert_eq!(
+            admission.discard_candidate(expired),
+            PnCandidateDiscardResult::Discarded
         );
         assert_eq!(admission.throttle_count(), 0);
     }
