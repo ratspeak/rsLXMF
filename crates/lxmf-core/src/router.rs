@@ -18,6 +18,7 @@ use crate::inbound_resource::{
 use crate::message::{LxMessage, MessageError};
 use crate::peer::{LxmPeer, OutboundOfferPolicy};
 use crate::propagation::PropagationStore;
+use crate::propagation_client::PropagationTransferStatus;
 use crate::stamper;
 use crate::ticket::{Ticket, TicketStore};
 use crate::types::PropagationTransientId;
@@ -296,8 +297,8 @@ pub struct LxmRouter {
     /// the embedder's loop rate.
     last_jobs_tick: f64,
     pub outbound_propagation_node: Option<[u8; 16]>,
-    /// Progress in the range 0.0..=1.0.
-    pub propagation_transfer_progress: f64,
+    /// Last coherent propagation-client transfer snapshot.
+    pub propagation_transfer_status: PropagationTransferStatus,
     pub client_propagation_messages_received: u64,
     pub client_propagation_messages_served: u64,
     pub unpeered_propagation_incoming: u64,
@@ -363,7 +364,7 @@ impl LxmRouter {
             processing_count: 0,
             last_jobs_tick: 0.0,
             outbound_propagation_node: None,
-            propagation_transfer_progress: 0.0,
+            propagation_transfer_status: PropagationTransferStatus::default(),
             client_propagation_messages_received: 0,
             client_propagation_messages_served: 0,
             unpeered_propagation_incoming: 0,
@@ -374,6 +375,11 @@ impl LxmRouter {
 
     pub fn set_transport(&mut self, tx: mpsc::Sender<rns_transport::messages::TransportMessage>) {
         self.transport_tx = Some(tx);
+    }
+
+    /// Replace the public propagation transfer snapshot from its actor owner.
+    pub fn update_propagation_transfer_status(&mut self, status: PropagationTransferStatus) {
+        self.propagation_transfer_status = status;
     }
 
     pub fn has_transport(&self) -> bool {

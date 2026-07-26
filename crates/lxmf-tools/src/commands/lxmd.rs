@@ -2107,6 +2107,8 @@ impl LxmdRunner {
 
         // Drive propagation client (download from node)
         let mut downloaded_messages = Vec::new();
+        let mut propagation_status = None;
+        let mut acknowledge_propagation = false;
         let propagation_node_ready = self
             .router
             .outbound_propagation_node
@@ -2120,7 +2122,7 @@ impl LxmdRunner {
 
             // Auto-download every 90s
             if now - self.last_propagation_check > 90.0
-                && client.state == lxmf_core::propagation_client::PropagationClientState::Idle
+                && client.state() == lxmf_core::propagation_client::PropagationClientState::Idle
             {
                 if propagation_node_ready {
                     client.start_download();
@@ -2140,10 +2142,23 @@ impl LxmdRunner {
                     );
                 }
             }
+            let status = client.transfer_status();
+            acknowledge_propagation = matches!(
+                status.state,
+                lxmf_core::propagation_client::PropagationClientState::Complete
+                    | lxmf_core::propagation_client::PropagationClientState::Failed
+            );
+            propagation_status = Some(status);
+        }
+        if let Some(status) = propagation_status {
+            self.router.update_propagation_transfer_status(status);
         }
         // Borrow is released; process downloaded messages.
         for msg_data in downloaded_messages {
             self.handle_propagation_downloaded_data(&msg_data);
+        }
+        if acknowledge_propagation && let Some(client) = self.propagation_client.as_mut() {
+            client.acknowledge_transfer();
         }
 
         if let Some(interval) = self.config.announce_interval

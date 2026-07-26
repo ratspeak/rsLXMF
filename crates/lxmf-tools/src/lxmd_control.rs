@@ -612,12 +612,10 @@ pub fn format_remote_status(
                 }
                 _ => "never synced".to_string(),
             };
-            let name = map_str(peer, "name")
-                .unwrap_or("")
-                .trim()
-                .replace(['\n', '\r'], "");
-            let display_name = if name.len() > 45 {
-                format!("{}...", &name[..45])
+            let name =
+                lxmf_core::presentation::sanitize_name(map_str(peer, "name").unwrap_or(""), 46);
+            let display_name = if name.chars().count() > 45 {
+                format!("{}...", name.chars().take(45).collect::<String>())
             } else {
                 name
             };
@@ -953,6 +951,34 @@ mod tests {
         assert!(out.contains("Traffic : 8 messages received in total"));
         assert!(out.contains("3 propagation messages received directly from clients"));
         assert!(out.contains("4 propagation messages served to clients"));
+    }
+
+    #[test]
+    fn status_formatter_bounds_multibyte_untrusted_peer_names() {
+        let hostile_name = format!("{}\u{202e}\u{1f680}", "界".repeat(50));
+        let peer = Value::Map(vec![
+            (
+                Value::String("name".into()),
+                Value::String(hostile_name.into()),
+            ),
+            (Value::String("alive".into()), Value::Boolean(true)),
+        ]);
+        let stats = Value::Map(vec![
+            (
+                Value::String("destination_hash".into()),
+                Value::Binary(vec![0x01; 16]),
+            ),
+            (
+                Value::String("peers".into()),
+                Value::Map(vec![(Value::Binary(vec![0x02; 16]), peer)]),
+            ),
+        ]);
+
+        let out = format_remote_status(&stats, false, true, 0.0);
+        let expected = format!("Name       : {}...", "界".repeat(45));
+        assert!(out.contains(&expected));
+        assert!(!out.contains('\u{202e}'));
+        assert!(!out.contains('\u{1f680}'));
     }
 
     #[test]

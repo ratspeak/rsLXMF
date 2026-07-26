@@ -14,6 +14,7 @@
 //! | [`message`]           | Message object: fields, packing, stamp, encryption |
 //! | [`delivery_ratchet`]  | Durable delivery-announce ratchet transaction      |
 //! | [`inbound_resource`]  | Public inbound Resource tracking/cancellation      |
+//! | [`presentation`]      | Safe bounded presentation of untrusted names       |
 //! | [`router`]            | Actor-driven routing and delivery state machine    |
 //! | [`peer`]              | Propagation-peer state and sync bookkeeping        |
 //! | [`propagation`]       | On-disk store-and-forward message pool             |
@@ -51,6 +52,7 @@ pub mod link_delivery;
 pub mod message;
 pub mod peer;
 pub mod persist;
+pub mod presentation;
 pub mod propagation;
 pub mod propagation_admission;
 pub mod propagation_client;
