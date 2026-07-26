@@ -188,6 +188,20 @@ impl PropagationClient {
             Some(h) => h,
             None => return false,
         };
+        if !matches!(
+            self.status.state,
+            PropagationClientState::Idle
+                | PropagationClientState::Complete
+                | PropagationClientState::Failed
+        ) {
+            return false;
+        }
+        if matches!(
+            self.status.state,
+            PropagationClientState::Complete | PropagationClientState::Failed
+        ) {
+            self.cleanup();
+        }
 
         let (link, request_data) = Link::new_initiator(node_hash, 1);
         let link_id = link.link_id;
@@ -1177,6 +1191,20 @@ mod tests {
         ));
         let outbound = rx.try_recv();
         assert!(matches!(outbound.unwrap(), TransportMessage::Outbound(_)));
+    }
+
+    #[test]
+    fn test_start_download_rejects_an_active_transfer() {
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut client = PropagationClient::new(tx, None, None);
+        client.set_propagation_node([0xBC; 16]);
+
+        assert!(client.start_download());
+        while rx.try_recv().is_ok() {}
+
+        assert!(!client.start_download());
+        assert!(rx.try_recv().is_err());
+        assert_eq!(client.state(), PropagationClientState::LinkEstablishing);
     }
 
     #[test]
