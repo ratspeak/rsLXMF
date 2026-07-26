@@ -661,6 +661,7 @@ impl LxmdRunner {
                     .message_storage_limit
                     .unwrap_or(config.propagation_limit_kb * 1024),
                 max_message_size: config.propagation_limit_kb * 1024,
+                max_offer_size: config.sync_limit_kb.saturating_mul(1000),
                 max_message_age: lxmf_core::constants::MESSAGE_EXPIRY,
                 min_stamp_cost: config
                     .propagation_stamp_cost
@@ -682,6 +683,7 @@ impl LxmdRunner {
                                 .message_storage_limit
                                 .unwrap_or(config.propagation_limit_kb * 1024),
                             max_message_size: config.propagation_limit_kb * 1024,
+                            max_offer_size: config.sync_limit_kb.saturating_mul(1000),
                             max_message_age: lxmf_core::constants::MESSAGE_EXPIRY,
                             min_stamp_cost: config
                                 .propagation_stamp_cost

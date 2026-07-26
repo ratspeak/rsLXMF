@@ -441,12 +441,10 @@ impl PropagationRequestHandler {
             true
         };
 
-        let peer_hash = remote_identity_hash.copied().unwrap_or([0u8; 16]);
-
         node.handle_offer_request(
             request_data,
             crate::propagation_node::OfferRequestContext {
-                peer_hash,
+                peer_hash: remote_identity_hash.copied().unwrap_or([0u8; 16]),
                 identity_known,
                 is_throttled,
                 access_allowed,

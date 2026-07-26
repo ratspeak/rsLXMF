@@ -650,6 +650,7 @@ dependencies = [
  "hex",
  "proptest",
  "rand 0.8.5",
+ "rmp",
  "rmp-serde",
  "rmpv",
  "rns-crypto",

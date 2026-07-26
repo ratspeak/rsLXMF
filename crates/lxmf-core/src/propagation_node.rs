@@ -12,6 +12,8 @@ use crate::constants::*;
 use crate::message::LxMessage;
 use crate::peer::LxmPeer;
 use crate::propagation::{PropagationEntry, PropagationStore, hex_encode};
+use crate::propagation_admission::PnOfferCandidate;
+use crate::propagation_offer::{PnOfferEvaluation, PnOfferEvaluationError};
 use crate::sync::{OfferResponse, SyncGet, SyncOffer, SyncSession};
 use crate::types::PropagationTransientId;
 
@@ -24,6 +26,9 @@ pub struct PropagationNodeConfig {
     pub min_stamp_cost: u8,
     pub peering_cost: u8,
     pub max_message_size: usize,
+    /// Maximum encoded inbound `/offer` request size. This follows the
+    /// node's advertised propagation sync budget.
+    pub max_offer_size: usize,
 }
 
 impl Default for PropagationNodeConfig {
@@ -35,6 +40,7 @@ impl Default for PropagationNodeConfig {
             min_stamp_cost: 0,
             peering_cost: PEERING_COST,
             max_message_size: DELIVERY_LIMIT * 1024,
+            max_offer_size: SYNC_LIMIT * 1000,
         }
     }
 }
@@ -147,7 +153,8 @@ pub struct PropagationNode {
     sync_sessions: HashMap<[u8; 16], SyncSession>,
     pub dest_hash: [u8; 16],
     storage_path: Option<PathBuf>,
-    /// Per-peer last offer time, for rate-limiting.
+    /// Transitional pre-1.1 behavior; removed when the daemon-lifetime
+    /// `PnInboundAdmission` becomes the live throttle owner.
     last_offer_times: HashMap<[u8; 16], f64>,
 }
 
@@ -586,49 +593,6 @@ impl PropagationNode {
             .collect()
     }
 
-    /// Offer request with typed error responses. Python reference:
-    /// LXMRouter.offer_request() (LXMRouter.py:2139-2189).
-    ///
-    /// The returned `OfferResponse` distinguishes
-    /// NoIdentity/Throttled/NoAccess/InvalidKey errors from
-    /// HaveAll/WantAll/WantSome outcomes.
-    pub fn offer_request_checked(
-        &mut self,
-        _peer_hash: [u8; 16],
-        identity_known: bool,
-        is_throttled: bool,
-        access_allowed: bool,
-        peering_key_valid: bool,
-        offered_ids: &[PropagationTransientId],
-    ) -> OfferResponse {
-        if !identity_known {
-            return OfferResponse::ErrorNoIdentity;
-        }
-        if is_throttled {
-            return OfferResponse::ErrorThrottled;
-        }
-        if !access_allowed {
-            return OfferResponse::ErrorNoAccess;
-        }
-        if !peering_key_valid {
-            return OfferResponse::ErrorInvalidKey;
-        }
-
-        let wanted: Vec<PropagationTransientId> = offered_ids
-            .iter()
-            .filter(|id| !self.store.contains(id))
-            .copied()
-            .collect();
-
-        if wanted.is_empty() {
-            OfferResponse::HaveAll
-        } else if wanted.len() == offered_ids.len() {
-            OfferResponse::WantAll
-        } else {
-            OfferResponse::WantSome(wanted.iter().map(|id| id.to_vec()).collect())
-        }
-    }
-
     /// Wire format matches Python: Boolean for WantAll/HaveAll, integer for
     /// error codes, array of binary IDs for WantSome.
     pub fn encode_offer_response(response: &OfferResponse) -> Vec<u8> {
@@ -656,8 +620,10 @@ impl PropagationNode {
     /// LXMRouter.offer_request() (LXMRouter.py:2139-2189).
     ///
     /// `request_data` is msgpack `[peering_key, [transient_id_1, ...]]`.
-    /// Decodes, runs `offer_request_checked`, and returns an encoded
-    /// `OfferResponse` ready for `link.create_response()`.
+    /// Transitional compatibility wrapper for callers that still compute the
+    /// outer identity/access/throttle gates. New daemon code must preflight a
+    /// long-lived `PnInboundAdmission` and call `evaluate_offer_request`
+    /// directly before committing the exact candidate.
     pub fn handle_offer_request(
         &mut self,
         request_data: &[u8],
@@ -665,78 +631,65 @@ impl PropagationNode {
     ) -> Vec<u8> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs_f64())
+            .map(|duration| duration.as_secs_f64())
             .unwrap_or(0.0);
-        if let Some(&last_time) = self.last_offer_times.get(&ctx.peer_hash)
-            && now - last_time < PN_STAMP_THROTTLE as f64
+        if self
+            .last_offer_times
+            .get(&ctx.peer_hash)
+            .is_some_and(|last_time| now - last_time < PN_STAMP_THROTTLE as f64)
         {
             return Self::encode_offer_response(&OfferResponse::ErrorThrottled);
         }
 
-        let (peering_key, offered_ids) = match Self::decode_offer_request(request_data) {
-            Some(parsed) => parsed,
-            None => {
-                return Self::encode_offer_response(&OfferResponse::ErrorInvalidData);
-            }
+        let offer = match crate::propagation_offer::decode(request_data, self.config.max_offer_size)
+        {
+            Ok(offer) => offer,
+            Err(error) => return Self::encode_offer_response(&error.wire_response()),
         };
 
-        // Python validates peering_id = local_identity.hash || remote_identity.hash.
-        let peering_key_valid = if peering_key.is_empty() {
-            self.config.peering_cost == 0
-        } else if peering_key.len() == 32 {
-            if let (Some(local_hash), Some(remote_hash)) =
-                (ctx.local_identity_hash, ctx.remote_identity_hash)
-            {
-                let mut key = [0u8; 32];
-                key.copy_from_slice(&peering_key);
-                let mut peering_id = Vec::with_capacity(32);
-                peering_id.extend_from_slice(local_hash);
-                peering_id.extend_from_slice(remote_hash);
-                crate::stamper::validate_peering_key(&peering_id, &key, self.config.peering_cost)
-            } else {
-                false
+        let response = if !ctx.identity_known {
+            OfferResponse::ErrorNoIdentity
+        } else if ctx.is_throttled {
+            OfferResponse::ErrorThrottled
+        } else if !ctx.access_allowed {
+            OfferResponse::ErrorNoAccess
+        } else if let (Some(local_hash), Some(remote_hash)) =
+            (ctx.local_identity_hash, ctx.remote_identity_hash)
+        {
+            match crate::propagation_offer::evaluate_decoded(
+                offer,
+                local_hash,
+                remote_hash,
+                self.config.peering_cost,
+                |transient_id| self.store.contains(transient_id),
+            ) {
+                Ok(evaluation) => evaluation.into_wire_response(),
+                Err(error) => error.wire_response(),
             }
         } else {
-            false
+            OfferResponse::ErrorInvalidKey
         };
 
-        let response = self.offer_request_checked(
-            ctx.peer_hash,
-            ctx.identity_known,
-            ctx.is_throttled,
-            ctx.access_allowed,
-            peering_key_valid,
-            &offered_ids,
-        );
-
         self.last_offer_times.insert(ctx.peer_hash, now);
-
         Self::encode_offer_response(&response)
     }
 
-    /// Expected wire format: `[peering_key_bytes, [transient_id_1, ...]]`.
-    fn decode_offer_request(data: &[u8]) -> Option<(Vec<u8>, Vec<PropagationTransientId>)> {
-        let value: rmpv::Value = rmpv::decode::read_value(&mut &data[..]).ok()?;
-        let arr = value.as_array()?;
-        if arr.len() < 2 {
-            return None;
-        }
-
-        let peering_key = arr[0].as_slice().unwrap_or(&[]).to_vec();
-
-        let ids_array = arr[1].as_array()?;
-        let mut offered_ids = Vec::with_capacity(ids_array.len());
-        for id_val in ids_array {
-            if let Some(id_bytes) = id_val.as_slice()
-                && id_bytes.len() == 32
-            {
-                let mut tid = [0u8; 32];
-                tid.copy_from_slice(id_bytes);
-                offered_ids.push(tid);
-            }
-        }
-
-        Some((peering_key, offered_ids))
+    /// Evaluate a preflighted `/offer` without mutating admission state.
+    pub fn evaluate_offer_request(
+        &self,
+        request_data: &[u8],
+        local_identity_hash: &[u8; 16],
+        candidate: &PnOfferCandidate,
+    ) -> Result<PnOfferEvaluation, PnOfferEvaluationError> {
+        let remote_identity_hash = candidate.peer_identity_hash();
+        crate::propagation_offer::evaluate(
+            request_data,
+            local_identity_hash,
+            &remote_identity_hash,
+            self.config.peering_cost,
+            self.config.max_offer_size,
+            |transient_id| self.store.contains(transient_id),
+        )
     }
 
     /// Handle a Link REQUEST at the `/get` path for client download. Python
@@ -1782,84 +1735,6 @@ mod tests {
     }
 
     #[test]
-    fn test_offer_request_checked_no_identity() {
-        let mut node = PropagationNode::new(PropagationNodeConfig::default(), [0xAA; 16]);
-        let resp = node.offer_request_checked([0xDD; 16], false, false, true, true, &[]);
-        assert_eq!(resp, OfferResponse::ErrorNoIdentity);
-    }
-
-    #[test]
-    fn test_offer_request_checked_throttled() {
-        let mut node = PropagationNode::new(PropagationNodeConfig::default(), [0xAA; 16]);
-        let resp = node.offer_request_checked([0xDD; 16], true, true, true, true, &[]);
-        assert_eq!(resp, OfferResponse::ErrorThrottled);
-    }
-
-    #[test]
-    fn test_offer_request_checked_no_access() {
-        let mut node = PropagationNode::new(PropagationNodeConfig::default(), [0xAA; 16]);
-        let resp = node.offer_request_checked([0xDD; 16], true, false, false, true, &[]);
-        assert_eq!(resp, OfferResponse::ErrorNoAccess);
-    }
-
-    #[test]
-    fn test_offer_request_checked_invalid_key() {
-        let mut node = PropagationNode::new(PropagationNodeConfig::default(), [0xAA; 16]);
-        let resp = node.offer_request_checked([0xDD; 16], true, false, true, false, &[]);
-        assert_eq!(resp, OfferResponse::ErrorInvalidKey);
-    }
-
-    #[test]
-    fn test_offer_request_checked_have_all() {
-        let mut node = PropagationNode::new(PropagationNodeConfig::default(), [0xAA; 16]);
-        let msg = make_signed_message([0xBB; 16], [0xCC; 16], "Test", "content");
-        let tid = msg.transient_id.unwrap();
-        node.accept_message(&msg);
-
-        let resp = node.offer_request_checked([0xDD; 16], true, false, true, true, &[tid]);
-        assert_eq!(resp, OfferResponse::HaveAll);
-    }
-
-    #[test]
-    fn test_offer_request_checked_want_all() {
-        let mut node = PropagationNode::new(PropagationNodeConfig::default(), [0xAA; 16]);
-
-        let resp = node.offer_request_checked(
-            [0xDD; 16],
-            true,
-            false,
-            true,
-            true,
-            &[tid(0x11), tid(0x22)],
-        );
-        assert_eq!(resp, OfferResponse::WantAll);
-    }
-
-    #[test]
-    fn test_offer_request_checked_want_some() {
-        let mut node = PropagationNode::new(PropagationNodeConfig::default(), [0xAA; 16]);
-        let msg = make_signed_message([0xBB; 16], [0xCC; 16], "Test", "content");
-        let stored_tid = msg.transient_id.unwrap();
-        node.accept_message(&msg);
-
-        let resp = node.offer_request_checked(
-            [0xDD; 16],
-            true,
-            false,
-            true,
-            true,
-            &[stored_tid, tid(0x99)],
-        );
-        match resp {
-            OfferResponse::WantSome(ids) => {
-                assert_eq!(ids.len(), 1);
-                assert_eq!(ids[0], id(0x99));
-            }
-            _ => panic!("expected WantSome"),
-        }
-    }
-
-    #[test]
     fn test_encode_offer_response_roundtrip() {
         let encoded = PropagationNode::encode_offer_response(&OfferResponse::WantAll);
         let parsed = OfferResponse::from_msgpack(&encoded);
@@ -1921,6 +1796,32 @@ mod tests {
         );
         let response = OfferResponse::from_msgpack(&response_bytes);
         assert_eq!(response, OfferResponse::WantAll);
+    }
+
+    #[test]
+    fn test_offer_evaluation_uses_preflight_candidate_identity() {
+        let cost = 8;
+        let local_identity = [0xAA; 16];
+        let remote_identity = [0xBB; 16];
+        let config = PropagationNodeConfig {
+            peering_cost: cost,
+            ..Default::default()
+        };
+        let node = PropagationNode::new(config, [0xCC; 16]);
+        let mut admission = crate::propagation_admission::PnInboundAdmission::default();
+        let candidate = admission
+            .preflight_offer([0xDD; 16], Some(remote_identity), std::time::Duration::ZERO)
+            .unwrap();
+        let key = peering_key(&local_identity, &remote_identity, cost);
+        let request = crate::encode_value(&rmpv::Value::Array(vec![
+            rmpv::Value::Binary(key.to_vec()),
+            rmpv::Value::Array(vec![rmpv::Value::Binary(id(0x11))]),
+        ]));
+
+        assert_eq!(
+            node.evaluate_offer_request(&request, &local_identity, &candidate),
+            Ok(PnOfferEvaluation::WantAll)
+        );
     }
 
     #[test]
@@ -2004,52 +1905,47 @@ mod tests {
 
     #[test]
     fn test_handle_offer_request_invalid_data() {
-        let mut node = PropagationNode::new(PropagationNodeConfig::default(), [0xAA; 16]);
+        let mut node = PropagationNode::new(
+            PropagationNodeConfig {
+                peering_cost: 0,
+                ..Default::default()
+            },
+            [0xAA; 16],
+        );
+        let local_identity = [0xAA; 16];
+        let remote_identity = [0xBB; 16];
 
         let response_bytes = node.handle_offer_request(
             &[0xFF, 0xFF],
-            offer_ctx([0xBB; 16], true, false, true, None, None),
+            offer_ctx(
+                [0xBB; 16],
+                true,
+                false,
+                true,
+                Some(&local_identity),
+                Some(&remote_identity),
+            ),
         );
         let response = OfferResponse::from_msgpack(&response_bytes);
         assert_eq!(response, OfferResponse::ErrorInvalidData);
-    }
 
-    #[test]
-    fn test_decode_offer_request_valid() {
-        use rmpv::Value;
-        let offer = Value::Array(vec![
-            Value::Binary(vec![0xAA; 32]),
-            Value::Array(vec![Value::Binary(id(0x11)), Value::Binary(id(0x22))]),
-        ]);
-        let mut buf = Vec::new();
-        rmpv::encode::write_value(&mut buf, &offer).unwrap();
-
-        let result = PropagationNode::decode_offer_request(&buf);
-        assert!(result.is_some());
-        let (key, ids) = result.unwrap();
-        assert_eq!(key, vec![0xAA; 32]);
-        assert_eq!(ids.len(), 2);
-        assert_eq!(ids[0], tid(0x11));
-        assert_eq!(ids[1], tid(0x22));
-    }
-
-    #[test]
-    fn test_decode_offer_request_filters_bad_ids() {
-        use rmpv::Value;
-        let offer = Value::Array(vec![
-            Value::Binary(vec![]),
-            Value::Array(vec![
-                Value::Binary(vec![0x11; 16]),
-                Value::Binary(vec![0x22; 8]),
-                Value::Binary(id(0x33)),
-            ]),
-        ]);
-        let mut buf = Vec::new();
-        rmpv::encode::write_value(&mut buf, &offer).unwrap();
-
-        let (_, ids) = PropagationNode::decode_offer_request(&buf).unwrap();
-        assert_eq!(ids.len(), 1);
-        assert_eq!(ids[0], tid(0x33));
+        let valid_request = crate::encode_value(&rmpv::Value::Array(vec![
+            rmpv::Value::Binary(vec![]),
+            rmpv::Value::Array(vec![rmpv::Value::Binary(id(0x11))]),
+        ]));
+        let response_bytes = node.handle_offer_request(
+            &valid_request,
+            offer_ctx(
+                [0xBB; 16],
+                true,
+                false,
+                true,
+                Some(&local_identity),
+                Some(&remote_identity),
+            ),
+        );
+        let response = OfferResponse::from_msgpack(&response_bytes);
+        assert_eq!(response, OfferResponse::WantAll);
     }
 
     #[test]

@@ -30,6 +30,7 @@ lxmf-tools = { path = "crates/lxmf-tools", version = "1.0.1" }
 base64 = "0.22"
 
 # Serialization
+rmp = "0.8"
 rmp-serde = "1"
 rmpv = "1"
 serde = { version = "1", features = ["derive"] }
