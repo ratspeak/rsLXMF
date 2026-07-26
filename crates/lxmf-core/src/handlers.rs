@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 
 use crate::constants::*;
+use crate::presentation::{MAX_ADVERTISED_NAME_CHARS, sanitize_name};
 
 /// Announce handler type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,7 +100,12 @@ impl PropagationNodeAnnounceData {
     }
 
     pub fn set_name(&mut self, name: &str) {
-        self.metadata.insert(PN_META_NAME, name.as_bytes().to_vec());
+        let name = sanitize_name(name, MAX_ADVERTISED_NAME_CHARS);
+        if name.is_empty() {
+            self.metadata.remove(&PN_META_NAME);
+        } else {
+            self.metadata.insert(PN_META_NAME, name.into_bytes());
+        }
     }
 }
 
@@ -144,6 +150,17 @@ pub fn get_propagation_node_app_data(data: &PropagationNodeAnnounceData) -> Vec<
 /// dropped because it duplicated this function's checks and every
 /// in-tree caller called both back-to-back.
 pub fn parse_pn_announce_data(data: &[u8]) -> Option<PropagationNodeAnnounceData> {
+    fn nonnegative_u64(value: &rmpv::Value) -> Option<u64> {
+        value
+            .as_u64()
+            .or_else(|| value.as_i64().and_then(|number| number.try_into().ok()))
+            .or_else(|| {
+                value.as_f64().and_then(|number| {
+                    (number.is_finite() && number >= 0.0).then_some(number as u64)
+                })
+            })
+    }
+
     let value: rmpv::Value = rmpv::decode::read_value(&mut &data[..]).ok()?;
     let arr = value.as_array()?;
     if arr.len() < 7 {
@@ -155,38 +172,27 @@ pub fn parse_pn_announce_data(data: &[u8]) -> Option<PropagationNodeAnnounceData
         .or_else(|| arr[1].as_u64().map(|u| u as i64))
         .or_else(|| arr[1].as_f64().map(|f| f as i64))?;
     let node_state = arr[2].as_bool()?;
-    let transfer_limit = arr[3]
-        .as_u64()
-        .or_else(|| arr[3].as_i64().map(|i| i as u64))
-        .or_else(|| arr[3].as_f64().map(|f| f as u64))?;
-    let sync_limit = arr[4]
-        .as_u64()
-        .or_else(|| arr[4].as_i64().map(|i| i as u64))
-        .or_else(|| arr[4].as_f64().map(|f| f as u64))?;
+    let transfer_limit = nonnegative_u64(&arr[3])?;
+    let sync_limit = nonnegative_u64(&arr[4])?;
 
     let costs = arr[5].as_array()?;
     if costs.len() < 3 {
         return None;
     }
-    let stamp_cost = costs[0]
-        .as_u64()
-        .or_else(|| costs[0].as_i64().map(|i| i as u64))? as u8;
-    let stamp_flex = costs[1]
-        .as_u64()
-        .or_else(|| costs[1].as_i64().map(|i| i as u64))? as u8;
-    let peering_cost = costs[2]
-        .as_u64()
-        .or_else(|| costs[2].as_i64().map(|i| i as u64))? as u8;
+    let stamp_cost = u8::try_from(nonnegative_u64(&costs[0])?).ok()?;
+    let stamp_flex = u8::try_from(nonnegative_u64(&costs[1])?).ok()?;
+    let peering_cost = u8::try_from(nonnegative_u64(&costs[2])?).ok()?;
 
+    // Python's `pn_announce_data_is_valid()` requires the metadata element to
+    // be a map. Unknown keys and non-binary values are ignored here because
+    // the typed Rust API can only retain metadata it can represent safely.
     let mut metadata = HashMap::new();
-    if let Some(map) = arr[6].as_map() {
-        for (k, v) in map {
-            if let (Some(key), Some(val)) = (
-                k.as_u64().map(|u| u as u8),
-                v.as_slice().map(|s| s.to_vec()),
-            ) {
-                metadata.insert(key, val);
-            }
+    for (k, v) in arr[6].as_map()? {
+        if let (Some(key), Some(val)) = (
+            k.as_u64().and_then(|number| number.try_into().ok()),
+            v.as_slice().map(|s| s.to_vec()),
+        ) {
+            metadata.insert(key, val);
         }
     }
 
@@ -212,7 +218,7 @@ pub fn pn_stamp_cost_from_app_data(data: &[u8]) -> Option<u8> {
 
 /// Encode delivery-announce `app_data` as msgpack
 /// `[display_name, stamp_cost, supported_functionality]` where the feature
-/// list advertises [`SF_COMPRESSION`](crate::constants::SF_COMPRESSION).
+/// list advertises [`SF_COMPRESSION`].
 ///
 /// `stamp_cost` must be in `1..=254`; out-of-range or `None` values are encoded as nil.
 ///
@@ -220,10 +226,10 @@ pub fn pn_stamp_cost_from_app_data(data: &[u8]) -> Option<u8> {
 pub fn get_announce_app_data(display_name: Option<&str>, stamp_cost: Option<u8>) -> Vec<u8> {
     use rmpv::Value;
 
-    let name_val = match display_name {
-        Some(name) => Value::Binary(name.as_bytes().to_vec()),
-        None => Value::Nil,
-    };
+    let name_val = display_name
+        .map(|name| sanitize_name(name, MAX_ADVERTISED_NAME_CHARS))
+        .filter(|name| !name.is_empty())
+        .map_or(Value::Nil, |name| Value::Binary(name.into_bytes()));
 
     let cost_val = match stamp_cost {
         Some(cost) if cost > 0 && cost < 255 => Value::from(cost as u64),
@@ -252,7 +258,8 @@ pub fn parse_announce_app_data(data: &[u8]) -> Option<(Option<String>, Option<u8
     let display_name = arr[0]
         .as_slice()
         .and_then(|b| String::from_utf8(b.to_vec()).ok())
-        .map(|name| name.replace('\0', "").trim().to_string());
+        .map(|name| sanitize_name(&name, MAX_ADVERTISED_NAME_CHARS))
+        .filter(|name| !name.is_empty());
 
     let stamp_cost = arr[1].as_u64().map(|c| c as u8);
 
@@ -322,7 +329,10 @@ pub fn compression_support_from_app_data(data: &[u8]) -> bool {
 pub fn pn_name_from_app_data(data: &[u8]) -> Option<String> {
     let parsed = parse_pn_announce_data(data)?;
     let name_bytes = parsed.metadata.get(&crate::constants::PN_META_NAME)?;
-    String::from_utf8(name_bytes.clone()).ok()
+    String::from_utf8(name_bytes.clone())
+        .ok()
+        .map(|name| sanitize_name(&name, MAX_ADVERTISED_NAME_CHARS))
+        .filter(|name| !name.is_empty())
 }
 
 /// Outcome of a resource transfer, matching Python `resource_concluded` /
@@ -441,12 +451,10 @@ impl PropagationRequestHandler {
             true
         };
 
-        let peer_hash = remote_identity_hash.copied().unwrap_or([0u8; 16]);
-
         node.handle_offer_request(
             request_data,
             crate::propagation_node::OfferRequestContext {
-                peer_hash,
+                peer_hash: remote_identity_hash.copied().unwrap_or([0u8; 16]),
                 identity_known,
                 is_throttled,
                 access_allowed,
@@ -457,8 +465,9 @@ impl PropagationRequestHandler {
     }
 
     /// Handle a `/get` request from a client downloading messages. Phase-2
-    /// responses come back as a [`GetRequestAction::ServeFiles`] plan — the
-    /// embedder resolves it after releasing the node lock.
+    /// responses come back as a
+    /// [`GetRequestAction::ServeFiles`](crate::propagation_node::GetRequestAction::ServeFiles)
+    /// plan — the embedder resolves it after releasing the node lock.
     ///
     /// Python reference: `LXMRouter.message_get_request` — LXMRouter.py:1425-1499.
     pub fn handle_message_get_request(
@@ -717,6 +726,47 @@ mod tests {
         assert!(parse_pn_announce_data(&[]).is_none());
         assert!(parse_pn_announce_data(&[0x91, 0xC2]).is_none());
         assert!(parse_pn_announce_data(&[0x01]).is_none());
+
+        let non_map_metadata = rmpv::Value::Array(vec![
+            rmpv::Value::Boolean(false),
+            rmpv::Value::from(1_777_716_440u64),
+            rmpv::Value::Boolean(true),
+            rmpv::Value::from(10_240),
+            rmpv::Value::from(10_240),
+            rmpv::Value::Array(vec![
+                rmpv::Value::from(16),
+                rmpv::Value::from(3),
+                rmpv::Value::from(18),
+            ]),
+            rmpv::Value::Array(Vec::new()),
+        ]);
+        assert!(
+            parse_pn_announce_data(&crate::encode_value(&non_map_metadata)).is_none(),
+            "Python rejects propagation announces whose metadata is not a map"
+        );
+    }
+
+    #[test]
+    fn test_pn_announce_data_rejects_wrapping_policy_values() {
+        use rmpv::Value;
+
+        let encode = |transfer_limit: Value, stamp_cost: Value| {
+            let value = Value::Array(vec![
+                Value::Boolean(false),
+                Value::from(1_777_716_440u64),
+                Value::Boolean(true),
+                transfer_limit,
+                Value::from(10240),
+                Value::Array(vec![stamp_cost, Value::from(3), Value::from(18)]),
+                Value::Map(vec![]),
+            ]);
+            let mut packed = Vec::new();
+            rmpv::encode::write_value(&mut packed, &value).unwrap();
+            packed
+        };
+
+        assert!(parse_pn_announce_data(&encode(Value::from(-1), Value::from(16))).is_none());
+        assert!(parse_pn_announce_data(&encode(Value::from(10240), Value::from(256))).is_none());
     }
 
     #[test]
@@ -801,6 +851,18 @@ mod tests {
         assert_eq!(
             display_name_from_app_data(&packed),
             Some("Alice".to_string())
+        );
+    }
+
+    #[test]
+    fn test_display_name_from_app_data_sanitizes_untrusted_unicode() {
+        let packed = get_announce_app_data(
+            Some("  Ａlice\u{202e}\u{e000}\u{1f680}\nNetwork  "),
+            Some(12),
+        );
+        assert_eq!(
+            display_name_from_app_data(&packed),
+            Some("AliceNetwork".to_string())
         );
     }
 

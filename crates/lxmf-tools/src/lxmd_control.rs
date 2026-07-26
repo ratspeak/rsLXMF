@@ -300,7 +300,7 @@ pub fn encode_router_control_stats(
         (Value::String("uptime".into()), Value::F64(uptime)),
         (
             Value::String("delivery_limit".into()),
-            Value::from(router.config.delivery_limit_kb as u64),
+            Value::F64(router.config.delivery_limit_kb),
         ),
         (
             Value::String("propagation_limit".into()),
@@ -612,12 +612,10 @@ pub fn format_remote_status(
                 }
                 _ => "never synced".to_string(),
             };
-            let name = map_str(peer, "name")
-                .unwrap_or("")
-                .trim()
-                .replace(['\n', '\r'], "");
-            let display_name = if name.len() > 45 {
-                format!("{}...", &name[..45])
+            let name =
+                lxmf_core::presentation::sanitize_name(map_str(peer, "name").unwrap_or(""), 46);
+            let display_name = if name.chars().count() > 45 {
+                format!("{}...", name.chars().take(45).collect::<String>())
             } else {
                 name
             };
@@ -956,6 +954,34 @@ mod tests {
     }
 
     #[test]
+    fn status_formatter_bounds_multibyte_untrusted_peer_names() {
+        let hostile_name = format!("{}\u{202e}\u{1f680}", "界".repeat(50));
+        let peer = Value::Map(vec![
+            (
+                Value::String("name".into()),
+                Value::String(hostile_name.into()),
+            ),
+            (Value::String("alive".into()), Value::Boolean(true)),
+        ]);
+        let stats = Value::Map(vec![
+            (
+                Value::String("destination_hash".into()),
+                Value::Binary(vec![0x01; 16]),
+            ),
+            (
+                Value::String("peers".into()),
+                Value::Map(vec![(Value::Binary(vec![0x02; 16]), peer)]),
+            ),
+        ]);
+
+        let out = format_remote_status(&stats, false, true, 0.0);
+        let expected = format!("Name       : {}...", "界".repeat(45));
+        assert!(out.contains(&expected));
+        assert!(!out.contains('\u{202e}'));
+        assert!(!out.contains('\u{1f680}'));
+    }
+
+    #[test]
     fn stats_encoder_uses_python_compile_stats_shape() {
         use lxmf_core::peer::LxmPeer;
         use lxmf_core::router::{LxmRouter, RouterConfig};
@@ -964,6 +990,7 @@ mod tests {
             propagation_enabled: true,
             ..Default::default()
         };
+        config.delivery_limit_kb = 0.38;
         config.ext.message_storage_limit = Some(500_000_000);
         let mut router = LxmRouter::new(config);
         router.propagation_start_time = Some(1_700_000_000.0);
@@ -1022,6 +1049,7 @@ mod tests {
         assert_eq!(map_u64(&stats, "static_peers"), Some(1));
         assert_eq!(map_u64(&stats, "discovered_peers"), Some(0));
         assert_eq!(map_u64(&stats, "total_peers"), Some(1));
+        assert_eq!(map_f64(&stats, "delivery_limit"), Some(0.38));
 
         let peers = map_value(&stats, "peers").unwrap().as_map().unwrap();
         let peer_stats = &peers[0].1;

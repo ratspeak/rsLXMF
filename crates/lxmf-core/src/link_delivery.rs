@@ -3157,6 +3157,7 @@ mod tests {
             .try_send(DestinationEvent::InboundPacket {
                 raw: proof_raw.into(),
                 interface_id: 0,
+                metrics: Default::default(),
             })
             .unwrap();
         mgr.drain_events(&HashMap::new());
@@ -3780,6 +3781,7 @@ mod tests {
             .try_send(DestinationEvent::InboundPacket {
                 raw: raw.clone(),
                 interface_id: 0,
+                metrics: Default::default(),
             })
             .unwrap();
 
@@ -3850,6 +3852,7 @@ mod tests {
             .try_send(DestinationEvent::InboundPacket {
                 raw: raw.clone(),
                 interface_id: 0,
+                metrics: Default::default(),
             })
             .unwrap();
 
@@ -4279,6 +4282,7 @@ mod tests {
                     &close_body,
                 ),
                 interface_id: 0,
+                metrics: Default::default(),
             })
             .unwrap();
 
@@ -4320,6 +4324,7 @@ mod tests {
             .try_send(DestinationEvent::InboundPacket {
                 raw: link_data_packet(link_id, rns_wire::context::PacketContext::LinkClose, &[0u8]),
                 interface_id: 0,
+                metrics: Default::default(),
             })
             .unwrap();
 
@@ -4411,6 +4416,7 @@ mod tests {
             .try_send(DestinationEvent::InboundPacket {
                 raw: proof_raw.into(),
                 interface_id: 0,
+                metrics: Default::default(),
             })
             .unwrap();
         mgr.drain_events(&HashMap::new());
@@ -4460,6 +4466,7 @@ mod tests {
                     &close_body,
                 ),
                 interface_id: 0,
+                metrics: Default::default(),
             })
             .unwrap();
 

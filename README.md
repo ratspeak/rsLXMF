@@ -238,8 +238,8 @@ Minimal config:
 [lxmf]
 display_name = Rat
 announce_at_start = no
+# stamp_cost = 12
 delivery_transfer_max_accepted_size = 1000
-# stamp_cost = 8
 # on_inbound = /path/to/handler
 
 [propagation]

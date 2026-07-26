@@ -3,6 +3,9 @@
 //! Python reference: LXMF/Utilities/lxmd.py.
 
 use lxmf_core::constants::*;
+use lxmf_core::propagation_admission::{
+    PN_DEFAULT_MAX_INBOUND_SYNCS, PN_MIN_MAX_INBOUND_SYNCS, PnInboundAdmissionConfig,
+};
 use lxmf_core::router::{LxmRouter, RouterConfig, RouterConfigExt};
 use rns_runtime::config::{Config, ConfigSection};
 
@@ -16,6 +19,7 @@ pub struct PythonLxmdConfig {
     pub display_name: String,
     pub peer_announce_at_start: bool,
     pub peer_announce_interval: Option<i64>,
+    pub peer_stamp_cost: i64,
     pub delivery_transfer_max_accepted_size: f64,
     pub on_inbound: Option<String>,
     pub enable_propagation_node: bool,
@@ -24,6 +28,9 @@ pub struct PythonLxmdConfig {
     pub node_announce_at_start: bool,
     pub autopeer: bool,
     pub autopeer_maxdepth: Option<i64>,
+    pub sequential_pn_stamp_validation: bool,
+    pub static_peers_bypass_sequential: bool,
+    pub max_inbound_syncs: i64,
     pub node_announce_interval: Option<i64>,
     pub message_storage_limit: f64,
     pub propagation_transfer_max_accepted_size: f64,
@@ -58,6 +65,9 @@ impl PythonLxmdConfig {
                 .to_string(),
             peer_announce_at_start: get_bool_or(lxmf, "announce_at_start", false),
             peer_announce_interval: get_int(lxmf, "announce_interval").map(|v| v * 60),
+            peer_stamp_cost: get_int(lxmf, "stamp_cost")
+                .map(|value| value.max(1))
+                .unwrap_or(12),
             delivery_transfer_max_accepted_size: get_float_or_floor(
                 lxmf,
                 "delivery_transfer_max_accepted_size",
@@ -75,6 +85,19 @@ impl PythonLxmdConfig {
             node_announce_at_start: get_bool_or(propagation, "announce_at_start", false),
             autopeer: get_bool_or(propagation, "autopeer", true),
             autopeer_maxdepth: get_int(propagation, "autopeer_maxdepth"),
+            sequential_pn_stamp_validation: get_bool_or(
+                propagation,
+                "sequential_pn_stamp_validation",
+                true,
+            ),
+            static_peers_bypass_sequential: get_bool_or(
+                propagation,
+                "static_peers_bypass_sequential",
+                true,
+            ),
+            max_inbound_syncs: get_int(propagation, "max_inbound_syncs")
+                .map(|value| value.max(PN_MIN_MAX_INBOUND_SYNCS as i64))
+                .unwrap_or(PN_DEFAULT_MAX_INBOUND_SYNCS as i64),
             node_announce_interval: get_int(propagation, "announce_interval").map(|v| v * 60),
             message_storage_limit: get_float_or_floor(
                 propagation,
@@ -152,6 +175,9 @@ pub struct DaemonConfig {
     pub max_peers: usize,
     pub autopeer: bool,
     pub autopeer_maxdepth: usize,
+    pub sequential_pn_stamp_validation: bool,
+    pub static_peers_bypass_sequential: bool,
+    pub max_inbound_syncs: usize,
     pub propagation_limit_kb: usize,
     pub sync_limit_kb: usize,
     pub on_inbound_command: Option<String>,
@@ -166,7 +192,7 @@ pub struct DaemonConfig {
     pub from_static_only: bool,
     /// Max accepted inbound delivery transfer size in KB. Python reference:
     /// `delivery_transfer_max_accepted_size` in `lxmd.py`.
-    pub delivery_transfer_max_accepted_size: usize,
+    pub delivery_transfer_max_accepted_size: f64,
 }
 
 impl Default for DaemonConfig {
@@ -176,7 +202,7 @@ impl Default for DaemonConfig {
             node_name: None,
             announce_at_start: false,
             announce_interval: None,
-            stamp_cost: None,
+            stamp_cost: Some(12),
             propagation_enabled: false,
             outbound_propagation_node: None,
             propagation_stamp_cost: PROPAGATION_COST,
@@ -186,6 +212,9 @@ impl Default for DaemonConfig {
             max_peers: MAX_PEERS,
             autopeer: true,
             autopeer_maxdepth: AUTOPEER_MAXDEPTH,
+            sequential_pn_stamp_validation: true,
+            static_peers_bypass_sequential: true,
+            max_inbound_syncs: PN_DEFAULT_MAX_INBOUND_SYNCS,
             propagation_limit_kb: PROPAGATION_LIMIT,
             sync_limit_kb: SYNC_LIMIT,
             on_inbound_command: None,
@@ -198,7 +227,7 @@ impl Default for DaemonConfig {
             enforce_stamps: false,
             message_storage_limit: Some(500_000_000),
             from_static_only: false,
-            delivery_transfer_max_accepted_size: DELIVERY_LIMIT,
+            delivery_transfer_max_accepted_size: 1000.0,
         }
     }
 }
@@ -228,6 +257,16 @@ impl DaemonConfig {
         }
     }
 
+    /// Build the long-lived inbound propagation admission policy.
+    pub fn to_inbound_admission_config(&self) -> PnInboundAdmissionConfig {
+        PnInboundAdmissionConfig {
+            sequential_validation: self.sequential_pn_stamp_validation,
+            static_sequential: !self.static_peers_bypass_sequential,
+            max_inbound_syncs: self.max_inbound_syncs,
+            from_static_only: self.from_static_only,
+        }
+    }
+
     /// Parse from `[lxmf]`, `[propagation]`, and `[control]` sections.
     pub fn from_config(config: &Config) -> Self {
         let py = PythonLxmdConfig::from_config(config);
@@ -236,6 +275,7 @@ impl DaemonConfig {
             node_name: py.node_name,
             announce_at_start: py.peer_announce_at_start,
             announce_interval: seconds_to_u64(py.peer_announce_interval),
+            stamp_cost: normalize_peer_stamp_cost(py.peer_stamp_cost),
             propagation_enabled: py.enable_propagation_node,
             propagation_stamp_cost: clamp_python_cost_to_u8(
                 py.propagation_stamp_cost_target,
@@ -256,6 +296,9 @@ impl DaemonConfig {
                 .autopeer_maxdepth
                 .and_then(|value| usize::try_from(value).ok())
                 .unwrap_or(AUTOPEER_MAXDEPTH),
+            sequential_pn_stamp_validation: py.sequential_pn_stamp_validation,
+            static_peers_bypass_sequential: py.static_peers_bypass_sequential,
+            max_inbound_syncs: usize::try_from(py.max_inbound_syncs).unwrap_or(usize::MAX),
             propagation_limit_kb: kb_to_usize_ceil(py.propagation_transfer_max_accepted_size),
             sync_limit_kb: kb_to_usize_ceil(py.propagation_sync_max_accepted_size),
             on_inbound_command: py.on_inbound,
@@ -267,17 +310,9 @@ impl DaemonConfig {
             prioritise_destinations: py.prioritised_lxmf_destinations,
             message_storage_limit: megabytes_to_bytes(py.message_storage_limit),
             from_static_only: py.from_static_only,
-            delivery_transfer_max_accepted_size: kb_to_usize_ceil(
-                py.delivery_transfer_max_accepted_size,
-            ),
+            delivery_transfer_max_accepted_size: py.delivery_transfer_max_accepted_size,
             ..DaemonConfig::default()
         };
-
-        if let Some(sec) = config.section("lxmf")
-            && let Some(cost) = sec.get_uint("stamp_cost")
-        {
-            dc.stamp_cost = Some(cost as u8);
-        }
 
         if let Some(sec) = config.section("propagation") {
             if let Some(node) = sec.get("outbound_node") {
@@ -321,6 +356,13 @@ impl DaemonConfig {
 
 fn clamp_python_cost_to_u8(value: i64, floor: i64) -> u8 {
     value.max(floor).min(u8::MAX as i64) as u8
+}
+
+/// Apply Python lxmd's signed floor, then mirror `set_inbound_stamp_cost`:
+/// delivery stamp costs are valid only in `1..=254`.
+fn normalize_peer_stamp_cost(value: i64) -> Option<u8> {
+    let cost = u8::try_from(value.max(1)).ok()?;
+    (cost < u8::MAX).then_some(cost)
 }
 
 fn get_float(section: Option<&ConfigSection>, key: &str) -> Option<f64> {
@@ -389,6 +431,7 @@ mod tests {
         assert_eq!(dc.display_name.as_deref(), Some("Anonymous Peer"));
         assert!(!dc.announce_at_start);
         assert_eq!(dc.announce_interval, None);
+        assert_eq!(dc.stamp_cost, Some(12));
         assert!(!dc.propagation_enabled);
         assert_eq!(dc.propagation_stamp_cost, 16);
         assert_eq!(dc.propagation_stamp_flex, 3);
@@ -397,12 +440,19 @@ mod tests {
         assert_eq!(dc.max_peers, 20);
         assert!(dc.autopeer);
         assert_eq!(dc.autopeer_maxdepth, AUTOPEER_MAXDEPTH);
+        assert!(dc.sequential_pn_stamp_validation);
+        assert!(dc.static_peers_bypass_sequential);
+        assert_eq!(dc.max_inbound_syncs, PN_DEFAULT_MAX_INBOUND_SYNCS);
+        assert_eq!(
+            dc.to_inbound_admission_config(),
+            PnInboundAdmissionConfig::default()
+        );
         assert_eq!(dc.propagation_limit_kb, 256);
         assert_eq!(dc.sync_limit_kb, 10_240);
         assert!(!dc.node_announce_at_start);
         assert_eq!(dc.node_announce_interval, None);
         assert_eq!(dc.message_storage_limit, Some(500_000_000));
-        assert_eq!(dc.delivery_transfer_max_accepted_size, 1000);
+        assert_eq!(dc.delivery_transfer_max_accepted_size, 1000.0);
         assert!(!dc.from_static_only);
     }
 
@@ -414,6 +464,7 @@ mod tests {
         assert_eq!(py.display_name, "Anonymous Peer");
         assert!(!py.peer_announce_at_start);
         assert_eq!(py.peer_announce_interval, None);
+        assert_eq!(py.peer_stamp_cost, 12);
         assert_eq!(py.delivery_transfer_max_accepted_size, 1000.0);
         assert_eq!(py.on_inbound, None);
         assert!(!py.enable_propagation_node);
@@ -422,6 +473,9 @@ mod tests {
         assert!(!py.node_announce_at_start);
         assert!(py.autopeer);
         assert_eq!(py.autopeer_maxdepth, None);
+        assert!(py.sequential_pn_stamp_validation);
+        assert!(py.static_peers_bypass_sequential);
+        assert_eq!(py.max_inbound_syncs, PN_DEFAULT_MAX_INBOUND_SYNCS as i64);
         assert_eq!(py.node_announce_interval, None);
         assert_eq!(py.message_storage_limit, 500.0);
         assert_eq!(py.propagation_transfer_max_accepted_size, 256.0);
@@ -455,9 +509,13 @@ prioritise_destinations = 0102030405060708090a0b0c0d0e0f10
 control_allowed = 11111111111111111111111111111111
 from_static_only = yes
 max_peers = 7
+sequential_pn_stamp_validation = no
+static_peers_bypass_sequential = no
+max_inbound_syncs = 0
 
 [lxmf]
 announce_interval = 3
+stamp_cost = -9
 delivery_transfer_max_accepted_size = 0.1
 
 [logging]
@@ -468,6 +526,7 @@ loglevel = 6
 
         assert_eq!(py.peer_announce_interval, Some(180));
         assert_eq!(py.node_announce_interval, Some(120));
+        assert_eq!(py.peer_stamp_cost, 1);
         assert_eq!(py.delivery_transfer_max_accepted_size, 0.38);
         assert_eq!(py.message_storage_limit, 0.005);
         assert_eq!(py.propagation_transfer_max_accepted_size, 0.38);
@@ -486,6 +545,9 @@ loglevel = 6
             ["11111111111111111111111111111111"]
         );
         assert_eq!(py.max_peers, Some(7));
+        assert!(!py.sequential_pn_stamp_validation);
+        assert!(!py.static_peers_bypass_sequential);
+        assert_eq!(py.max_inbound_syncs, PN_MIN_MAX_INBOUND_SYNCS as i64);
         assert!(py.from_static_only);
         assert_eq!(py.target_loglevel, Some(6));
     }
@@ -526,7 +588,8 @@ propagation_transfer_max_accepted_size = 12
         let rc = dc.to_router_config();
         assert!(!rc.propagation_enabled);
         assert_eq!(rc.max_peers, 20);
-        assert_eq!(rc.delivery_limit_kb, 1000);
+        assert_eq!(rc.delivery_limit_kb, 1000.0);
+        assert_eq!(RouterConfig::default().delivery_limit_kb, 1000.0);
         assert_eq!(rc.propagation_limit_kb, 256);
         assert_eq!(rc.sync_limit_kb, 10_240);
         assert_eq!(rc.propagation_stamp_cost, 16);
@@ -582,6 +645,9 @@ remote_peering_cost_max = -2
 max_peers = 10
 autopeer = no
 autopeer_maxdepth = 2
+sequential_pn_stamp_validation = no
+static_peers_bypass_sequential = no
+max_inbound_syncs = 5
 static_peers = 00112233445566778899aabbccddeeff
 prioritise_destinations = 0102030405060708090a0b0c0d0e0f10
 control_allowed = 11111111111111111111111111111111
@@ -592,7 +658,7 @@ from_static_only = yes
         assert_eq!(dc.display_name.as_deref(), Some("TestNode"));
         assert!(dc.announce_at_start);
         assert_eq!(dc.announce_interval, Some(180));
-        assert_eq!(dc.delivery_transfer_max_accepted_size, 1);
+        assert_eq!(dc.delivery_transfer_max_accepted_size, 0.38);
         assert_eq!(dc.stamp_cost, Some(8));
         assert!(dc.propagation_enabled);
         assert_eq!(dc.node_name.as_deref(), Some("PropNode"));
@@ -612,6 +678,18 @@ from_static_only = yes
         assert_eq!(dc.max_peers, 10);
         assert!(!dc.autopeer);
         assert_eq!(dc.autopeer_maxdepth, 2);
+        assert!(!dc.sequential_pn_stamp_validation);
+        assert!(!dc.static_peers_bypass_sequential);
+        assert_eq!(dc.max_inbound_syncs, 5);
+        assert_eq!(
+            dc.to_inbound_admission_config(),
+            PnInboundAdmissionConfig {
+                sequential_validation: false,
+                static_sequential: true,
+                max_inbound_syncs: 5,
+                from_static_only: true,
+            }
+        );
         assert_eq!(dc.static_peers, ["00112233445566778899aabbccddeeff"]);
         assert_eq!(
             dc.prioritise_destinations,
@@ -619,6 +697,38 @@ from_static_only = yes
         );
         assert_eq!(dc.control_allowed, ["11111111111111111111111111111111"]);
         assert!(dc.from_static_only);
+    }
+
+    #[test]
+    fn delivery_stamp_cost_matches_python_floor_and_destination_range() {
+        for (configured, normalized, expected) in [
+            (-7, 1, Some(1)),
+            (0, 1, Some(1)),
+            (254, 254, Some(254)),
+            (255, 255, None),
+            (256, 256, None),
+            (1000, 1000, None),
+        ] {
+            let input = format!("[lxmf]\nstamp_cost = {configured}\n");
+            let config = rns_runtime::config::Config::parse(&input).unwrap();
+            let py = PythonLxmdConfig::from_config(&config);
+            let dc = DaemonConfig::from_config(&config);
+
+            assert_eq!(py.peer_stamp_cost, normalized, "configured {configured}");
+            assert_eq!(dc.stamp_cost, expected, "configured {configured}");
+        }
+    }
+
+    #[test]
+    fn fractional_delivery_limit_survives_daemon_and_router_config() {
+        let config = rns_runtime::config::Config::parse(
+            "[lxmf]\ndelivery_transfer_max_accepted_size = 0.38\n",
+        )
+        .unwrap();
+        let dc = DaemonConfig::from_config(&config);
+
+        assert_eq!(dc.delivery_transfer_max_accepted_size, 0.38);
+        assert_eq!(dc.to_router_config().delivery_limit_kb, 0.38);
     }
 
     #[test]

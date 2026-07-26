@@ -62,3 +62,8 @@ jobs:
         working-directory: rsLXMF
       - run: cargo clippy --workspace --all-targets -- -D warnings
         working-directory: rsLXMF
+      - name: Check public API documentation
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --workspace --no-deps
+        working-directory: rsLXMF

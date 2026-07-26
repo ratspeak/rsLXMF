@@ -94,7 +94,7 @@ pub struct Args {
     #[arg(long, value_name = "PATH")]
     pub identity: Option<PathBuf>,
 
-    /// Send a single message and exit: --send <dest_hash> <content>
+    /// Send a single message and exit: `--send <dest_hash> <content>`.
     #[arg(long, num_args = 1..=2, value_names = ["DEST_HASH", "CONTENT"])]
     pub send: Option<Vec<String>>,
 
@@ -180,6 +180,15 @@ autopeer = yes
 
 autopeer_maxdepth = 6
 
+# Validate inbound propagation stamp batches sequentially by default.
+# sequential_pn_stamp_validation = yes
+
+# Let configured static peers bypass sequential validation and inbound limits.
+# static_peers_bypass_sequential = yes
+
+# Maximum concurrent inbound propagation sync transfers.
+# max_inbound_syncs = 3
+
 # message_storage_limit = 500
 
 # propagation_message_max_accepted_size = 256
@@ -212,6 +221,8 @@ display_name = Anonymous Peer
 announce_at_start = no
 
 # announce_interval = 360
+
+# stamp_cost = 12
 
 delivery_transfer_max_accepted_size = 1000
 
