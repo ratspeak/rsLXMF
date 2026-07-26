@@ -4186,9 +4186,9 @@ mod tests {
     #[test]
     fn delivery_resource_admission_uses_decimal_kilobytes_with_exact_boundary() {
         let default_limit = DaemonConfig::default().delivery_transfer_max_accepted_size;
-        assert_eq!(default_limit, 1.0);
-        assert!(accepts_delivery_resource(1000, default_limit));
-        assert!(!accepts_delivery_resource(1001, default_limit));
+        assert_eq!(default_limit, 1000.0);
+        assert!(accepts_delivery_resource(1_000_000, default_limit));
+        assert!(!accepts_delivery_resource(1_000_001, default_limit));
 
         assert!(accepts_delivery_resource(380, 0.38));
         assert!(!accepts_delivery_resource(381, 0.38));
