@@ -2054,13 +2054,14 @@ mod tests {
 
         task.send_offer_request();
         assert!(task.offer_preparation_rx.is_some());
-        for _ in 0..100 {
-            tokio::task::yield_now().await;
-            task.send_offer_request();
-            if task.state != SyncTaskState::Offering {
-                break;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while task.state == SyncTaskState::Offering {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                task.send_offer_request();
             }
-        }
+        })
+        .await
+        .expect("bounded offer-preparation worker did not complete");
 
         assert_eq!(task.state, SyncTaskState::Complete);
         assert!(rx.try_recv().is_err());
