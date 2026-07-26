@@ -266,11 +266,10 @@ pub struct LxmRouter {
     pub pending_outbound: Vec<LxMessage>,
     /// Messages awaiting deferred stamp generation, keyed by message hash.
     pub pending_deferred_stamps: HashMap<[u8; 32], LxMessage>,
-    /// Captured at construction (or via [`set_runtime_handle`](Self::set_runtime_handle))
-    /// so deferred-stamp PoW can spawn onto the blocking pool even when the
-    /// caller is itself on a `spawn_blocking` thread, where
-    /// `Handle::try_current()` fails. Without it the tick grinds stamps
-    /// inline while holding the manager lock (observed 53 s stall).
+    /// Captured at construction so deferred-stamp PoW can spawn onto the
+    /// blocking pool even when the caller is itself on a `spawn_blocking`
+    /// thread, where `Handle::try_current()` fails. Without it the tick grinds
+    /// stamps inline while holding the manager lock (observed 53 s stall).
     pub runtime_handle: Option<tokio::runtime::Handle>,
     pub active_deferred_stamp: Option<DeferredStampJob>,
     /// Identities allowed for delivery. An empty list means "all allowed".

@@ -218,7 +218,7 @@ pub fn pn_stamp_cost_from_app_data(data: &[u8]) -> Option<u8> {
 
 /// Encode delivery-announce `app_data` as msgpack
 /// `[display_name, stamp_cost, supported_functionality]` where the feature
-/// list advertises [`SF_COMPRESSION`](crate::constants::SF_COMPRESSION).
+/// list advertises [`SF_COMPRESSION`].
 ///
 /// `stamp_cost` must be in `1..=254`; out-of-range or `None` values are encoded as nil.
 ///
@@ -465,8 +465,9 @@ impl PropagationRequestHandler {
     }
 
     /// Handle a `/get` request from a client downloading messages. Phase-2
-    /// responses come back as a [`GetRequestAction::ServeFiles`] plan — the
-    /// embedder resolves it after releasing the node lock.
+    /// responses come back as a
+    /// [`GetRequestAction::ServeFiles`](crate::propagation_node::GetRequestAction::ServeFiles)
+    /// plan — the embedder resolves it after releasing the node lock.
     ///
     /// Python reference: `LXMRouter.message_get_request` — LXMRouter.py:1425-1499.
     pub fn handle_message_get_request(

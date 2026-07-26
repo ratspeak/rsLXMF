@@ -94,7 +94,7 @@ pub struct Args {
     #[arg(long, value_name = "PATH")]
     pub identity: Option<PathBuf>,
 
-    /// Send a single message and exit: --send <dest_hash> <content>
+    /// Send a single message and exit: `--send <dest_hash> <content>`.
     #[arg(long, num_args = 1..=2, value_names = ["DEST_HASH", "CONTENT"])]
     pub send: Option<Vec<String>>,
 
