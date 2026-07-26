@@ -3,6 +3,9 @@
 //! Python reference: LXMF/Utilities/lxmd.py.
 
 use lxmf_core::constants::*;
+use lxmf_core::propagation_admission::{
+    PN_DEFAULT_MAX_INBOUND_SYNCS, PN_MIN_MAX_INBOUND_SYNCS, PnInboundAdmissionConfig,
+};
 use lxmf_core::router::{LxmRouter, RouterConfig, RouterConfigExt};
 use rns_runtime::config::{Config, ConfigSection};
 
@@ -24,6 +27,9 @@ pub struct PythonLxmdConfig {
     pub node_announce_at_start: bool,
     pub autopeer: bool,
     pub autopeer_maxdepth: Option<i64>,
+    pub sequential_pn_stamp_validation: bool,
+    pub static_peers_bypass_sequential: bool,
+    pub max_inbound_syncs: i64,
     pub node_announce_interval: Option<i64>,
     pub message_storage_limit: f64,
     pub propagation_transfer_max_accepted_size: f64,
@@ -75,6 +81,19 @@ impl PythonLxmdConfig {
             node_announce_at_start: get_bool_or(propagation, "announce_at_start", false),
             autopeer: get_bool_or(propagation, "autopeer", true),
             autopeer_maxdepth: get_int(propagation, "autopeer_maxdepth"),
+            sequential_pn_stamp_validation: get_bool_or(
+                propagation,
+                "sequential_pn_stamp_validation",
+                true,
+            ),
+            static_peers_bypass_sequential: get_bool_or(
+                propagation,
+                "static_peers_bypass_sequential",
+                true,
+            ),
+            max_inbound_syncs: get_int(propagation, "max_inbound_syncs")
+                .map(|value| value.max(PN_MIN_MAX_INBOUND_SYNCS as i64))
+                .unwrap_or(PN_DEFAULT_MAX_INBOUND_SYNCS as i64),
             node_announce_interval: get_int(propagation, "announce_interval").map(|v| v * 60),
             message_storage_limit: get_float_or_floor(
                 propagation,
@@ -152,6 +171,9 @@ pub struct DaemonConfig {
     pub max_peers: usize,
     pub autopeer: bool,
     pub autopeer_maxdepth: usize,
+    pub sequential_pn_stamp_validation: bool,
+    pub static_peers_bypass_sequential: bool,
+    pub max_inbound_syncs: usize,
     pub propagation_limit_kb: usize,
     pub sync_limit_kb: usize,
     pub on_inbound_command: Option<String>,
@@ -186,6 +208,9 @@ impl Default for DaemonConfig {
             max_peers: MAX_PEERS,
             autopeer: true,
             autopeer_maxdepth: AUTOPEER_MAXDEPTH,
+            sequential_pn_stamp_validation: true,
+            static_peers_bypass_sequential: true,
+            max_inbound_syncs: PN_DEFAULT_MAX_INBOUND_SYNCS,
             propagation_limit_kb: PROPAGATION_LIMIT,
             sync_limit_kb: SYNC_LIMIT,
             on_inbound_command: None,
@@ -228,6 +253,16 @@ impl DaemonConfig {
         }
     }
 
+    /// Build the long-lived inbound propagation admission policy.
+    pub fn to_inbound_admission_config(&self) -> PnInboundAdmissionConfig {
+        PnInboundAdmissionConfig {
+            sequential_validation: self.sequential_pn_stamp_validation,
+            static_sequential: !self.static_peers_bypass_sequential,
+            max_inbound_syncs: self.max_inbound_syncs,
+            from_static_only: self.from_static_only,
+        }
+    }
+
     /// Parse from `[lxmf]`, `[propagation]`, and `[control]` sections.
     pub fn from_config(config: &Config) -> Self {
         let py = PythonLxmdConfig::from_config(config);
@@ -256,6 +291,9 @@ impl DaemonConfig {
                 .autopeer_maxdepth
                 .and_then(|value| usize::try_from(value).ok())
                 .unwrap_or(AUTOPEER_MAXDEPTH),
+            sequential_pn_stamp_validation: py.sequential_pn_stamp_validation,
+            static_peers_bypass_sequential: py.static_peers_bypass_sequential,
+            max_inbound_syncs: usize::try_from(py.max_inbound_syncs).unwrap_or(usize::MAX),
             propagation_limit_kb: kb_to_usize_ceil(py.propagation_transfer_max_accepted_size),
             sync_limit_kb: kb_to_usize_ceil(py.propagation_sync_max_accepted_size),
             on_inbound_command: py.on_inbound,
@@ -397,6 +435,13 @@ mod tests {
         assert_eq!(dc.max_peers, 20);
         assert!(dc.autopeer);
         assert_eq!(dc.autopeer_maxdepth, AUTOPEER_MAXDEPTH);
+        assert!(dc.sequential_pn_stamp_validation);
+        assert!(dc.static_peers_bypass_sequential);
+        assert_eq!(dc.max_inbound_syncs, PN_DEFAULT_MAX_INBOUND_SYNCS);
+        assert_eq!(
+            dc.to_inbound_admission_config(),
+            PnInboundAdmissionConfig::default()
+        );
         assert_eq!(dc.propagation_limit_kb, 256);
         assert_eq!(dc.sync_limit_kb, 10_240);
         assert!(!dc.node_announce_at_start);
@@ -422,6 +467,9 @@ mod tests {
         assert!(!py.node_announce_at_start);
         assert!(py.autopeer);
         assert_eq!(py.autopeer_maxdepth, None);
+        assert!(py.sequential_pn_stamp_validation);
+        assert!(py.static_peers_bypass_sequential);
+        assert_eq!(py.max_inbound_syncs, PN_DEFAULT_MAX_INBOUND_SYNCS as i64);
         assert_eq!(py.node_announce_interval, None);
         assert_eq!(py.message_storage_limit, 500.0);
         assert_eq!(py.propagation_transfer_max_accepted_size, 256.0);
@@ -455,6 +503,9 @@ prioritise_destinations = 0102030405060708090a0b0c0d0e0f10
 control_allowed = 11111111111111111111111111111111
 from_static_only = yes
 max_peers = 7
+sequential_pn_stamp_validation = no
+static_peers_bypass_sequential = no
+max_inbound_syncs = 0
 
 [lxmf]
 announce_interval = 3
@@ -486,6 +537,9 @@ loglevel = 6
             ["11111111111111111111111111111111"]
         );
         assert_eq!(py.max_peers, Some(7));
+        assert!(!py.sequential_pn_stamp_validation);
+        assert!(!py.static_peers_bypass_sequential);
+        assert_eq!(py.max_inbound_syncs, PN_MIN_MAX_INBOUND_SYNCS as i64);
         assert!(py.from_static_only);
         assert_eq!(py.target_loglevel, Some(6));
     }
@@ -582,6 +636,9 @@ remote_peering_cost_max = -2
 max_peers = 10
 autopeer = no
 autopeer_maxdepth = 2
+sequential_pn_stamp_validation = no
+static_peers_bypass_sequential = no
+max_inbound_syncs = 5
 static_peers = 00112233445566778899aabbccddeeff
 prioritise_destinations = 0102030405060708090a0b0c0d0e0f10
 control_allowed = 11111111111111111111111111111111
@@ -612,6 +669,18 @@ from_static_only = yes
         assert_eq!(dc.max_peers, 10);
         assert!(!dc.autopeer);
         assert_eq!(dc.autopeer_maxdepth, 2);
+        assert!(!dc.sequential_pn_stamp_validation);
+        assert!(!dc.static_peers_bypass_sequential);
+        assert_eq!(dc.max_inbound_syncs, 5);
+        assert_eq!(
+            dc.to_inbound_admission_config(),
+            PnInboundAdmissionConfig {
+                sequential_validation: false,
+                static_sequential: true,
+                max_inbound_syncs: 5,
+                from_static_only: true,
+            }
+        );
         assert_eq!(dc.static_peers, ["00112233445566778899aabbccddeeff"]);
         assert_eq!(
             dc.prioritise_destinations,

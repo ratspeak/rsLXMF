@@ -180,6 +180,15 @@ autopeer = yes
 
 autopeer_maxdepth = 6
 
+# Validate inbound propagation stamp batches sequentially by default.
+# sequential_pn_stamp_validation = yes
+
+# Let configured static peers bypass sequential validation and inbound limits.
+# static_peers_bypass_sequential = yes
+
+# Maximum concurrent inbound propagation sync transfers.
+# max_inbound_syncs = 3
+
 # message_storage_limit = 500
 
 # propagation_message_max_accepted_size = 256
