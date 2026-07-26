@@ -23,6 +23,16 @@ pub const STAMP_COSTS_FILE: &str = "outbound_stamp_costs";
 pub const TICKETS_FILE: &str = "available_tickets";
 pub const LOCAL_DELIVERIES_FILE: &str = "local_deliveries";
 pub const LOCALLY_PROCESSED_FILE: &str = "locally_processed";
+pub const NODE_STATS_FILE: &str = "node_stats";
+
+/// Counters persisted by Python's `LXMRouter.save_node_stats`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PersistedNodeStats {
+    pub client_propagation_messages_received: u64,
+    pub client_propagation_messages_served: u64,
+    pub unpeered_propagation_incoming: u64,
+    pub unpeered_propagation_rx_bytes: u64,
+}
 
 /// Atomically write `data` to `path`: unique tmp file + flush + fsync + rename.
 ///
@@ -78,10 +88,7 @@ fn write_mpk<T: serde::Serialize>(path: &Path, value: &T) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, &bytes)?;
-    fs::rename(&tmp, path)?;
-    Ok(())
+    write_file_atomic(path, &bytes)
 }
 
 fn read_mpk<T: serde::de::DeserializeOwned>(path: &Path) -> io::Result<Option<T>> {
@@ -134,6 +141,17 @@ pub fn load_locally_processed(dir: &Path) -> io::Result<HashMap<PropagationTrans
     Ok(read_mpk(&dir.join(LOCALLY_PROCESSED_FILE))?.unwrap_or_default())
 }
 
+pub fn save_node_stats(dir: &Path, stats: &PersistedNodeStats) -> io::Result<()> {
+    let bytes = rmp_serde::to_vec_named(stats)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    fs::create_dir_all(dir)?;
+    write_file_atomic(&dir.join(NODE_STATS_FILE), &bytes)
+}
+
+pub fn load_node_stats(dir: &Path) -> io::Result<PersistedNodeStats> {
+    Ok(read_mpk(&dir.join(NODE_STATS_FILE))?.unwrap_or_default())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,6 +202,37 @@ mod tests {
         assert!(load_tickets(tmp.path()).unwrap().is_empty());
         assert!(load_local_deliveries(tmp.path()).unwrap().is_empty());
         assert!(load_locally_processed(tmp.path()).unwrap().is_empty());
+        assert_eq!(
+            load_node_stats(tmp.path()).unwrap(),
+            PersistedNodeStats::default()
+        );
+    }
+
+    #[test]
+    fn node_stats_roundtrip_uses_named_python_fields() {
+        let tmp = TempDir::new().unwrap();
+        let expected = PersistedNodeStats {
+            client_propagation_messages_received: 11,
+            client_propagation_messages_served: 12,
+            unpeered_propagation_incoming: 13,
+            unpeered_propagation_rx_bytes: 14,
+        };
+
+        save_node_stats(tmp.path(), &expected).unwrap();
+        assert_eq!(load_node_stats(tmp.path()).unwrap(), expected);
+
+        let encoded = fs::read(tmp.path().join(NODE_STATS_FILE)).unwrap();
+        let value = rmpv::decode::read_value(&mut std::io::Cursor::new(encoded)).unwrap();
+        let keys = value
+            .as_map()
+            .unwrap()
+            .iter()
+            .filter_map(|(key, _)| key.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        assert!(keys.contains("client_propagation_messages_received"));
+        assert!(keys.contains("client_propagation_messages_served"));
+        assert!(keys.contains("unpeered_propagation_incoming"));
+        assert!(keys.contains("unpeered_propagation_rx_bytes"));
     }
 
     #[test]
@@ -222,5 +271,64 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
             .collect();
         assert!(leftovers.is_empty());
+    }
+
+    #[test]
+    fn serialization_failure_preserves_existing_file_without_temp_residue() {
+        struct FailsToSerialize;
+
+        impl serde::Serialize for FailsToSerialize {
+            fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                Err(serde::ser::Error::custom("intentional failure"))
+            }
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("state");
+        fs::write(&path, b"previous-good-state").unwrap();
+
+        assert!(write_mpk(&path, &FailsToSerialize).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"previous-good-state");
+        assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn concurrent_atomic_writers_never_publish_torn_data_or_collide_on_temp_names() {
+        use std::sync::{Arc, Barrier};
+
+        let tmp = TempDir::new().unwrap();
+        let path = Arc::new(tmp.path().join("shared"));
+        let barrier = Arc::new(Barrier::new(8));
+        let payloads = (0u8..8)
+            .map(|value| vec![value; 16 * 1024])
+            .collect::<Vec<_>>();
+        let threads = payloads
+            .iter()
+            .cloned()
+            .map(|payload| {
+                let path = Arc::clone(&path);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    write_file_atomic(path.as_ref(), &payload).unwrap();
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for thread in threads {
+            thread.join().unwrap();
+        }
+
+        let published = fs::read(path.as_ref()).unwrap();
+        assert!(payloads.contains(&published));
+        let leftovers = fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp."))
+            .count();
+        assert_eq!(leftovers, 0);
     }
 }

@@ -20,6 +20,7 @@ use crate::peer::{LxmPeer, OutboundOfferPolicy};
 use crate::propagation::PropagationStore;
 use crate::stamper;
 use crate::ticket::{Ticket, TicketStore};
+use crate::types::PropagationTransientId;
 
 /// Router configuration.
 ///
@@ -926,12 +927,55 @@ impl LxmRouter {
             .and_then(|m| m.stamp_cost)
     }
 
+    /// Return whether a message or propagation transient ID has already been
+    /// delivered locally.
+    ///
+    /// Python reference: `LXMRouter.has_message` — LXMRouter.py:1667-1669.
+    pub fn has_message(&self, transient_id: &PropagationTransientId) -> bool {
+        self.propagation_store.is_locally_delivered(transient_id)
+    }
+
+    /// Atomically admit one already-decoded inbound message and invoke the
+    /// router callback at most once.
+    ///
+    /// Both ordinary packet/Resource delivery and propagation download must
+    /// use this actor-owned gate before any application-visible side effect.
+    /// A propagation message may carry a ciphertext-derived `transient_id`
+    /// distinct from its signed message hash; both identifiers are retained
+    /// so a later delivery through another representation is still deduped.
+    pub fn deliver_inbound(&mut self, message: &LxMessage, allow_duplicate: bool) -> bool {
+        let Some(message_id) = message.message_id.or(message.hash) else {
+            return false;
+        };
+        let transient_id = message.transient_id.unwrap_or(message_id);
+        let propagated = transient_id != message_id;
+
+        if !allow_duplicate
+            && (self.propagation_store.is_locally_delivered(&message_id)
+                || self.propagation_store.is_locally_delivered(&transient_id)
+                || (propagated && self.propagation_store.is_locally_processed(&transient_id)))
+        {
+            return false;
+        }
+
+        self.propagation_store.mark_locally_delivered(message_id);
+        if propagated {
+            self.propagation_store.mark_locally_processed(transient_id);
+            self.propagation_store.mark_locally_delivered(transient_id);
+        }
+
+        if let Some(ref callback) = self.delivery_callback {
+            callback(message);
+        }
+        true
+    }
+
     /// Ingest an encrypted paper (`lxm://...`) URI and invoke the delivery callback as if the
     /// message had arrived via the network.
     ///
     /// Python reference: `LXMRouter.ingest_lxm_uri` — LXMRouter.py:2370-2385.
     pub fn ingest_lxm_uri<F>(
-        &self,
+        &mut self,
         uri: &str,
         decrypt_fn: F,
     ) -> Result<LxMessage, crate::message::MessageError>
@@ -939,9 +983,7 @@ impl LxmRouter {
         F: FnOnce(&[u8]) -> Result<Vec<u8>, crate::message::MessageError>,
     {
         let message = LxMessage::from_paper_uri(uri, decrypt_fn)?;
-        if let Some(ref cb) = self.delivery_callback {
-            cb(&message);
-        }
+        self.deliver_inbound(&message, false);
         Ok(message)
     }
 
@@ -968,6 +1010,11 @@ impl LxmRouter {
             .replace_locally_delivered(persist::load_local_deliveries(state_dir)?);
         self.propagation_store
             .replace_locally_processed(persist::load_locally_processed(state_dir)?);
+        let stats = persist::load_node_stats(state_dir)?;
+        self.client_propagation_messages_received = stats.client_propagation_messages_received;
+        self.client_propagation_messages_served = stats.client_propagation_messages_served;
+        self.unpeered_propagation_incoming = stats.unpeered_propagation_incoming;
+        self.unpeered_propagation_rx_bytes = stats.unpeered_propagation_rx_bytes;
         // Python cleans tickets and stamp costs at load (LXMRouter.py:258-284).
         let now = now_f64();
         self.ticket_store.cull(now);
@@ -985,6 +1032,15 @@ impl LxmRouter {
         persist::save_tickets(state_dir, self.ticket_store.all())?;
         persist::save_local_deliveries(state_dir, self.propagation_store.locally_delivered_ids())?;
         persist::save_locally_processed(state_dir, self.propagation_store.locally_processed_ids())?;
+        persist::save_node_stats(
+            state_dir,
+            &persist::PersistedNodeStats {
+                client_propagation_messages_received: self.client_propagation_messages_received,
+                client_propagation_messages_served: self.client_propagation_messages_served,
+                unpeered_propagation_incoming: self.unpeered_propagation_incoming,
+                unpeered_propagation_rx_bytes: self.unpeered_propagation_rx_bytes,
+            },
+        )?;
         Ok(())
     }
 
@@ -2626,9 +2682,68 @@ mod tests {
             fired_clone.store(true, Ordering::Relaxed);
         });
 
-        let msg = LxMessage::new([0xAA; 16], [0xBB; 16], "t", "c", DeliveryMethod::Direct);
-        (router.delivery_callback.as_ref().unwrap())(&msg);
+        let mut msg = LxMessage::new([0xAA; 16], [0xBB; 16], "t", "c", DeliveryMethod::Direct);
+        msg.hash = Some([0x11; 32]);
+        msg.message_id = msg.hash;
+        msg.transient_id = msg.hash;
+        assert!(router.deliver_inbound(&msg, false));
         assert!(fired.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn inbound_delivery_is_deduped_across_packet_and_resource_representations() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mut router = LxmRouter::new(RouterConfig::default());
+        let deliveries = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&deliveries);
+        router.register_delivery_callback(move |_| {
+            observed.fetch_add(1, Ordering::Relaxed);
+        });
+
+        let mut packet = LxMessage::new(
+            [0xAA; 16],
+            [0xBB; 16],
+            "same",
+            "message",
+            DeliveryMethod::Opportunistic,
+        );
+        packet.hash = Some([0x22; 32]);
+        packet.message_id = packet.hash;
+        packet.transient_id = packet.hash;
+        let mut resource = packet.clone();
+        resource.method = DeliveryMethod::Direct;
+
+        assert!(router.deliver_inbound(&packet, false));
+        assert!(!router.deliver_inbound(&resource, false));
+        assert_eq!(deliveries.load(Ordering::Relaxed), 1);
+        assert!(router.has_message(&[0x22; 32]));
+    }
+
+    #[test]
+    fn propagated_delivery_records_ciphertext_and_signed_message_ids() {
+        let mut router = LxmRouter::new(RouterConfig::default());
+        let mut propagated = LxMessage::new(
+            [0xAA; 16],
+            [0xBB; 16],
+            "propagated",
+            "message",
+            DeliveryMethod::Propagated,
+        );
+        propagated.hash = Some([0x33; 32]);
+        propagated.message_id = propagated.hash;
+        propagated.transient_id = Some([0x44; 32]);
+
+        assert!(router.deliver_inbound(&propagated, false));
+        assert!(router.has_message(&[0x33; 32]));
+        assert!(router.has_message(&[0x44; 32]));
+        assert!(router.propagation_store.is_locally_processed(&[0x44; 32]));
+
+        let mut direct = propagated.clone();
+        direct.method = DeliveryMethod::Direct;
+        direct.transient_id = direct.hash;
+        assert!(!router.deliver_inbound(&direct, false));
     }
 
     #[test]
@@ -2676,6 +2791,10 @@ mod tests {
         r1.remember_ticket(dest_a, [0x01; 16], 4_102_444_800.0);
         r1.propagation_store.mark_locally_delivered(transient_a);
         r1.propagation_store.mark_locally_processed(transient_a);
+        r1.client_propagation_messages_received = 10;
+        r1.client_propagation_messages_served = 11;
+        r1.unpeered_propagation_incoming = 12;
+        r1.unpeered_propagation_rx_bytes = 13;
         r1.save_state(tmp.path()).unwrap();
 
         let mut r2 = LxmRouter::new(RouterConfig::default());
@@ -2687,6 +2806,10 @@ mod tests {
         assert_eq!(r2.get_outbound_ticket(&dest_a), Some([0x01; 16]));
         assert!(r2.propagation_store.is_locally_delivered(&transient_a));
         assert!(r2.propagation_store.is_locally_processed(&transient_a));
+        assert_eq!(r2.client_propagation_messages_received, 10);
+        assert_eq!(r2.client_propagation_messages_served, 11);
+        assert_eq!(r2.unpeered_propagation_incoming, 12);
+        assert_eq!(r2.unpeered_propagation_rx_bytes, 13);
     }
 
     /// T1-10: persisted dedup timestamps are the REAL first-seen times —

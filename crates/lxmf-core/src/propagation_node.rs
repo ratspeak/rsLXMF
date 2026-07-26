@@ -727,7 +727,7 @@ impl PropagationNode {
             let filename = format!("{}.peer", hex_encode(&peer.destination_hash));
             let path = dir.join(filename);
             let data = peer.to_bytes_with_handled();
-            std::fs::write(path, data)?;
+            crate::persist::write_file_atomic(&path, &data)?;
         }
         Ok(())
     }
@@ -1855,6 +1855,14 @@ mod tests {
         peer.add_handled_message(&live_id);
         peer.add_handled_message(&tid(0xCC));
         node.save_peer(&peer).unwrap();
+
+        drop(node);
+        let node = PropagationNode::with_storage(
+            PropagationNodeConfig::default(),
+            [0xAA; 16],
+            dir.clone(),
+        )
+        .unwrap();
 
         let loaded_peers = node.load_peers();
         assert_eq!(loaded_peers.len(), 1);

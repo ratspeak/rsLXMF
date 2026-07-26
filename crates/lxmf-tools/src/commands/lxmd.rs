@@ -2710,6 +2710,12 @@ impl LxmdRunner {
             return;
         }
 
+        // The propagation transient ID is over the representation received
+        // from the node, before destination decryption. Retain it alongside
+        // the signed message hash so redelivery through a different LXMF path
+        // is still suppressed by the router-owned gate.
+        let propagation_transient_id = LxMessage::compute_propagation_transient_id(data);
+
         let unpack_data = if data[..16] == self.lxmf_dest_hash {
             match self.decrypt_inbound(&data[16..]) {
                 Some(plaintext) => {
@@ -2726,6 +2732,7 @@ impl LxmdRunner {
         match LxMessage::unpack(&unpack_data) {
             Ok(mut msg) => {
                 msg.method = lxmf_core::constants::DeliveryMethod::Propagated;
+                msg.transient_id = Some(propagation_transient_id);
                 tracing::info!(
                     from = %hex::encode(msg.source_hash),
                     title = %msg.title,
@@ -2876,7 +2883,15 @@ impl LxmdRunner {
     }
 
     /// Write a received LXMF message to disk and invoke `on_inbound`.
-    fn handle_inbound_message(&self, msg: LxMessage) {
+    fn handle_inbound_message(&mut self, msg: LxMessage) {
+        if !self.router.deliver_inbound(&msg, false) {
+            tracing::debug!(
+                message = ?msg.message_id.or(msg.hash).map(hex::encode),
+                "ignoring already delivered inbound LXMF message"
+            );
+            return;
+        }
+
         // Also deposit into the propagation store (if enabled) so peers can
         // download it via offer/get sync.
         if let Some(ref pn) = self.propagation_node
@@ -4459,6 +4474,71 @@ mod tests {
             msg_path.exists(),
             "message must be stored once enforcement is off"
         );
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[tokio::test]
+    async fn packet_then_link_resource_delivers_one_application_message() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp = std::env::temp_dir().join(format!(
+            "lxmd-cross-path-dedup-{}-{unique}",
+            std::process::id()
+        ));
+        let (tx, _rx) = mpsc::channel::<TransportMessage>(64);
+        let mut runner = LxmdRunner::new(DaemonConfig::default(), &temp, tx).expect("runner");
+
+        let deliveries = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&deliveries);
+        runner.router.register_delivery_callback(move |_| {
+            observed.fetch_add(1, Ordering::Relaxed);
+        });
+
+        let mut message = LxMessage::new(
+            runner.lxmf_dest_hash,
+            [0xCD; 16],
+            "one",
+            "delivery",
+            DeliveryMethod::Direct,
+        );
+        message.signature = Some([0u8; 64]);
+        let packed = message.pack().expect("pack");
+        let message_id = LxMessage::unpack(&packed)
+            .expect("unpack")
+            .message_id
+            .expect("message id");
+
+        let ciphertext = runner
+            .identity
+            .encrypt(&packed[16..], None)
+            .expect("encrypt opportunistic payload");
+        let header = rns_wire::header::PacketHeader {
+            flags: rns_wire::flags::PacketFlags {
+                header_type: rns_wire::flags::HeaderType::Header1,
+                context_flag: false,
+                transport_type: rns_wire::flags::TransportType::Broadcast,
+                destination_type: rns_wire::flags::DestinationType::Single,
+                packet_type: rns_wire::flags::PacketType::Data,
+            },
+            hops: 0,
+            transport_id: None,
+            destination_hash: runner.lxmf_dest_hash,
+            context: rns_wire::context::PacketContext::None,
+        };
+        let mut packet = header.pack();
+        packet.extend_from_slice(&ciphertext);
+
+        runner.handle_inbound_packet(&packet);
+        runner.handle_link_delivered_data(&packed);
+
+        assert_eq!(deliveries.load(Ordering::Relaxed), 1);
+        assert!(runner.router.has_message(&message_id));
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let _ = std::fs::remove_dir_all(&temp);
     }
 
