@@ -50,6 +50,7 @@ pub mod message;
 pub mod peer;
 pub mod persist;
 pub mod propagation;
+pub mod propagation_admission;
 pub mod propagation_client;
 pub mod propagation_node;
 pub mod propagation_sync;
