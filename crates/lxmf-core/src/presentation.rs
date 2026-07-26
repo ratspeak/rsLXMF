@@ -28,7 +28,10 @@ pub fn sanitize_name(input: &str, max_chars: usize) -> String {
             continue;
         }
         if pending_space {
-            if retained == max_chars {
+            // A collapsed separator is useful only when the current visible
+            // character also fits. Never consume the final slot with a
+            // trailing space that disappears on the next sanitization pass.
+            if max_chars.saturating_sub(retained) < 2 {
                 break;
             }
             output.push(' ');
@@ -135,6 +138,12 @@ mod tests {
         assert_eq!(sanitize_name("Ångström東京", 8), "Ångström");
         assert_eq!(sanitize_name("東京通信", 3), "東京通");
         assert_eq!(sanitize_name("anything", 0), "");
+    }
+
+    #[test]
+    fn truncation_never_retains_a_separator_without_following_text() {
+        assert_eq!(sanitize_name("¡ A", 2), "¡");
+        assert_eq!(sanitize_name("A B", 3), "A B");
     }
 
     proptest! {
