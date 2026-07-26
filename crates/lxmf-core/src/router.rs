@@ -11,6 +11,10 @@ use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::constants::*;
+use crate::inbound_resource::{
+    InboundResourceCancelRequest, InboundResourceEvent, InboundResourceHandle, InboundResourceKey,
+    InboundResourceTracker,
+};
 use crate::message::{LxMessage, MessageError};
 use crate::peer::{LxmPeer, OutboundOfferPolicy};
 use crate::propagation::PropagationStore;
@@ -297,6 +301,9 @@ pub struct LxmRouter {
     pub client_propagation_messages_served: u64,
     pub unpeered_propagation_incoming: u64,
     pub unpeered_propagation_rx_bytes: u64,
+    /// Active ordinary delivery Resources. The embedding Reticulum runtime
+    /// remains the transfer owner and feeds this registry lifecycle events.
+    inbound_resource_tracker: InboundResourceTracker,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -360,6 +367,7 @@ impl LxmRouter {
             client_propagation_messages_served: 0,
             unpeered_propagation_incoming: 0,
             unpeered_propagation_rx_bytes: 0,
+            inbound_resource_tracker: InboundResourceTracker::default(),
         }
     }
 
@@ -369,6 +377,64 @@ impl LxmRouter {
 
     pub fn has_transport(&self) -> bool {
         self.transport_tx.is_some()
+    }
+
+    /// Install the bounded adapter used to request cancellation from the
+    /// embedding Reticulum Resource owner.
+    pub fn set_inbound_resource_cancel_sender(
+        &mut self,
+        tx: mpsc::Sender<InboundResourceCancelRequest>,
+    ) {
+        self.inbound_resource_tracker.set_cancel_sender(tx);
+    }
+
+    /// Project one transport-neutral Resource lifecycle event into the
+    /// router-owned public registry.
+    pub fn handle_inbound_resource_event(&mut self, event: InboundResourceEvent) {
+        self.inbound_resource_tracker.handle_event(event);
+    }
+
+    /// Number of active ordinary inbound delivery Resources.
+    ///
+    /// Python reference: `LXMRouter.inbound_count` — LXMRouter.py:466.
+    pub fn inbound_count(&self) -> usize {
+        self.inbound_resource_tracker.inbound_count()
+    }
+
+    /// Owned handles for all active ordinary inbound delivery Resources.
+    ///
+    /// Python reference: `LXMRouter.inbound_resources` — LXMRouter.py:474.
+    pub fn inbound_resources(&self) -> Vec<InboundResourceHandle> {
+        self.inbound_resource_tracker.inbound_resources()
+    }
+
+    /// Return one unique active logical Resource.
+    pub fn inbound_resource(&self, resource_id: &[u8; 32]) -> Option<InboundResourceHandle> {
+        self.inbound_resource_tracker.inbound_resource(resource_id)
+    }
+
+    /// Return one exact active `(Link, Resource)` owner.
+    pub fn inbound_resource_exact(&self, key: InboundResourceKey) -> Option<InboundResourceHandle> {
+        self.inbound_resource_tracker.inbound_resource_exact(key)
+    }
+
+    /// Queue cancellation for one unique active logical Resource.
+    ///
+    /// Python reference: `LXMRouter.cancel_inbound` — LXMRouter.py:484.
+    pub fn cancel_inbound(&self, resource_id: &[u8; 32]) -> bool {
+        self.inbound_resource_tracker.cancel_inbound(resource_id)
+    }
+
+    /// Queue cancellation for one exact active Resource owner.
+    pub fn cancel_inbound_exact(&self, key: InboundResourceKey) -> bool {
+        self.inbound_resource_tracker.cancel_inbound_exact(key)
+    }
+
+    /// Queue cancellation for a stable snapshot of all active Resources.
+    ///
+    /// Python reference: `LXMRouter.cancel_all_inbound` — LXMRouter.py:505.
+    pub fn cancel_all_inbound(&self) -> usize {
+        self.inbound_resource_tracker.cancel_all_inbound()
     }
 
     /// Queue a message for outbound delivery.

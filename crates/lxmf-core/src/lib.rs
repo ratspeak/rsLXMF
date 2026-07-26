@@ -13,6 +13,7 @@
 //! | --------------------- | -------------------------------------------------- |
 //! | [`message`]           | Message object: fields, packing, stamp, encryption |
 //! | [`delivery_ratchet`]  | Durable delivery-announce ratchet transaction      |
+//! | [`inbound_resource`]  | Public inbound Resource tracking/cancellation      |
 //! | [`router`]            | Actor-driven routing and delivery state machine    |
 //! | [`peer`]              | Propagation-peer state and sync bookkeeping        |
 //! | [`propagation`]       | On-disk store-and-forward message pool             |
@@ -45,6 +46,7 @@ pub mod constants;
 pub mod delivery_ratchet;
 pub mod discovery_stamper;
 pub mod handlers;
+pub mod inbound_resource;
 pub mod link_delivery;
 pub mod message;
 pub mod peer;

@@ -19,6 +19,10 @@ use lxmf_core::constants::{
     DELIVERY_RETRY_WAIT, DeliveryMethod, MAX_DELIVERY_ATTEMPTS, PATH_REQUEST_WAIT,
 };
 use lxmf_core::delivery_ratchet::{DELIVERY_APP_NAME, DeliveryAnnounceKind, DeliveryRatchetState};
+use lxmf_core::inbound_resource::{
+    InboundResourceCancelRequest, InboundResourceConclusion, InboundResourceEvent,
+    InboundResourceKey,
+};
 use lxmf_core::link_delivery::{
     BackchannelSendCommand, BackchannelSendError, BackchannelSendReceipt, DeliveryResult,
     is_retryable_link_delivery_failure,
@@ -52,6 +56,10 @@ use rns_identity::ratchet::{
     ReceivedRatchet, clean_received_ratchets_dir, purge_expired_ratchets_in_memory,
 };
 use rns_runtime::lifecycle::ShutdownSignal;
+use rns_runtime::link_manager::{
+    LinkManagerAccountingEvent, LinkManagerCommand, LinkResourceConclusion, LinkResourceDirection,
+    LinkResourceEvent,
+};
 use rns_transport::messages::{
     AnnounceHandlerEvent, TransportMessage, TransportQuery, TransportQueryResponse,
 };
@@ -98,6 +106,71 @@ struct PeeringKeyWorkerResult {
 
 fn accepts_delivery_resource(data_size: usize, limit_kb: f64) -> bool {
     data_size as f64 <= limit_kb * 1000.0
+}
+
+fn delivery_resource_event_from_runtime(event: LinkResourceEvent) -> Option<InboundResourceEvent> {
+    match event {
+        LinkResourceEvent::Started {
+            link_id,
+            resource_id,
+            direction: LinkResourceDirection::Inbound,
+            data_size,
+            total_segments,
+        } => Some(InboundResourceEvent::Started {
+            key: InboundResourceKey::new(link_id, resource_id),
+            data_size,
+            total_segments,
+        }),
+        LinkResourceEvent::Progress {
+            link_id,
+            resource_id,
+            direction: LinkResourceDirection::Inbound,
+            transferred,
+            total,
+        } => Some(InboundResourceEvent::Progress {
+            key: InboundResourceKey::new(link_id, resource_id),
+            transferred,
+            total,
+        }),
+        LinkResourceEvent::Concluded {
+            link_id,
+            resource_id,
+            direction: LinkResourceDirection::Inbound,
+            conclusion,
+        } => Some(InboundResourceEvent::Concluded {
+            key: InboundResourceKey::new(link_id, resource_id),
+            conclusion: match conclusion {
+                LinkResourceConclusion::Complete => InboundResourceConclusion::Complete,
+                LinkResourceConclusion::Cancelled => InboundResourceConclusion::Cancelled,
+                LinkResourceConclusion::Rejected => InboundResourceConclusion::Rejected,
+                LinkResourceConclusion::Failed(_) => InboundResourceConclusion::Failed,
+            },
+        }),
+        LinkResourceEvent::Started { .. }
+        | LinkResourceEvent::Progress { .. }
+        | LinkResourceEvent::Concluded { .. } => None,
+    }
+}
+
+async fn forward_inbound_resource_cancellations(
+    mut cancel_rx: mpsc::Receiver<InboundResourceCancelRequest>,
+    link_command_tx: mpsc::Sender<LinkManagerCommand>,
+) {
+    while let Some(request) = cancel_rx.recv().await {
+        let key = request.key();
+        if link_command_tx
+            .send(LinkManagerCommand::CancelLinkResource {
+                link_id: key.link_id,
+                resource_id: key.resource_id,
+                direction: LinkResourceDirection::Inbound,
+                result_tx: None,
+            })
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -675,8 +748,12 @@ struct LxmdRunner {
     transport_tx: mpsc::Sender<TransportMessage>,
     /// Plaintext application data decoded by the LinkManager.
     link_packet_rx: mpsc::Receiver<(Vec<u8>, [u8; 16])>,
-    /// Completed resource transfers from the LinkManager.
-    resource_rx: mpsc::Receiver<(Vec<u8>, [u8; 16])>,
+    /// Ordered, lossless ordinary delivery Resource starts/conclusions and
+    /// payload completions used by delivery and the public inbound tracker.
+    delivery_accounting_rx: mpsc::UnboundedReceiver<LinkManagerAccountingEvent>,
+    /// Bounded best-effort delivery Resource progress. Starts/conclusions are
+    /// consumed from `delivery_accounting_rx` instead.
+    delivery_resource_event_rx: mpsc::Receiver<LinkResourceEvent>,
     /// Plaintext propagation-wrapper packets decoded by the propagation LinkManager.
     prop_link_packet_rx: mpsc::Receiver<(Vec<u8>, [u8; 16])>,
     /// Ordered, lossless lifecycle and completion stream from the propagation LinkManager.
@@ -802,7 +879,13 @@ impl LxmdRunner {
         // and resource transfers; it forwards plaintext application data here.
         let (delivery_tx, delivery_rx) = mpsc::channel(256);
         let (link_packet_tx, link_packet_rx) = mpsc::channel::<(Vec<u8>, [u8; 16])>(256);
-        let (resource_tx, resource_rx) = mpsc::channel::<(Vec<u8>, [u8; 16])>(256);
+        let (delivery_accounting_tx, delivery_accounting_rx) =
+            mpsc::unbounded_channel::<LinkManagerAccountingEvent>();
+        let (delivery_resource_event_tx, delivery_resource_event_rx) =
+            mpsc::channel::<LinkResourceEvent>(256);
+        let (inbound_resource_cancel_tx, inbound_resource_cancel_rx) =
+            mpsc::channel::<InboundResourceCancelRequest>(64);
+        router.set_inbound_resource_cancel_sender(inbound_resource_cancel_tx);
         let (prop_link_packet_tx, prop_link_packet_rx) = mpsc::channel::<(Vec<u8>, [u8; 16])>(256);
         let (prop_accounting_tx, prop_accounting_rx) =
             mpsc::unbounded_channel::<rns_runtime::link_manager::LinkManagerAccountingEvent>();
@@ -828,7 +911,8 @@ impl LxmdRunner {
             signing_key,
         );
         link_mgr.set_link_packet_channel(link_packet_tx);
-        link_mgr.set_resource_completed_channel(resource_tx);
+        link_mgr.set_accounting_event_channel(delivery_accounting_tx);
+        link_mgr.set_resource_event_channel(delivery_resource_event_tx);
         link_mgr.set_inbound_raw_channel(inbound_raw_tx);
         link_mgr.set_link_identified_channel(link_identified_tx);
         link_mgr.set_link_packet_proof_channel(link_packet_proof_tx);
@@ -846,6 +930,11 @@ impl LxmdRunner {
         });
 
         // Spawn the LinkManager as a background task
+        let cancellation_command_tx = link_command_tx.clone();
+        tokio::spawn(forward_inbound_resource_cancellations(
+            inbound_resource_cancel_rx,
+            cancellation_command_tx,
+        ));
         tokio::spawn(async move {
             link_mgr.run_with_commands(link_command_rx).await;
         });
@@ -1212,7 +1301,8 @@ impl LxmdRunner {
             prop_link_command_tx,
             transport_tx: transport_tx.clone(),
             link_packet_rx,
-            resource_rx,
+            delivery_accounting_rx,
+            delivery_resource_event_rx,
             prop_link_packet_rx,
             prop_accounting_rx,
             prop_validation_rx,
@@ -2332,6 +2422,25 @@ impl LxmdRunner {
     }
 
     fn drain_link_packets(&mut self) {
+        while let Ok(event) = self.delivery_accounting_rx.try_recv() {
+            self.handle_delivery_accounting_event(event);
+        }
+
+        while let Ok(event) = self.delivery_resource_event_rx.try_recv() {
+            // Starts and conclusions are capacity-lossless on the accounting
+            // stream. Only progress is intentionally consumed here.
+            if matches!(
+                &event,
+                LinkResourceEvent::Progress {
+                    direction: LinkResourceDirection::Inbound,
+                    ..
+                }
+            ) && let Some(event) = delivery_resource_event_from_runtime(event)
+            {
+                self.router.handle_inbound_resource_event(event);
+            }
+        }
+
         while let Ok((plaintext, link_id)) = self.link_packet_rx.try_recv() {
             tracing::info!(
                 link_id = %hex::encode(link_id),
@@ -2339,15 +2448,6 @@ impl LxmdRunner {
                 "received decrypted packet via link"
             );
             self.handle_link_delivered_data(&plaintext);
-        }
-
-        while let Ok((data, link_id)) = self.resource_rx.try_recv() {
-            tracing::info!(
-                link_id = %hex::encode(link_id),
-                len = data.len(),
-                "resource transfer completed on link"
-            );
-            self.handle_link_delivered_data(&data);
         }
 
         while let Ok((data, link_id)) = self.prop_link_packet_rx.try_recv() {
@@ -2365,6 +2465,29 @@ impl LxmdRunner {
 
         while let Ok(result) = self.prop_validation_rx.try_recv() {
             self.handle_propagation_validation_result(result);
+        }
+    }
+
+    fn handle_delivery_accounting_event(&mut self, event: LinkManagerAccountingEvent) {
+        match event {
+            LinkManagerAccountingEvent::ResourceEvent(event) => {
+                if let Some(event) = delivery_resource_event_from_runtime(event) {
+                    self.router.handle_inbound_resource_event(event);
+                }
+            }
+            LinkManagerAccountingEvent::LinkClosed { link_id } => {
+                self.router
+                    .handle_inbound_resource_event(InboundResourceEvent::LinkClosed { link_id });
+            }
+            LinkManagerAccountingEvent::ResourceCompletion(completion) => {
+                tracing::info!(
+                    link_id = %hex::encode(completion.link_id),
+                    len = completion.data.len(),
+                    "resource transfer completed on link"
+                );
+                self.handle_link_delivered_data(&completion.data);
+            }
+            _ => {}
         }
     }
 
@@ -3895,6 +4018,23 @@ pub(crate) async fn main() {
                 runner.handle_link_delivered_data(&plaintext);
                 runner.drain_link_packets();
             }
+            Some(event) = runner.delivery_accounting_rx.recv() => {
+                runner.handle_delivery_accounting_event(event);
+                runner.drain_link_packets();
+            }
+            Some(event) = runner.delivery_resource_event_rx.recv() => {
+                if matches!(
+                    &event,
+                    LinkResourceEvent::Progress {
+                        direction: LinkResourceDirection::Inbound,
+                        ..
+                    }
+                ) && let Some(event) = delivery_resource_event_from_runtime(event)
+                {
+                    runner.router.handle_inbound_resource_event(event);
+                }
+                runner.drain_link_packets();
+            }
             Some((data, link_id)) = runner.prop_link_packet_rx.recv() => {
                 runner.handle_propagation_transfer_data(link_id, &data);
                 runner.drain_link_packets();
@@ -3923,6 +4063,73 @@ pub(crate) async fn main() {
 mod tests {
     use super::*;
     use lxmf_core::constants::DeliveryMethod;
+
+    #[tokio::test]
+    async fn inbound_resource_cancel_adapter_preserves_exact_owner_and_direction() {
+        let (cancel_tx, cancel_rx) = mpsc::channel(2);
+        let (link_command_tx, mut link_command_rx) = mpsc::channel(2);
+        tokio::spawn(forward_inbound_resource_cancellations(
+            cancel_rx,
+            link_command_tx,
+        ));
+
+        let mut router = LxmRouter::new(lxmf_core::router::RouterConfig::default());
+        router.set_inbound_resource_cancel_sender(cancel_tx);
+        let key = InboundResourceKey::new([0x11; 16], [0x22; 32]);
+        router.handle_inbound_resource_event(InboundResourceEvent::Started {
+            key,
+            data_size: 512,
+            total_segments: 2,
+        });
+
+        assert_eq!(router.inbound_count(), 1);
+        assert!(router.cancel_inbound_exact(key));
+        let command = link_command_rx.recv().await.expect("cancellation command");
+        let LinkManagerCommand::CancelLinkResource {
+            link_id,
+            resource_id,
+            direction,
+            result_tx,
+        } = command
+        else {
+            panic!("expected exact LinkManager Resource cancellation");
+        };
+        assert_eq!(link_id, key.link_id);
+        assert_eq!(resource_id, key.resource_id);
+        assert_eq!(direction, LinkResourceDirection::Inbound);
+        assert!(result_tx.is_none());
+    }
+
+    #[test]
+    fn runtime_resource_projection_tracks_only_inbound_resources() {
+        let key = InboundResourceKey::new([0x33; 16], [0x44; 32]);
+        let projected = delivery_resource_event_from_runtime(LinkResourceEvent::Progress {
+            link_id: key.link_id,
+            resource_id: key.resource_id,
+            direction: LinkResourceDirection::Inbound,
+            transferred: 12,
+            total: 24,
+        });
+        assert_eq!(
+            projected,
+            Some(InboundResourceEvent::Progress {
+                key,
+                transferred: 12,
+                total: 24,
+            })
+        );
+
+        assert!(
+            delivery_resource_event_from_runtime(LinkResourceEvent::Progress {
+                link_id: key.link_id,
+                resource_id: key.resource_id,
+                direction: LinkResourceDirection::Outbound,
+                transferred: 12,
+                total: 24,
+            })
+            .is_none()
+        );
+    }
 
     fn unpack_announce(raw: &[u8]) -> (rns_wire::header::PacketHeader, AnnounceData) {
         let (header, header_len) = rns_wire::header::PacketHeader::unpack(raw).unwrap();
