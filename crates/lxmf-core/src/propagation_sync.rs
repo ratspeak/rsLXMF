@@ -9,22 +9,27 @@
 //! 3. Receive a Response packet (context 0x0A) with OfferResponse.
 //! 4. Transfer requested messages as a Resource.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use rns_crypto::ed25519::Ed25519PublicKey;
+use rns_crypto::ed25519::{Ed25519PrivateKey, Ed25519PublicKey};
 use rns_link::link::{CloseReason, Link};
-use rns_protocol::resource::{OutboundTransfer, TransferAction};
+use rns_protocol::resource::{
+    MAX_EFFICIENT_SIZE, MultiSegmentOutbound, OutboundTransfer, ResourceError, TransferAction,
+};
 use rns_transport::link_messages::DestinationEvent;
 use rns_transport::messages::{OutboundRequest, TransportMessage};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::constants::OFFER_REQUEST_PATH;
-use crate::peer::LxmPeer;
+use crate::peer::{LxmPeer, OutboundOfferPolicy};
 use crate::propagation::hex_encode;
-use crate::propagation_node::{PropagationNode, PropagationNodeConfig};
+use crate::propagation_node::{
+    InstallPreparedSyncOffer, PreparedSyncOffer, PropagationNode, PropagationNodeConfig,
+    prepare_sync_offer_snapshot, read_planned_messages,
+};
 use crate::sync::OfferResponse;
 use crate::types::PropagationTransientId;
 
@@ -37,6 +42,61 @@ pub enum SyncTaskState {
     Transferring,
     Complete,
     Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerSyncTerminalState {
+    Complete,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerSyncTerminalResult {
+    pub peer_hash: [u8; 16],
+    pub state: PeerSyncTerminalState,
+    /// Store generation used by successful offer preparation. Failures leave
+    /// this unset so unchanged-store work remains retryable after backoff.
+    pub offer_generation: Option<u64>,
+    /// True only when no cumulative-limit or vanished-file work remains for
+    /// this generation.
+    pub generation_exhausted: bool,
+}
+
+#[derive(Debug)]
+struct PreparedTransferBatch {
+    requested_count: usize,
+    transient_ids: Vec<PropagationTransientId>,
+    payload: Vec<u8>,
+}
+
+fn prepare_outbound_resource_transfers(
+    payload: Vec<u8>,
+    auto_compress: bool,
+    rtt: Duration,
+    link_keys: rns_link::key_derivation::LinkKeys,
+) -> Result<VecDeque<OutboundTransfer>, ResourceError> {
+    if payload.len() <= MAX_EFFICIENT_SIZE {
+        return Ok(VecDeque::from([OutboundTransfer::new_encrypted(
+            payload,
+            auto_compress,
+            rtt,
+            link_keys,
+        )?]));
+    }
+
+    // Reticulum encrypts each logical Resource segment as one assembled blob
+    // before chunking it into raw RESOURCE packets. MultiSegmentOutbound also
+    // enforces the protocol's MAX_RESOURCE_SIZE / MAX_SEGMENTS bounds.
+    let encrypt = |plaintext: &[u8]| {
+        rns_link::encryption::link_encrypt(&link_keys, plaintext)
+            .unwrap_or_else(|_| plaintext.to_vec())
+    };
+    let resources =
+        MultiSegmentOutbound::with_encrypt(payload, auto_compress, Some(&encrypt))?.segments;
+    Ok(resources
+        .into_iter()
+        .map(|resource| OutboundTransfer::from_prebuilt(resource, rtt))
+        .collect())
 }
 
 pub struct PropagationSyncTask {
@@ -52,9 +112,22 @@ pub struct PropagationSyncTask {
     sync_interval: Duration,
     sync_started: Option<Instant>,
     sync_timeout: Duration,
-    transfer_queue: Vec<Vec<u8>>,
     active_transfer: Option<OutboundTransfer>,
+    pending_transfer_segments: VecDeque<OutboundTransfer>,
+    active_transfer_ids: Vec<PropagationTransientId>,
+    transfer_preparation_rx: Option<oneshot::Receiver<PreparedTransferBatch>>,
+    ready_transfer_batch: Option<PreparedTransferBatch>,
     peer: Option<LxmPeer>,
+    offer_policy: Option<OutboundOfferPolicy>,
+    offer_preparation_rx: Option<oneshot::Receiver<PreparedSyncOffer>>,
+    ready_prepared_offer: Option<PreparedSyncOffer>,
+    handled_updates: Vec<PropagationTransientId>,
+    runtime_handle: Option<tokio::runtime::Handle>,
+    identity_pub: Option<[u8; 64]>,
+    identity_key: Option<Ed25519PrivateKey>,
+    active_offer_generation: Option<u64>,
+    generation_exhausted: bool,
+    terminal_result: Option<PeerSyncTerminalResult>,
 }
 
 impl PropagationSyncTask {
@@ -76,9 +149,22 @@ impl PropagationSyncTask {
             sync_interval: Duration::from_secs(300),
             sync_started: None,
             sync_timeout: Duration::from_secs(120),
-            transfer_queue: Vec::new(),
             active_transfer: None,
+            pending_transfer_segments: VecDeque::new(),
+            active_transfer_ids: Vec::new(),
+            transfer_preparation_rx: None,
+            ready_transfer_batch: None,
             peer: None,
+            offer_policy: None,
+            offer_preparation_rx: None,
+            ready_prepared_offer: None,
+            handled_updates: Vec::new(),
+            runtime_handle: tokio::runtime::Handle::try_current().ok(),
+            identity_pub: None,
+            identity_key: None,
+            active_offer_generation: None,
+            generation_exhausted: false,
+            terminal_result: None,
         }
     }
 
@@ -106,9 +192,22 @@ impl PropagationSyncTask {
             sync_interval: Duration::from_secs(300),
             sync_started: None,
             sync_timeout: Duration::from_secs(120),
-            transfer_queue: Vec::new(),
             active_transfer: None,
+            pending_transfer_segments: VecDeque::new(),
+            active_transfer_ids: Vec::new(),
+            transfer_preparation_rx: None,
+            ready_transfer_batch: None,
             peer: None,
+            offer_policy: None,
+            offer_preparation_rx: None,
+            ready_prepared_offer: None,
+            handled_updates: Vec::new(),
+            runtime_handle: tokio::runtime::Handle::try_current().ok(),
+            identity_pub: None,
+            identity_key: None,
+            active_offer_generation: None,
+            generation_exhausted: false,
+            terminal_result: None,
         })
     }
 
@@ -132,13 +231,32 @@ impl PropagationSyncTask {
             sync_interval: Duration::from_secs(300),
             sync_started: None,
             sync_timeout: Duration::from_secs(120),
-            transfer_queue: Vec::new(),
             active_transfer: None,
+            pending_transfer_segments: VecDeque::new(),
+            active_transfer_ids: Vec::new(),
+            transfer_preparation_rx: None,
+            ready_transfer_batch: None,
             peer: None,
+            offer_policy: None,
+            offer_preparation_rx: None,
+            ready_prepared_offer: None,
+            handled_updates: Vec::new(),
+            runtime_handle: tokio::runtime::Handle::try_current().ok(),
+            identity_pub: None,
+            identity_key: None,
+            active_offer_generation: None,
+            generation_exhausted: false,
+            terminal_result: None,
         }
     }
 
     pub fn set_node(&mut self, dest_hash: [u8; 16]) {
+        if self.state != SyncTaskState::Idle && self.node_dest_hash != Some(dest_hash) {
+            return;
+        }
+        if self.node_dest_hash != Some(dest_hash) {
+            self.offer_policy = None;
+        }
         self.node_dest_hash = Some(dest_hash);
     }
 
@@ -147,16 +265,94 @@ impl PropagationSyncTask {
     /// Python `LXMPeer.sync()` is called directly by lxmd control requests;
     /// this public shim preserves that behavior without waiting for the
     /// periodic sync interval.
-    pub fn request_sync_now(&mut self, dest_hash: [u8; 16]) {
-        self.node_dest_hash = Some(dest_hash);
-        if self.state == SyncTaskState::Idle {
-            self.start_sync(dest_hash);
-            self.last_sync = Instant::now();
+    pub fn request_sync_now(&mut self, dest_hash: [u8; 16]) -> bool {
+        if self.state != SyncTaskState::Idle || self.terminal_result.is_some() {
+            return false;
         }
+        self.node_dest_hash = Some(dest_hash);
+        self.offer_policy = None;
+        self.start_sync(dest_hash);
+        self.last_sync = Instant::now();
+        true
+    }
+
+    /// Force an immediate sync using an authoritative peer-policy snapshot.
+    pub fn request_sync_now_with_policy(&mut self, policy: OutboundOfferPolicy) -> bool {
+        if self.state != SyncTaskState::Idle || self.terminal_result.is_some() {
+            return false;
+        }
+        let dest_hash = policy.peer_hash;
+        self.node_dest_hash = Some(dest_hash);
+        self.offer_policy = Some(policy);
+        self.start_sync(dest_hash);
+        self.last_sync = Instant::now();
+        true
+    }
+
+    /// Configure the local identity used for Link identification. Production
+    /// peer sync must set this before requesting a sync; compatibility callers
+    /// without identity material retain the historical unidentified behavior.
+    pub fn set_identity(&mut self, identity_pub: [u8; 64], identity_key: Ed25519PrivateKey) {
+        self.identity_pub = Some(identity_pub);
+        self.identity_key = Some(identity_key);
+    }
+
+    /// Drain peer-handled updates discovered during offer negotiation or
+    /// proven Resource transfer. The daemon merges these into its authoritative
+    /// `LxmPeer` and persists that peer.
+    pub fn take_handled_updates(&mut self) -> Vec<PropagationTransientId> {
+        std::mem::take(&mut self.handled_updates)
+    }
+
+    pub fn take_terminal_peer_result(&mut self) -> Option<PeerSyncTerminalResult> {
+        self.terminal_result.take()
+    }
+
+    /// Cancel all active and pending work for one peer. Dropping the bounded
+    /// worker receivers makes late preparation results inert, and clearing
+    /// handled deltas prevents an explicit unpeer from recreating persistence.
+    pub fn cancel_peer_sync(&mut self, peer_hash: &[u8; 16]) -> bool {
+        let matches_active = self.node_dest_hash.as_ref() == Some(peer_hash);
+        let matches_policy = self
+            .offer_policy
+            .as_ref()
+            .is_some_and(|policy| &policy.peer_hash == peer_hash);
+        if !matches_active && !matches_policy {
+            return false;
+        }
+
+        if matches_active && self.state != SyncTaskState::Idle {
+            self.cleanup_sync();
+        }
+        if let Ok(mut node) = self.propagation_node.lock() {
+            node.remove_session(peer_hash);
+        }
+        self.node_dest_hash = None;
+        self.offer_policy = None;
+        self.offer_preparation_rx = None;
+        self.ready_prepared_offer = None;
+        self.transfer_preparation_rx = None;
+        self.ready_transfer_batch = None;
+        self.active_transfer = None;
+        self.pending_transfer_segments.clear();
+        self.active_transfer_ids.clear();
+        self.active_offer_generation = None;
+        self.generation_exhausted = false;
+        self.handled_updates.clear();
+        self.terminal_result = None;
+        self.state = SyncTaskState::Idle;
+        true
     }
 
     pub fn node_dest_hash(&self) -> Option<[u8; 16]> {
         self.node_dest_hash
+    }
+
+    fn blocking_runtime(&mut self) -> Option<tokio::runtime::Handle> {
+        if self.runtime_handle.is_none() {
+            self.runtime_handle = tokio::runtime::Handle::try_current().ok();
+        }
+        self.runtime_handle.clone()
     }
 
     pub fn accept_message(&mut self, msg: &crate::message::LxMessage) -> bool {
@@ -222,14 +418,19 @@ impl PropagationSyncTask {
                                 transfer.handle_hmu(&plaintext);
                             }
                         }
+                        rns_wire::context::PacketContext::ResourceReq => {
+                            self.handle_resource_request(data);
+                        }
                         rns_wire::context::PacketContext::ResourcePrf => {
                             // Python Packet.pack() sends PROOF+RESOURCE_PRF as
                             // plaintext (Packet.py:195-197) on PacketType::Proof.
                             // Body = resource_hash(32) || proof(32).
-                            if let Some(ref mut transfer) = self.active_transfer
-                                && transfer.handle_proof(data)
-                            {
-                                self.active_transfer = None;
+                            let completed = self
+                                .active_transfer
+                                .as_mut()
+                                .is_some_and(|transfer| transfer.handle_proof(data));
+                            if completed {
+                                self.complete_active_transfer_segment();
                             }
                         }
                         rns_wire::context::PacketContext::Response => {
@@ -241,6 +442,10 @@ impl PropagationSyncTask {
                                 self.handle_offer_response(offer_response);
                             }
                         }
+                        rns_wire::context::PacketContext::ResourceRcl
+                        | rns_wire::context::PacketContext::ResourceIcl => {
+                            self.handle_resource_cancel(data);
+                        }
                         rns_wire::context::PacketContext::LinkClose => {
                             self.handle_link_closed(header.destination_hash, Some(data));
                         }
@@ -250,6 +455,98 @@ impl PropagationSyncTask {
                 _ => {}
             }
         }
+    }
+
+    fn handle_resource_request(&mut self, encrypted_data: &[u8]) {
+        let Some(plaintext) = self
+            .link
+            .as_ref()
+            .and_then(|link| link.decrypt(encrypted_data).ok())
+        else {
+            return;
+        };
+        let resource_hash_start =
+            if plaintext.first().copied() == Some(rns_protocol::resource::HASHMAP_IS_EXHAUSTED) {
+                1 + rns_protocol::resource::MAPHASH_LEN
+            } else {
+                1
+            };
+        let Some(requested_resource_hash) =
+            plaintext.get(resource_hash_start..resource_hash_start + 32)
+        else {
+            return;
+        };
+        let Some(transfer) = self.active_transfer.as_mut() else {
+            return;
+        };
+        if requested_resource_hash != transfer.resource.resource_hash {
+            return;
+        }
+        let actions = transfer.handle_request(&plaintext);
+
+        for action in actions {
+            match action {
+                TransferAction::SendPart(_, part_data) => self
+                    .send_resource_packet(&part_data, rns_wire::context::PacketContext::Resource),
+                TransferAction::SendHmu(hmu_data) => self
+                    .send_resource_packet(&hmu_data, rns_wire::context::PacketContext::ResourceHmu),
+                TransferAction::SendCancel(cancel_type, resource_hash) => {
+                    let context = match cancel_type {
+                        rns_protocol::resource::CancelType::Icl => {
+                            rns_wire::context::PacketContext::ResourceIcl
+                        }
+                        rns_protocol::resource::CancelType::Rcl => {
+                            rns_wire::context::PacketContext::ResourceRcl
+                        }
+                    };
+                    self.send_resource_packet(&resource_hash, context);
+                    self.fail_active_transfer();
+                    break;
+                }
+                TransferAction::Failed(_) => {
+                    self.fail_active_transfer();
+                    break;
+                }
+                TransferAction::Complete => {
+                    self.complete_active_transfer_segment();
+                    break;
+                }
+                // OutboundTransfer::handle_request currently emits only
+                // parts, hashmap updates, or initiator-cancel. Ignore actions
+                // belonging to other Resource lifecycle roles.
+                TransferAction::None
+                | TransferAction::SendAdvertisement(_)
+                | TransferAction::SendProof(_)
+                | TransferAction::SendRequest(_) => {}
+            }
+        }
+    }
+
+    fn handle_resource_cancel(&mut self, encrypted_data: &[u8]) {
+        let Some(plaintext) = self
+            .link
+            .as_ref()
+            .and_then(|link| link.decrypt(encrypted_data).ok())
+        else {
+            return;
+        };
+        let Ok(resource_hash) = <[u8; 32]>::try_from(plaintext.as_slice()) else {
+            return;
+        };
+        let matches_active = self
+            .active_transfer
+            .as_ref()
+            .is_some_and(|transfer| transfer.resource.resource_hash == resource_hash);
+        if matches_active {
+            self.fail_active_transfer();
+        }
+    }
+
+    fn fail_active_transfer(&mut self) {
+        self.active_transfer = None;
+        self.pending_transfer_segments.clear();
+        self.active_transfer_ids.clear();
+        self.state = SyncTaskState::Failed;
     }
 
     fn handle_link_closed(&mut self, link_id: [u8; 16], encrypted_teardown: Option<&[u8]>) -> bool {
@@ -271,7 +568,10 @@ impl PropagationSyncTask {
 
         if verified {
             self.active_transfer = None;
-            self.transfer_queue.clear();
+            self.pending_transfer_segments.clear();
+            self.active_transfer_ids.clear();
+            self.transfer_preparation_rx = None;
+            self.ready_transfer_batch = None;
             self.state = SyncTaskState::Failed;
         }
 
@@ -325,6 +625,10 @@ impl PropagationSyncTask {
                         peer.link_established(link_id, establishment_rate);
                     }
                 }
+                if !self.send_identify() {
+                    self.state = SyncTaskState::Failed;
+                    return;
+                }
                 self.state = SyncTaskState::Offering;
             }
             Err(_) => {
@@ -340,32 +644,47 @@ impl PropagationSyncTask {
             None => return,
         };
 
+        let offered_ids = self
+            .propagation_node
+            .lock()
+            .ok()
+            .and_then(|node| {
+                node.get_session(&node_hash)
+                    .map(|session| session.offered_ids.clone())
+            })
+            .unwrap_or_default();
+
         match response {
-            OfferResponse::WantAll => {
-                let all_ids = self
-                    .propagation_node
-                    .lock()
-                    .map(|node| node.create_offer(node_hash, None))
-                    .unwrap_or_default();
-                self.queue_messages_for_ids(&all_ids);
-            }
+            OfferResponse::WantAll => self.prepare_transfer_for_ids(&offered_ids),
             OfferResponse::HaveAll => {
+                self.record_handled_updates(&offered_ids);
+                if let Ok(mut node) = self.propagation_node.lock() {
+                    node.complete_sync(&node_hash);
+                }
                 self.state = SyncTaskState::Complete;
             }
             OfferResponse::WantSome(wanted_id_bytes) => {
+                let offered = offered_ids.iter().copied().collect::<HashSet<_>>();
+                let mut seen = HashSet::new();
                 let wanted_ids: Vec<PropagationTransientId> = wanted_id_bytes
                     .iter()
                     .filter_map(|id| {
                         if id.len() == 32 {
                             let mut arr = [0u8; 32];
                             arr.copy_from_slice(id);
-                            Some(arr)
+                            (offered.contains(&arr) && seen.insert(arr)).then_some(arr)
                         } else {
                             None
                         }
                     })
                     .collect();
-                self.queue_messages_for_ids(&wanted_ids);
+                let already_handled = offered_ids
+                    .iter()
+                    .copied()
+                    .filter(|id| !seen.contains(id))
+                    .collect::<Vec<_>>();
+                self.record_handled_updates(&already_handled);
+                self.prepare_transfer_for_ids(&wanted_ids);
             }
             _ => {
                 self.state = SyncTaskState::Failed;
@@ -373,7 +692,17 @@ impl PropagationSyncTask {
         }
     }
 
-    fn queue_messages_for_ids(&mut self, ids: &[PropagationTransientId]) {
+    fn prepare_transfer_for_ids(&mut self, ids: &[PropagationTransientId]) {
+        if ids.is_empty() {
+            if let Some(node_hash) = self.node_dest_hash
+                && let Ok(mut node) = self.propagation_node.lock()
+            {
+                node.complete_sync(&node_hash);
+            }
+            self.state = SyncTaskState::Complete;
+            return;
+        }
+
         // Resolve paths under the node lock; read the files after dropping it.
         let plan = match self.propagation_node.lock() {
             Ok(node) => node.plan_message_reads(ids),
@@ -382,14 +711,38 @@ impl PropagationSyncTask {
                 return;
             }
         };
-        let results = crate::propagation_node::read_planned_messages(&plan);
-        self.transfer_queue = results.into_iter().map(|(_tid, data)| data).collect();
+        let requested_count = ids.len();
+        let prepare = move || {
+            let messages = read_planned_messages(&plan);
+            let transient_ids = messages.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+            let payload = {
+                use rmpv::Value;
+                let blobs = messages
+                    .into_iter()
+                    .map(|(_, data)| Value::Binary(data))
+                    .collect::<Vec<_>>();
+                crate::encode_value(&Value::Array(vec![
+                    Value::from(crate::now_f64()),
+                    Value::Array(blobs),
+                ]))
+            };
+            PreparedTransferBatch {
+                requested_count,
+                transient_ids,
+                payload,
+            }
+        };
 
-        if self.transfer_queue.is_empty() {
-            self.state = SyncTaskState::Complete;
+        if let Some(runtime) = self.blocking_runtime() {
+            let (tx, rx) = oneshot::channel();
+            runtime.spawn_blocking(move || {
+                let _ = tx.send(prepare());
+            });
+            self.transfer_preparation_rx = Some(rx);
         } else {
-            self.state = SyncTaskState::Transferring;
+            self.ready_transfer_batch = Some(prepare());
         }
+        self.state = SyncTaskState::Transferring;
     }
 
     pub fn tick(&mut self) {
@@ -404,7 +757,9 @@ impl PropagationSyncTask {
 
         match self.state {
             SyncTaskState::Idle => {
-                if self.last_sync.elapsed() >= self.sync_interval
+                if self.terminal_result.is_none()
+                    && self.offer_policy.is_none()
+                    && self.last_sync.elapsed() >= self.sync_interval
                     && let Some(node_hash) = self.node_dest_hash
                 {
                     if self.message_count() > 0 {
@@ -422,6 +777,23 @@ impl PropagationSyncTask {
                 self.drive_transfers();
             }
             SyncTaskState::Complete | SyncTaskState::Failed => {
+                if self.terminal_result.is_none()
+                    && let Some(peer_hash) = self.node_dest_hash
+                {
+                    let complete = self.state == SyncTaskState::Complete;
+                    self.terminal_result = Some(PeerSyncTerminalResult {
+                        peer_hash,
+                        state: if complete {
+                            PeerSyncTerminalState::Complete
+                        } else {
+                            PeerSyncTerminalState::Failed
+                        },
+                        offer_generation: complete
+                            .then_some(self.active_offer_generation)
+                            .flatten(),
+                        generation_exhausted: complete && self.generation_exhausted,
+                    });
+                }
                 self.cleanup_sync();
                 self.last_sync = Instant::now();
                 self.state = SyncTaskState::Idle;
@@ -439,14 +811,103 @@ impl PropagationSyncTask {
             }
         };
 
-        // Wire: msgpack([peering_key, [transient_id_1, transient_id_2, ...]])
-        let offer = match self.propagation_node.lock() {
-            Ok(mut node) => node.prepare_sync_offer(node_hash),
-            Err(_) => {
-                self.state = SyncTaskState::Failed;
-                return;
+        // Compatibility callers without an authoritative policy keep the
+        // synchronous wrapper. Production always uses the staged snapshot ->
+        // bounded blocking worker -> generation revalidation path below.
+        let offer = if self.offer_policy.is_none() {
+            match self.propagation_node.lock() {
+                Ok(mut node) => {
+                    let generation = node.offer_generation();
+                    let offer = node.prepare_sync_offer(node_hash);
+                    self.active_offer_generation = Some(generation);
+                    self.generation_exhausted = true;
+                    if offer.transient_ids.is_empty() {
+                        node.complete_sync(&node_hash);
+                    }
+                    offer
+                }
+                Err(_) => {
+                    self.state = SyncTaskState::Failed;
+                    return;
+                }
+            }
+        } else {
+            if self.offer_preparation_rx.is_none() && self.ready_prepared_offer.is_none() {
+                let policy = self.offer_policy.as_ref().expect("policy checked above");
+                if policy.peer_hash != node_hash {
+                    self.state = SyncTaskState::Failed;
+                    return;
+                }
+                let snapshot = match self.propagation_node.lock() {
+                    Ok(node) => node.snapshot_sync_offer_preparation(policy),
+                    Err(_) => {
+                        self.state = SyncTaskState::Failed;
+                        return;
+                    }
+                };
+                if let Some(runtime) = self.blocking_runtime() {
+                    let (tx, rx) = oneshot::channel();
+                    runtime.spawn_blocking(move || {
+                        let _ = tx.send(prepare_sync_offer_snapshot(snapshot));
+                    });
+                    self.offer_preparation_rx = Some(rx);
+                    return;
+                }
+                self.ready_prepared_offer = Some(prepare_sync_offer_snapshot(snapshot));
+            }
+
+            let prepared = if let Some(prepared) = self.ready_prepared_offer.take() {
+                prepared
+            } else {
+                let Some(receiver) = self.offer_preparation_rx.as_mut() else {
+                    self.state = SyncTaskState::Failed;
+                    return;
+                };
+                match receiver.try_recv() {
+                    Ok(prepared) => {
+                        self.offer_preparation_rx = None;
+                        prepared
+                    }
+                    Err(oneshot::error::TryRecvError::Empty) => return,
+                    Err(oneshot::error::TryRecvError::Closed) => {
+                        self.offer_preparation_rx = None;
+                        self.state = SyncTaskState::Failed;
+                        return;
+                    }
+                }
+            };
+
+            let installed = match self.propagation_node.lock() {
+                Ok(mut node) => node.install_prepared_sync_offer(prepared),
+                Err(_) => {
+                    self.state = SyncTaskState::Failed;
+                    return;
+                }
+            };
+            match installed {
+                InstallPreparedSyncOffer::Stale => return,
+                InstallPreparedSyncOffer::Installed {
+                    offer,
+                    generation,
+                    terminal_handled_ids,
+                    generation_exhausted,
+                } => {
+                    self.active_offer_generation = Some(generation);
+                    self.generation_exhausted = generation_exhausted;
+                    self.record_handled_updates(&terminal_handled_ids);
+                    if offer.transient_ids.is_empty()
+                        && let Ok(mut node) = self.propagation_node.lock()
+                    {
+                        node.complete_sync(&node_hash);
+                    }
+                    offer
+                }
             }
         };
+        if offer.transient_ids.is_empty() {
+            self.state = SyncTaskState::Complete;
+            return;
+        }
         let offer_data = {
             use rmpv::Value;
             let ids: Vec<Value> = offer
@@ -508,6 +969,15 @@ impl PropagationSyncTask {
     }
 
     fn start_sync(&mut self, node_hash: [u8; 16]) {
+        self.offer_preparation_rx = None;
+        self.ready_prepared_offer = None;
+        self.transfer_preparation_rx = None;
+        self.ready_transfer_batch = None;
+        self.active_transfer = None;
+        self.pending_transfer_segments.clear();
+        self.active_transfer_ids.clear();
+        self.active_offer_generation = None;
+        self.generation_exhausted = false;
         let (link, request_data) = Link::new_initiator(node_hash, 1);
         let link_id = link.link_id;
 
@@ -559,20 +1029,65 @@ impl PropagationSyncTask {
 
     fn drive_transfers(&mut self) {
         if self.active_transfer.is_none() {
-            if let Some(msg_data) = self.transfer_queue.pop() {
-                let rtt = self
-                    .link
-                    .as_ref()
-                    .and_then(|l| l.rtt)
-                    .unwrap_or(Duration::from_millis(500));
-                match OutboundTransfer::new(msg_data, true, rtt) {
-                    Ok(transfer) => {
-                        self.active_transfer = Some(transfer);
+            let batch = if let Some(batch) = self.ready_transfer_batch.take() {
+                Some(batch)
+            } else if let Some(receiver) = self.transfer_preparation_rx.as_mut() {
+                match receiver.try_recv() {
+                    Ok(batch) => {
+                        self.transfer_preparation_rx = None;
+                        Some(batch)
                     }
-                    Err(_) => return,
+                    Err(oneshot::error::TryRecvError::Empty) => return,
+                    Err(oneshot::error::TryRecvError::Closed) => {
+                        self.transfer_preparation_rx = None;
+                        self.state = SyncTaskState::Failed;
+                        return;
+                    }
                 }
             } else {
-                self.state = SyncTaskState::Complete;
+                None
+            };
+
+            if let Some(batch) = batch {
+                if batch.transient_ids.len() != batch.requested_count {
+                    // Requested files that vanished between offer and read are
+                    // not treated as remotely handled; retry this generation.
+                    self.generation_exhausted = false;
+                }
+                if batch.transient_ids.is_empty() {
+                    // The offer named data that the disk read could not
+                    // produce. Treat this as a failed attempt so the daemon's
+                    // peer backoff applies; reporting a successful but
+                    // unexhausted generation would reconnect every tick.
+                    self.state = SyncTaskState::Failed;
+                    return;
+                }
+                let Some(link) = self.link.as_ref() else {
+                    self.state = SyncTaskState::Failed;
+                    return;
+                };
+                let rtt = link.rtt.unwrap_or(Duration::from_millis(500));
+                let Some(link_keys) = link.session_keys() else {
+                    self.state = SyncTaskState::Failed;
+                    return;
+                };
+                let Ok(mut transfers) =
+                    prepare_outbound_resource_transfers(batch.payload, true, rtt, link_keys)
+                else {
+                    self.state = SyncTaskState::Failed;
+                    return;
+                };
+                let Some(first) = transfers.pop_front() else {
+                    self.state = SyncTaskState::Failed;
+                    return;
+                };
+                self.active_transfer = Some(first);
+                self.pending_transfer_segments = transfers;
+                self.active_transfer_ids = batch.transient_ids;
+            } else {
+                // Transferring without either a live Resource or a pending
+                // preparation is an internal failure, never a successful sync.
+                self.state = SyncTaskState::Failed;
                 return;
             }
         }
@@ -593,15 +1108,31 @@ impl PropagationSyncTask {
                     );
                 }
                 TransferAction::Complete => {
-                    self.active_transfer = None;
+                    self.complete_active_transfer_segment();
                 }
                 TransferAction::Failed(_) => {
-                    self.active_transfer = None;
-                    self.state = SyncTaskState::Failed;
+                    self.fail_active_transfer();
                 }
                 _ => {}
             }
         }
+    }
+
+    fn complete_active_transfer_segment(&mut self) {
+        self.active_transfer = None;
+        if let Some(next) = self.pending_transfer_segments.pop_front() {
+            self.active_transfer = Some(next);
+            return;
+        }
+
+        let completed_ids = std::mem::take(&mut self.active_transfer_ids);
+        self.record_handled_updates(&completed_ids);
+        if let Some(node_hash) = self.node_dest_hash
+            && let Ok(mut node) = self.propagation_node.lock()
+        {
+            node.complete_sync(&node_hash);
+        }
+        self.state = SyncTaskState::Complete;
     }
 
     fn send_resource_packet(&self, data: &[u8], context: rns_wire::context::PacketContext) {
@@ -614,29 +1145,73 @@ impl PropagationSyncTask {
             None => return,
         };
 
-        if let Ok(encrypted) = link.encrypt(data) {
-            let header = rns_wire::header::PacketHeader {
-                flags: rns_wire::flags::PacketFlags {
-                    header_type: rns_wire::flags::HeaderType::Header1,
-                    context_flag: false,
-                    transport_type: rns_wire::flags::TransportType::Broadcast,
-                    destination_type: rns_wire::flags::DestinationType::Link,
-                    packet_type: rns_wire::flags::PacketType::Data,
-                },
-                hops: 0,
-                transport_id: None,
+        // Resource ADVs and control frames use ordinary Link encryption. The
+        // assembled Resource itself was already encrypted before chunking, so
+        // RESOURCE parts must ride raw or their advertised map hashes will no
+        // longer match.
+        let body = if context == rns_wire::context::PacketContext::Resource {
+            data.to_vec()
+        } else if let Ok(encrypted) = link.encrypt(data) {
+            encrypted
+        } else {
+            return;
+        };
+        let header = rns_wire::header::PacketHeader {
+            flags: rns_wire::flags::PacketFlags {
+                header_type: rns_wire::flags::HeaderType::Header1,
+                context_flag: false,
+                transport_type: rns_wire::flags::TransportType::Broadcast,
+                destination_type: rns_wire::flags::DestinationType::Link,
+                packet_type: rns_wire::flags::PacketType::Data,
+            },
+            hops: 0,
+            transport_id: None,
+            destination_hash: link_id,
+            context,
+        };
+        let mut raw = header.pack();
+        raw.extend_from_slice(&body);
+        let _ = self
+            .transport_tx
+            .try_send(TransportMessage::Outbound(OutboundRequest {
+                raw: Bytes::from(raw),
                 destination_hash: link_id,
-                context,
-            };
-            let mut raw = header.pack();
-            raw.extend_from_slice(&encrypted);
-            let _ = self
-                .transport_tx
-                .try_send(TransportMessage::Outbound(OutboundRequest {
-                    raw: Bytes::from(raw),
-                    destination_hash: link_id,
-                }));
-        }
+            }));
+    }
+
+    fn send_identify(&mut self) -> bool {
+        let (Some(link), Some(link_id), Some(identity_pub), Some(identity_key)) = (
+            self.link.as_mut(),
+            self.link_id,
+            self.identity_pub.as_ref(),
+            self.identity_key.as_ref(),
+        ) else {
+            return true;
+        };
+        let Ok(identify_data) = link.identify(identity_pub, identity_key) else {
+            return false;
+        };
+        let header = rns_wire::header::PacketHeader {
+            flags: rns_wire::flags::PacketFlags {
+                header_type: rns_wire::flags::HeaderType::Header1,
+                context_flag: false,
+                transport_type: rns_wire::flags::TransportType::Broadcast,
+                destination_type: rns_wire::flags::DestinationType::Link,
+                packet_type: rns_wire::flags::PacketType::Data,
+            },
+            hops: 0,
+            transport_id: None,
+            destination_hash: link_id,
+            context: rns_wire::context::PacketContext::LinkIdentify,
+        };
+        let mut raw = header.pack();
+        raw.extend_from_slice(&identify_data);
+        self.transport_tx
+            .try_send(TransportMessage::Outbound(OutboundRequest {
+                raw: Bytes::from(raw),
+                destination_hash: link_id,
+            }))
+            .is_ok()
     }
 
     /// Python LXMPeer.py:540-542.
@@ -654,7 +1229,12 @@ impl PropagationSyncTask {
         self.link = None;
         self.peer = None;
         self.active_transfer = None;
-        self.transfer_queue.clear();
+        self.pending_transfer_segments.clear();
+        self.active_transfer_ids.clear();
+        self.offer_preparation_rx = None;
+        self.ready_prepared_offer = None;
+        self.transfer_preparation_rx = None;
+        self.ready_transfer_batch = None;
         self.sync_started = None;
     }
 
@@ -701,6 +1281,20 @@ impl PropagationSyncTask {
     pub fn peer(&self) -> Option<&LxmPeer> {
         self.peer.as_ref()
     }
+
+    fn record_handled_updates(&mut self, transient_ids: &[PropagationTransientId]) {
+        if transient_ids.is_empty() {
+            return;
+        }
+        for transient_id in transient_ids {
+            if !self.handled_updates.contains(transient_id) {
+                self.handled_updates.push(*transient_id);
+            }
+            if let Some(peer) = self.peer.as_mut() {
+                peer.add_handled_message(transient_id);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -718,6 +1312,391 @@ mod tests {
             .unwrap();
         responder.receive_rtt_packet(&rtt_data).unwrap();
         (initiator, responder)
+    }
+
+    #[test]
+    fn resource_is_encrypted_before_chunking_and_advertisement_maps_raw_parts() {
+        let (initiator, responder) = active_link_pair([0x41; 16]);
+        let initiator_keys = initiator.session_keys().unwrap();
+        let responder_keys = responder.session_keys().unwrap();
+        let payload = (0..8192)
+            .map(|index| ((index * 31) % 251) as u8)
+            .collect::<Vec<_>>();
+
+        let mut transfers = prepare_outbound_resource_transfers(
+            payload.clone(),
+            false,
+            Duration::from_millis(500),
+            initiator_keys,
+        )
+        .unwrap();
+        assert_eq!(transfers.len(), 1);
+        let mut transfer = transfers.pop_front().unwrap();
+        assert!(transfer.resource.flags.encrypted);
+
+        let advertisement = match transfer.tick() {
+            TransferAction::SendAdvertisement(data) => {
+                rns_protocol::resource_adv::ResourceAdvertisement::unpack(&data).unwrap()
+            }
+            other => panic!("expected Resource advertisement, got {other:?}"),
+        };
+        assert!(advertisement.flags.encrypted);
+        assert_eq!(advertisement.resource_hash, transfer.resource.resource_hash);
+        assert_eq!(advertisement.random_hash, transfer.resource.random_hash);
+        let advertised_hashes = advertisement.get_map_hashes();
+        assert_eq!(
+            advertised_hashes,
+            transfer.resource.map_hashes[..advertised_hashes.len()]
+        );
+
+        for (part, expected_hash) in transfer
+            .resource
+            .parts
+            .iter()
+            .zip(&transfer.resource.map_hashes)
+        {
+            assert_eq!(
+                rns_protocol::resource::get_map_hash(part, &transfer.resource.random_hash),
+                *expected_hash
+            );
+        }
+
+        let encrypted_stream = transfer.resource.parts.concat();
+        assert_ne!(encrypted_stream, payload);
+        let plaintext =
+            rns_link::encryption::link_decrypt(&responder_keys, &encrypted_stream).unwrap();
+        assert_eq!(
+            &plaintext[..rns_protocol::resource::RANDOM_HASH_SIZE],
+            &transfer.resource.random_hash
+        );
+        assert_eq!(
+            &plaintext[rns_protocol::resource::RANDOM_HASH_SIZE..],
+            payload
+        );
+    }
+
+    #[test]
+    fn resource_packets_are_raw_while_advertisements_use_link_encryption() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let (initiator, responder) = active_link_pair([0x42; 16]);
+        let link_id = initiator.link_id;
+        let mut task = PropagationSyncTask::new(tx, [0xAA; 16]);
+        task.link_id = Some(link_id);
+        task.link = Some(initiator);
+
+        let resource_part = b"already-encrypted-resource-part";
+        task.send_resource_packet(resource_part, rns_wire::context::PacketContext::Resource);
+        let TransportMessage::Outbound(part_request) = rx.try_recv().unwrap() else {
+            panic!("expected outbound Resource packet");
+        };
+        let (part_header, part_offset) =
+            rns_wire::header::PacketHeader::unpack(&part_request.raw).unwrap();
+        assert_eq!(
+            part_header.context,
+            rns_wire::context::PacketContext::Resource
+        );
+        assert_eq!(&part_request.raw[part_offset..], resource_part);
+
+        let advertisement = b"resource-advertisement";
+        task.send_resource_packet(advertisement, rns_wire::context::PacketContext::ResourceAdv);
+        let TransportMessage::Outbound(adv_request) = rx.try_recv().unwrap() else {
+            panic!("expected outbound Resource advertisement");
+        };
+        let (adv_header, adv_offset) =
+            rns_wire::header::PacketHeader::unpack(&adv_request.raw).unwrap();
+        assert_eq!(
+            adv_header.context,
+            rns_wire::context::PacketContext::ResourceAdv
+        );
+        assert_ne!(&adv_request.raw[adv_offset..], advertisement);
+        assert_eq!(
+            responder.decrypt(&adv_request.raw[adv_offset..]).unwrap(),
+            advertisement
+        );
+    }
+
+    fn deliver_encrypted_resource_control(
+        task: &PropagationSyncTask,
+        responder: &Link,
+        context: rns_wire::context::PacketContext,
+        plaintext: &[u8],
+    ) {
+        let link_id = task.link_id.unwrap();
+        let encrypted = responder.encrypt(plaintext).unwrap();
+        task.event_tx
+            .try_send(DestinationEvent::InboundPacket {
+                raw: link_data_packet(link_id, context, &encrypted),
+                interface_id: 0,
+                metrics: Default::default(),
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn encrypted_resource_request_retransmits_map_compatible_part_raw() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let (initiator, responder) = active_link_pair([0x44; 16]);
+        let link_id = initiator.link_id;
+        let mut transfers = prepare_outbound_resource_transfers(
+            (0..4096).map(|index| (index % 251) as u8).collect(),
+            false,
+            Duration::from_millis(500),
+            initiator.session_keys().unwrap(),
+        )
+        .unwrap();
+        let transfer = transfers.pop_front().unwrap();
+        let requested_index = 1;
+        let expected_part = transfer.resource.parts[requested_index].clone();
+        let requested_hash = transfer.resource.map_hashes[requested_index];
+        let random_hash = transfer.resource.random_hash;
+        let resource_hash = transfer.resource.resource_hash;
+
+        let mut request = vec![rns_protocol::resource::HASHMAP_IS_NOT_EXHAUSTED];
+        request.extend_from_slice(&resource_hash);
+        request.extend_from_slice(&requested_hash);
+
+        let mut task = PropagationSyncTask::new(tx, [0xAA; 16]);
+        task.link_id = Some(link_id);
+        task.link = Some(initiator);
+        task.active_transfer = Some(transfer);
+        task.state = SyncTaskState::Transferring;
+        let mut stale_request = request.clone();
+        stale_request[1..33].fill(0xFF);
+        deliver_encrypted_resource_control(
+            &task,
+            &responder,
+            rns_wire::context::PacketContext::ResourceReq,
+            &stale_request,
+        );
+        task.drain_events(&HashMap::new());
+        assert!(rx.try_recv().is_err());
+        assert_eq!(task.active_transfer.as_ref().unwrap().sent_parts, 0);
+
+        deliver_encrypted_resource_control(
+            &task,
+            &responder,
+            rns_wire::context::PacketContext::ResourceReq,
+            &request,
+        );
+
+        task.drain_events(&HashMap::new());
+
+        let TransportMessage::Outbound(response) = rx.try_recv().unwrap() else {
+            panic!("expected requested Resource part");
+        };
+        let (header, offset) = rns_wire::header::PacketHeader::unpack(&response.raw).unwrap();
+        assert_eq!(header.context, rns_wire::context::PacketContext::Resource);
+        assert_eq!(&response.raw[offset..], expected_part);
+        assert_eq!(
+            rns_protocol::resource::get_map_hash(&response.raw[offset..], &random_hash),
+            requested_hash
+        );
+        assert_eq!(task.state, SyncTaskState::Transferring);
+        assert_eq!(task.active_transfer.as_ref().unwrap().sent_parts, 1);
+    }
+
+    #[test]
+    fn exhausted_resource_request_sends_link_encrypted_hmu() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let (initiator, responder) = active_link_pair([0x45; 16]);
+        let link_id = initiator.link_id;
+        let hashmap_len =
+            rns_protocol::resource_adv::hashmap_max_len(rns_wire::constants::LINK_MDU);
+        let mut transfers = prepare_outbound_resource_transfers(
+            vec![0xA7; (hashmap_len + 8) * rns_protocol::resource::SDU],
+            false,
+            Duration::from_millis(500),
+            initiator.session_keys().unwrap(),
+        )
+        .unwrap();
+        let transfer = transfers.pop_front().unwrap();
+        assert!(transfer.resource.parts.len() > hashmap_len);
+        let resource_hash = transfer.resource.resource_hash;
+
+        let mut request = vec![rns_protocol::resource::HASHMAP_IS_EXHAUSTED];
+        request.extend_from_slice(&transfer.resource.map_hashes[hashmap_len - 1]);
+        request.extend_from_slice(&resource_hash);
+
+        let mut task = PropagationSyncTask::new(tx, [0xAA; 16]);
+        task.link_id = Some(link_id);
+        task.link = Some(initiator);
+        task.active_transfer = Some(transfer);
+        task.state = SyncTaskState::Transferring;
+        deliver_encrypted_resource_control(
+            &task,
+            &responder,
+            rns_wire::context::PacketContext::ResourceReq,
+            &request,
+        );
+
+        task.drain_events(&HashMap::new());
+
+        let TransportMessage::Outbound(response) = rx.try_recv().unwrap() else {
+            panic!("expected Resource hashmap update");
+        };
+        let (header, offset) = rns_wire::header::PacketHeader::unpack(&response.raw).unwrap();
+        assert_eq!(
+            header.context,
+            rns_wire::context::PacketContext::ResourceHmu
+        );
+        let plaintext = responder.decrypt(&response.raw[offset..]).unwrap();
+        assert_eq!(&plaintext[..32], resource_hash);
+        let update: rmpv::Value = rmpv::decode::read_value(&mut &plaintext[32..]).unwrap();
+        assert_eq!(update.as_array().unwrap()[0].as_u64(), Some(1));
+        assert_eq!(task.state, SyncTaskState::Transferring);
+    }
+
+    #[test]
+    fn invalid_exhausted_request_sends_encrypted_cancel_and_fails_closed() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let (initiator, responder) = active_link_pair([0x46; 16]);
+        let link_id = initiator.link_id;
+        let mut transfers = prepare_outbound_resource_transfers(
+            vec![0xB8; 20_000],
+            false,
+            Duration::from_millis(500),
+            initiator.session_keys().unwrap(),
+        )
+        .unwrap();
+        let transfer = transfers.pop_front().unwrap();
+        let resource_hash = transfer.resource.resource_hash;
+        let mut request = vec![rns_protocol::resource::HASHMAP_IS_EXHAUSTED];
+        request.extend_from_slice(&transfer.resource.map_hashes[0]);
+        request.extend_from_slice(&resource_hash);
+
+        let mut task = PropagationSyncTask::new(tx, [0xAA; 16]);
+        task.link_id = Some(link_id);
+        task.link = Some(initiator);
+        task.active_transfer = Some(transfer);
+        task.active_transfer_ids = vec![[0x66; 32]];
+        task.state = SyncTaskState::Transferring;
+        deliver_encrypted_resource_control(
+            &task,
+            &responder,
+            rns_wire::context::PacketContext::ResourceReq,
+            &request,
+        );
+
+        task.drain_events(&HashMap::new());
+
+        let TransportMessage::Outbound(response) = rx.try_recv().unwrap() else {
+            panic!("expected initiator Resource cancel");
+        };
+        let (header, offset) = rns_wire::header::PacketHeader::unpack(&response.raw).unwrap();
+        assert_eq!(
+            header.context,
+            rns_wire::context::PacketContext::ResourceIcl
+        );
+        assert_eq!(
+            responder.decrypt(&response.raw[offset..]).unwrap(),
+            resource_hash
+        );
+        assert_eq!(task.state, SyncTaskState::Failed);
+        assert!(task.active_transfer.is_none());
+        assert!(task.active_transfer_ids.is_empty());
+    }
+
+    #[test]
+    fn inbound_resource_cancels_require_exact_active_segment_hash() {
+        for context in [
+            rns_wire::context::PacketContext::ResourceRcl,
+            rns_wire::context::PacketContext::ResourceIcl,
+        ] {
+            let (tx, _rx) = mpsc::channel(4);
+            let (initiator, responder) = active_link_pair([0x47; 16]);
+            let link_id = initiator.link_id;
+            let mut transfers = prepare_outbound_resource_transfers(
+                b"cancelled Resource".to_vec(),
+                false,
+                Duration::from_millis(500),
+                initiator.session_keys().unwrap(),
+            )
+            .unwrap();
+            let transfer = transfers.pop_front().unwrap();
+            let resource_hash = transfer.resource.resource_hash;
+            let mut task = PropagationSyncTask::new(tx, [0xAA; 16]);
+            task.link_id = Some(link_id);
+            task.link = Some(initiator);
+            task.active_transfer = Some(transfer);
+            task.active_transfer_ids = vec![[0x77; 32]];
+            task.state = SyncTaskState::Transferring;
+
+            deliver_encrypted_resource_control(&task, &responder, context, &[0xEE; 31]);
+            deliver_encrypted_resource_control(&task, &responder, context, &[0xEF; 32]);
+            task.drain_events(&HashMap::new());
+            assert_eq!(task.state, SyncTaskState::Transferring);
+            assert!(task.active_transfer.is_some());
+
+            deliver_encrypted_resource_control(&task, &responder, context, &resource_hash);
+            task.drain_events(&HashMap::new());
+            assert_eq!(task.state, SyncTaskState::Failed);
+            assert!(task.active_transfer.is_none());
+            assert!(task.active_transfer_ids.is_empty());
+        }
+    }
+
+    #[test]
+    fn aggregate_above_single_resource_limit_uses_ordered_encrypted_segments() {
+        let (initiator, responder) = active_link_pair([0x43; 16]);
+        let initiator_keys = initiator.session_keys().unwrap();
+        let responder_keys = responder.session_keys().unwrap();
+        let payload_len = MAX_EFFICIENT_SIZE + 4096;
+        let payload = (0..payload_len)
+            .map(|index| ((index * 17) % 251) as u8)
+            .collect::<Vec<_>>();
+
+        let mut transfers = prepare_outbound_resource_transfers(
+            payload.clone(),
+            false,
+            Duration::from_millis(500),
+            initiator_keys,
+        )
+        .unwrap();
+        assert_eq!(transfers.len(), 2);
+
+        let mut reassembled = Vec::with_capacity(payload.len());
+        let mut shared_original_hash = None;
+        for (index, transfer) in transfers.iter().enumerate() {
+            let resource = &transfer.resource;
+            assert!(resource.flags.encrypted);
+            assert!(resource.flags.split);
+            assert_eq!(resource.segment_index, index + 1);
+            assert_eq!(resource.total_segments, 2);
+            assert_eq!(resource.advertisement_data_size, payload.len());
+            match shared_original_hash {
+                Some(expected) => assert_eq!(resource.original_hash, Some(expected)),
+                None => shared_original_hash = resource.original_hash,
+            }
+
+            let encrypted_stream = resource.parts.concat();
+            let plaintext =
+                rns_link::encryption::link_decrypt(&responder_keys, &encrypted_stream).unwrap();
+            assert_eq!(
+                &plaintext[..rns_protocol::resource::RANDOM_HASH_SIZE],
+                &resource.random_hash
+            );
+            reassembled.extend_from_slice(&plaintext[rns_protocol::resource::RANDOM_HASH_SIZE..]);
+        }
+        assert_eq!(reassembled, payload);
+
+        let (tx, _rx) = mpsc::channel(4);
+        let mut task = PropagationSyncTask::new(tx, [0xAA; 16]);
+        task.state = SyncTaskState::Transferring;
+        task.node_dest_hash = Some([0x43; 16]);
+        task.active_transfer = transfers.pop_front();
+        task.pending_transfer_segments = transfers;
+        task.active_transfer_ids = vec![[0x55; 32]];
+
+        task.complete_active_transfer_segment();
+        assert_eq!(task.state, SyncTaskState::Transferring);
+        assert!(task.take_handled_updates().is_empty());
+        assert!(task.pending_transfer_segments.is_empty());
+        assert!(task.active_transfer.is_some());
+
+        task.complete_active_transfer_segment();
+        assert_eq!(task.state, SyncTaskState::Complete);
+        assert_eq!(task.take_handled_updates(), vec![[0x55; 32]]);
+        assert!(task.active_transfer.is_none());
     }
 
     fn link_data_packet(
@@ -1008,6 +1987,223 @@ mod tests {
     }
 
     #[test]
+    fn empty_policy_selection_completes_without_sending_offer_request() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let shared_node = Arc::new(Mutex::new(PropagationNode::new(
+            PropagationNodeConfig::default(),
+            [0xAA; 16],
+        )));
+        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
+        let mut message = crate::message::LxMessage::new(
+            [0xBB; 16],
+            [0xCC; 16],
+            "Test",
+            "already handled",
+            crate::constants::DeliveryMethod::Propagated,
+        );
+        message.sign(&key).unwrap();
+        let transient_id = message.transient_id.unwrap();
+        assert!(shared_node.lock().unwrap().accept_message(&message));
+
+        let node_hash = [0xDD; 16];
+        let (link, _responder) = active_link_pair(node_hash);
+        let mut task = PropagationSyncTask::with_shared_node(tx, shared_node);
+        task.set_node(node_hash);
+        task.link_id = Some(link.link_id);
+        task.link = Some(link);
+        task.state = SyncTaskState::Offering;
+        let mut policy = OutboundOfferPolicy::unrestricted(node_hash);
+        policy.handled_messages.insert(transient_id);
+        task.offer_policy = Some(policy);
+
+        task.send_offer_request();
+
+        assert_eq!(task.state, SyncTaskState::Complete);
+        assert!(
+            rx.try_recv().is_err(),
+            "empty offer must not emit a request"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn production_policy_preparation_runs_through_bounded_worker() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let shared_node = Arc::new(Mutex::new(PropagationNode::new(
+            PropagationNodeConfig::default(),
+            [0xAA; 16],
+        )));
+        let key = Ed25519PrivateKey::generate();
+        let mut message = crate::message::LxMessage::new(
+            [0xBB; 16],
+            [0xCC; 16],
+            "Test",
+            "already handled async",
+            crate::constants::DeliveryMethod::Propagated,
+        );
+        message.sign(&key).unwrap();
+        let transient_id = message.transient_id.unwrap();
+        assert!(shared_node.lock().unwrap().accept_message(&message));
+
+        let node_hash = [0xDD; 16];
+        let mut task = PropagationSyncTask::with_shared_node(tx, shared_node);
+        task.set_node(node_hash);
+        task.state = SyncTaskState::Offering;
+        let mut policy = OutboundOfferPolicy::unrestricted(node_hash);
+        policy.handled_messages.insert(transient_id);
+        task.offer_policy = Some(policy);
+
+        task.send_offer_request();
+        assert!(task.offer_preparation_rx.is_some());
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+            task.send_offer_request();
+            if task.state != SyncTaskState::Offering {
+                break;
+            }
+        }
+
+        assert_eq!(task.state, SyncTaskState::Complete);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn terminal_offer_filters_are_exposed_and_complete_without_wire_offer() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let node_hash = [0xDD; 16];
+        let shared_node = Arc::new(Mutex::new(PropagationNode::new(
+            PropagationNodeConfig::default(),
+            [0xAA; 16],
+        )));
+        let low = vec![0x11; 64];
+        let oversized = vec![0x22; 700];
+        assert!(shared_node.lock().unwrap().accept_propagated_blob(&low, 9));
+        assert!(
+            shared_node
+                .lock()
+                .unwrap()
+                .accept_propagated_blob(&oversized, 20)
+        );
+        let mut policy = OutboundOfferPolicy::unrestricted(node_hash);
+        policy.minimum_stamp_cost = 10;
+        policy.propagation_transfer_limit = Some(0.5);
+        let mut task = PropagationSyncTask::with_shared_node(tx, shared_node);
+        task.set_node(node_hash);
+        task.offer_policy = Some(policy);
+        task.state = SyncTaskState::Offering;
+
+        task.send_offer_request();
+
+        let mut updates = task.take_handled_updates();
+        updates.sort();
+        let mut expected = vec![
+            rns_crypto::sha::full_hash(&low),
+            rns_crypto::sha::full_hash(&oversized),
+        ];
+        expected.sort();
+        assert_eq!(updates, expected);
+        assert_eq!(task.state, SyncTaskState::Complete);
+        assert!(task.generation_exhausted);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn have_all_exposes_every_offered_id_for_authoritative_persistence() {
+        let dir = std::env::temp_dir().join("lxmf_sync_have_all_persist");
+        let _ = std::fs::remove_dir_all(&dir);
+        let node_hash = [0xBB; 16];
+        let node = PropagationNode::with_storage(
+            PropagationNodeConfig::default(),
+            [0xAA; 16],
+            dir.clone(),
+        )
+        .unwrap();
+        let shared_node = Arc::new(Mutex::new(node));
+        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
+        for content in ["first", "second"] {
+            let mut message = crate::message::LxMessage::new(
+                [0xCC; 16],
+                [0xDD; 16],
+                "Test",
+                content,
+                crate::constants::DeliveryMethod::Propagated,
+            );
+            message.sign(&key).unwrap();
+            assert!(shared_node.lock().unwrap().accept_message(&message));
+        }
+        let policy = OutboundOfferPolicy::unrestricted(node_hash);
+        let offered = {
+            let mut node = shared_node.lock().unwrap();
+            node.prepare_sync_offer_with_policy(&policy);
+            node.get_session(&node_hash).unwrap().offered_ids.clone()
+        };
+        let (tx, _rx) = mpsc::channel(16);
+        let mut task = PropagationSyncTask::with_shared_node(tx, shared_node.clone());
+        task.set_node(node_hash);
+        task.offer_policy = Some(policy);
+
+        task.handle_offer_response(OfferResponse::HaveAll);
+
+        assert_eq!(task.state, SyncTaskState::Complete);
+        let mut updates = task.take_handled_updates();
+        updates.sort();
+        let mut expected = offered.clone();
+        expected.sort();
+        assert_eq!(updates, expected);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn want_some_is_intersected_with_offer_and_marks_complement_handled() {
+        let dir = std::env::temp_dir().join("lxmf_sync_want_some_bound");
+        let _ = std::fs::remove_dir_all(&dir);
+        let node_hash = [0xBB; 16];
+        let node = PropagationNode::with_storage(
+            PropagationNodeConfig::default(),
+            [0xAA; 16],
+            dir.clone(),
+        )
+        .unwrap();
+        let shared_node = Arc::new(Mutex::new(node));
+        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
+        for content in ["first", "second"] {
+            let mut message = crate::message::LxMessage::new(
+                [0xCC; 16],
+                [0xDD; 16],
+                "Test",
+                content,
+                crate::constants::DeliveryMethod::Propagated,
+            );
+            message.sign(&key).unwrap();
+            assert!(shared_node.lock().unwrap().accept_message(&message));
+        }
+        let policy = OutboundOfferPolicy::unrestricted(node_hash);
+        let offered = {
+            let mut node = shared_node.lock().unwrap();
+            node.prepare_sync_offer_with_policy(&policy);
+            node.get_session(&node_hash).unwrap().offered_ids.clone()
+        };
+        assert_eq!(offered.len(), 2);
+        let wanted = offered[0];
+        let already_handled = offered[1];
+        let (tx, _rx) = mpsc::channel(16);
+        let mut task = PropagationSyncTask::with_shared_node(tx, shared_node);
+        task.set_node(node_hash);
+        task.offer_policy = Some(policy);
+
+        task.handle_offer_response(OfferResponse::WantSome(vec![
+            wanted.to_vec(),
+            vec![0xEF; 32],
+            wanted.to_vec(),
+        ]));
+
+        assert_eq!(task.state, SyncTaskState::Transferring);
+        let batch = task.ready_transfer_batch.as_ref().unwrap();
+        assert_eq!(batch.transient_ids, vec![wanted]);
+        assert_eq!(task.take_handled_updates(), vec![already_handled]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_handle_offer_response_error() {
         let (tx, _rx) = mpsc::channel(16);
         let mut task = PropagationSyncTask::new(tx, [0xAA; 16]);
@@ -1075,11 +2271,124 @@ mod tests {
         let tid = msg.transient_id.unwrap();
         task.accept_message(&msg);
 
+        let policy = OutboundOfferPolicy::unrestricted([0xBB; 16]);
+        task.propagation_node
+            .lock()
+            .unwrap()
+            .prepare_sync_offer_with_policy(&policy);
+        task.offer_policy = Some(policy);
+
         let wanted = vec![tid.to_vec()];
         task.handle_offer_response(OfferResponse::WantSome(wanted));
         assert_eq!(task.state, SyncTaskState::Transferring);
-        assert_eq!(task.transfer_queue.len(), 1);
+        let batch = task.ready_transfer_batch.as_ref().unwrap();
+        assert_eq!(batch.transient_ids, vec![tid]);
+        let decoded: rmpv::Value = rmpv::decode::read_value(&mut &batch.payload[..]).unwrap();
+        let outer = decoded.as_array().unwrap();
+        assert_eq!(outer.len(), 2);
+        assert!(outer[0].as_f64().is_some());
+        let blobs = outer[1].as_array().unwrap();
+        assert_eq!(blobs.len(), 1, "one Resource carries the exact blob batch");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn want_all_builds_one_timestamped_resource_batch_and_waits_for_proof() {
+        let dir = std::env::temp_dir().join("lxmf_test_sync_one_batch");
+        let _ = std::fs::remove_dir_all(&dir);
+        let node_hash = [0xBB; 16];
+        let (tx, _rx) = mpsc::channel(16);
+        let mut task = PropagationSyncTask::with_storage(tx, [0xAA; 16], dir.clone()).unwrap();
+        task.set_node(node_hash);
+        let key = Ed25519PrivateKey::generate();
+        for content in ["one", "two"] {
+            let mut message = crate::message::LxMessage::new(
+                [0xCC; 16],
+                [0xDD; 16],
+                "Test",
+                content,
+                crate::constants::DeliveryMethod::Propagated,
+            );
+            message.sign(&key).unwrap();
+            assert!(task.accept_message(&message));
+        }
+        let policy = OutboundOfferPolicy::unrestricted(node_hash);
+        task.propagation_node
+            .lock()
+            .unwrap()
+            .prepare_sync_offer_with_policy(&policy);
+        task.offer_policy = Some(policy);
+        task.state = SyncTaskState::AwaitingResponse;
+
+        task.handle_offer_response(OfferResponse::WantAll);
+
+        let batch = task.ready_transfer_batch.as_ref().unwrap();
+        assert_eq!(batch.transient_ids.len(), 2);
+        let decoded: rmpv::Value = rmpv::decode::read_value(&mut &batch.payload[..]).unwrap();
+        let outer = decoded.as_array().unwrap();
+        assert_eq!(outer.len(), 2);
+        assert!(outer[0].as_f64().is_some());
+        assert_eq!(outer[1].as_array().unwrap().len(), 2);
+        assert!(
+            task.take_handled_updates().is_empty(),
+            "wanted IDs converge only after the batch Resource is proven"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn vanished_requested_file_fails_retryably_for_peer_backoff() {
+        let dir = std::env::temp_dir().join("lxmf_test_sync_vanished_batch");
+        let _ = std::fs::remove_dir_all(&dir);
+        let node_hash = [0xBB; 16];
+        let (tx, _rx) = mpsc::channel(16);
+        let mut task = PropagationSyncTask::with_storage(tx, [0xAA; 16], dir.clone()).unwrap();
+        task.set_node(node_hash);
+        let key = Ed25519PrivateKey::generate();
+        let mut message = crate::message::LxMessage::new(
+            [0xCC; 16],
+            [0xDD; 16],
+            "Test",
+            "vanish",
+            crate::constants::DeliveryMethod::Propagated,
+        );
+        message.sign(&key).unwrap();
+        assert!(task.accept_message(&message));
+        let policy = OutboundOfferPolicy::unrestricted(node_hash);
+        let (generation, reads) = {
+            let mut node = task.propagation_node.lock().unwrap();
+            let offer = node.prepare_sync_offer_with_policy(&policy);
+            let ids = offer
+                .transient_ids
+                .iter()
+                .map(|id| id.clone().try_into().unwrap())
+                .collect::<Vec<PropagationTransientId>>();
+            (node.offer_generation(), node.plan_message_reads(&ids))
+        };
+        assert_eq!(reads.len(), 1);
+        std::fs::remove_file(&reads[0].path).unwrap();
+        task.offer_policy = Some(policy);
+        task.active_offer_generation = Some(generation);
+        task.generation_exhausted = true;
+        task.state = SyncTaskState::AwaitingResponse;
+
+        task.handle_offer_response(OfferResponse::WantAll);
+        task.drive_transfers();
+
+        assert_eq!(task.state, SyncTaskState::Failed);
+        assert!(!task.generation_exhausted);
+        assert!(task.take_handled_updates().is_empty());
+        task.tick();
+        assert_eq!(
+            task.take_terminal_peer_result(),
+            Some(PeerSyncTerminalResult {
+                peer_hash: node_hash,
+                state: PeerSyncTerminalState::Failed,
+                offer_generation: None,
+                generation_exhausted: false,
+            })
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1122,6 +2431,130 @@ mod tests {
         assert_eq!(task.state, SyncTaskState::Establishing);
         let peer = task.peer().expect("peer should exist after forced sync");
         assert_eq!(peer.destination_hash, [0xBB; 16]);
+    }
+
+    #[test]
+    fn active_sync_rejects_different_request_without_mutating_target_or_policy() {
+        let (tx, _rx) = mpsc::channel(64);
+        let mut task = PropagationSyncTask::new(tx, [0xAA; 16]);
+        let policy_a = OutboundOfferPolicy::unrestricted([0xA1; 16]);
+        let policy_b = OutboundOfferPolicy::unrestricted([0xB2; 16]);
+
+        assert!(task.request_sync_now_with_policy(policy_a.clone()));
+        assert!(!task.request_sync_now_with_policy(policy_b));
+        assert_eq!(task.node_dest_hash(), Some(policy_a.peer_hash));
+        assert_eq!(task.offer_policy, Some(policy_a));
+    }
+
+    #[test]
+    fn cancel_peer_sync_clears_active_pending_and_session_state() {
+        let (tx, _rx) = mpsc::channel(64);
+        let mut task = PropagationSyncTask::new(tx, [0xAA; 16]);
+        let peer_hash = [0xA1; 16];
+        assert!(task.request_sync_now_with_policy(OutboundOfferPolicy::unrestricted(peer_hash)));
+        task.handled_updates.push([0x44; 32]);
+        task.propagation_node
+            .lock()
+            .unwrap()
+            .start_session(peer_hash);
+
+        assert!(task.cancel_peer_sync(&peer_hash));
+        assert_eq!(task.state, SyncTaskState::Idle);
+        assert_eq!(task.node_dest_hash(), None);
+        assert!(task.offer_policy.is_none());
+        assert!(task.take_handled_updates().is_empty());
+        assert!(
+            task.propagation_node
+                .lock()
+                .unwrap()
+                .get_session(&peer_hash)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn terminal_results_advance_generation_only_on_success_and_must_be_drained() {
+        let (tx, _rx) = mpsc::channel(64);
+        let mut task = PropagationSyncTask::new(tx, [0xAA; 16]);
+        task.node_dest_hash = Some([0xA1; 16]);
+        task.active_offer_generation = Some(7);
+        task.generation_exhausted = false;
+        task.state = SyncTaskState::Complete;
+        task.tick();
+
+        assert!(!task.request_sync_now([0xB2; 16]));
+        assert_eq!(
+            task.take_terminal_peer_result(),
+            Some(PeerSyncTerminalResult {
+                peer_hash: [0xA1; 16],
+                state: PeerSyncTerminalState::Complete,
+                offer_generation: Some(7),
+                generation_exhausted: false,
+            })
+        );
+        assert!(task.request_sync_now([0xB2; 16]));
+        task.state = SyncTaskState::Failed;
+        task.tick();
+        assert_eq!(
+            task.take_terminal_peer_result(),
+            Some(PeerSyncTerminalResult {
+                peer_hash: [0xB2; 16],
+                state: PeerSyncTerminalState::Failed,
+                offer_generation: None,
+                generation_exhausted: false,
+            })
+        );
+    }
+
+    #[test]
+    fn link_identify_is_emitted_after_rtt_and_before_offer_request() {
+        let (tx, mut rx) = mpsc::channel(64);
+        let node_hash = [0xB2; 16];
+        let responder_key = Ed25519PrivateKey::generate();
+        let responder_pub = responder_key.public_key();
+        let (link, request_data) = Link::new_initiator(node_hash, 1);
+        let (_responder, proof_data) =
+            Link::new_responder(&request_data, &responder_key, node_hash, 1).unwrap();
+
+        let mut task = PropagationSyncTask::new(tx, [0xAA; 16]);
+        let local_key = Ed25519PrivateKey::generate();
+        let mut local_pub = [0x33; 64];
+        local_pub[32..].copy_from_slice(&local_key.public_key().to_bytes());
+        task.set_identity(local_pub, local_key);
+        task.node_dest_hash = Some(node_hash);
+        task.link_id = Some(link.link_id);
+        task.link = Some(link);
+        task.peer = Some(LxmPeer::new(node_hash));
+        task.state = SyncTaskState::Establishing;
+
+        let message_key = Ed25519PrivateKey::generate();
+        let mut message = crate::message::LxMessage::new(
+            [0xCC; 16],
+            [0xDD; 16],
+            "Test",
+            "identify ordering",
+            crate::constants::DeliveryMethod::Propagated,
+        );
+        message.sign(&message_key).unwrap();
+        assert!(task.accept_message(&message));
+        task.offer_policy = Some(OutboundOfferPolicy::unrestricted(node_hash));
+
+        task.handle_link_proof(&proof_data, &responder_pub, &responder_pub.to_bytes());
+        task.send_offer_request();
+
+        let mut contexts = Vec::new();
+        while let Ok(TransportMessage::Outbound(request)) = rx.try_recv() {
+            let (header, _) = rns_wire::header::PacketHeader::unpack(&request.raw).unwrap();
+            contexts.push(header.context);
+        }
+        assert_eq!(
+            contexts,
+            vec![
+                rns_wire::context::PacketContext::Lrrtt,
+                rns_wire::context::PacketContext::LinkIdentify,
+                rns_wire::context::PacketContext::Request,
+            ]
+        );
     }
 
     #[test]

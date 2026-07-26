@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use crate::constants::*;
 use crate::message::LxMessage;
-use crate::peer::LxmPeer;
+use crate::peer::{LxmPeer, OutboundOfferPolicy};
 use crate::propagation::{PropagationEntry, PropagationStore, hex_encode};
 use crate::propagation_admission::PnOfferCandidate;
 use crate::propagation_offer::{PnOfferEvaluation, PnOfferEvaluationError};
@@ -147,6 +147,129 @@ pub fn read_planned_messages(
         .collect()
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct SyncOfferCandidateSnapshot {
+    transient_id: PropagationTransientId,
+    weight: f64,
+    size: usize,
+    stamp_value: u8,
+}
+
+/// Cheap, owned view captured while the shared node lock is held. Expensive
+/// peer-file loading and full-store sorting happen from this snapshot on a
+/// blocking worker.
+#[derive(Debug, Clone)]
+pub(crate) struct SyncOfferPreparationSnapshot {
+    pub policy: OutboundOfferPolicy,
+    pub generation: u64,
+    peer_path: Option<PathBuf>,
+    candidates: Vec<SyncOfferCandidateSnapshot>,
+}
+
+#[derive(Debug)]
+pub(crate) struct PreparedSyncOffer {
+    pub policy: OutboundOfferPolicy,
+    pub generation: u64,
+    pub selected_ids: Vec<PropagationTransientId>,
+    pub terminal_handled_ids: Vec<PropagationTransientId>,
+    pub generation_exhausted: bool,
+}
+
+#[derive(Debug)]
+pub(crate) enum InstallPreparedSyncOffer {
+    Installed {
+        offer: SyncOffer,
+        generation: u64,
+        terminal_handled_ids: Vec<PropagationTransientId>,
+        generation_exhausted: bool,
+    },
+    Stale,
+}
+
+/// Blocking half of outbound-offer preparation. This function owns its input
+/// and never touches a live `PropagationNode` or shared lock.
+pub(crate) fn prepare_sync_offer_snapshot(
+    snapshot: SyncOfferPreparationSnapshot,
+) -> PreparedSyncOffer {
+    const PER_MESSAGE_OVERHEAD: usize = 16;
+    const INITIAL_STRUCTURE_OVERHEAD: usize = 24;
+
+    let transfer_limit = snapshot
+        .policy
+        .propagation_transfer_limit
+        .map(kilobytes_to_bytes_fail_closed);
+    let sync_limit = snapshot
+        .policy
+        .propagation_sync_limit
+        .map(kilobytes_to_bytes_fail_closed);
+    let mut handled_messages = snapshot.policy.handled_messages.clone();
+    if let Some(path) = snapshot.peer_path.as_ref()
+        && let Ok(data) = std::fs::read(path)
+        && let Some(peer) = LxmPeer::from_bytes_with_handled(&data)
+    {
+        handled_messages.extend(peer.handled_messages);
+    }
+
+    let mut candidates = snapshot.candidates;
+    candidates.sort_by(|left, right| {
+        left.weight
+            .total_cmp(&right.weight)
+            .then_with(|| left.transient_id.cmp(&right.transient_id))
+    });
+
+    let mut cumulative_size = INITIAL_STRUCTURE_OVERHEAD;
+    let mut selected_ids = Vec::new();
+    let mut terminal_handled_ids = Vec::new();
+    let mut cumulative_deferred = false;
+    for candidate in candidates {
+        if handled_messages.contains(&candidate.transient_id) {
+            continue;
+        }
+        if candidate.stamp_value < snapshot.policy.minimum_stamp_cost {
+            terminal_handled_ids.push(candidate.transient_id);
+            continue;
+        }
+
+        let transfer_size = candidate.size.saturating_add(PER_MESSAGE_OVERHEAD);
+        if transfer_limit.is_some_and(|limit| transfer_size > limit) {
+            terminal_handled_ids.push(candidate.transient_id);
+            continue;
+        }
+
+        let next_size = cumulative_size.saturating_add(transfer_size);
+        if sync_limit.is_some_and(|limit| next_size >= limit) {
+            // The cumulative limit is session-local. Keep this candidate
+            // pending so a later sync can offer it.
+            cumulative_deferred = true;
+            continue;
+        }
+
+        cumulative_size = next_size;
+        selected_ids.push(candidate.transient_id);
+    }
+
+    // If not even one candidate fits the peer's cumulative limit, retrying
+    // this unchanged generation would only establish another Link and reach
+    // the same empty result. Treat that generation as scheduled-and-exhausted
+    // for the current constraints. A store revision or material announce
+    // policy change re-enables scheduling.
+    let generation_exhausted = !cumulative_deferred || selected_ids.is_empty();
+    PreparedSyncOffer {
+        policy: snapshot.policy,
+        generation: snapshot.generation,
+        selected_ids,
+        terminal_handled_ids,
+        generation_exhausted,
+    }
+}
+
+fn kilobytes_to_bytes_fail_closed(kilobytes: f64) -> usize {
+    if !kilobytes.is_finite() || kilobytes <= 0.0 {
+        return 0;
+    }
+    (kilobytes * 1000.0).floor() as usize
+}
+
 pub struct PropagationNode {
     config: PropagationNodeConfig,
     store: PropagationStore,
@@ -156,6 +279,10 @@ pub struct PropagationNode {
     /// Transitional pre-1.1 behavior; removed when the daemon-lifetime
     /// `PnInboundAdmission` becomes the live throttle owner.
     last_offer_times: HashMap<[u8; 16], f64>,
+    /// Monotonic in-process revision of the propagation store. Outbound peer
+    /// scheduling and offer-preparation revalidation use this to avoid both
+    /// stale offers and repeated scans of an unchanged fully-handled store.
+    offer_generation: u64,
 }
 
 impl PropagationNode {
@@ -168,6 +295,7 @@ impl PropagationNode {
             dest_hash,
             storage_path: None,
             last_offer_times: HashMap::new(),
+            offer_generation: 0,
         }
     }
 
@@ -177,6 +305,14 @@ impl PropagationNode {
 
     pub fn set_min_stamp_cost(&mut self, cost: u8) {
         self.config.min_stamp_cost = cost;
+    }
+
+    pub fn offer_generation(&self) -> u64 {
+        self.offer_generation
+    }
+
+    fn advance_offer_generation(&mut self) {
+        self.offer_generation = self.offer_generation.saturating_add(1);
     }
 
     /// Disk-backed node. Loads existing messages from `storage_path` on startup.
@@ -193,6 +329,7 @@ impl PropagationNode {
             dest_hash,
             storage_path: Some(storage_path),
             last_offer_times: HashMap::new(),
+            offer_generation: 0,
         };
         node.load_from_disk()?;
         Ok(node)
@@ -266,8 +403,11 @@ impl PropagationNode {
             }
         }
 
-        self.store.insert(entry);
-        true
+        let inserted = self.store.insert(entry);
+        if inserted {
+            self.advance_offer_generation();
+        }
+        inserted
     }
 
     /// Store an already propagation-packed LXMF blob (`dest_hash || encrypted_data`).
@@ -313,7 +453,11 @@ impl PropagationNode {
             }
         }
 
-        self.store.insert(entry)
+        let inserted = self.store.insert(entry);
+        if inserted {
+            self.advance_offer_generation();
+        }
+        inserted
     }
 
     /// Store a validated propagated LXMF blob with its propagation-node stamp.
@@ -369,7 +513,11 @@ impl PropagationNode {
             }
         }
 
-        self.store.insert(entry)
+        let inserted = self.store.insert(entry);
+        if inserted {
+            self.advance_offer_generation();
+        }
+        inserted
     }
 
     fn load_from_disk(&mut self) -> std::io::Result<()> {
@@ -453,13 +601,17 @@ impl PropagationNode {
                     pe.stamped = false;
                 }
 
-                self.store.insert(pe);
-                loaded += 1;
+                if self.store.insert(pe) {
+                    loaded += 1;
+                }
             }
         }
 
         if loaded > 0 || quarantined > 0 {
             tracing::info!(loaded, quarantined, "loaded propagation messages from disk");
+        }
+        if loaded > 0 {
+            self.advance_offer_generation();
         }
 
         Ok(())
@@ -474,6 +626,10 @@ impl PropagationNode {
         self.store.cull_expired(self.config.max_message_age);
         self.store.cull_by_weight(self.config.max_storage);
         let after = self.store.len();
+
+        if before != after {
+            self.advance_offer_generation();
+        }
 
         if before > after
             && let Some(ref dir) = self.storage_path
@@ -574,6 +730,20 @@ impl PropagationNode {
             std::fs::write(path, data)?;
         }
         Ok(())
+    }
+
+    /// Remove persisted state for an explicitly unpeered destination.
+    pub fn delete_peer(&mut self, peer_hash: &[u8; 16]) -> std::io::Result<()> {
+        self.remove_session(peer_hash);
+        let Some(dir) = self.storage_path.as_ref() else {
+            return Ok(());
+        };
+        let path = dir.join(format!("{}.peer", hex_encode(peer_hash)));
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     /// Inverse-offer pattern: the peer lists what it has; we return the IDs
@@ -806,11 +976,12 @@ impl PropagationNode {
         if !owned {
             return;
         }
-        if let Some(entry) = self.store.remove(tid)
-            && let Some(ref dir) = self.storage_path
-        {
-            let path = dir.join(entry.filename());
-            let _ = std::fs::remove_file(&path);
+        if let Some(entry) = self.store.remove(tid) {
+            self.advance_offer_generation();
+            if let Some(ref dir) = self.storage_path {
+                let path = dir.join(entry.filename());
+                let _ = std::fs::remove_file(&path);
+            }
         }
     }
 
@@ -852,18 +1023,104 @@ impl PropagationNode {
     /// The caller sends it over an established link. Python reference:
     /// LXMRouter.sync_request_received().
     pub fn prepare_sync_offer(&mut self, peer_hash: [u8; 16]) -> SyncOffer {
-        // Compute IDs before borrowing sync_sessions mutably.
-        let our_ids = if let Some(peer) = self.load_peer(&peer_hash) {
-            self.create_offer_filtered(&peer.handled_messages)
-        } else {
-            self.create_offer(peer_hash, None)
-        };
+        let policy = self
+            .load_peer(&peer_hash)
+            .as_ref()
+            .map(OutboundOfferPolicy::from)
+            .unwrap_or_else(|| OutboundOfferPolicy::unrestricted(peer_hash));
+        self.prepare_sync_offer_with_policy(&policy)
+    }
+
+    /// Capture an owned offer-preparation snapshot while holding the node lock.
+    /// The returned value contains no references into the live store.
+    pub(crate) fn snapshot_sync_offer_preparation(
+        &self,
+        policy: &OutboundOfferPolicy,
+    ) -> SyncOfferPreparationSnapshot {
+        let now = crate::now_f64();
+        let candidates = self
+            .store
+            .entries()
+            .map(|entry| SyncOfferCandidateSnapshot {
+                transient_id: entry.transient_id,
+                weight: self.store.compute_weight(entry, now),
+                size: entry.size,
+                stamp_value: entry.stamp_value,
+            })
+            .collect();
+        let peer_path = self
+            .storage_path
+            .as_ref()
+            .map(|dir| dir.join(format!("{}.peer", hex_encode(&policy.peer_hash))));
+
+        SyncOfferPreparationSnapshot {
+            policy: policy.clone(),
+            generation: self.offer_generation,
+            peer_path,
+            candidates,
+        }
+    }
+
+    /// Revalidate and install a prepared offer. A store mutation invalidates
+    /// the entire result so weight ordering and limits are recomputed from a
+    /// fresh snapshot instead of partially accepting stale work.
+    pub(crate) fn install_prepared_sync_offer(
+        &mut self,
+        prepared: PreparedSyncOffer,
+    ) -> InstallPreparedSyncOffer {
+        if prepared.generation != self.offer_generation
+            || prepared
+                .selected_ids
+                .iter()
+                .any(|transient_id| !self.store.contains(transient_id))
+        {
+            return InstallPreparedSyncOffer::Stale;
+        }
 
         let session = self
             .sync_sessions
-            .entry(peer_hash)
-            .or_insert_with(|| SyncSession::new(peer_hash));
-        session.prepare_offer(our_ids, Vec::new())
+            .entry(prepared.policy.peer_hash)
+            .or_insert_with(|| SyncSession::new(prepared.policy.peer_hash));
+        let offer =
+            session.prepare_offer(prepared.selected_ids, prepared.policy.peering_key.clone());
+        InstallPreparedSyncOffer::Installed {
+            offer,
+            generation: prepared.generation,
+            terminal_handled_ids: prepared.terminal_handled_ids,
+            generation_exhausted: prepared.generation_exhausted,
+        }
+    }
+
+    /// Prepare one offer from an authoritative peer-policy snapshot.
+    ///
+    /// Selection mirrors `LXMPeer.sync`: only existing, unhandled messages
+    /// meeting the peer's stamp and transfer limits are eligible. Candidates
+    /// are ordered by ascending store weight before the cumulative sync cap is
+    /// applied. The chosen IDs are retained in the session so a subsequent
+    /// response cannot request data outside this offer.
+    pub fn prepare_sync_offer_with_policy(&mut self, policy: &OutboundOfferPolicy) -> SyncOffer {
+        loop {
+            let snapshot = self.snapshot_sync_offer_preparation(policy);
+            let prepared = prepare_sync_offer_snapshot(snapshot);
+            match self.install_prepared_sync_offer(prepared) {
+                InstallPreparedSyncOffer::Installed {
+                    offer,
+                    terminal_handled_ids,
+                    ..
+                } => {
+                    // Compatibility wrapper: production uses the staged task
+                    // path and exposes this delta to the daemon for off-loop
+                    // persistence.
+                    if !terminal_handled_ids.is_empty()
+                        && let Err(error) = self.persist_peer_handled(policy, &terminal_handled_ids)
+                    {
+                        tracing::warn!(%error, "failed to persist terminal offer dispositions");
+                    }
+                    return offer;
+                }
+                InstallPreparedSyncOffer::Stale => continue,
+            }
+        }
     }
 
     /// Compare a peer's `SyncOffer` against our store and return a `SyncGet`
@@ -925,6 +1182,23 @@ impl PropagationNode {
         if let Some(session) = self.sync_sessions.get_mut(peer_hash) {
             session.record_transfer();
         }
+    }
+
+    /// Merge peer-handled observations into persisted state using the same
+    /// authoritative policy that produced the offer.
+    pub fn persist_peer_handled(
+        &self,
+        policy: &OutboundOfferPolicy,
+        transient_ids: &[PropagationTransientId],
+    ) -> std::io::Result<()> {
+        let mut peer = self
+            .load_peer(&policy.peer_hash)
+            .unwrap_or_else(|| policy.to_peer());
+        policy.apply_to_peer(&mut peer);
+        for transient_id in transient_ids {
+            peer.add_handled_message(transient_id);
+        }
+        self.save_peer(&peer)
     }
 
     pub fn complete_sync(&mut self, peer_hash: &[u8; 16]) {
@@ -1002,6 +1276,17 @@ mod tests {
 
     fn tid(byte: u8) -> PropagationTransientId {
         [byte; 32]
+    }
+
+    fn insert_offer_entry(
+        node: &mut PropagationNode,
+        transient_id: PropagationTransientId,
+        size: usize,
+        stamp_value: u8,
+    ) {
+        let entry =
+            PropagationEntry::new(transient_id, transient_id, [0xDD; 16], size, stamp_value);
+        assert!(node.store.insert(entry));
     }
 
     fn id(byte: u8) -> Vec<u8> {
@@ -1125,6 +1410,140 @@ mod tests {
 
         let filtered = node.create_offer_filtered(&handled);
         assert_eq!(filtered.len(), 1);
+    }
+
+    #[test]
+    fn authoritative_offer_policy_combines_all_filters_and_real_key() {
+        let mut node = PropagationNode::new(PropagationNodeConfig::default(), [0xAA; 16]);
+        insert_offer_entry(&mut node, tid(0x01), 100, 20); // handled
+        insert_offer_entry(&mut node, tid(0x02), 100, 12); // low stamp
+        insert_offer_entry(&mut node, tid(0x03), 100, 13); // accepted
+        insert_offer_entry(&mut node, tid(0x04), 985, 20); // 1001 B with overhead
+        insert_offer_entry(&mut node, tid(0x05), 984, 13); // exact 1000 B
+
+        let mut policy = OutboundOfferPolicy::unrestricted([0xBB; 16]);
+        policy.handled_messages.insert(tid(0x01));
+        policy.minimum_stamp_cost = 13;
+        policy.propagation_transfer_limit = Some(1.0);
+        policy.propagation_sync_limit = Some(10.0);
+        policy.peering_key = vec![0x77; 32];
+
+        let offer = node.prepare_sync_offer_with_policy(&policy);
+
+        assert_eq!(offer.peering_key, vec![0x77; 32]);
+        assert_eq!(
+            offer.transient_ids,
+            vec![tid(0x03).to_vec(), tid(0x05).to_vec()]
+        );
+        assert_eq!(
+            node.get_session(&policy.peer_hash).unwrap().offered_ids,
+            vec![tid(0x03), tid(0x05)]
+        );
+    }
+
+    #[test]
+    fn offer_cumulative_limit_is_decimal_and_excludes_exact_boundary() {
+        let mut node = PropagationNode::new(PropagationNodeConfig::default(), [0xAA; 16]);
+        insert_offer_entry(&mut node, tid(0x01), 50, 0);
+        insert_offer_entry(&mut node, tid(0x02), 50, 0);
+        let mut policy = OutboundOfferPolicy::unrestricted([0xBB; 16]);
+        // 24 initial + (50 + 16) + (50 + 16) = 156 bytes. The second
+        // candidate is excluded because upstream uses next_size >= limit.
+        policy.propagation_sync_limit = Some(0.156);
+
+        let offer = node.prepare_sync_offer_with_policy(&policy);
+
+        assert_eq!(offer.transient_ids, vec![tid(0x01).to_vec()]);
+    }
+
+    #[test]
+    fn prepared_offer_distinguishes_terminal_filters_from_cumulative_deferral() {
+        let mut node = PropagationNode::new(PropagationNodeConfig::default(), [0xAA; 16]);
+        insert_offer_entry(&mut node, tid(0x01), 10, 9); // terminal low stamp
+        insert_offer_entry(&mut node, tid(0x02), 100, 20); // selected
+        insert_offer_entry(&mut node, tid(0x03), 100, 20); // cumulative deferred
+        insert_offer_entry(&mut node, tid(0x04), 1000, 20); // terminal oversize
+        let mut policy = OutboundOfferPolicy::unrestricted([0xBB; 16]);
+        policy.minimum_stamp_cost = 10;
+        policy.propagation_transfer_limit = Some(0.5);
+        policy.propagation_sync_limit = Some(0.2);
+
+        let prepared = prepare_sync_offer_snapshot(node.snapshot_sync_offer_preparation(&policy));
+
+        assert_eq!(prepared.selected_ids, vec![tid(0x02)]);
+        assert_eq!(prepared.terminal_handled_ids, vec![tid(0x01), tid(0x04)]);
+        assert!(
+            !prepared.generation_exhausted,
+            "cumulative-only skips must stay pending for another batch"
+        );
+    }
+
+    #[test]
+    fn all_cumulatively_deferred_candidates_exhaust_unchanged_generation() {
+        let mut node = PropagationNode::new(PropagationNodeConfig::default(), [0xAA; 16]);
+        insert_offer_entry(&mut node, tid(0x01), 50, 20);
+        insert_offer_entry(&mut node, tid(0x02), 50, 20);
+        let mut policy = OutboundOfferPolicy::unrestricted([0xBB; 16]);
+        // Initial overhead (24) + either transfer (50 + 16) exceeds this
+        // generation's peer policy, so a reconnect cannot make progress.
+        policy.propagation_sync_limit = Some(0.05);
+
+        let prepared = prepare_sync_offer_snapshot(node.snapshot_sync_offer_preparation(&policy));
+
+        assert!(prepared.selected_ids.is_empty());
+        assert!(prepared.terminal_handled_ids.is_empty());
+        assert!(
+            prepared.generation_exhausted,
+            "zero-progress cumulative deferral must not hot-loop the same generation"
+        );
+    }
+
+    #[test]
+    fn prepared_offer_revalidates_store_generation_before_install() {
+        let mut node = PropagationNode::new(PropagationNodeConfig::default(), [0xAA; 16]);
+        let mut first = vec![0x11; DESTINATION_LENGTH + 1];
+        first[0] = 0x01;
+        assert!(node.accept_propagated_blob(&first, 0));
+        let policy = OutboundOfferPolicy::unrestricted([0xBB; 16]);
+        let snapshot = node.snapshot_sync_offer_preparation(&policy);
+
+        let mut second = vec![0x22; DESTINATION_LENGTH + 1];
+        second[0] = 0x02;
+        assert!(node.accept_propagated_blob(&second, 0));
+        let prepared = prepare_sync_offer_snapshot(snapshot);
+
+        assert!(matches!(
+            node.install_prepared_sync_offer(prepared),
+            InstallPreparedSyncOffer::Stale
+        ));
+    }
+
+    #[test]
+    fn passed_and_persisted_handled_sets_are_unioned() {
+        let dir = std::env::temp_dir().join("lxmf_test_offer_handled_union");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut node = PropagationNode::with_storage(
+            PropagationNodeConfig::default(),
+            [0xAA; 16],
+            dir.clone(),
+        )
+        .unwrap();
+        insert_offer_entry(&mut node, tid(0x01), 50, 0);
+        insert_offer_entry(&mut node, tid(0x02), 50, 0);
+        insert_offer_entry(&mut node, tid(0x03), 50, 0);
+
+        let mut persisted = LxmPeer::new([0xBB; 16]);
+        persisted.add_handled_message(&tid(0x01));
+        node.save_peer(&persisted).unwrap();
+        let mut policy = OutboundOfferPolicy::unrestricted([0xBB; 16]);
+        policy.handled_messages.insert(tid(0x02));
+
+        let offer = node.prepare_sync_offer_with_policy(&policy);
+        assert_eq!(offer.transient_ids, vec![tid(0x03).to_vec()]);
+
+        node.delete_peer(&[0xBB; 16]).unwrap();
+        assert!(node.load_peers().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

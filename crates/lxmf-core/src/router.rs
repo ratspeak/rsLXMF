@@ -12,7 +12,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::constants::*;
 use crate::message::{LxMessage, MessageError};
-use crate::peer::LxmPeer;
+use crate::peer::{LxmPeer, OutboundOfferPolicy};
 use crate::propagation::PropagationStore;
 use crate::stamper;
 use crate::ticket::{Ticket, TicketStore};
@@ -317,6 +317,9 @@ pub struct AutopeerCandidate {
     pub stamp_cost: Option<u8>,
     pub stamp_flexibility: Option<u8>,
     pub peering_cost: Option<u8>,
+    /// Parsed propagation-node announce metadata. The peer layer applies
+    /// deterministic entry/value/aggregate bounds before retaining it.
+    pub metadata: Option<std::collections::HashMap<u8, Vec<u8>>>,
     pub hops: Option<u8>,
 }
 
@@ -940,6 +943,29 @@ impl LxmRouter {
         due
     }
 
+    /// Return authoritative policies for peers that have not processed the
+    /// current propagation-store generation. This is an O(peers) scheduler
+    /// query; exact message eligibility is intentionally deferred to the
+    /// sync task's off-loop offer preparation.
+    ///
+    /// The method does not mutate peer state, allowing a single shared sync
+    /// task to accept one policy before the daemon marks that peer started.
+    pub fn sync_peer_policies_for_store(&self, offer_generation: u64) -> Vec<OutboundOfferPolicy> {
+        let mut policies = self
+            .peers
+            .values()
+            .filter(|peer| {
+                peer.alive
+                    && peer.state == PeerState::Idle
+                    && peer.should_sync()
+                    && peer.needs_offer_generation(offer_generation)
+            })
+            .map(OutboundOfferPolicy::from)
+            .collect::<Vec<_>>();
+        policies.sort_by_key(|policy| policy.peer_hash);
+        policies
+    }
+
     pub fn add_peer(&mut self, peer: LxmPeer) -> bool {
         if self.peers.len() >= self.config.max_peers {
             return false;
@@ -961,31 +987,69 @@ impl LxmRouter {
             stamp_cost,
             stamp_flexibility,
             peering_cost,
+            metadata,
             hops,
         } = candidate;
+        let configured_static = self.static_peers.contains(&destination_hash);
 
-        if !self.config.autopeer {
-            return false;
-        }
         // Python LXMRouter.peer() (LXMRouter.py:1896-1901): a peering cost
         // above our accepted maximum refuses the peering — and breaks an
-        // existing one — before any PoW could be attempted.
+        // existing one only when that policy announce is not stale.
         if peering_cost.unwrap_or(0) > self.config.ext.max_peering_cost {
-            if self.peers.contains_key(&destination_hash) {
-                self.unpeer(&destination_hash);
+            if self
+                .peers
+                .get(&destination_hash)
+                .is_some_and(|peer| timebase >= peer.peering_timebase)
+            {
+                self.remove_peer(&destination_hash);
             }
             return false;
         }
-        if self.peers.contains_key(&destination_hash) {
+
+        // Configured static peers always consume newer policy announces.
+        // Automatically discovered peers remain governed by the live
+        // autopeer/range policy, matching the upstream announce handler.
+        if let Some(peer) = self.peers.get(&destination_hash) {
+            let static_peer = configured_static || peer.is_static;
+            if !static_peer && !self.config.autopeer {
+                return false;
+            }
+            if !static_peer && hops.is_some_and(|h| h as usize > self.config.ext.autopeer_maxdepth)
+            {
+                if timebase >= peer.peering_timebase {
+                    self.remove_peer(&destination_hash);
+                }
+                return false;
+            }
+        }
+        if let Some(peer) = self.peers.get_mut(&destination_hash) {
+            let refreshed = peer.refresh_from_announce_with_metadata(
+                timebase,
+                transfer_limit,
+                sync_limit,
+                stamp_cost,
+                stamp_flexibility,
+                peering_cost,
+                metadata,
+            );
+            if configured_static {
+                peer.is_static = true;
+                peer.autopeered = false;
+            }
+            return refreshed;
+        }
+
+        if !configured_static && !self.config.autopeer {
             return false;
         }
-        if let Some(h) = hops
+        if !configured_static
+            && let Some(h) = hops
             && h as usize > self.config.ext.autopeer_maxdepth
         {
             return false;
         }
 
-        let peer = LxmPeer::from_announce(
+        let mut peer = LxmPeer::from_announce_with_metadata(
             destination_hash,
             timebase,
             transfer_limit,
@@ -993,7 +1057,12 @@ impl LxmRouter {
             stamp_cost,
             stamp_flexibility,
             peering_cost,
+            metadata,
         );
+        if configured_static {
+            peer.is_static = true;
+            peer.autopeered = false;
+        }
         self.add_peer(peer)
     }
 
@@ -2630,6 +2699,48 @@ mod tests {
     }
 
     #[test]
+    fn store_generation_scheduler_skips_unchanged_and_reenables_on_store_or_policy_change() {
+        let peer_hash = [0x11; 16];
+        let mut router = LxmRouter::new(RouterConfig::default());
+        let mut peer = LxmPeer::from_announce(
+            peer_hash,
+            10.0,
+            Some(1.0),
+            Some(2.0),
+            Some(16),
+            Some(3),
+            Some(18),
+        );
+        peer.mark_offer_generation_processed(5);
+        router.add_peer(peer);
+
+        assert!(router.sync_peer_policies_for_store(5).is_empty());
+        let due = router.sync_peer_policies_for_store(6);
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].peer_hash, peer_hash);
+        assert_eq!(router.peers[&peer_hash].state, PeerState::Idle);
+
+        router
+            .peers
+            .get_mut(&peer_hash)
+            .unwrap()
+            .mark_offer_generation_processed(6);
+        assert!(router.sync_peer_policies_for_store(6).is_empty());
+        assert!(router.autopeer(AutopeerCandidate {
+            destination_hash: peer_hash,
+            timebase: 11.0,
+            transfer_limit: Some(1.0),
+            sync_limit: Some(2.0),
+            stamp_cost: Some(12),
+            stamp_flexibility: Some(3),
+            peering_cost: Some(18),
+            metadata: Some(std::collections::HashMap::new()),
+            hops: Some(1),
+        }));
+        assert_eq!(router.sync_peer_policies_for_store(6).len(), 1);
+    }
+
+    #[test]
     fn test_validate_stamp() {
         let router = LxmRouter::new(RouterConfig::default());
         let msg_id = rns_crypto::sha::sha256(b"test message");
@@ -3210,6 +3321,7 @@ mod tests {
             stamp_cost: Some(16),
             stamp_flexibility: Some(3),
             peering_cost: Some(18),
+            metadata: None,
             hops: Some(2),
         }));
         assert_eq!(router.peers.len(), 1);
@@ -3222,6 +3334,7 @@ mod tests {
             stamp_cost: None,
             stamp_flexibility: None,
             peering_cost: None,
+            metadata: None,
             hops: None,
         }));
         assert!(!router.autopeer(AutopeerCandidate {
@@ -3232,8 +3345,161 @@ mod tests {
             stamp_cost: None,
             stamp_flexibility: None,
             peering_cost: None,
+            metadata: None,
             hops: Some(10),
         }));
+    }
+
+    #[test]
+    fn existing_static_peer_accepts_only_newer_policy_when_autopeer_is_disabled() {
+        let peer_hash = [0xAA; 16];
+        let mut router = LxmRouter::new(RouterConfig {
+            autopeer: false,
+            ..Default::default()
+        });
+        let mut peer = LxmPeer::new(peer_hash);
+        peer.is_static = true;
+        peer.peering_timebase = 100.0;
+        peer.stamp_cost = Some(8);
+        router.add_peer(peer);
+
+        let candidate = |timebase, stamp_cost| AutopeerCandidate {
+            destination_hash: peer_hash,
+            timebase,
+            transfer_limit: Some(2.0),
+            sync_limit: Some(8.0),
+            stamp_cost: Some(stamp_cost),
+            stamp_flexibility: Some(3),
+            peering_cost: Some(18),
+            metadata: None,
+            hops: Some(99),
+        };
+
+        assert!(router.autopeer(candidate(101.0, 16)));
+        let refreshed = router.peers.get(&peer_hash).unwrap();
+        assert_eq!(refreshed.stamp_cost, Some(16));
+        assert_eq!(refreshed.propagation_sync_limit, Some(8.0));
+        assert!(refreshed.is_static);
+
+        assert!(!router.autopeer(candidate(100.0, 4)));
+        assert_eq!(router.peers.get(&peer_hash).unwrap().stamp_cost, Some(16));
+
+        assert!(!router.autopeer(AutopeerCandidate {
+            destination_hash: [0xBB; 16],
+            timebase: 101.0,
+            transfer_limit: Some(2.0),
+            sync_limit: Some(8.0),
+            stamp_cost: Some(16),
+            stamp_flexibility: Some(3),
+            peering_cost: Some(18),
+            metadata: None,
+            hops: Some(1),
+        }));
+        assert!(!router.peers.contains_key(&[0xBB; 16]));
+    }
+
+    #[test]
+    fn configured_static_announce_recreates_missing_peer_with_autopeer_disabled() {
+        let peer_hash = [0xA5; 16];
+        let mut router = LxmRouter::new(RouterConfig {
+            autopeer: false,
+            ext: RouterConfigExt {
+                autopeer_maxdepth: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        router.static_peers.push(peer_hash);
+        router.remove_peer(&peer_hash);
+
+        assert!(router.autopeer(AutopeerCandidate {
+            destination_hash: peer_hash,
+            timebase: 101.0,
+            transfer_limit: Some(2.0),
+            sync_limit: Some(8.0),
+            stamp_cost: Some(16),
+            stamp_flexibility: Some(3),
+            peering_cost: Some(18),
+            metadata: Some(std::collections::HashMap::from([(
+                crate::constants::PN_META_NAME,
+                b"static".to_vec(),
+            )])),
+            hops: Some(99),
+        }));
+        let peer = router.peers.get(&peer_hash).unwrap();
+        assert!(peer.is_static);
+        assert!(!peer.autopeered);
+        assert_eq!(
+            peer.metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get(&crate::constants::PN_META_NAME)),
+            Some(&b"static".to_vec())
+        );
+    }
+
+    #[test]
+    fn stale_over_cost_announce_does_not_remove_newer_peer() {
+        let peer_hash = [0xAA; 16];
+        let mut router = LxmRouter::new(RouterConfig::default());
+        let mut peer = LxmPeer::new(peer_hash);
+        peer.peering_timebase = 200.0;
+        router.add_peer(peer);
+        let max = router.config.ext.max_peering_cost;
+
+        assert!(!router.autopeer(AutopeerCandidate {
+            destination_hash: peer_hash,
+            timebase: 199.0,
+            transfer_limit: None,
+            sync_limit: None,
+            stamp_cost: None,
+            stamp_flexibility: None,
+            peering_cost: Some(max + 1),
+            metadata: None,
+            hops: None,
+        }));
+        assert!(router.peers.contains_key(&peer_hash));
+    }
+
+    #[test]
+    fn nonstatic_peer_still_obeys_autopeer_and_range_on_refresh() {
+        let peer_hash = [0xAA; 16];
+        let candidate = |timebase, hops| AutopeerCandidate {
+            destination_hash: peer_hash,
+            timebase,
+            transfer_limit: Some(2.0),
+            sync_limit: Some(8.0),
+            stamp_cost: Some(16),
+            stamp_flexibility: Some(3),
+            peering_cost: Some(18),
+            metadata: None,
+            hops: Some(hops),
+        };
+
+        let mut disabled = LxmRouter::new(RouterConfig {
+            autopeer: false,
+            ..Default::default()
+        });
+        let mut peer = LxmPeer::new(peer_hash);
+        peer.peering_timebase = 100.0;
+        disabled.add_peer(peer);
+        assert!(!disabled.autopeer(candidate(101.0, 1)));
+        assert_eq!(
+            disabled.peers.get(&peer_hash).unwrap().peering_timebase,
+            100.0
+        );
+
+        let mut ranged = LxmRouter::new(RouterConfig {
+            ext: RouterConfigExt {
+                autopeer_maxdepth: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let mut peer = LxmPeer::new(peer_hash);
+        peer.peering_timebase = 100.0;
+        ranged.add_peer(peer);
+        assert!(!ranged.autopeer(candidate(101.0, 2)));
+        assert!(!ranged.peers.contains_key(&peer_hash));
     }
 
     /// T0-4: peering cost above `max_peering_cost` refuses peering, and an
@@ -3252,6 +3518,7 @@ mod tests {
             stamp_cost: Some(16),
             stamp_flexibility: Some(3),
             peering_cost: cost,
+            metadata: None,
             hops: Some(2),
         };
 
@@ -3286,6 +3553,7 @@ mod tests {
             stamp_cost: None,
             stamp_flexibility: None,
             peering_cost: None,
+            metadata: None,
             hops: Some(2),
         }));
         assert!(router.autopeer(AutopeerCandidate {
@@ -3296,6 +3564,7 @@ mod tests {
             stamp_cost: None,
             stamp_flexibility: None,
             peering_cost: None,
+            metadata: None,
             hops: Some(1),
         }));
     }

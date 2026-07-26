@@ -24,10 +24,11 @@ use lxmf_core::link_delivery::{
     is_retryable_link_delivery_failure,
 };
 use lxmf_core::message::LxMessage;
+use lxmf_core::peer::{LxmPeer, OutboundOfferPolicy};
 use lxmf_core::propagation_node::{PropagationNode, PropagationNodeConfig};
 use lxmf_core::router::{
-    DirectDeliveryPlan, DirectDeliveryPlanInput, DirectReusableLinkState, DirectRouteSnapshot,
-    LxmRouter, OutboundAction, plan_direct_delivery,
+    AutopeerCandidate, DirectDeliveryPlan, DirectDeliveryPlanInput, DirectReusableLinkState,
+    DirectRouteSnapshot, LxmRouter, OutboundAction, plan_direct_delivery,
 };
 use lxmf_tools::daemon::{DaemonConfig, create_router_with_transport, execute_on_inbound};
 use lxmf_tools::lxmd_cli::{
@@ -86,6 +87,50 @@ struct PnValidationWorkerResult {
     outcome: PnValidationOutcome,
     entries: Vec<ValidatedPnEntry>,
     rejected: usize,
+}
+
+#[derive(Debug)]
+struct PeeringKeyWorkerResult {
+    peer_hash: [u8; 16],
+    peering_cost: u8,
+    peering_key: Option<([u8; 32], u32)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PeerOfferConstraints {
+    transfer_limit: Option<f64>,
+    sync_limit: Option<f64>,
+    stamp_cost: Option<u8>,
+    stamp_flexibility: Option<u8>,
+    peering_cost: u8,
+}
+
+impl From<&LxmPeer> for PeerOfferConstraints {
+    fn from(peer: &LxmPeer) -> Self {
+        Self {
+            transfer_limit: peer.propagation_transfer_limit,
+            sync_limit: peer.propagation_sync_limit,
+            stamp_cost: peer.stamp_cost,
+            stamp_flexibility: peer.stamp_cost_flexibility,
+            peering_cost: peer.peering_cost,
+        }
+    }
+}
+
+fn generate_peering_key_job(
+    peer_hash: [u8; 16],
+    peering_cost: u8,
+    peer_identity_hash: [u8; 16],
+    local_identity_hash: [u8; 16],
+) -> PeeringKeyWorkerResult {
+    let mut peer = LxmPeer::new(peer_hash);
+    peer.peering_cost = peering_cost;
+    let _ = peer.generate_peering_key(&peer_identity_hash, &local_identity_hash);
+    PeeringKeyWorkerResult {
+        peer_hash,
+        peering_cost,
+        peering_key: peer.peering_key,
+    }
 }
 
 fn validate_pn_resource_job(
@@ -637,6 +682,11 @@ struct LxmdRunner {
     prop_validation_rx: mpsc::Receiver<PnValidationWorkerResult>,
     /// Retained sender used to dispatch bounded validation results.
     prop_validation_tx: mpsc::Sender<PnValidationWorkerResult>,
+    /// Peering keys are CPU-bound PoW and must never run on the daemon loop.
+    peering_key_result_rx: mpsc::Receiver<PeeringKeyWorkerResult>,
+    peering_key_result_tx: mpsc::Sender<PeeringKeyWorkerResult>,
+    peering_key_jobs: HashSet<[u8; 16]>,
+    pending_peer_syncs: HashSet<[u8; 16]>,
     /// Non-link inbound packets; still encrypted, need destination-level decrypt.
     inbound_raw_rx: mpsc::Receiver<Vec<u8>>,
     announce_rx: mpsc::Receiver<AnnounceHandlerEvent>,
@@ -742,7 +792,7 @@ impl LxmdRunner {
             "Crypto state loaded"
         );
 
-        let router = create_router_with_transport(&config, transport_tx.clone());
+        let mut router = create_router_with_transport(&config, transport_tx.clone());
 
         // LinkManager handles link handshakes (ECDH), keepalive, identification,
         // and resource transfers; it forwards plaintext application data here.
@@ -754,6 +804,8 @@ impl LxmdRunner {
             mpsc::unbounded_channel::<rns_runtime::link_manager::LinkManagerAccountingEvent>();
         let (prop_validation_tx, prop_validation_rx) =
             mpsc::channel::<PnValidationWorkerResult>(256);
+        let (peering_key_result_tx, peering_key_result_rx) =
+            mpsc::channel::<PeeringKeyWorkerResult>(64);
         let (inbound_raw_tx, inbound_raw_rx) = mpsc::channel::<Vec<u8>>(256);
         let (link_command_tx, link_command_rx) =
             mpsc::channel::<rns_runtime::link_manager::LinkManagerCommand>(256);
@@ -806,6 +858,11 @@ impl LxmdRunner {
                 delivery_tx: Some(prop_delivery_tx),
             });
 
+            let static_peer_hashes = config
+                .static_peers
+                .iter()
+                .filter_map(|peer| parse_destination_hash(peer).ok())
+                .collect::<Vec<_>>();
             let pn_config = PropagationNodeConfig {
                 max_storage: config
                     .message_storage_limit
@@ -844,12 +901,13 @@ impl LxmdRunner {
                     )))
                 }
             };
+            if let Ok(node) = pn.lock() {
+                for mut peer in node.load_peers() {
+                    peer.is_static = static_peer_hashes.contains(&peer.destination_hash);
+                    let _ = router.add_peer(peer);
+                }
+            }
 
-            let static_peer_hashes = config
-                .static_peers
-                .iter()
-                .filter_map(|peer| parse_destination_hash(peer).ok())
-                .collect::<Vec<_>>();
             let pn_admission = Arc::new(Mutex::new(PnInboundRuntime::new(
                 config.to_inbound_admission_config(),
                 static_peer_hashes,
@@ -1150,6 +1208,10 @@ impl LxmdRunner {
             prop_accounting_rx,
             prop_validation_rx,
             prop_validation_tx,
+            peering_key_result_rx,
+            peering_key_result_tx,
+            peering_key_jobs: HashSet::new(),
+            pending_peer_syncs: HashSet::new(),
             inbound_raw_rx,
             announce_rx,
             last_peer_announce: 0.0,
@@ -1166,10 +1228,17 @@ impl LxmdRunner {
 
         if runner.config.propagation_enabled {
             if let Some(ref pn) = propagation_node {
-                let sync = lxmf_core::propagation_sync::PropagationSyncTask::with_shared_node(
+                let mut sync = lxmf_core::propagation_sync::PropagationSyncTask::with_shared_node(
                     transport_tx.clone(),
                     pn.clone(),
                 );
+                if let Some(signing_key) = runner.identity.get_signing_key() {
+                    sync.set_identity(runner.identity.get_public_key(), signing_key);
+                } else {
+                    tracing::error!(
+                        "local identity has no signing key; outbound peer sync cannot identify"
+                    );
+                }
                 runner.propagation_sync = Some(sync);
             }
             runner.propagation_node = propagation_node;
@@ -1190,11 +1259,12 @@ impl LxmdRunner {
                         node.copy_from_slice(&bytes);
                         client.set_propagation_node(node);
                         runner.router.outbound_propagation_node = Some(node);
-                        runner
+                        let peer = runner
                             .router
                             .peers
                             .entry(node)
                             .or_insert_with(|| lxmf_core::peer::LxmPeer::new(node));
+                        peer.is_static = true;
                         if !runner.router.static_peers.contains(&node) {
                             runner.router.static_peers.push(node);
                         }
@@ -1257,10 +1327,12 @@ impl LxmdRunner {
                     if !self.router.static_peers.contains(&hash) {
                         self.router.static_peers.push(hash);
                     }
-                    self.router
+                    let peer = self
+                        .router
                         .peers
                         .entry(hash)
                         .or_insert_with(|| lxmf_core::peer::LxmPeer::new(hash));
+                    peer.is_static = true;
                 }
                 Err(e) => {
                     tracing::warn!(hash = %configured, "ignoring invalid static peer hash: {e}")
@@ -1389,9 +1461,7 @@ impl LxmdRunner {
                     if !self.router.peers.contains_key(&peer_hash) {
                         continue;
                     }
-                    if let Some(ref mut sync) = self.propagation_sync {
-                        sync.request_sync_now(peer_hash);
-                    }
+                    self.pending_peer_syncs.insert(peer_hash);
                     if let Some(peer) = self.router.peers.get_mut(&peer_hash) {
                         peer.next_sync_attempt = 0.0;
                         peer.alive = true;
@@ -1399,11 +1469,21 @@ impl LxmdRunner {
                     tracing::info!(peer = %hex::encode(peer_hash), "control: queued peer sync");
                 }
                 ControlCommand::Unpeer(peer_hash) => {
-                    self.router.unpeer(&peer_hash);
-                    if let Some(ref admission) = self.propagation_admission
-                        && let Ok(mut admission) = admission.lock()
+                    self.pending_peer_syncs.remove(&peer_hash);
+                    if let Some(sync) = self.propagation_sync.as_mut() {
+                        sync.cancel_peer_sync(&peer_hash);
+                    }
+                    // Upstream control unpeer breaks the live peering without
+                    // mutating the operator's configured static-peer set.
+                    self.router.remove_peer(&peer_hash);
+                    if let Some(ref node) = self.propagation_node
+                        && let Ok(mut node) = node.lock()
+                        && let Err(error) = node.delete_peer(&peer_hash)
                     {
-                        admission.remove_static_peer(&peer_hash);
+                        tracing::warn!(
+                            peer = %hex::encode(peer_hash),
+                            "failed to remove persisted propagation peer: {error}"
+                        );
                     }
                     if let Err(e) = self.router.save_state(&self.data_dir) {
                         tracing::warn!("Failed to save router state after control unpeer: {e}");
@@ -1411,6 +1491,157 @@ impl LxmdRunner {
                     tracing::info!(peer = %hex::encode(peer_hash), "control: unpeered peer");
                 }
             }
+        }
+    }
+
+    fn drain_peering_key_results(&mut self) {
+        while let Ok(result) = self.peering_key_result_rx.try_recv() {
+            self.peering_key_jobs.remove(&result.peer_hash);
+
+            let mut applied = false;
+            let mut current_cost = false;
+            if let Some(peer) = self.router.peers.get_mut(&result.peer_hash) {
+                current_cost = peer.peering_cost == result.peering_cost;
+                // Peering-key work binds only the two identities. A newer
+                // announce timebase (or a lower current target) does not make
+                // a completed key stale if its measured value is still high
+                // enough for the current policy.
+                if let Some((key, value)) = result.peering_key
+                    && value >= peer.peering_cost as u32
+                {
+                    peer.peering_key = Some((key, value));
+                    applied = true;
+                }
+            }
+
+            if applied {
+                if let (Some(node), Some(peer)) = (
+                    self.propagation_node.as_ref(),
+                    self.router.peers.get(&result.peer_hash),
+                ) && let Ok(node) = node.lock()
+                    && let Err(error) = node.save_peer(peer)
+                {
+                    tracing::warn!(
+                        peer = %hex::encode(result.peer_hash),
+                        "failed to persist generated peering key: {error}"
+                    );
+                }
+            } else if current_cost {
+                // A bounded key search can fail for an excessive advertised
+                // cost. Put this policy generation into the normal peer
+                // backoff instead of spinning a fresh CPU job every tick.
+                self.pending_peer_syncs.remove(&result.peer_hash);
+                if let Some(peer) = self.router.peers.get_mut(&result.peer_hash) {
+                    peer.next_sync_attempt =
+                        now_f64() + lxmf_core::constants::SYNC_BACKOFF_STEP as f64;
+                }
+                tracing::warn!(
+                    peer = %hex::encode(result.peer_hash),
+                    peering_cost = result.peering_cost,
+                    "could not generate a peering key; sync remains postponed"
+                );
+            }
+            // A result for a different cost that no longer satisfies policy
+            // is ignored. The pending sync remains queued and dispatches a
+            // new job for the current target.
+        }
+    }
+
+    fn queue_due_peer_syncs(&mut self) {
+        if self.propagation_sync.is_none() {
+            return;
+        }
+        let Some(offer_generation) = self
+            .propagation_node
+            .as_ref()
+            .and_then(|node| node.lock().ok().map(|node| node.offer_generation()))
+        else {
+            return;
+        };
+
+        for policy in self.router.sync_peer_policies_for_store(offer_generation) {
+            self.pending_peer_syncs.insert(policy.peer_hash);
+        }
+    }
+
+    fn drive_pending_peer_syncs(&mut self) {
+        if self
+            .propagation_sync
+            .as_ref()
+            .is_none_or(|sync| sync.state != lxmf_core::propagation_sync::SyncTaskState::Idle)
+        {
+            return;
+        }
+
+        let mut pending = self.pending_peer_syncs.iter().copied().collect::<Vec<_>>();
+        pending.sort_unstable();
+        for peer_hash in pending {
+            let Some(peer_identity_hash) = recall_identity_hash(&self.known_identities, &peer_hash)
+            else {
+                tracing::debug!(
+                    peer = %hex::encode(peer_hash),
+                    "peer sync postponed until its identity is known"
+                );
+                continue;
+            };
+            let policy = self.router.peers.get(&peer_hash).and_then(|peer| {
+                (peer.stamp_costs_known() && (peer.peering_cost == 0 || peer.peering_key_ready()))
+                    .then(|| OutboundOfferPolicy::from(peer))
+            });
+            if let Some(policy) = policy {
+                if let Some(sync) = self.propagation_sync.as_mut()
+                    && sync.request_sync_now_with_policy(policy)
+                {
+                    if let Some(peer) = self.router.peers.get_mut(&peer_hash) {
+                        peer.begin_sync();
+                    }
+                    self.pending_peer_syncs.remove(&peer_hash);
+                }
+                return;
+            }
+
+            if self
+                .router
+                .peers
+                .get(&peer_hash)
+                .is_some_and(|peer| !peer.stamp_costs_known())
+            {
+                tracing::debug!(
+                    peer = %hex::encode(peer_hash),
+                    "peer sync postponed until its stamp policy is known"
+                );
+                continue;
+            }
+
+            if self.peering_key_jobs.contains(&peer_hash) {
+                continue;
+            }
+            let Some(peer) = self.router.peers.get(&peer_hash) else {
+                self.pending_peer_syncs.remove(&peer_hash);
+                continue;
+            };
+
+            let peering_cost = peer.peering_cost;
+            let local_identity_hash = self.identity.hash;
+            let result_tx = self.peering_key_result_tx.clone();
+            self.peering_key_jobs.insert(peer_hash);
+            tokio::spawn(async move {
+                let result = tokio::task::spawn_blocking(move || {
+                    generate_peering_key_job(
+                        peer_hash,
+                        peering_cost,
+                        peer_identity_hash,
+                        local_identity_hash,
+                    )
+                })
+                .await
+                .unwrap_or(PeeringKeyWorkerResult {
+                    peer_hash,
+                    peering_cost,
+                    peering_key: None,
+                });
+                let _ = result_tx.send(result).await;
+            });
         }
     }
 
@@ -1663,6 +1894,9 @@ impl LxmdRunner {
         let now = now_f64();
 
         self.drain_control_commands();
+        self.drain_peering_key_results();
+        self.queue_due_peer_syncs();
+        self.drive_pending_peer_syncs();
         self.drain_backchannel_events();
 
         self.router.process_deferred_stamps();
@@ -1717,9 +1951,58 @@ impl LxmdRunner {
             }
         }
 
+        let mut peer_handled_updates = None;
+        let mut peer_terminal_result = None;
         if let Some(ref mut ps) = self.propagation_sync {
             ps.drain_events(&self.known_identities);
             ps.tick();
+            let updates = ps.take_handled_updates();
+            if !updates.is_empty()
+                && let Some(peer_hash) = ps.node_dest_hash()
+            {
+                peer_handled_updates = Some((peer_hash, updates));
+            }
+            peer_terminal_result = ps.take_terminal_peer_result();
+        }
+        let mut peers_to_persist = HashSet::new();
+        if let Some((peer_hash, updates)) = peer_handled_updates
+            && let Some(peer) = self.router.peers.get_mut(&peer_hash)
+        {
+            for transient_id in updates {
+                peer.add_handled_message(&transient_id);
+            }
+            peers_to_persist.insert(peer_hash);
+        }
+        if let Some(result) = peer_terminal_result
+            && let Some(peer) = self.router.peers.get_mut(&result.peer_hash)
+        {
+            match result.state {
+                lxmf_core::propagation_sync::PeerSyncTerminalState::Complete => {
+                    peer.sync_complete();
+                    if result.generation_exhausted
+                        && let Some(generation) = result.offer_generation
+                    {
+                        peer.mark_offer_generation_processed(generation);
+                    }
+                }
+                lxmf_core::propagation_sync::PeerSyncTerminalState::Failed => {
+                    peer.sync_failed();
+                }
+            }
+            peers_to_persist.insert(result.peer_hash);
+        }
+        for peer_hash in peers_to_persist {
+            if let (Some(node), Some(peer)) = (
+                self.propagation_node.as_ref(),
+                self.router.peers.get(&peer_hash),
+            ) && let Ok(node) = node.lock()
+                && let Err(error) = node.save_peer(peer)
+            {
+                tracing::warn!(
+                    peer = %hex::encode(peer_hash),
+                    "failed to persist peer sync state: {error}"
+                );
+            }
         }
 
         // Drive propagation client (download from node)
@@ -1897,6 +2180,98 @@ impl LxmdRunner {
             {
                 self.router
                     .set_stamp_cost(event.destination_hash, pn.stamp_cost);
+                let is_static = self.router.static_peers.contains(&event.destination_hash);
+                let previous_offer_constraints = self
+                    .router
+                    .peers
+                    .get(&event.destination_hash)
+                    .map(PeerOfferConstraints::from);
+                let static_observation = is_static
+                    && (!event.is_path_response
+                        || self
+                            .router
+                            .peers
+                            .get(&event.destination_hash)
+                            .is_some_and(|peer| !peer.stamp_costs_known()));
+                let autopeer_observation =
+                    !is_static && self.config.autopeer && !event.is_path_response;
+                let mut peer_changed = false;
+                let mut peer_removed = false;
+                if static_observation || (autopeer_observation && pn.node_state) {
+                    let had_peer = self.router.peers.contains_key(&event.destination_hash);
+                    peer_changed = self.router.autopeer(AutopeerCandidate {
+                        destination_hash: event.destination_hash,
+                        timebase: pn.timebase as f64,
+                        transfer_limit: Some(pn.transfer_limit as f64),
+                        sync_limit: Some(pn.sync_limit as f64),
+                        stamp_cost: Some(pn.stamp_cost),
+                        stamp_flexibility: Some(pn.stamp_flex),
+                        peering_cost: Some(pn.peering_cost),
+                        hops: Some(event.hops),
+                        metadata: Some(pn.metadata.clone()),
+                    });
+                    peer_removed =
+                        had_peer && !self.router.peers.contains_key(&event.destination_hash);
+                } else if autopeer_observation
+                    && !pn.node_state
+                    && self
+                        .router
+                        .peers
+                        .get(&event.destination_hash)
+                        .is_some_and(|peer| {
+                            !peer.is_static && pn.timebase as f64 >= peer.peering_timebase
+                        })
+                {
+                    self.router.remove_peer(&event.destination_hash);
+                    peer_removed = true;
+                }
+
+                if peer_removed {
+                    self.pending_peer_syncs.remove(&event.destination_hash);
+                    if let Some(sync) = self.propagation_sync.as_mut() {
+                        sync.cancel_peer_sync(&event.destination_hash);
+                    }
+                    if let Some(node) = self.propagation_node.as_ref()
+                        && let Ok(mut node) = node.lock()
+                        && let Err(error) = node.delete_peer(&event.destination_hash)
+                    {
+                        tracing::warn!(
+                            peer = %dest_hex,
+                            "failed to remove retired propagation peer: {error}"
+                        );
+                    }
+                } else if peer_changed {
+                    let offer_constraints_changed =
+                        previous_offer_constraints.is_some_and(|previous| {
+                            self.router
+                                .peers
+                                .get(&event.destination_hash)
+                                .map(PeerOfferConstraints::from)
+                                != Some(previous)
+                        });
+                    if offer_constraints_changed
+                        && self
+                            .propagation_sync
+                            .as_mut()
+                            .is_some_and(|sync| sync.cancel_peer_sync(&event.destination_hash))
+                    {
+                        if let Some(peer) = self.router.peers.get_mut(&event.destination_hash) {
+                            peer.link_closed();
+                        }
+                        self.pending_peer_syncs.insert(event.destination_hash);
+                    }
+                    if let (Some(node), Some(peer)) = (
+                        self.propagation_node.as_ref(),
+                        self.router.peers.get(&event.destination_hash),
+                    ) && let Ok(node) = node.lock()
+                        && let Err(error) = node.save_peer(peer)
+                    {
+                        tracing::warn!(
+                            peer = %dest_hex,
+                            "failed to persist propagation peer policy: {error}"
+                        );
+                    }
+                }
                 tracing::debug!(
                     dest = %dest_hex,
                     stamp_cost = pn.stamp_cost,
@@ -3926,6 +4301,24 @@ mod tests {
             repeated,
             PropagationNode::encode_offer_response(&lxmf_core::sync::OfferResponse::ErrorThrottled)
         );
+    }
+
+    #[test]
+    fn peer_key_worker_binds_remote_identity_before_local_identity() {
+        let remote_identity = [0x21; 16];
+        let local_identity = [0x43; 16];
+        let result = generate_peering_key_job([0x65; 16], 1, remote_identity, local_identity);
+        let (key, value) = result.peering_key.expect("cost-one key");
+        assert!(value >= 1);
+
+        let mut peering_id = [0u8; 32];
+        peering_id[..16].copy_from_slice(&remote_identity);
+        peering_id[16..].copy_from_slice(&local_identity);
+        assert!(lxmf_core::stamper::validate_peering_key(
+            &peering_id,
+            &key,
+            1
+        ));
     }
 
     #[test]

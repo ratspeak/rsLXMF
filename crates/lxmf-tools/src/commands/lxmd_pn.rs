@@ -241,10 +241,6 @@ impl PnInboundRuntime {
         self.admission.discard_candidate(candidate)
     }
 
-    pub(super) fn remove_static_peer(&mut self, peer_destination_hash: &[u8; 16]) -> bool {
-        self.admission.remove_static_peer(peer_destination_hash)
-    }
-
     pub(super) fn is_link_quarantined(&self, link_id: &LinkId) -> bool {
         self.quarantined_links.contains(link_id)
     }
@@ -1032,12 +1028,6 @@ mod tests {
         assert!(runtime.accept_resource(link(1), resource(3), 100, Some(peer)));
         assert!(!runtime.accept_resource(link(2), resource(4), 100, Some(identity(9))));
         assert!(!runtime.accept_resource(link(3), resource(5), 100, None));
-
-        assert!(runtime.remove_static_peer(&peer_destination));
-        assert!(
-            !runtime.accept_resource(link(1), resource(3), 100, Some(peer)),
-            "live unpeer revokes later split advertisements"
-        );
     }
 
     #[test]
