@@ -222,7 +222,9 @@ announce_at_start = no
 
 # announce_interval = 360
 
-delivery_transfer_max_accepted_size = 1000
+# stamp_cost = 12
+
+delivery_transfer_max_accepted_size = 1
 
 # on_inbound = /path/to/handler
 

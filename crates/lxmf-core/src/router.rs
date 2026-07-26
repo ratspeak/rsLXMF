@@ -27,7 +27,7 @@ pub struct RouterConfig {
     pub autopeer: bool,
     pub max_peers: usize,
     pub propagation_limit_kb: usize,
-    pub delivery_limit_kb: usize,
+    pub delivery_limit_kb: f64,
     pub sync_limit_kb: usize,
     pub propagation_stamp_cost: u8,
     pub propagation_stamp_flex: u8,
@@ -84,7 +84,7 @@ impl Default for RouterConfig {
             autopeer: AUTOPEER,
             max_peers: MAX_PEERS,
             propagation_limit_kb: PROPAGATION_LIMIT,
-            delivery_limit_kb: DELIVERY_LIMIT,
+            delivery_limit_kb: DELIVERY_LIMIT as f64,
             sync_limit_kb: SYNC_LIMIT,
             propagation_stamp_cost: PROPAGATION_COST,
             propagation_stamp_flex: PROPAGATION_COST_FLEX,
@@ -1919,7 +1919,7 @@ pub struct PeerStats {
 #[derive(Debug)]
 pub struct NodeStats {
     pub uptime: f64,
-    pub delivery_limit: usize,
+    pub delivery_limit: f64,
     pub propagation_limit: usize,
     pub sync_limit: usize,
     pub stamp_cost: u8,

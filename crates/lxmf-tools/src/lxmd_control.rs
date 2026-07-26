@@ -300,7 +300,7 @@ pub fn encode_router_control_stats(
         (Value::String("uptime".into()), Value::F64(uptime)),
         (
             Value::String("delivery_limit".into()),
-            Value::from(router.config.delivery_limit_kb as u64),
+            Value::F64(router.config.delivery_limit_kb),
         ),
         (
             Value::String("propagation_limit".into()),
@@ -964,6 +964,7 @@ mod tests {
             propagation_enabled: true,
             ..Default::default()
         };
+        config.delivery_limit_kb = 0.38;
         config.ext.message_storage_limit = Some(500_000_000);
         let mut router = LxmRouter::new(config);
         router.propagation_start_time = Some(1_700_000_000.0);
@@ -1022,6 +1023,7 @@ mod tests {
         assert_eq!(map_u64(&stats, "static_peers"), Some(1));
         assert_eq!(map_u64(&stats, "discovered_peers"), Some(0));
         assert_eq!(map_u64(&stats, "total_peers"), Some(1));
+        assert_eq!(map_f64(&stats, "delivery_limit"), Some(0.38));
 
         let peers = map_value(&stats, "peers").unwrap().as_map().unwrap();
         let peer_stats = &peers[0].1;

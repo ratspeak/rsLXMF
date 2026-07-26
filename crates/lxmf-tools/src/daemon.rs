@@ -19,6 +19,7 @@ pub struct PythonLxmdConfig {
     pub display_name: String,
     pub peer_announce_at_start: bool,
     pub peer_announce_interval: Option<i64>,
+    pub peer_stamp_cost: i64,
     pub delivery_transfer_max_accepted_size: f64,
     pub on_inbound: Option<String>,
     pub enable_propagation_node: bool,
@@ -64,10 +65,13 @@ impl PythonLxmdConfig {
                 .to_string(),
             peer_announce_at_start: get_bool_or(lxmf, "announce_at_start", false),
             peer_announce_interval: get_int(lxmf, "announce_interval").map(|v| v * 60),
+            peer_stamp_cost: get_int(lxmf, "stamp_cost")
+                .map(|value| value.max(1))
+                .unwrap_or(12),
             delivery_transfer_max_accepted_size: get_float_or_floor(
                 lxmf,
                 "delivery_transfer_max_accepted_size",
-                1000.0,
+                1.0,
                 0.38,
             ),
             on_inbound: lxmf
@@ -188,7 +192,7 @@ pub struct DaemonConfig {
     pub from_static_only: bool,
     /// Max accepted inbound delivery transfer size in KB. Python reference:
     /// `delivery_transfer_max_accepted_size` in `lxmd.py`.
-    pub delivery_transfer_max_accepted_size: usize,
+    pub delivery_transfer_max_accepted_size: f64,
 }
 
 impl Default for DaemonConfig {
@@ -198,7 +202,7 @@ impl Default for DaemonConfig {
             node_name: None,
             announce_at_start: false,
             announce_interval: None,
-            stamp_cost: None,
+            stamp_cost: Some(12),
             propagation_enabled: false,
             outbound_propagation_node: None,
             propagation_stamp_cost: PROPAGATION_COST,
@@ -223,7 +227,7 @@ impl Default for DaemonConfig {
             enforce_stamps: false,
             message_storage_limit: Some(500_000_000),
             from_static_only: false,
-            delivery_transfer_max_accepted_size: DELIVERY_LIMIT,
+            delivery_transfer_max_accepted_size: 1.0,
         }
     }
 }
@@ -271,6 +275,7 @@ impl DaemonConfig {
             node_name: py.node_name,
             announce_at_start: py.peer_announce_at_start,
             announce_interval: seconds_to_u64(py.peer_announce_interval),
+            stamp_cost: normalize_peer_stamp_cost(py.peer_stamp_cost),
             propagation_enabled: py.enable_propagation_node,
             propagation_stamp_cost: clamp_python_cost_to_u8(
                 py.propagation_stamp_cost_target,
@@ -305,17 +310,9 @@ impl DaemonConfig {
             prioritise_destinations: py.prioritised_lxmf_destinations,
             message_storage_limit: megabytes_to_bytes(py.message_storage_limit),
             from_static_only: py.from_static_only,
-            delivery_transfer_max_accepted_size: kb_to_usize_ceil(
-                py.delivery_transfer_max_accepted_size,
-            ),
+            delivery_transfer_max_accepted_size: py.delivery_transfer_max_accepted_size,
             ..DaemonConfig::default()
         };
-
-        if let Some(sec) = config.section("lxmf")
-            && let Some(cost) = sec.get_uint("stamp_cost")
-        {
-            dc.stamp_cost = Some(cost as u8);
-        }
 
         if let Some(sec) = config.section("propagation") {
             if let Some(node) = sec.get("outbound_node") {
@@ -359,6 +356,13 @@ impl DaemonConfig {
 
 fn clamp_python_cost_to_u8(value: i64, floor: i64) -> u8 {
     value.max(floor).min(u8::MAX as i64) as u8
+}
+
+/// Apply Python lxmd's signed floor, then mirror `set_inbound_stamp_cost`:
+/// delivery stamp costs are valid only in `1..=254`.
+fn normalize_peer_stamp_cost(value: i64) -> Option<u8> {
+    let cost = u8::try_from(value.max(1)).ok()?;
+    (cost < u8::MAX).then_some(cost)
 }
 
 fn get_float(section: Option<&ConfigSection>, key: &str) -> Option<f64> {
@@ -427,6 +431,7 @@ mod tests {
         assert_eq!(dc.display_name.as_deref(), Some("Anonymous Peer"));
         assert!(!dc.announce_at_start);
         assert_eq!(dc.announce_interval, None);
+        assert_eq!(dc.stamp_cost, Some(12));
         assert!(!dc.propagation_enabled);
         assert_eq!(dc.propagation_stamp_cost, 16);
         assert_eq!(dc.propagation_stamp_flex, 3);
@@ -447,7 +452,7 @@ mod tests {
         assert!(!dc.node_announce_at_start);
         assert_eq!(dc.node_announce_interval, None);
         assert_eq!(dc.message_storage_limit, Some(500_000_000));
-        assert_eq!(dc.delivery_transfer_max_accepted_size, 1000);
+        assert_eq!(dc.delivery_transfer_max_accepted_size, 1.0);
         assert!(!dc.from_static_only);
     }
 
@@ -459,7 +464,8 @@ mod tests {
         assert_eq!(py.display_name, "Anonymous Peer");
         assert!(!py.peer_announce_at_start);
         assert_eq!(py.peer_announce_interval, None);
-        assert_eq!(py.delivery_transfer_max_accepted_size, 1000.0);
+        assert_eq!(py.peer_stamp_cost, 12);
+        assert_eq!(py.delivery_transfer_max_accepted_size, 1.0);
         assert_eq!(py.on_inbound, None);
         assert!(!py.enable_propagation_node);
         assert_eq!(py.node_name, None);
@@ -509,6 +515,7 @@ max_inbound_syncs = 0
 
 [lxmf]
 announce_interval = 3
+stamp_cost = -9
 delivery_transfer_max_accepted_size = 0.1
 
 [logging]
@@ -519,6 +526,7 @@ loglevel = 6
 
         assert_eq!(py.peer_announce_interval, Some(180));
         assert_eq!(py.node_announce_interval, Some(120));
+        assert_eq!(py.peer_stamp_cost, 1);
         assert_eq!(py.delivery_transfer_max_accepted_size, 0.38);
         assert_eq!(py.message_storage_limit, 0.005);
         assert_eq!(py.propagation_transfer_max_accepted_size, 0.38);
@@ -580,7 +588,8 @@ propagation_transfer_max_accepted_size = 12
         let rc = dc.to_router_config();
         assert!(!rc.propagation_enabled);
         assert_eq!(rc.max_peers, 20);
-        assert_eq!(rc.delivery_limit_kb, 1000);
+        assert_eq!(rc.delivery_limit_kb, 1.0);
+        assert_eq!(RouterConfig::default().delivery_limit_kb, 1000.0);
         assert_eq!(rc.propagation_limit_kb, 256);
         assert_eq!(rc.sync_limit_kb, 10_240);
         assert_eq!(rc.propagation_stamp_cost, 16);
@@ -649,7 +658,7 @@ from_static_only = yes
         assert_eq!(dc.display_name.as_deref(), Some("TestNode"));
         assert!(dc.announce_at_start);
         assert_eq!(dc.announce_interval, Some(180));
-        assert_eq!(dc.delivery_transfer_max_accepted_size, 1);
+        assert_eq!(dc.delivery_transfer_max_accepted_size, 0.38);
         assert_eq!(dc.stamp_cost, Some(8));
         assert!(dc.propagation_enabled);
         assert_eq!(dc.node_name.as_deref(), Some("PropNode"));
@@ -688,6 +697,38 @@ from_static_only = yes
         );
         assert_eq!(dc.control_allowed, ["11111111111111111111111111111111"]);
         assert!(dc.from_static_only);
+    }
+
+    #[test]
+    fn delivery_stamp_cost_matches_python_floor_and_destination_range() {
+        for (configured, normalized, expected) in [
+            (-7, 1, Some(1)),
+            (0, 1, Some(1)),
+            (254, 254, Some(254)),
+            (255, 255, None),
+            (256, 256, None),
+            (1000, 1000, None),
+        ] {
+            let input = format!("[lxmf]\nstamp_cost = {configured}\n");
+            let config = rns_runtime::config::Config::parse(&input).unwrap();
+            let py = PythonLxmdConfig::from_config(&config);
+            let dc = DaemonConfig::from_config(&config);
+
+            assert_eq!(py.peer_stamp_cost, normalized, "configured {configured}");
+            assert_eq!(dc.stamp_cost, expected, "configured {configured}");
+        }
+    }
+
+    #[test]
+    fn fractional_delivery_limit_survives_daemon_and_router_config() {
+        let config = rns_runtime::config::Config::parse(
+            "[lxmf]\ndelivery_transfer_max_accepted_size = 0.38\n",
+        )
+        .unwrap();
+        let dc = DaemonConfig::from_config(&config);
+
+        assert_eq!(dc.delivery_transfer_max_accepted_size, 0.38);
+        assert_eq!(dc.to_router_config().delivery_limit_kb, 0.38);
     }
 
     #[test]

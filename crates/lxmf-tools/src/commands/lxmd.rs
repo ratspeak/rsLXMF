@@ -96,6 +96,10 @@ struct PeeringKeyWorkerResult {
     peering_key: Option<([u8; 32], u32)>,
 }
 
+fn accepts_delivery_resource(data_size: usize, limit_kb: f64) -> bool {
+    data_size as f64 <= limit_kb * 1000.0
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct PeerOfferConstraints {
     transfer_limit: Option<f64>,
@@ -829,6 +833,11 @@ impl LxmdRunner {
         link_mgr.set_link_identified_channel(link_identified_tx);
         link_mgr.set_link_packet_proof_channel(link_packet_proof_tx);
         link_mgr.set_outbound_resource_proof_channel(link_resource_proof_tx);
+        link_mgr.set_resource_strategy(rns_runtime::prelude::ResourceStrategy::AcceptApp);
+        let delivery_limit_kb = config.delivery_transfer_max_accepted_size;
+        link_mgr.set_resource_accept_handler(move |_, advertisement| {
+            accepts_delivery_resource(advertisement.data_size, delivery_limit_kb)
+        });
 
         let _ = transport_tx.try_send(TransportMessage::RegisterDestination {
             hash: lxmf_dest_hash,
@@ -1252,6 +1261,7 @@ impl LxmdRunner {
                 Some(runner.identity.get_public_key()),
                 runner.identity.get_signing_key(),
             );
+            client.set_delivery_limit(runner.config.delivery_transfer_max_accepted_size);
             if let Some(ref node_hex) = runner.config.outbound_propagation_node {
                 match hex::decode(node_hex) {
                     Ok(bytes) if bytes.len() == 16 => {
@@ -3934,6 +3944,47 @@ mod tests {
         let (header, announce) = unpack_announce(&raw);
         assert!(!header.flags.context_flag);
         assert_eq!(announce.ratchet, None);
+    }
+
+    #[test]
+    fn delivery_resource_admission_uses_decimal_kilobytes_with_exact_boundary() {
+        let default_limit = DaemonConfig::default().delivery_transfer_max_accepted_size;
+        assert_eq!(default_limit, 1.0);
+        assert!(accepts_delivery_resource(1000, default_limit));
+        assert!(!accepts_delivery_resource(1001, default_limit));
+
+        assert!(accepts_delivery_resource(380, 0.38));
+        assert!(!accepts_delivery_resource(381, 0.38));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn delivery_announce_stamp_cost_is_independent_of_enforcement() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        for enforce_stamps in [false, true] {
+            let temp = std::env::temp_dir().join(format!(
+                "lxmd-delivery-announce-stamp-{}-{unique}-{enforce_stamps}",
+                std::process::id()
+            ));
+            let (tx, _rx) = mpsc::channel::<TransportMessage>(64);
+            let config = DaemonConfig {
+                stamp_cost: Some(12),
+                enforce_stamps,
+                ..Default::default()
+            };
+            let mut runner = LxmdRunner::new(config, &temp, tx).expect("runner");
+            let raw = runner.create_announce_packet().expect("delivery announce");
+            let (_, announce) = unpack_announce(&raw);
+            let (_, stamp_cost) = lxmf_core::handlers::parse_announce_app_data(
+                announce.app_data.as_deref().expect("delivery app data"),
+            )
+            .expect("valid delivery app data");
+            assert_eq!(stamp_cost, Some(12));
+            drop(runner);
+            let _ = std::fs::remove_dir_all(&temp);
+        }
     }
 
     /// Blackhole gating mirrors LXMessage.py:804: only a recallable source
