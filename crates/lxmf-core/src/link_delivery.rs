@@ -447,7 +447,9 @@ pub struct LinkDeliveryManager {
     backchannel_links: HashMap<[u8; 16], [u8; 16]>,
     pending: HashMap<[u8; 16], PendingDelivery>,
     backchannel_tx: Option<mpsc::Sender<BackchannelSendCommand>>,
-    inbound_packet_tx: Option<mpsc::Sender<(Vec<u8>, [u8; 16])>>,
+    /// Unbounded: inbound link data is proved to the peer on receipt, so
+    /// local delivery must not drop.
+    inbound_packet_tx: Option<mpsc::UnboundedSender<(Vec<u8>, [u8; 16])>>,
     pending_backchannel_starts: Vec<PendingBackchannelStart>,
     pending_backchannel_deliveries: HashMap<BackchannelProofKey, PendingBackchannelDelivery>,
     identity_pub: Option<[u8; 64]>,
@@ -492,7 +494,7 @@ impl LinkDeliveryManager {
     /// backchannels: the outbound Direct manager owns the link_id destination,
     /// so ordinary link DATA replies route back here rather than to the
     /// responder-side LinkManager.
-    pub fn set_inbound_packet_sender(&mut self, tx: mpsc::Sender<(Vec<u8>, [u8; 16])>) {
+    pub fn set_inbound_packet_sender(&mut self, tx: mpsc::UnboundedSender<(Vec<u8>, [u8; 16])>) {
         self.inbound_packet_tx = Some(tx);
     }
 
@@ -1227,7 +1229,7 @@ impl LinkDeliveryManager {
         };
 
         if let Some(ref tx) = self.inbound_packet_tx {
-            let _ = tx.try_send((plaintext, *link_id));
+            let _ = tx.send((plaintext, *link_id));
         }
 
         let packet_hash = rns_wire::hash::packet_hash(raw, header_type);
@@ -3745,7 +3747,7 @@ mod tests {
     #[test]
     fn test_outbound_direct_link_accepts_backchannel_packet() {
         let (tx, mut rx) = mpsc::channel(128);
-        let (inbound_tx, mut inbound_rx) = mpsc::channel(4);
+        let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel();
         let mut mgr = LinkDeliveryManager::new(tx, None, None);
         mgr.set_inbound_packet_sender(inbound_tx);
 
@@ -3812,7 +3814,7 @@ mod tests {
     #[test]
     fn test_outbound_direct_backchannel_proof_uses_received_header_type() {
         let (tx, mut rx) = mpsc::channel(128);
-        let (inbound_tx, mut inbound_rx) = mpsc::channel(4);
+        let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel();
         let mut mgr = LinkDeliveryManager::new(tx, None, None);
         mgr.set_inbound_packet_sender(inbound_tx);
 

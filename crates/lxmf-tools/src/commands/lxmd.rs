@@ -747,7 +747,7 @@ struct LxmdRunner {
     prop_link_command_tx: Option<mpsc::Sender<rns_runtime::link_manager::LinkManagerCommand>>,
     transport_tx: mpsc::Sender<TransportMessage>,
     /// Plaintext application data decoded by the LinkManager.
-    link_packet_rx: mpsc::Receiver<(Vec<u8>, [u8; 16])>,
+    link_packet_rx: mpsc::UnboundedReceiver<(Vec<u8>, [u8; 16])>,
     /// Ordered, lossless ordinary delivery Resource starts/conclusions and
     /// payload completions used by delivery and the public inbound tracker.
     delivery_accounting_rx: mpsc::UnboundedReceiver<LinkManagerAccountingEvent>,
@@ -755,7 +755,7 @@ struct LxmdRunner {
     /// consumed from `delivery_accounting_rx` instead.
     delivery_resource_event_rx: mpsc::Receiver<LinkResourceEvent>,
     /// Plaintext propagation-wrapper packets decoded by the propagation LinkManager.
-    prop_link_packet_rx: mpsc::Receiver<(Vec<u8>, [u8; 16])>,
+    prop_link_packet_rx: mpsc::UnboundedReceiver<(Vec<u8>, [u8; 16])>,
     /// Ordered, lossless lifecycle and completion stream from the propagation LinkManager.
     prop_accounting_rx:
         mpsc::UnboundedReceiver<rns_runtime::link_manager::LinkManagerAccountingEvent>,
@@ -878,7 +878,7 @@ impl LxmdRunner {
         // LinkManager handles link handshakes (ECDH), keepalive, identification,
         // and resource transfers; it forwards plaintext application data here.
         let (delivery_tx, delivery_rx) = mpsc::channel(256);
-        let (link_packet_tx, link_packet_rx) = mpsc::channel::<(Vec<u8>, [u8; 16])>(256);
+        let (link_packet_tx, link_packet_rx) = mpsc::unbounded_channel::<(Vec<u8>, [u8; 16])>();
         let (delivery_accounting_tx, delivery_accounting_rx) =
             mpsc::unbounded_channel::<LinkManagerAccountingEvent>();
         let (delivery_resource_event_tx, delivery_resource_event_rx) =
@@ -886,7 +886,8 @@ impl LxmdRunner {
         let (inbound_resource_cancel_tx, inbound_resource_cancel_rx) =
             mpsc::channel::<InboundResourceCancelRequest>(64);
         router.set_inbound_resource_cancel_sender(inbound_resource_cancel_tx);
-        let (prop_link_packet_tx, prop_link_packet_rx) = mpsc::channel::<(Vec<u8>, [u8; 16])>(256);
+        let (prop_link_packet_tx, prop_link_packet_rx) =
+            mpsc::unbounded_channel::<(Vec<u8>, [u8; 16])>();
         let (prop_accounting_tx, prop_accounting_rx) =
             mpsc::unbounded_channel::<rns_runtime::link_manager::LinkManagerAccountingEvent>();
         let (prop_validation_tx, prop_validation_rx) =
