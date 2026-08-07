@@ -321,16 +321,17 @@ impl DaemonConfig {
                     dc.outbound_propagation_node = Some(trimmed.to_string());
                 }
             }
-            if get_int(Some(sec), "propagation_stamp_cost_target").is_none()
-                && let Some(cost) = sec.get_uint("propagation_stamp_cost")
-            {
-                dc.propagation_stamp_cost = cost as u8;
+            if get_int(Some(sec), "propagation_stamp_cost_target").is_none() {
+                if let Some(cost) = sec.get_uint("propagation_stamp_cost") {
+                    dc.propagation_stamp_cost = cost as u8;
+                }
             }
             if get_float(Some(sec), "propagation_message_max_accepted_size").is_none()
                 && get_float(Some(sec), "propagation_transfer_max_accepted_size").is_none()
-                && let Some(limit) = sec.get_uint("propagation_limit")
             {
-                dc.propagation_limit_kb = limit as usize;
+                if let Some(limit) = sec.get_uint("propagation_limit") {
+                    dc.propagation_limit_kb = limit as usize;
+                }
             }
             dc.enforce_stamps = sec.get_bool_or("enforce_stamps", false);
         }
@@ -339,14 +340,14 @@ impl DaemonConfig {
             if !dc.auth_required {
                 dc.auth_required = sec.get_bool_or("auth_required", false);
             }
-            if dc.control_allowed.is_empty()
-                && let Some(allowed) = sec.get("allowed")
-            {
-                dc.control_allowed = allowed
-                    .split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
+            if dc.control_allowed.is_empty() {
+                if let Some(allowed) = sec.get("allowed") {
+                    dc.control_allowed = allowed
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                }
             }
         }
 

@@ -755,8 +755,10 @@ impl LinkDeliveryManager {
                         .try_send(TransportMessage::DeregisterDestination { hash: link_id });
                 }
                 self.direct_links.remove(&dest_hash);
-            } else if let Some(delivery) = self.pending.get_mut(&link_id)
-                && delivery.reusable
+            } else if let Some(delivery) = self
+                .pending
+                .get_mut(&link_id)
+                .filter(|delivery| delivery.reusable)
             {
                 let msg_hash = message.hash;
                 let attempts = message.delivery_attempts;
@@ -1327,32 +1329,37 @@ impl LinkDeliveryManager {
                 match delivery.state {
                     DeliveryState::Idle => {}
                     DeliveryState::Identifying if delivery.link.is_active() => {
-                        if !delivery.reusable
-                            && let (Some(pub_key), Some(sign_key)) =
+                        if !delivery.reusable {
+                            if let (Some(pub_key), Some(sign_key)) =
                                 (&self.identity_pub, &self.identity_key)
-                            && let Ok(identify_data) = delivery.link.identify(pub_key, sign_key)
-                        {
-                            let id_header = rns_wire::header::PacketHeader {
-                                flags: rns_wire::flags::PacketFlags {
-                                    header_type: rns_wire::flags::HeaderType::Header1,
-                                    context_flag: false,
-                                    transport_type: rns_wire::flags::TransportType::Broadcast,
-                                    destination_type: rns_wire::flags::DestinationType::Link,
-                                    packet_type: rns_wire::flags::PacketType::Data,
-                                },
-                                hops: 0,
-                                transport_id: None,
-                                destination_hash: *link_id,
-                                context: rns_wire::context::PacketContext::LinkIdentify,
-                            };
-                            let mut id_raw = id_header.pack();
-                            id_raw.extend_from_slice(&identify_data);
-                            let _ = self.transport_tx.try_send(TransportMessage::Outbound(
-                                OutboundRequest {
-                                    raw: Bytes::from(id_raw),
-                                    destination_hash: *link_id,
-                                },
-                            ));
+                            {
+                                if let Ok(identify_data) = delivery.link.identify(pub_key, sign_key)
+                                {
+                                    let id_header = rns_wire::header::PacketHeader {
+                                        flags: rns_wire::flags::PacketFlags {
+                                            header_type: rns_wire::flags::HeaderType::Header1,
+                                            context_flag: false,
+                                            transport_type:
+                                                rns_wire::flags::TransportType::Broadcast,
+                                            destination_type:
+                                                rns_wire::flags::DestinationType::Link,
+                                            packet_type: rns_wire::flags::PacketType::Data,
+                                        },
+                                        hops: 0,
+                                        transport_id: None,
+                                        destination_hash: *link_id,
+                                        context: rns_wire::context::PacketContext::LinkIdentify,
+                                    };
+                                    let mut id_raw = id_header.pack();
+                                    id_raw.extend_from_slice(&identify_data);
+                                    let _ = self.transport_tx.try_send(TransportMessage::Outbound(
+                                        OutboundRequest {
+                                            raw: Bytes::from(id_raw),
+                                            destination_hash: *link_id,
+                                        },
+                                    ));
+                                }
+                            }
                         }
                         // Reusable Direct links follow upstream LXMF and identify
                         // after a successful delivery, not before the transfer.
@@ -1809,25 +1816,27 @@ impl LinkDeliveryManager {
     }
 
     pub fn handle_hmu(&mut self, link_id: &[u8; 16], hmu_data: &[u8]) {
-        let event = if let Some(delivery) = self.pending.get_mut(link_id)
-            && let Some(ref mut transfer) = delivery.transfer
-        {
-            transfer.handle_hmu(hmu_data);
-            let progress = delivery_resource_progress(delivery);
-            if let Some(progress) = progress
-                && should_update_resource_progress(delivery.message.progress, progress)
-            {
-                delivery.message.progress = progress;
+        let event = if let Some(delivery) = self.pending.get_mut(link_id) {
+            if let Some(ref mut transfer) = delivery.transfer {
+                transfer.handle_hmu(hmu_data);
+                let progress = delivery_resource_progress(delivery);
+                if let Some(progress) = progress {
+                    if should_update_resource_progress(delivery.message.progress, progress) {
+                        delivery.message.progress = progress;
+                    }
+                }
+                progress.map(|_| {
+                    delivery_event(
+                        LxmfDeliveryEventKind::TransferProgress,
+                        *link_id,
+                        delivery,
+                        Some(delivery.message.progress),
+                        None,
+                    )
+                })
+            } else {
+                None
             }
-            progress.map(|_| {
-                delivery_event(
-                    LxmfDeliveryEventKind::TransferProgress,
-                    *link_id,
-                    delivery,
-                    Some(delivery.message.progress),
-                    None,
-                )
-            })
         } else {
             None
         };
@@ -1864,10 +1873,10 @@ impl LinkDeliveryManager {
                 }
             }
             let progress = delivery_resource_progress(delivery);
-            if let Some(progress) = progress
-                && should_update_resource_progress(delivery.message.progress, progress)
-            {
-                delivery.message.progress = progress;
+            if let Some(progress) = progress {
+                if should_update_resource_progress(delivery.message.progress, progress) {
+                    delivery.message.progress = progress;
+                }
             }
             progress.map(|_| {
                 delivery_event(
@@ -1887,28 +1896,33 @@ impl LinkDeliveryManager {
     /// Apply an inbound resource proof; returns `true` when the proof was accepted.
     pub fn handle_resource_proof(&mut self, link_id: &[u8; 16], proof_data: &[u8]) -> bool {
         let mut event = None;
-        let accepted = if let Some(delivery) = self.pending.get_mut(link_id)
-            && let Some(ref mut transfer) = delivery.transfer
-            && transfer.handle_proof(proof_data)
-        {
-            let progress = delivery_resource_proof_progress(delivery).unwrap_or(1.0);
-            delivery.message.progress = progress;
-            event = Some(delivery_event(
-                LxmfDeliveryEventKind::TransferProgress,
-                *link_id,
-                delivery,
-                Some(progress),
-                None,
-            ));
-            if delivery.remaining_segments.is_empty() {
-                delivery.state = DeliveryState::Complete;
+        let accepted = if let Some(delivery) = self.pending.get_mut(link_id) {
+            if delivery
+                .transfer
+                .as_mut()
+                .is_some_and(|transfer| transfer.handle_proof(proof_data))
+            {
+                let progress = delivery_resource_proof_progress(delivery).unwrap_or(1.0);
+                delivery.message.progress = progress;
+                event = Some(delivery_event(
+                    LxmfDeliveryEventKind::TransferProgress,
+                    *link_id,
+                    delivery,
+                    Some(progress),
+                    None,
+                ));
+                if delivery.remaining_segments.is_empty() {
+                    delivery.state = DeliveryState::Complete;
+                } else {
+                    let rtt = delivery.link.rtt.unwrap_or(Duration::from_millis(500));
+                    let next_segment = delivery.remaining_segments.remove(0);
+                    delivery.transfer = Some(OutboundTransfer::from_prebuilt(next_segment, rtt));
+                    delivery.state = DeliveryState::Transferring;
+                }
+                true
             } else {
-                let rtt = delivery.link.rtt.unwrap_or(Duration::from_millis(500));
-                let next_segment = delivery.remaining_segments.remove(0);
-                delivery.transfer = Some(OutboundTransfer::from_prebuilt(next_segment, rtt));
-                delivery.state = DeliveryState::Transferring;
+                false
             }
-            true
         } else {
             false
         };
@@ -1927,16 +1941,17 @@ impl LinkDeliveryManager {
         let mut rejected_hash = [0u8; 32];
         rejected_hash.copy_from_slice(&reject_data[..32]);
 
-        if let Some(delivery) = self.pending.get_mut(link_id)
-            && let Some(ref mut transfer) = delivery.transfer
-            && transfer.resource.resource_hash == rejected_hash
-        {
-            transfer.handle_cancel();
-            delivery.remaining_segments.clear();
-            delivery.message.mark_rejected();
-            delivery.state = DeliveryState::Rejected;
-            delivery.failure_reason = Some("resource rejected".to_string());
-            return true;
+        if let Some(delivery) = self.pending.get_mut(link_id) {
+            if let Some(ref mut transfer) = delivery.transfer {
+                if transfer.resource.resource_hash == rejected_hash {
+                    transfer.handle_cancel();
+                    delivery.remaining_segments.clear();
+                    delivery.message.mark_rejected();
+                    delivery.state = DeliveryState::Rejected;
+                    delivery.failure_reason = Some("resource rejected".to_string());
+                    return true;
+                }
+            }
         }
 
         false
@@ -1979,15 +1994,18 @@ impl LinkDeliveryManager {
 
     /// Apply an inbound link-packet proof; returns `true` when the packet delivery is complete.
     pub fn handle_link_packet_proof(&mut self, link_id: &[u8; 16], proof_data: &[u8]) -> bool {
-        if let Some(delivery) = self.pending.get_mut(link_id)
-            && delivery.state == DeliveryState::AwaitingProof
-            && let Some(packet_hash) = delivery.packet_proof_hash
-            && delivery
-                .link
-                .validate_packet_proof(&packet_hash, proof_data)
-        {
-            delivery.state = DeliveryState::Complete;
-            return true;
+        if let Some(delivery) = self.pending.get_mut(link_id) {
+            if delivery.state == DeliveryState::AwaitingProof {
+                if let Some(packet_hash) = delivery.packet_proof_hash {
+                    if delivery
+                        .link
+                        .validate_packet_proof(&packet_hash, proof_data)
+                    {
+                        delivery.state = DeliveryState::Complete;
+                        return true;
+                    }
+                }
+            }
         }
         false
     }
@@ -2122,30 +2140,30 @@ impl LinkDeliveryManager {
             .pending_backchannel_deliveries
             .iter()
             .find_map(|(key, delivery)| (delivery.message.hash == Some(msg_hash)).then_some(*key));
-        if let Some(key) = pending_key
-            && let Some(delivery) = self.pending_backchannel_deliveries.remove(&key)
-        {
-            self.backchannel_links.remove(&delivery.dest_hash);
-            self.delivery_events.push_back(backchannel_delivery_event(
-                BackchannelDeliveryEventInput {
-                    kind: LxmfDeliveryEventKind::Failed,
-                    message: &delivery.message,
-                    dest_hash: delivery.dest_hash,
+        if let Some(key) = pending_key {
+            if let Some(delivery) = self.pending_backchannel_deliveries.remove(&key) {
+                self.backchannel_links.remove(&delivery.dest_hash);
+                self.delivery_events.push_back(backchannel_delivery_event(
+                    BackchannelDeliveryEventInput {
+                        kind: LxmfDeliveryEventKind::Failed,
+                        message: &delivery.message,
+                        dest_hash: delivery.dest_hash,
+                        link_id: delivery.link_id,
+                        representation: delivery.representation,
+                        progress: Some(delivery.message.progress),
+                        reason: Some(reason.to_string()),
+                        link_state: LinkState::Closed,
+                        delivery_state: DeliveryState::Failed,
+                    },
+                ));
+                results.push(DeliveryResult::Failed {
                     link_id: delivery.link_id,
-                    representation: delivery.representation,
-                    progress: Some(delivery.message.progress),
-                    reason: Some(reason.to_string()),
-                    link_state: LinkState::Closed,
-                    delivery_state: DeliveryState::Failed,
-                },
-            ));
-            results.push(DeliveryResult::Failed {
-                link_id: delivery.link_id,
-                msg_hash: delivery.message.hash,
-                dest_hash: delivery.dest_hash,
-                message: delivery.message,
-                reason: reason.to_string(),
-            });
+                    msg_hash: delivery.message.hash,
+                    dest_hash: delivery.dest_hash,
+                    message: delivery.message,
+                    reason: reason.to_string(),
+                });
+            }
         }
 
         results
@@ -2535,11 +2553,11 @@ fn finish_reusable_delivery(
     link_id: &[u8; 16],
     delivery: &mut PendingDelivery,
 ) {
-    if !delivery.backchannel_identified
-        && let (Some(pub_key), Some(sign_key)) = (identity_pub, identity_key)
-    {
-        delivery.backchannel_identified =
-            send_link_identify(transport_tx, link_id, &delivery.link, pub_key, sign_key);
+    if !delivery.backchannel_identified {
+        if let (Some(pub_key), Some(sign_key)) = (identity_pub, identity_key) {
+            delivery.backchannel_identified =
+                send_link_identify(transport_tx, link_id, &delivery.link, pub_key, sign_key);
+        }
     }
 
     delivery.transfer = None;

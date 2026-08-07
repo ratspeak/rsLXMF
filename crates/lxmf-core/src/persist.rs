@@ -68,15 +68,14 @@ pub fn write_file_atomic(path: &Path, data: &[u8]) -> io::Result<()> {
         fs::rename(&tmp, path)
     })();
 
-    if result.is_err()
-        && tmp.exists()
-        && let Err(e) = fs::remove_file(&tmp)
-    {
-        tracing::error!(
-            "Error while cleaning temporary file {} for {}: {e}",
-            tmp.display(),
-            path.display()
-        );
+    if result.is_err() && tmp.exists() {
+        if let Err(e) = fs::remove_file(&tmp) {
+            tracing::error!(
+                "Error while cleaning temporary file {} for {}: {e}",
+                tmp.display(),
+                path.display()
+            );
+        }
     }
 
     result

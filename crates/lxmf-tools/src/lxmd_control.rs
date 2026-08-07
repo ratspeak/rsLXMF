@@ -92,10 +92,10 @@ pub async fn resolve_remote_identity_hash(
 
     let wait = async {
         while let Some(event) = ann_rx.recv().await {
-            if event.destination_hash == remote_destination_hash
-                && let Some(identity_hash) = event.identity_hash
-            {
-                return Ok(identity_hash);
+            if event.destination_hash == remote_destination_hash {
+                if let Some(identity_hash) = event.identity_hash {
+                    return Ok(identity_hash);
+                }
             }
         }
         Err(LinkClientError::PubkeyNotDiscovered)
@@ -123,10 +123,10 @@ pub fn decode_control_response(response: &[u8]) -> ControlResponse {
         return ControlResponse::Success;
     };
 
-    if let Some(code) = value.as_u64()
-        && let Some(error) = peer_error_from_code(code as u8)
-    {
-        return ControlResponse::Error(error);
+    if let Some(code) = value.as_u64() {
+        if let Some(error) = peer_error_from_code(code as u8) {
+            return ControlResponse::Error(error);
+        }
     }
 
     if value.is_nil() {

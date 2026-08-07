@@ -295,23 +295,25 @@ impl PropagationClient {
                                 continue;
                             }
                             let node_hex = self.outbound_propagation_node.map(|h| hex_encode(&h));
-                            if let Some(node_hex) = node_hex
-                                && let Some(pub_key) = known_identities.get(&node_hex)
-                            {
-                                let ed25519_bytes: [u8; 32] = pub_key[32..64]
-                                    .try_into()
-                                    .expect("known_identities values are [u8; 64]; slice [32..64] is always 32 bytes");
-                                if let Ok(verify_key) = Ed25519PublicKey::from_bytes(&ed25519_bytes)
-                                {
-                                    self.handle_link_proof(data, &verify_key, &ed25519_bytes);
+                            if let Some(node_hex) = node_hex {
+                                if let Some(pub_key) = known_identities.get(&node_hex) {
+                                    let ed25519_bytes: [u8; 32] = pub_key[32..64]
+                                        .try_into()
+                                        .expect("known_identities values are [u8; 64]; slice [32..64] is always 32 bytes");
+                                    if let Ok(verify_key) =
+                                        Ed25519PublicKey::from_bytes(&ed25519_bytes)
+                                    {
+                                        self.handle_link_proof(data, &verify_key, &ed25519_bytes);
+                                    }
                                 }
                             }
                         }
                         rns_wire::context::PacketContext::Response => {
-                            if let Some(ref mut link) = self.link
-                                && let Ok((_request_id, response_data)) = link.handle_response(data)
-                            {
-                                self.handle_response_data(&response_data);
+                            if let Some(ref mut link) = self.link {
+                                if let Ok((_request_id, response_data)) = link.handle_response(data)
+                                {
+                                    self.handle_response_data(&response_data);
+                                }
                             }
                         }
                         rns_wire::context::PacketContext::ResourceAdv => {
@@ -745,10 +747,10 @@ impl PropagationClient {
         context: rns_wire::context::PacketContext,
         plaintext: &[u8],
     ) {
-        if let Some(link) = self.link.as_ref()
-            && let Ok(encrypted) = link.encrypt(plaintext)
-        {
-            self.send_link_packet(context, rns_wire::flags::PacketType::Data, &encrypted);
+        if let Some(link) = self.link.as_ref() {
+            if let Ok(encrypted) = link.encrypt(plaintext) {
+                self.send_link_packet(context, rns_wire::flags::PacketType::Data, &encrypted);
+            }
         }
     }
 
@@ -805,10 +807,10 @@ impl PropagationClient {
         if let Some(arr) = value.as_array() {
             self.available_messages.clear();
             for item in arr {
-                if let Some(id_bytes) = item.as_slice()
-                    && id_bytes.len() == 32
-                {
-                    self.available_messages.push(id_bytes.to_vec());
+                if let Some(id_bytes) = item.as_slice() {
+                    if id_bytes.len() == 32 {
+                        self.available_messages.push(id_bytes.to_vec());
+                    }
                 }
             }
 
@@ -864,14 +866,15 @@ impl PropagationClient {
     }
 
     pub fn tick(&mut self) {
-        if let Some(started) = self.started_at
-            && started.elapsed() > self.timeout
-            && self.status.state != PropagationClientState::Idle
-            && self.status.state != PropagationClientState::Complete
-        {
-            self.cleanup();
-            self.status.state = PropagationClientState::Failed;
-            return;
+        if let Some(started) = self.started_at {
+            if started.elapsed() > self.timeout
+                && self.status.state != PropagationClientState::Idle
+                && self.status.state != PropagationClientState::Complete
+            {
+                self.cleanup();
+                self.status.state = PropagationClientState::Failed;
+                return;
+            }
         }
 
         match self.status.state {
@@ -895,31 +898,32 @@ impl PropagationClient {
     }
 
     fn send_identify(&mut self) {
-        if let (Some(link), Some(link_id)) = (&mut self.link, self.link_id)
-            && let (Some(pub_key), Some(sign_key)) = (&self.identity_pub, &self.identity_key)
-            && let Ok(identify_data) = link.identify(pub_key, sign_key)
-        {
-            let id_header = rns_wire::header::PacketHeader {
-                flags: rns_wire::flags::PacketFlags {
-                    header_type: rns_wire::flags::HeaderType::Header1,
-                    context_flag: false,
-                    transport_type: rns_wire::flags::TransportType::Broadcast,
-                    destination_type: rns_wire::flags::DestinationType::Link,
-                    packet_type: rns_wire::flags::PacketType::Data,
-                },
-                hops: 0,
-                transport_id: None,
-                destination_hash: link_id,
-                context: rns_wire::context::PacketContext::LinkIdentify,
-            };
-            let mut id_raw = id_header.pack();
-            id_raw.extend_from_slice(&identify_data);
-            let _ = self
-                .transport_tx
-                .try_send(TransportMessage::Outbound(OutboundRequest {
-                    raw: Bytes::from(id_raw),
-                    destination_hash: link_id,
-                }));
+        if let (Some(link), Some(link_id)) = (&mut self.link, self.link_id) {
+            if let (Some(pub_key), Some(sign_key)) = (&self.identity_pub, &self.identity_key) {
+                if let Ok(identify_data) = link.identify(pub_key, sign_key) {
+                    let id_header = rns_wire::header::PacketHeader {
+                        flags: rns_wire::flags::PacketFlags {
+                            header_type: rns_wire::flags::HeaderType::Header1,
+                            context_flag: false,
+                            transport_type: rns_wire::flags::TransportType::Broadcast,
+                            destination_type: rns_wire::flags::DestinationType::Link,
+                            packet_type: rns_wire::flags::PacketType::Data,
+                        },
+                        hops: 0,
+                        transport_id: None,
+                        destination_hash: link_id,
+                        context: rns_wire::context::PacketContext::LinkIdentify,
+                    };
+                    let mut id_raw = id_header.pack();
+                    id_raw.extend_from_slice(&identify_data);
+                    let _ =
+                        self.transport_tx
+                            .try_send(TransportMessage::Outbound(OutboundRequest {
+                                raw: Bytes::from(id_raw),
+                                destination_hash: link_id,
+                            }));
+                }
+            }
         }
     }
 

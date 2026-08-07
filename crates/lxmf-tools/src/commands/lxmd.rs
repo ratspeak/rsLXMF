@@ -841,10 +841,10 @@ impl LxmdRunner {
         if let Ok(entries) = std::fs::read_dir(&received_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if let Some(name) = path.file_stem().and_then(|n| n.to_str())
-                    && let Ok(rr) = ReceivedRatchet::load(&path)
-                {
-                    received_ratchets.insert(name.to_string(), rr);
+                if let Some(name) = path.file_stem().and_then(|n| n.to_str()) {
+                    if let Ok(rr) = ReceivedRatchet::load(&path) {
+                        received_ratchets.insert(name.to_string(), rr);
+                    }
                 }
             }
         }
@@ -852,17 +852,17 @@ impl LxmdRunner {
         // known_identities format: concat of [dest_hash:16][pubkey:64]
         let ki_path = paths.known_identities_path.clone();
         let mut known_identities: HashMap<String, [u8; 64]> = HashMap::new();
-        if ki_path.exists()
-            && let Ok(data) = std::fs::read(&ki_path)
-        {
-            let mut pos = 0;
-            while pos + 80 <= data.len() {
-                let mut dh = [0u8; 16];
-                dh.copy_from_slice(&data[pos..pos + 16]);
-                let mut pk = [0u8; 64];
-                pk.copy_from_slice(&data[pos + 16..pos + 80]);
-                known_identities.insert(hex::encode(dh), pk);
-                pos += 80;
+        if ki_path.exists() {
+            if let Ok(data) = std::fs::read(&ki_path) {
+                let mut pos = 0;
+                while pos + 80 <= data.len() {
+                    let mut dh = [0u8; 16];
+                    dh.copy_from_slice(&data[pos..pos + 16]);
+                    let mut pk = [0u8; 64];
+                    pk.copy_from_slice(&data[pos + 16..pos + 80]);
+                    known_identities.insert(hex::encode(dh), pk);
+                    pos += 80;
+                }
             }
         }
 
@@ -1577,14 +1577,15 @@ impl LxmdRunner {
                     // Upstream control unpeer breaks the live peering without
                     // mutating the operator's configured static-peer set.
                     self.router.remove_peer(&peer_hash);
-                    if let Some(ref node) = self.propagation_node
-                        && let Ok(mut node) = node.lock()
-                        && let Err(error) = node.delete_peer(&peer_hash)
-                    {
-                        tracing::warn!(
-                            peer = %hex::encode(peer_hash),
-                            "failed to remove persisted propagation peer: {error}"
-                        );
+                    if let Some(ref node) = self.propagation_node {
+                        if let Ok(mut node) = node.lock() {
+                            if let Err(error) = node.delete_peer(&peer_hash) {
+                                tracing::warn!(
+                                    peer = %hex::encode(peer_hash),
+                                    "failed to remove persisted propagation peer: {error}"
+                                );
+                            }
+                        }
                     }
                     if let Err(e) = self.router.save_state(&self.data_dir) {
                         tracing::warn!("Failed to save router state after control unpeer: {e}");
@@ -1607,11 +1608,11 @@ impl LxmdRunner {
                 // announce timebase (or a lower current target) does not make
                 // a completed key stale if its measured value is still high
                 // enough for the current policy.
-                if let Some((key, value)) = result.peering_key
-                    && value >= peer.peering_cost as u32
-                {
-                    peer.peering_key = Some((key, value));
-                    applied = true;
+                if let Some((key, value)) = result.peering_key {
+                    if value >= peer.peering_cost as u32 {
+                        peer.peering_key = Some((key, value));
+                        applied = true;
+                    }
                 }
             }
 
@@ -1619,13 +1620,15 @@ impl LxmdRunner {
                 if let (Some(node), Some(peer)) = (
                     self.propagation_node.as_ref(),
                     self.router.peers.get(&result.peer_hash),
-                ) && let Ok(node) = node.lock()
-                    && let Err(error) = node.save_peer(peer)
-                {
-                    tracing::warn!(
-                        peer = %hex::encode(result.peer_hash),
-                        "failed to persist generated peering key: {error}"
-                    );
+                ) {
+                    if let Ok(node) = node.lock() {
+                        if let Err(error) = node.save_peer(peer) {
+                            tracing::warn!(
+                                peer = %hex::encode(result.peer_hash),
+                                "failed to persist generated peering key: {error}"
+                            );
+                        }
+                    }
                 }
             } else if current_cost {
                 // A bounded key search can fail for an excessive advertised
@@ -1690,13 +1693,13 @@ impl LxmdRunner {
                     .then(|| OutboundOfferPolicy::from(peer))
             });
             if let Some(policy) = policy {
-                if let Some(sync) = self.propagation_sync.as_mut()
-                    && sync.request_sync_now_with_policy(policy)
-                {
-                    if let Some(peer) = self.router.peers.get_mut(&peer_hash) {
-                        peer.begin_sync();
+                if let Some(sync) = self.propagation_sync.as_mut() {
+                    if sync.request_sync_now_with_policy(policy) {
+                        if let Some(peer) = self.router.peers.get_mut(&peer_hash) {
+                            peer.begin_sync();
+                        }
+                        self.pending_peer_syncs.remove(&peer_hash);
                     }
-                    self.pending_peer_syncs.remove(&peer_hash);
                 }
                 return;
             }
@@ -2058,51 +2061,53 @@ impl LxmdRunner {
             ps.drain_events(&self.known_identities);
             ps.tick();
             let updates = ps.take_handled_updates();
-            if !updates.is_empty()
-                && let Some(peer_hash) = ps.node_dest_hash()
-            {
-                peer_handled_updates = Some((peer_hash, updates));
+            if !updates.is_empty() {
+                if let Some(peer_hash) = ps.node_dest_hash() {
+                    peer_handled_updates = Some((peer_hash, updates));
+                }
             }
             peer_terminal_result = ps.take_terminal_peer_result();
         }
         let mut peers_to_persist = HashSet::new();
-        if let Some((peer_hash, updates)) = peer_handled_updates
-            && let Some(peer) = self.router.peers.get_mut(&peer_hash)
-        {
-            for transient_id in updates {
-                peer.add_handled_message(&transient_id);
+        if let Some((peer_hash, updates)) = peer_handled_updates {
+            if let Some(peer) = self.router.peers.get_mut(&peer_hash) {
+                for transient_id in updates {
+                    peer.add_handled_message(&transient_id);
+                }
+                peers_to_persist.insert(peer_hash);
             }
-            peers_to_persist.insert(peer_hash);
         }
-        if let Some(result) = peer_terminal_result
-            && let Some(peer) = self.router.peers.get_mut(&result.peer_hash)
-        {
-            match result.state {
-                lxmf_core::propagation_sync::PeerSyncTerminalState::Complete => {
-                    peer.sync_complete();
-                    if result.generation_exhausted
-                        && let Some(generation) = result.offer_generation
-                    {
-                        peer.mark_offer_generation_processed(generation);
+        if let Some(result) = peer_terminal_result {
+            if let Some(peer) = self.router.peers.get_mut(&result.peer_hash) {
+                match result.state {
+                    lxmf_core::propagation_sync::PeerSyncTerminalState::Complete => {
+                        peer.sync_complete();
+                        if result.generation_exhausted {
+                            if let Some(generation) = result.offer_generation {
+                                peer.mark_offer_generation_processed(generation);
+                            }
+                        }
+                    }
+                    lxmf_core::propagation_sync::PeerSyncTerminalState::Failed => {
+                        peer.sync_failed();
                     }
                 }
-                lxmf_core::propagation_sync::PeerSyncTerminalState::Failed => {
-                    peer.sync_failed();
-                }
+                peers_to_persist.insert(result.peer_hash);
             }
-            peers_to_persist.insert(result.peer_hash);
         }
         for peer_hash in peers_to_persist {
             if let (Some(node), Some(peer)) = (
                 self.propagation_node.as_ref(),
                 self.router.peers.get(&peer_hash),
-            ) && let Ok(node) = node.lock()
-                && let Err(error) = node.save_peer(peer)
-            {
-                tracing::warn!(
-                    peer = %hex::encode(peer_hash),
-                    "failed to persist peer sync state: {error}"
-                );
+            ) {
+                if let Ok(node) = node.lock() {
+                    if let Err(error) = node.save_peer(peer) {
+                        tracing::warn!(
+                            peer = %hex::encode(peer_hash),
+                            "failed to persist peer sync state: {error}"
+                        );
+                    }
+                }
             }
         }
 
@@ -2129,18 +2134,18 @@ impl LxmdRunner {
                     client.start_download();
                     self.last_propagation_check = now;
                     tracing::debug!("auto-triggered propagation download");
-                } else if let Some(node) = self.router.outbound_propagation_node
-                    && queue_unknown_propagation_node_path_request(
+                } else if let Some(node) = self.router.outbound_propagation_node {
+                    if queue_unknown_propagation_node_path_request(
                         &self.transport_tx,
                         node,
                         &mut self.last_propagation_check,
                         now,
-                    )
-                {
-                    tracing::debug!(
-                        node = %hex::encode(node),
-                        "propagation node identity unknown; requesting path before download"
-                    );
+                    ) {
+                        tracing::debug!(
+                            node = %hex::encode(node),
+                            "propagation node identity unknown; requesting path before download"
+                        );
+                    }
                 }
             }
             let status = client.transfer_status();
@@ -2158,52 +2163,58 @@ impl LxmdRunner {
         for msg_data in downloaded_messages {
             self.handle_propagation_downloaded_data(&msg_data);
         }
-        if acknowledge_propagation && let Some(client) = self.propagation_client.as_mut() {
-            client.acknowledge_transfer();
-        }
-
-        if let Some(interval) = self.config.announce_interval
-            && now - self.last_peer_announce > interval as f64
-        {
-            let tx = self.transport_tx.clone();
-            if let Ok(raw) = self.create_announce_packet() {
-                let dest = self.lxmf_dest_hash;
-                let _ = tx.try_send(TransportMessage::Outbound(
-                    rns_transport::messages::OutboundRequest {
-                        raw: Bytes::from(raw),
-                        destination_hash: dest,
-                    },
-                ));
-                self.last_peer_announce = now;
-                tracing::debug!("periodic peer announce sent");
+        if acknowledge_propagation {
+            if let Some(client) = self.propagation_client.as_mut() {
+                client.acknowledge_transfer();
             }
         }
 
-        if self.config.propagation_enabled
-            && let Some(interval) = self.config.node_announce_interval
-            && now - self.last_node_announce > interval as f64
-            && let Ok(raw) = self.create_propagation_announce_packet()
-        {
-            let dest = self.propagation_dest_hash;
-            let _ = self.transport_tx.try_send(TransportMessage::Outbound(
-                rns_transport::messages::OutboundRequest {
-                    raw: Bytes::from(raw),
-                    destination_hash: dest,
-                },
-            ));
-            if self.should_announce_control()
-                && let Ok(raw) =
-                    create_control_announce_packet(&self.identity, self.control_dest_hash)
-            {
-                let _ = self.transport_tx.try_send(TransportMessage::Outbound(
-                    rns_transport::messages::OutboundRequest {
-                        raw: Bytes::from(raw),
-                        destination_hash: self.control_dest_hash,
-                    },
-                ));
+        if let Some(interval) = self.config.announce_interval {
+            if now - self.last_peer_announce > interval as f64 {
+                let tx = self.transport_tx.clone();
+                if let Ok(raw) = self.create_announce_packet() {
+                    let dest = self.lxmf_dest_hash;
+                    let _ = tx.try_send(TransportMessage::Outbound(
+                        rns_transport::messages::OutboundRequest {
+                            raw: Bytes::from(raw),
+                            destination_hash: dest,
+                        },
+                    ));
+                    self.last_peer_announce = now;
+                    tracing::debug!("periodic peer announce sent");
+                }
             }
-            self.last_node_announce = now;
-            tracing::debug!("periodic propagation node announce sent");
+        }
+
+        if self.config.propagation_enabled {
+            if let Some(interval) = self.config.node_announce_interval {
+                if now - self.last_node_announce > interval as f64 {
+                    if let Ok(raw) = self.create_propagation_announce_packet() {
+                        let dest = self.propagation_dest_hash;
+                        let _ = self.transport_tx.try_send(TransportMessage::Outbound(
+                            rns_transport::messages::OutboundRequest {
+                                raw: Bytes::from(raw),
+                                destination_hash: dest,
+                            },
+                        ));
+                        if self.should_announce_control() {
+                            if let Ok(raw) = create_control_announce_packet(
+                                &self.identity,
+                                self.control_dest_hash,
+                            ) {
+                                let _ = self.transport_tx.try_send(TransportMessage::Outbound(
+                                    rns_transport::messages::OutboundRequest {
+                                        raw: Bytes::from(raw),
+                                        destination_hash: self.control_dest_hash,
+                                    },
+                                ));
+                            }
+                        }
+                        self.last_node_announce = now;
+                        tracing::debug!("periodic propagation node announce sent");
+                    }
+                }
+            }
         }
 
         if now - self.last_cull > 300.0 {
@@ -2212,10 +2223,10 @@ impl LxmdRunner {
             // jobloop cadences. The propagation node's own store (separate
             // from the router's) ages out expired messages and enforces the
             // weight cap here — previously this never ran.
-            if let Some(ref pn) = self.propagation_node
-                && let Ok(mut node) = pn.lock()
-            {
-                node.tick();
+            if let Some(ref pn) = self.propagation_node {
+                if let Ok(mut node) = pn.lock() {
+                    node.tick();
+                }
             }
             self.last_cull = now;
         }
@@ -2264,20 +2275,21 @@ impl LxmdRunner {
                 .insert(event.destination_hash, event.hops.max(1));
 
             if event.name_hash == delivery_name_hash {
-                if let Some(ref data) = event.app_data
-                    && let Some((display_name, stamp_cost)) =
+                if let Some(ref data) = event.app_data {
+                    if let Some((display_name, stamp_cost)) =
                         lxmf_core::handlers::parse_announce_app_data(data)
-                {
-                    if let Some(name) = display_name {
-                        tracing::info!(dest = %dest_hex, name = %name, "announce display name");
-                    }
-                    if let Some(cost) = stamp_cost {
-                        self.router.set_stamp_cost(event.destination_hash, cost);
-                        tracing::debug!(
-                            dest = %dest_hex,
-                            stamp_cost = cost,
-                            "learned delivery stamp cost from announce"
-                        );
+                    {
+                        if let Some(name) = display_name {
+                            tracing::info!(dest = %dest_hex, name = %name, "announce display name");
+                        }
+                        if let Some(cost) = stamp_cost {
+                            self.router.set_stamp_cost(event.destination_hash, cost);
+                            tracing::debug!(
+                                dest = %dest_hex,
+                                stamp_cost = cost,
+                                "learned delivery stamp cost from announce"
+                            );
+                        }
                     }
                 }
                 let triggered = self
@@ -2290,9 +2302,13 @@ impl LxmdRunner {
                         "delivery announce made pending outbound messages eligible"
                     );
                 }
-            } else if event.name_hash == propagation_name_hash
-                && let Some(ref data) = event.app_data
-                && let Some(pn) = lxmf_core::handlers::parse_pn_announce_data(data)
+            } else if let Some((data, pn)) = event
+                .app_data
+                .as_deref()
+                .filter(|_| event.name_hash == propagation_name_hash)
+                .and_then(|data| {
+                    lxmf_core::handlers::parse_pn_announce_data(data).map(|pn| (data, pn))
+                })
             {
                 self.router
                     .set_stamp_cost(event.destination_hash, pn.stamp_cost);
@@ -2347,14 +2363,15 @@ impl LxmdRunner {
                     if let Some(sync) = self.propagation_sync.as_mut() {
                         sync.cancel_peer_sync(&event.destination_hash);
                     }
-                    if let Some(node) = self.propagation_node.as_ref()
-                        && let Ok(mut node) = node.lock()
-                        && let Err(error) = node.delete_peer(&event.destination_hash)
-                    {
-                        tracing::warn!(
-                            peer = %dest_hex,
-                            "failed to remove retired propagation peer: {error}"
-                        );
+                    if let Some(node) = self.propagation_node.as_ref() {
+                        if let Ok(mut node) = node.lock() {
+                            if let Err(error) = node.delete_peer(&event.destination_hash) {
+                                tracing::warn!(
+                                    peer = %dest_hex,
+                                    "failed to remove retired propagation peer: {error}"
+                                );
+                            }
+                        }
                     }
                 } else if peer_changed {
                     let offer_constraints_changed =
@@ -2379,13 +2396,15 @@ impl LxmdRunner {
                     if let (Some(node), Some(peer)) = (
                         self.propagation_node.as_ref(),
                         self.router.peers.get(&event.destination_hash),
-                    ) && let Ok(node) = node.lock()
-                        && let Err(error) = node.save_peer(peer)
-                    {
-                        tracing::warn!(
-                            peer = %dest_hex,
-                            "failed to persist propagation peer policy: {error}"
-                        );
+                    ) {
+                        if let Ok(node) = node.lock() {
+                            if let Err(error) = node.save_peer(peer) {
+                                tracing::warn!(
+                                    peer = %dest_hex,
+                                    "failed to persist propagation peer policy: {error}"
+                                );
+                            }
+                        }
                     }
                 }
                 tracing::debug!(
@@ -2404,34 +2423,35 @@ impl LxmdRunner {
                     );
                 }
             }
-            if let Some(pub_key) = event.public_key
-                && self.known_identities.get(&dest_hex) != Some(&pub_key)
-            {
-                self.known_identities.insert(dest_hex.clone(), pub_key);
-                tracing::debug!(dest = %dest_hex, "learned identity key from announce");
+            if let Some(pub_key) = event.public_key {
+                if self.known_identities.get(&dest_hex) != Some(&pub_key) {
+                    self.known_identities.insert(dest_hex.clone(), pub_key);
+                    tracing::debug!(dest = %dest_hex, "learned identity key from announce");
+                }
             }
             // Python Identity._remember_ratchet: persist only the single
             // changed ratchet, off the daemon loop. Identity keys and the
             // ring stay on the periodic/shutdown saves.
-            if let Some(ratchet_key) = event.ratchet
-                && self
+            if let Some(ratchet_key) = event.ratchet {
+                if self
                     .received_ratchets
                     .get(&dest_hex)
                     .is_none_or(|rr| rr.ratchet_pub != ratchet_key)
-            {
-                let rr = ReceivedRatchet::new(ratchet_key);
-                self.received_ratchets.insert(dest_hex.clone(), rr);
-                tracing::debug!(dest = %dest_hex, "learned ratchet from announce");
-                let path = self
-                    .received_ratchets_dir
-                    .join(format!("{dest_hex}.ratchet"));
-                let dir = self.received_ratchets_dir.clone();
-                tokio::task::spawn_blocking(move || {
-                    std::fs::create_dir_all(&dir).ok();
-                    if let Err(e) = rr.save(&path) {
-                        tracing::warn!("Failed to persist received ratchet: {e}");
-                    }
-                });
+                {
+                    let rr = ReceivedRatchet::new(ratchet_key);
+                    self.received_ratchets.insert(dest_hex.clone(), rr);
+                    tracing::debug!(dest = %dest_hex, "learned ratchet from announce");
+                    let path = self
+                        .received_ratchets_dir
+                        .join(format!("{dest_hex}.ratchet"));
+                    let dir = self.received_ratchets_dir.clone();
+                    tokio::task::spawn_blocking(move || {
+                        std::fs::create_dir_all(&dir).ok();
+                        if let Err(e) = rr.save(&path) {
+                            tracing::warn!("Failed to persist received ratchet: {e}");
+                        }
+                    });
+                }
             }
         }
         seen
@@ -2451,9 +2471,10 @@ impl LxmdRunner {
                     direction: LinkResourceDirection::Inbound,
                     ..
                 }
-            ) && let Some(event) = delivery_resource_event_from_runtime(event)
-            {
-                self.router.handle_inbound_resource_event(event);
+            ) {
+                if let Some(event) = delivery_resource_event_from_runtime(event) {
+                    self.router.handle_inbound_resource_event(event);
+                }
             }
         }
 
@@ -2617,17 +2638,17 @@ impl LxmdRunner {
         };
 
         let mut accepted = 0usize;
-        if let Some(ref node) = self.propagation_node
-            && let Ok(mut node) = node.lock()
-        {
-            for entry in result.entries {
-                let stamp_value = u8::try_from(entry.stamp_value).unwrap_or(u8::MAX);
-                if node.accept_stamped_propagated_blob(
-                    &entry.lxmf_data,
-                    &entry.stamp_data,
-                    stamp_value,
-                ) {
-                    accepted += 1;
+        if let Some(ref node) = self.propagation_node {
+            if let Ok(mut node) = node.lock() {
+                for entry in result.entries {
+                    let stamp_value = u8::try_from(entry.stamp_value).unwrap_or(u8::MAX);
+                    if node.accept_stamped_propagated_blob(
+                        &entry.lxmf_data,
+                        &entry.stamp_data,
+                        stamp_value,
+                    ) {
+                        accepted += 1;
+                    }
                 }
             }
         }
@@ -2640,26 +2661,26 @@ impl LxmdRunner {
             "processed inbound propagation Resource"
         );
 
-        if claim.should_close_link()
-            && let Some(command_tx) = self.prop_link_command_tx.clone()
-        {
-            let link_id = claim.link_id();
-            tokio::spawn(async move {
-                if command_tx
-                    .send(rns_runtime::link_manager::LinkManagerCommand::CloseLink {
-                        link_id,
-                        reason: rns_runtime::prelude::CloseReason::DestinationClosed,
-                        send_teardown: true,
-                    })
-                    .await
-                    .is_err()
-                {
-                    tracing::debug!(
-                        link_id = %hex::encode(link_id),
-                        "propagation Link already closed before validation teardown"
-                    );
-                }
-            });
+        if claim.should_close_link() {
+            if let Some(command_tx) = self.prop_link_command_tx.clone() {
+                let link_id = claim.link_id();
+                tokio::spawn(async move {
+                    if command_tx
+                        .send(rns_runtime::link_manager::LinkManagerCommand::CloseLink {
+                            link_id,
+                            reason: rns_runtime::prelude::CloseReason::DestinationClosed,
+                            send_teardown: true,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        tracing::debug!(
+                            link_id = %hex::encode(link_id),
+                            "propagation Link already closed before validation teardown"
+                        );
+                    }
+                });
+            }
         }
     }
 
@@ -2910,14 +2931,15 @@ impl LxmdRunner {
 
         // Also deposit into the propagation store (if enabled) so peers can
         // download it via offer/get sync.
-        if let Some(ref pn) = self.propagation_node
-            && let Ok(mut node) = pn.lock()
-            && node.accept_message(&msg)
-        {
-            tracing::info!(
-                from = %hex::encode(msg.source_hash),
-                "propagation: message accepted into store"
-            );
+        if let Some(ref pn) = self.propagation_node {
+            if let Ok(mut node) = pn.lock() {
+                if node.accept_message(&msg) {
+                    tracing::info!(
+                        from = %hex::encode(msg.source_hash),
+                        "propagation: message accepted into store"
+                    );
+                }
+            }
         }
 
         let messages_dir = self.messages_dir.clone();
@@ -2951,10 +2973,10 @@ impl LxmdRunner {
         }
 
         // Execute on_inbound command if configured
-        if let Some(ref cmd) = self.config.on_inbound_command
-            && let Err(e) = execute_on_inbound(cmd, &msg_path.to_string_lossy())
-        {
-            tracing::error!("on_inbound command failed: {e}");
+        if let Some(ref cmd) = self.config.on_inbound_command {
+            if let Err(e) = execute_on_inbound(cmd, &msg_path.to_string_lossy()) {
+                tracing::error!("on_inbound command failed: {e}");
+            }
         }
 
         // Update known identity from sender
@@ -3019,24 +3041,25 @@ impl LxmdRunner {
                             }
                             let hops = route_hops_for(&self.route_hops, prop_hash);
                             self.ensure_link_delivery();
-                            if let Some(ref mut ld) = self.link_delivery
-                                && let Err(err) = ld
+                            if let Some(ref mut ld) = self.link_delivery {
+                                if let Err(err) = ld
                                     .start_packed_delivery(message, prop_hash, hops, packed, false)
-                            {
-                                let reason = err.error.to_string();
-                                tracing::warn!(
-                                    error = %reason,
-                                    prop = %hex::encode(prop_hash),
-                                    "failed to start propagated link delivery"
-                                );
-                                requeue_after_path_request(
-                                    &mut self.router,
-                                    &self.transport_tx,
-                                    *err.message,
-                                    prop_hash,
-                                    &reason,
-                                    false,
-                                );
+                                {
+                                    let reason = err.error.to_string();
+                                    tracing::warn!(
+                                        error = %reason,
+                                        prop = %hex::encode(prop_hash),
+                                        "failed to start propagated link delivery"
+                                    );
+                                    requeue_after_path_request(
+                                        &mut self.router,
+                                        &self.transport_tx,
+                                        *err.message,
+                                        prop_hash,
+                                        &reason,
+                                        false,
+                                    );
+                                }
                             }
                         }
                         None => {
@@ -3052,17 +3075,18 @@ impl LxmdRunner {
                 OutboundAction::Failed(_) | OutboundAction::Expired(_) => continue,
             };
 
-            if message.stamp.is_none()
-                && let Some(cost) = self.router.get_stamp_cost(&message.destination_hash)
-                && cost > 0
-            {
-                tracing::info!(
-                    dest = %hex::encode(message.destination_hash),
-                    cost = cost,
-                    "generating stamp"
-                );
-                message.stamp_cost = Some(cost);
-                message.get_stamp();
+            if message.stamp.is_none() {
+                if let Some(cost) = self.router.get_stamp_cost(&message.destination_hash) {
+                    if cost > 0 {
+                        tracing::info!(
+                            dest = %hex::encode(message.destination_hash),
+                            cost = cost,
+                            "generating stamp"
+                        );
+                        message.stamp_cost = Some(cost);
+                        message.get_stamp();
+                    }
+                }
             }
 
             let dest_hex = hex::encode(dest_hash);
@@ -3316,23 +3340,23 @@ impl LxmdRunner {
                 }
                 let hops = route_hops_for(&self.route_hops, dest_hash);
                 self.ensure_link_delivery();
-                if let Some(ref mut ld) = self.link_delivery
-                    && let Err(err) = ld.start_delivery(message, dest_hash, hops)
-                {
-                    let reason = err.error.to_string();
-                    tracing::warn!(
-                        error = %reason,
-                        dest = %dest_hex,
-                        "failed to start oversized direct link delivery"
-                    );
-                    requeue_after_path_request(
-                        &mut self.router,
-                        &self.transport_tx,
-                        *err.message,
-                        dest_hash,
-                        &reason,
-                        false,
-                    );
+                if let Some(ref mut ld) = self.link_delivery {
+                    if let Err(err) = ld.start_delivery(message, dest_hash, hops) {
+                        let reason = err.error.to_string();
+                        tracing::warn!(
+                            error = %reason,
+                            dest = %dest_hex,
+                            "failed to start oversized direct link delivery"
+                        );
+                        requeue_after_path_request(
+                            &mut self.router,
+                            &self.transport_tx,
+                            *err.message,
+                            dest_hash,
+                            &reason,
+                            false,
+                        );
+                    }
                 }
                 continue;
             }
@@ -3491,11 +3515,11 @@ impl LxmdRunner {
         let ki_path = ratchet_dir.join("known_identities");
         let mut data = Vec::with_capacity(self.known_identities.len() * 80);
         for (hash_hex, pk) in &self.known_identities {
-            if let Ok(hash_bytes) = hex::decode(hash_hex)
-                && hash_bytes.len() == 16
-            {
-                data.extend_from_slice(&hash_bytes);
-                data.extend_from_slice(pk);
+            if let Ok(hash_bytes) = hex::decode(hash_hex) {
+                if hash_bytes.len() == 16 {
+                    data.extend_from_slice(&hash_bytes);
+                    data.extend_from_slice(pk);
+                }
             }
         }
         if let Err(e) = rns_identity::persistence::atomic_write(&ki_path, &data) {
@@ -3850,9 +3874,7 @@ pub(crate) async fn main() {
         tracing::info!("On-inbound command: {}", cmd);
     }
 
-    if !shutdown.is_triggered()
-        && let Some(ref send_args) = args.send
-    {
+    if let Some(send_args) = args.send.as_ref().filter(|_| !shutdown.is_triggered()) {
         let dest_hex = normalize_hash_hex(&send_args[0]);
         let content = match args.send_file.as_ref() {
             Some(path) => match std::fs::read_to_string(path) {
@@ -4060,9 +4082,10 @@ pub(crate) async fn main() {
                         direction: LinkResourceDirection::Inbound,
                         ..
                     }
-                ) && let Some(event) = delivery_resource_event_from_runtime(event)
-                {
-                    runner.router.handle_inbound_resource_event(event);
+                ) {
+                    if let Some(event) = delivery_resource_event_from_runtime(event) {
+                        runner.router.handle_inbound_resource_event(event);
+                    }
                 }
                 runner.drain_link_packets();
             }

@@ -34,7 +34,7 @@ jobs:
       - name: Install system deps
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libudev-dev libdbus-1-dev pkg-config
-      - run: cargo test --workspace
+      - run: cargo test --workspace --locked
         working-directory: rsLXMF
 
   lint:
@@ -60,10 +60,36 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libudev-dev libdbus-1-dev pkg-config
       - run: cargo fmt --all -- --check
         working-directory: rsLXMF
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
         working-directory: rsLXMF
       - name: Check public API documentation
         env:
           RUSTDOCFLAGS: "-D warnings"
-        run: cargo doc --workspace --no-deps
+        run: cargo doc --workspace --no-deps --locked
+        working-directory: rsLXMF
+
+  msrv:
+    name: Rust 1.85 MSRV
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: rsLXMF
+      - uses: actions/checkout@v5
+        with:
+          repository: ${{ github.repository_owner }}/rsReticulum
+          ref: main
+          path: rsReticulum
+      - uses: dtolnay/rust-toolchain@1.85.0
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rsLXMF -> target
+          cache-bin: false
+      - name: Install system deps
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev libdbus-1-dev pkg-config
+      - name: Clippy (all targets and features)
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
         working-directory: rsLXMF

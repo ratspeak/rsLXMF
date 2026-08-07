@@ -480,10 +480,10 @@ impl LxmRouter {
         }
 
         let now = now_f64();
-        if message.outbound_ticket.is_none()
-            && let Some(ticket) = self.ticket_store.find(&message.destination_hash, now)
-        {
-            message.outbound_ticket = Some(ticket.token);
+        if message.outbound_ticket.is_none() {
+            if let Some(ticket) = self.ticket_store.find(&message.destination_hash, now) {
+                message.outbound_ticket = Some(ticket.token);
+            }
         }
 
         if message.stamp.is_none() && message.stamp_cost.is_none() {
@@ -514,16 +514,16 @@ impl LxmRouter {
             }
         }
 
-        if message.method == DeliveryMethod::Opportunistic
-            && let Ok(packed) = message.pack_payload()
-        {
-            let content_size = packed
-                .len()
-                .saturating_sub(TIMESTAMP_SIZE + STRUCT_OVERHEAD);
-            // Approximates ENCRYPTED_PACKET_MAX_CONTENT for default RNS parameters.
-            let max_content = 295;
-            if content_size > max_content {
-                message.method = DeliveryMethod::Direct;
+        if message.method == DeliveryMethod::Opportunistic {
+            if let Ok(packed) = message.pack_payload() {
+                let content_size = packed
+                    .len()
+                    .saturating_sub(TIMESTAMP_SIZE + STRUCT_OVERHEAD);
+                // Approximates ENCRYPTED_PACKET_MAX_CONTENT for default RNS parameters.
+                let max_content = 295;
+                if content_size > max_content {
+                    message.method = DeliveryMethod::Direct;
+                }
             }
         }
 
@@ -817,13 +817,14 @@ impl LxmRouter {
 
         if let Some(mut msg) = self.pending_deferred_stamps.remove(message_hash) {
             msg.cancel();
-            if self
+            let active_matches = self
                 .active_deferred_stamp
                 .as_ref()
-                .is_some_and(|job| job.message_hash == *message_hash)
-                && let Some(job) = self.active_deferred_stamp.take()
-            {
-                job.handle.cancel();
+                .is_some_and(|job| job.message_hash == *message_hash);
+            if active_matches {
+                if let Some(job) = self.active_deferred_stamp.take() {
+                    job.handle.cancel();
+                }
             }
             return true;
         }
@@ -1170,8 +1171,7 @@ impl LxmRouter {
             return false;
         }
         if !configured_static
-            && let Some(h) = hops
-            && h as usize > self.config.ext.autopeer_maxdepth
+            && hops.is_some_and(|h| h as usize > self.config.ext.autopeer_maxdepth)
         {
             return false;
         }
@@ -1546,8 +1546,11 @@ impl LxmRouter {
 
         let mut i = 0;
         while i < self.pending_outbound.len() {
-            if let Some(limit) = self.config.ext.processing_limit
-                && processed >= limit
+            if self
+                .config
+                .ext
+                .processing_limit
+                .is_some_and(|limit| processed >= limit)
             {
                 break;
             }
@@ -1665,8 +1668,11 @@ impl LxmRouter {
         let mut i = 0;
 
         while i < self.pending_outbound.len() {
-            if let Some(limit) = self.config.ext.processing_limit
-                && processed >= limit
+            if self
+                .config
+                .ext
+                .processing_limit
+                .is_some_and(|limit| processed >= limit)
             {
                 break;
             }
@@ -1955,20 +1961,16 @@ impl LxmRouter {
 
     fn run_periodic_jobs(&mut self) {
         // Job cadences match the Python LXMRouter jobloop.
-        if self.processing_count.is_multiple_of(JOB_TRANSIENT_INTERVAL) {
+        if self.processing_count % JOB_TRANSIENT_INTERVAL == 0 {
             self.propagation_store.clean_transient_caches(now_f64());
         }
-        if self.processing_count.is_multiple_of(JOB_STORE_INTERVAL)
-            && self.config.propagation_enabled
-        {
+        if self.processing_count % JOB_STORE_INTERVAL == 0 && self.config.propagation_enabled {
             self.cull_propagation();
         }
-        if self.processing_count.is_multiple_of(JOB_PEERSYNC_INTERVAL) {
+        if self.processing_count % JOB_PEERSYNC_INTERVAL == 0 {
             self.clean_throttled_peers();
         }
-        if self.processing_count.is_multiple_of(JOB_ROTATE_INTERVAL)
-            && self.config.propagation_enabled
-        {
+        if self.processing_count % JOB_ROTATE_INTERVAL == 0 && self.config.propagation_enabled {
             self.rotate_peers();
         }
     }

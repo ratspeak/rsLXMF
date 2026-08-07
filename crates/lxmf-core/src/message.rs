@@ -391,19 +391,19 @@ impl LxMessage {
         self.transient_id = Some(tid);
 
         let mut stamp_value = 0;
-        if let Some(target_cost) = propagation_stamp_cost
-            && self.propagation_stamp.is_none()
-        {
-            let (stamp, value) = crate::stamper::generate_stamp(
-                &tid,
-                target_cost,
-                crate::constants::STAMP_WORKBLOCK_EXPAND_ROUNDS_PN,
-            )
-            .ok_or_else(|| {
-                MessageError::PackFailed("failed to generate propagation stamp".to_string())
-            })?;
-            self.propagation_stamp = Some(stamp);
-            stamp_value = value;
+        if let Some(target_cost) = propagation_stamp_cost {
+            if self.propagation_stamp.is_none() {
+                let (stamp, value) = crate::stamper::generate_stamp(
+                    &tid,
+                    target_cost,
+                    crate::constants::STAMP_WORKBLOCK_EXPAND_ROUNDS_PN,
+                )
+                .ok_or_else(|| {
+                    MessageError::PackFailed("failed to generate propagation stamp".to_string())
+                })?;
+                self.propagation_stamp = Some(stamp);
+                stamp_value = value;
+            }
         }
 
         if let Some(ref prop_stamp) = self.propagation_stamp {
@@ -791,9 +791,7 @@ impl LxMessage {
     ///
     /// Python reference: LXMessage.py:301-332.
     pub fn get_stamp(&mut self) -> Option<Vec<u8>> {
-        if let Some(ticket) = self.outbound_ticket
-            && let Some(message_id) = self.message_id
-        {
+        if let (Some(ticket), Some(message_id)) = (self.outbound_ticket, self.message_id) {
             let mut material = Vec::with_capacity(TICKET_LENGTH + 32);
             material.extend_from_slice(&ticket);
             material.extend_from_slice(&message_id);
@@ -816,13 +814,14 @@ impl LxMessage {
 
         // 4. Generate PoW stamp
         let cost = self.stamp_cost.unwrap();
-        if let Some(message_id) = self.message_id
-            && let Some((stamp, value)) =
+        if let Some(message_id) = self.message_id {
+            if let Some((stamp, value)) =
                 crate::stamper::generate_stamp(&message_id, cost, STAMP_WORKBLOCK_EXPAND_ROUNDS)
-        {
-            self.stamp_value = Some(value as u16);
-            self.stamp = Some(stamp.to_vec());
-            return Some(stamp.to_vec());
+            {
+                self.stamp_value = Some(value as u16);
+                self.stamp = Some(stamp.to_vec());
+                return Some(stamp.to_vec());
+            }
         }
 
         None
@@ -1347,7 +1346,7 @@ fn deserialize_bin_or_str<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<String, D::Error> {
     struct BinOrStrVisitor;
-    impl<'de> serde::de::Visitor<'de> for BinOrStrVisitor {
+    impl serde::de::Visitor<'_> for BinOrStrVisitor {
         type Value = String;
         fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
             f.write_str("string or binary data")

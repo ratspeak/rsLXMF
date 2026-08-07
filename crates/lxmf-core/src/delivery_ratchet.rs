@@ -159,15 +159,14 @@ impl DeliveryRatchetState {
             }
         }
 
-        if control_file_trusted
-            && (!control_existed || control_changed)
-            && let Err(error) = control.save_verified(&control_path, identity)
-        {
-            tracing::warn!(
-                path = %control_path.display(),
-                %error,
-                "could not persist initial ratchet control state; new announces remain deferred until persistence recovers"
-            );
+        if control_file_trusted && (!control_existed || control_changed) {
+            if let Err(error) = control.save_verified(&control_path, identity) {
+                tracing::warn!(
+                    path = %control_path.display(),
+                    %error,
+                    "could not persist initial ratchet control state; new announces remain deferred until persistence recovers"
+                );
+            }
         }
 
         Ok(Self {
@@ -211,12 +210,13 @@ impl DeliveryRatchetState {
         }
         let announce_time = AnnounceTime::new(wall_now, cache_now)?;
 
-        if let DeliveryAnnounceKind::PathResponse { tag: Some(tag) } = kind
-            && let Some(packet) = self
+        if let DeliveryAnnounceKind::PathResponse { tag: Some(tag) } = kind {
+            if let Some(packet) = self
                 .destination
                 .cached_path_response_packet(tag, cache_now)?
-        {
-            return Ok(packet);
+            {
+                return Ok(packet);
+            }
         }
 
         if !self.control_file_trusted {
@@ -292,15 +292,15 @@ impl DeliveryRatchetState {
     /// Best-effort shutdown checkpoint. Invalid files detected during load are
     /// never overwritten by this operation.
     pub fn save(&self, identity: &Identity) {
-        if self.ring_file_trusted
-            && let Err(error) = self.ring.save_verified(&self.ring_path, identity)
-        {
-            tracing::warn!(%error, "failed to save ratchet ring");
+        if self.ring_file_trusted {
+            if let Err(error) = self.ring.save_verified(&self.ring_path, identity) {
+                tracing::warn!(%error, "failed to save ratchet ring");
+            }
         }
-        if self.control_file_trusted
-            && let Err(error) = self.control.save_verified(&self.control_path, identity)
-        {
-            tracing::warn!(%error, "failed to save ratchet control state");
+        if self.control_file_trusted {
+            if let Err(error) = self.control.save_verified(&self.control_path, identity) {
+                tracing::warn!(%error, "failed to save ratchet control state");
+            }
         }
     }
 
