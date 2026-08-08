@@ -308,6 +308,18 @@ impl PropagationNode {
         self.config.min_stamp_cost = cost;
     }
 
+    pub fn set_peering_cost(&mut self, cost: u8) {
+        self.config.peering_cost = cost;
+    }
+
+    pub fn set_max_storage(&mut self, max: usize) {
+        self.config.max_storage = max;
+    }
+
+    pub fn set_max_message_size(&mut self, max: usize) {
+        self.config.max_message_size = max;
+    }
+
     pub fn offer_generation(&self) -> u64 {
         self.offer_generation
     }
