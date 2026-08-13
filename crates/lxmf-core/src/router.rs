@@ -109,12 +109,17 @@ pub struct DeferredStampJob {
 #[derive(Debug)]
 pub enum SendError {
     MissingOutboundPropagationNode(Box<LxMessage>),
+    TicketPreparation {
+        message: Box<LxMessage>,
+        source: TicketPreparationError,
+    },
 }
 
 impl SendError {
     pub fn message(&self) -> &LxMessage {
         match self {
             Self::MissingOutboundPropagationNode(message) => message,
+            Self::TicketPreparation { message, .. } => message,
         }
     }
 }
@@ -125,11 +130,20 @@ impl fmt::Display for SendError {
             Self::MissingOutboundPropagationNode(_) => f.write_str(
                 "attempt to send propagated message with no outbound propagation node configured",
             ),
+            Self::TicketPreparation { source, .. } => source.fmt(f),
         }
     }
 }
 
 impl std::error::Error for SendError {}
+
+#[derive(Debug, thiserror::Error)]
+pub enum TicketPreparationError {
+    #[error("reply ticket must be added before the LXMF message is signed")]
+    AlreadySigned,
+    #[error("failed to encode LXMF reply ticket: {0}")]
+    Encode(String),
+}
 
 /// Current route metadata for an LXMF Direct delivery destination.
 #[derive(Debug, Clone, PartialEq)]
@@ -457,6 +471,7 @@ impl LxmRouter {
             content_len = message.content.len(),
         ),
     )]
+    #[deprecated(note = "use try_send() and handle the immediate routing result")]
     pub fn send(&mut self, message: LxMessage) {
         let _ = self.try_send(message);
     }
@@ -479,11 +494,12 @@ impl LxmRouter {
             return Err(SendError::MissingOutboundPropagationNode(Box::new(message)));
         }
 
-        let now = now_f64();
-        if message.outbound_ticket.is_none() {
-            if let Some(ticket) = self.ticket_store.find(&message.destination_hash, now) {
-                message.outbound_ticket = Some(ticket.token);
-            }
+        if let Err(source) = self.prepare_outbound(&mut message) {
+            message.mark_failed();
+            return Err(SendError::TicketPreparation {
+                message: Box::new(message),
+                source,
+            });
         }
 
         if message.stamp.is_none() && message.stamp_cost.is_none() {
@@ -529,6 +545,53 @@ impl LxmRouter {
 
         message.state = MessageState::Outbound;
         self.pending_outbound.push(message);
+        Ok(())
+    }
+
+    /// Apply router-owned ticket state before a caller signs `message`.
+    ///
+    /// Learned outbound tickets do not change signed fields and can be
+    /// attached at any time. A requested reply ticket is a signed LXMF field,
+    /// so it must be inserted before signing. The method is deliberately
+    /// signer-agnostic: callers may subsequently use either `sign` or
+    /// `sign_with` without exposing private key material to the router.
+    pub fn prepare_outbound(
+        &mut self,
+        message: &mut LxMessage,
+    ) -> Result<(), TicketPreparationError> {
+        let now = now_f64();
+        if message.outbound_ticket.is_none() {
+            if let Some(ticket) = self
+                .ticket_store
+                .find_outbound(&message.destination_hash, now)
+            {
+                message.outbound_ticket = Some(ticket.token);
+            }
+        }
+
+        if message.include_ticket && !message.fields.contains_key(&FIELD_TICKET) {
+            if message.signature.is_some() {
+                if self
+                    .ticket_store
+                    .should_issue_for(&message.destination_hash, now)
+                {
+                    return Err(TicketPreparationError::AlreadySigned);
+                }
+                return Ok(());
+            }
+            if let Some(ticket) =
+                self.ticket_store
+                    .issue_for(message.destination_hash, TICKET_EXPIRY, now)
+            {
+                let encoded = ticket
+                    .encode_field()
+                    .map_err(|error| TicketPreparationError::Encode(error.to_string()))?;
+                message
+                    .set_msgpack_field(FIELD_TICKET, encoded)
+                    .map_err(|error| TicketPreparationError::Encode(error.to_string()))?;
+            }
+        }
+
         Ok(())
     }
 
@@ -758,7 +821,7 @@ impl LxmRouter {
         rand::thread_rng().fill_bytes(&mut token);
         let expires = now_f64() + expiry_secs.unwrap_or(TICKET_EXPIRY) as f64;
         self.ticket_store
-            .add(Ticket::new(token, destination_hash, expires));
+            .add_inbound(Ticket::new(token, destination_hash, expires));
         token
     }
 
@@ -767,7 +830,7 @@ impl LxmRouter {
     /// Python reference: `LXMRouter.remember_ticket` — LXMRouter.py:1110-1113.
     pub fn remember_ticket(&mut self, destination_hash: [u8; 16], token: [u8; 16], expires: f64) {
         self.ticket_store
-            .add(Ticket::new(token, destination_hash, expires));
+            .remember_outbound(Ticket::new(token, destination_hash, expires));
     }
 
     /// Returns the token of the first valid ticket for `destination_hash`.
@@ -776,7 +839,7 @@ impl LxmRouter {
     pub fn get_outbound_ticket(&self, destination_hash: &[u8; 16]) -> Option<[u8; 16]> {
         let now = now_f64();
         self.ticket_store
-            .find(destination_hash, now)
+            .find_outbound(destination_hash, now)
             .map(|t| t.token)
     }
 
@@ -786,7 +849,7 @@ impl LxmRouter {
     pub fn get_outbound_ticket_expiry(&self, destination_hash: &[u8; 16]) -> Option<f64> {
         let now = now_f64();
         self.ticket_store
-            .find(destination_hash, now)
+            .find_outbound(destination_hash, now)
             .map(|t| t.expires)
     }
 
@@ -794,7 +857,7 @@ impl LxmRouter {
     ///
     /// Python reference: `LXMRouter.get_inbound_tickets` — LXMRouter.py:1133-1136.
     pub fn get_inbound_tickets(&self) -> &[Ticket] {
-        self.ticket_store.all()
+        self.ticket_store.inbound()
     }
 
     /// Cancel an outbound message before it is sent.
@@ -843,9 +906,24 @@ impl LxmRouter {
             return false;
         };
 
-        let mut msg = self.pending_outbound.remove(pos);
-        msg.mark_delivered();
+        let msg = self.pending_outbound.remove(pos);
+        self.complete_outbound_message(msg);
         true
+    }
+
+    /// Complete an outbound message whose in-flight ownership moved from the
+    /// router queue into an embedding runtime.
+    ///
+    /// Opportunistic packet delivery is asynchronous: the network accepts the
+    /// packet first and authenticates a delivery proof later. Embedders retain
+    /// the message between those events and return it here only after proof so
+    /// ticket-delivery accounting and callbacks reflect the observable result.
+    pub fn complete_outbound_message(&mut self, mut msg: LxMessage) {
+        if msg.include_ticket && msg.fields.contains_key(&FIELD_TICKET) {
+            self.ticket_store
+                .mark_ticket_delivered(msg.destination_hash, now_f64());
+        }
+        msg.mark_delivered();
     }
 
     /// Mark a pending outbound message failed and remove it from the outbound
@@ -950,6 +1028,8 @@ impl LxmRouter {
     /// distinct from its signed message hash; both identifiers are retained
     /// so a later delivery through another representation is still deduped.
     pub fn deliver_inbound(&mut self, message: &LxMessage, allow_duplicate: bool) -> bool {
+        self.learn_ticket_from_inbound(message);
+
         let Some(message_id) = message.message_id.or(message.hash) else {
             return false;
         };
@@ -973,6 +1053,22 @@ impl LxmRouter {
         if let Some(ref callback) = self.delivery_callback {
             callback(message);
         }
+        true
+    }
+
+    /// Learn a reply ticket only from a cryptographically validated inbound
+    /// message. Returns whether valid outbound ticket state changed.
+    pub fn learn_ticket_from_inbound(&mut self, message: &LxMessage) -> bool {
+        if !message.signature_validated {
+            return false;
+        }
+        let Some(encoded) = message.fields.get(&FIELD_TICKET) else {
+            return false;
+        };
+        let Some(ticket) = Ticket::decode_field(message.source_hash, encoded, now_f64()) else {
+            return false;
+        };
+        self.ticket_store.remember_outbound(ticket);
         true
     }
 
@@ -1010,8 +1106,12 @@ impl LxmRouter {
     pub fn load_state(&mut self, state_dir: &std::path::Path) -> std::io::Result<()> {
         use crate::persist;
         self.outbound_stamp_costs = persist::load_stamp_costs(state_dir)?;
-        self.ticket_store
-            .replace_all(persist::load_tickets(state_dir)?);
+        let (snapshot, legacy) = persist::load_tickets(state_dir)?;
+        if let Some(legacy) = legacy {
+            self.ticket_store.replace_legacy(legacy);
+        } else {
+            self.ticket_store.replace_snapshot(snapshot);
+        }
         self.propagation_store
             .replace_locally_delivered(persist::load_local_deliveries(state_dir)?);
         self.propagation_store
@@ -1035,7 +1135,7 @@ impl LxmRouter {
         use crate::persist;
 
         persist::save_stamp_costs(state_dir, &self.outbound_stamp_costs)?;
-        persist::save_tickets(state_dir, self.ticket_store.all())?;
+        persist::save_tickets(state_dir, &self.ticket_store.snapshot())?;
         persist::save_local_deliveries(state_dir, self.propagation_store.locally_delivered_ids())?;
         persist::save_locally_processed(state_dir, self.propagation_store.locally_processed_ids())?;
         persist::save_node_stats(
@@ -1366,12 +1466,9 @@ impl LxmRouter {
         destination_hash: &[u8; 16],
     ) -> bool {
         let now = now_f64();
-        for ticket in self.ticket_store.all() {
-            if &ticket.destination_hash != destination_hash || !ticket.is_valid(now) {
-                continue;
-            }
+        for token in self.ticket_store.inbound_tokens(destination_hash, now) {
             let mut material = Vec::with_capacity(16 + 32);
-            material.extend_from_slice(&ticket.token);
+            material.extend_from_slice(&token);
             material.extend_from_slice(message_id);
             let expected = rns_crypto::sha::truncated_hash(&material);
             if stamp == expected.as_ref() {
@@ -2306,7 +2403,7 @@ mod tests {
         let msg = direct_policy_message();
         let msg_hash = msg.hash;
         let dest = msg.destination_hash;
-        router.send(msg);
+        router.try_send(msg).unwrap();
 
         let actions =
             router.process_outbound_with_direct(|message, _now| DirectDeliveryPlanInput {
@@ -2343,7 +2440,7 @@ mod tests {
         let mut msg = direct_policy_message();
         msg.next_delivery_attempt = now_f64() + 3600.0;
         let msg_hash = msg.hash;
-        router.send(msg);
+        router.try_send(msg).unwrap();
 
         let actions =
             router.process_outbound_with_direct(|_message, _now| DirectDeliveryPlanInput {
@@ -2368,7 +2465,7 @@ mod tests {
         let mut router = LxmRouter::new(RouterConfig::default());
         let first = direct_policy_message();
         let first_hash = first.hash.expect("first hash");
-        router.send(first);
+        router.try_send(first).unwrap();
 
         assert!(router.defer_outbound_for_path_request(&first_hash, 1000.0));
         assert_eq!(
@@ -2382,7 +2479,7 @@ mod tests {
 
         let second = direct_policy_message();
         let second_hash = second.hash.expect("second hash");
-        router.send(second);
+        router.try_send(second).unwrap();
         assert!(router.mark_outbound_failed(&second_hash));
         assert!(router.pending_outbound.is_empty());
     }
@@ -2471,13 +2568,121 @@ mod tests {
 
         let mut msg = LxMessage::new(dest, [0xBB; 16], "ticket", "stamp", DeliveryMethod::Direct);
         msg.sign(&key).unwrap();
-        router.send(msg);
+        router.try_send(msg).unwrap();
 
         assert!(router.pending_deferred_stamps.is_empty());
         assert_eq!(router.pending_outbound.len(), 1);
         let queued = &router.pending_outbound[0];
         assert_eq!(queued.stamp.as_ref().map(Vec::len), Some(TICKET_LENGTH));
         assert_eq!(queued.stamp_value, Some(COST_TICKET));
+    }
+
+    #[test]
+    fn prepare_outbound_issues_native_reply_ticket_before_signing() {
+        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
+        let mut router = LxmRouter::new(RouterConfig::default());
+        let dest = [0xAA; 16];
+        let mut msg = LxMessage::new(dest, [0xBB; 16], "ticket", "reply", DeliveryMethod::Direct);
+        msg.include_ticket = true;
+
+        router.prepare_outbound(&mut msg).unwrap();
+        assert!(msg.msgpack_field_ids.contains(&FIELD_TICKET));
+        let field = msg.fields.get(&FIELD_TICKET).unwrap();
+        let value = rmpv::decode::read_value(&mut field.as_slice()).unwrap();
+        assert_eq!(value.as_array().unwrap().len(), 2);
+        msg.sign(&key).unwrap();
+        router.try_send(msg).unwrap();
+
+        let hash = router.pending_outbound[0].hash.unwrap();
+        assert!(router.mark_outbound_delivered(&hash));
+
+        let mut next = LxMessage::new(dest, [0xBB; 16], "ticket", "later", DeliveryMethod::Direct);
+        next.include_ticket = true;
+        router.prepare_outbound(&mut next).unwrap();
+        assert!(!next.fields.contains_key(&FIELD_TICKET));
+    }
+
+    #[test]
+    fn externally_retained_message_updates_ticket_only_when_completed() {
+        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
+        let mut router = LxmRouter::new(RouterConfig::default());
+        let dest = [0xAC; 16];
+        let mut in_flight = LxMessage::new(
+            dest,
+            [0xBD; 16],
+            "ticket",
+            "proof",
+            DeliveryMethod::Opportunistic,
+        );
+        in_flight.include_ticket = true;
+        router.prepare_outbound(&mut in_flight).unwrap();
+        in_flight.sign(&key).unwrap();
+
+        let mut before_proof =
+            LxMessage::new(dest, [0xBD; 16], "ticket", "before", DeliveryMethod::Direct);
+        before_proof.include_ticket = true;
+        router.prepare_outbound(&mut before_proof).unwrap();
+        assert!(before_proof.fields.contains_key(&FIELD_TICKET));
+
+        router.complete_outbound_message(in_flight);
+
+        let mut after_proof =
+            LxMessage::new(dest, [0xBD; 16], "ticket", "after", DeliveryMethod::Direct);
+        after_proof.include_ticket = true;
+        router.prepare_outbound(&mut after_proof).unwrap();
+        assert!(!after_proof.fields.contains_key(&FIELD_TICKET));
+    }
+
+    #[test]
+    fn signed_message_requesting_ticket_fails_instead_of_invalidating_signature() {
+        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
+        let mut router = LxmRouter::new(RouterConfig::default());
+        let mut msg = LxMessage::new(
+            [0xAA; 16],
+            [0xBB; 16],
+            "ticket",
+            "late",
+            DeliveryMethod::Direct,
+        );
+        msg.include_ticket = true;
+        msg.sign(&key).unwrap();
+
+        assert!(matches!(
+            router.try_send(msg),
+            Err(SendError::TicketPreparation {
+                source: TicketPreparationError::AlreadySigned,
+                ..
+            })
+        ));
+        assert!(router.pending_outbound.is_empty());
+    }
+
+    #[test]
+    fn deliver_inbound_learns_ticket_only_after_signature_validation() {
+        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
+        let public = key.public_key();
+        let source = [0xBB; 16];
+        let mut sender = LxmRouter::new(RouterConfig::default());
+        let mut msg = LxMessage::new(
+            [0xAA; 16],
+            source,
+            "ticket",
+            "learn",
+            DeliveryMethod::Direct,
+        );
+        msg.include_ticket = true;
+        sender.prepare_outbound(&mut msg).unwrap();
+        msg.sign(&key).unwrap();
+
+        let mut unsigned_receiver = LxmRouter::new(RouterConfig::default());
+        assert!(unsigned_receiver.deliver_inbound(&msg, false));
+        assert!(unsigned_receiver.get_outbound_ticket(&source).is_none());
+
+        let mut verified = msg.clone();
+        assert!(verified.verify(&public));
+        let mut receiver = LxmRouter::new(RouterConfig::default());
+        assert!(receiver.deliver_inbound(&verified, false));
+        assert!(receiver.get_outbound_ticket(&source).is_some());
     }
 
     #[tokio::test]
@@ -2490,7 +2695,7 @@ mod tests {
         let mut msg = LxMessage::new(dest, [0xBB; 16], "defer", "stamp", DeliveryMethod::Direct);
         msg.sign(&key).unwrap();
         let message_id = msg.message_id.unwrap();
-        router.send(msg);
+        router.try_send(msg).unwrap();
 
         assert!(router.pending_outbound.is_empty());
         assert!(router.pending_deferred_stamps.contains_key(&message_id));
@@ -2534,7 +2739,7 @@ mod tests {
         );
         msg.sign(&key).unwrap();
         let message_id = msg.message_id.unwrap();
-        router.send(msg);
+        router.try_send(msg).unwrap();
         assert!(router.pending_deferred_stamps.contains_key(&message_id));
 
         // Drive entirely from a blocking thread (no implicit runtime).
@@ -2589,7 +2794,7 @@ mod tests {
         let mut msg = LxMessage::new(dest, [0xBB; 16], "cancel", "stamp", DeliveryMethod::Direct);
         msg.sign(&key).unwrap();
         let message_id = msg.message_id.unwrap();
-        router.send(msg);
+        router.try_send(msg).unwrap();
         router.process_deferred_stamps();
 
         assert!(router.active_deferred_stamp.is_some());
@@ -2634,13 +2839,16 @@ mod tests {
         assert!(router.get_inbound_tickets().is_empty());
 
         let token = router.generate_ticket(dest, None);
-        assert_eq!(router.get_outbound_ticket(&dest), Some(token));
-        assert!(router.get_outbound_ticket_expiry(&dest).unwrap() > now_f64());
+        assert!(router.get_outbound_ticket(&dest).is_none());
         assert_eq!(router.get_inbound_tickets().len(), 1);
+        assert_eq!(router.get_inbound_tickets()[0].token, token);
 
-        // remember_ticket adds another entry for the same dest.
+        // A remembered peer ticket is outbound and does not alter the
+        // locally-issued inbound set.
         router.remember_ticket(dest, [0x55; 16], now_f64() + 1000.0);
-        assert_eq!(router.get_inbound_tickets().len(), 2);
+        assert_eq!(router.get_inbound_tickets().len(), 1);
+        assert_eq!(router.get_outbound_ticket(&dest), Some([0x55; 16]));
+        assert!(router.get_outbound_ticket_expiry(&dest).unwrap() > now_f64());
     }
 
     #[test]
@@ -2648,8 +2856,12 @@ mod tests {
         let mut router = LxmRouter::new(RouterConfig::default());
         let dest = [0xAA; 16];
         let expires = now_f64() + 1000.0;
-        router.remember_ticket(dest, [0x01; 16], expires);
-        router.remember_ticket(dest, [0x02; 16], expires);
+        router
+            .ticket_store
+            .add_inbound(Ticket::new([0x01; 16], dest, expires));
+        router
+            .ticket_store
+            .add_inbound(Ticket::new([0x02; 16], dest, expires));
 
         // Stamp derived from the SECOND ticket must still validate.
         let message_id = [0x33u8; 32];
@@ -3000,7 +3212,7 @@ mod tests {
             "Content",
             DeliveryMethod::Direct,
         );
-        router.send(msg);
+        router.try_send(msg).unwrap();
         assert_eq!(router.pending_outbound.len(), 1);
         assert_eq!(router.pending_outbound[0].state, MessageState::Outbound);
     }
@@ -3035,7 +3247,7 @@ mod tests {
             DeliveryMethod::Direct,
         );
         msg.delivery_attempts = MAX_DELIVERY_ATTEMPTS + 1;
-        router.send(msg);
+        router.try_send(msg).unwrap();
 
         let actions = router.process_outbound();
         assert_eq!(actions.len(), 1);
@@ -3055,7 +3267,7 @@ mod tests {
             DeliveryMethod::Direct,
         );
         msg.delivery_attempts = MAX_DELIVERY_ATTEMPTS;
-        router.send(msg);
+        router.try_send(msg).unwrap();
 
         let actions = router.process_outbound();
         assert_eq!(actions.len(), 1);
@@ -3109,7 +3321,7 @@ mod tests {
             "Content",
             DeliveryMethod::Direct,
         );
-        router.send(msg);
+        router.try_send(msg).unwrap();
 
         let actions = router.process_outbound();
         let has_direct = actions
@@ -3133,7 +3345,7 @@ mod tests {
             "Content",
             DeliveryMethod::Propagated,
         );
-        router.send(msg);
+        router.try_send(msg).unwrap();
 
         let actions = router.process_outbound();
         let has_propagated = actions
@@ -3152,7 +3364,7 @@ mod tests {
             "Content",
             DeliveryMethod::Opportunistic,
         );
-        router.send(msg);
+        router.try_send(msg).unwrap();
 
         let actions = router.process_outbound();
         let has_opportunistic = actions
@@ -3171,7 +3383,10 @@ mod tests {
             "Content",
             DeliveryMethod::Propagated,
         );
-        router.send(msg);
+        assert!(matches!(
+            router.try_send(msg),
+            Err(SendError::MissingOutboundPropagationNode(_))
+        ));
 
         assert!(
             router.pending_outbound.is_empty(),
@@ -3193,7 +3408,7 @@ mod tests {
         msg.delivery_attempts = 1;
         msg.last_delivery_attempt = now_f64();
         msg.next_delivery_attempt = now_f64() + PATH_REQUEST_WAIT as f64;
-        router.send(msg);
+        router.try_send(msg).unwrap();
 
         assert!(router.process_outbound().is_empty());
         assert_eq!(router.trigger_outbound_for_delivery_announce(dest), 1);
@@ -3219,7 +3434,7 @@ mod tests {
         msg.delivery_attempts = 1;
         msg.last_delivery_attempt = now_f64();
         msg.next_delivery_attempt = now_f64() + PATH_REQUEST_WAIT as f64;
-        router.send(msg);
+        router.try_send(msg).unwrap();
 
         assert!(router.process_outbound().is_empty());
         assert_eq!(router.trigger_outbound_for_delivery_announce(dest), 1);
@@ -3244,7 +3459,7 @@ mod tests {
         msg.delivery_attempts = 1;
         msg.last_delivery_attempt = now_f64();
         msg.next_delivery_attempt = now_f64() + PATH_REQUEST_WAIT as f64;
-        router.send(msg);
+        router.try_send(msg).unwrap();
 
         assert!(router.process_outbound().is_empty());
 
@@ -3266,13 +3481,15 @@ mod tests {
         let mut router = LxmRouter::new(RouterConfig::default());
         let node = [0xCC; 16];
         router.set_outbound_propagation_node(Some(node));
-        router.send(LxMessage::new(
-            [0xAA; 16],
-            [0xBB; 16],
-            "Propagated",
-            "Content",
-            DeliveryMethod::Propagated,
-        ));
+        router
+            .try_send(LxMessage::new(
+                [0xAA; 16],
+                [0xBB; 16],
+                "Propagated",
+                "Content",
+                DeliveryMethod::Propagated,
+            ))
+            .unwrap();
 
         assert_eq!(
             router.trigger_outbound_for_propagation_node_announce([0xDD; 16], b"not-msgpack"),
@@ -3300,7 +3517,7 @@ mod tests {
         );
         // Anchor the timestamp comfortably past the expiry window.
         msg.timestamp = now_f64() - (MESSAGE_EXPIRY as f64) - 60.0;
-        router.send(msg);
+        router.try_send(msg).unwrap();
 
         let actions = router.process_outbound();
         assert_eq!(actions.len(), 1);
@@ -3332,7 +3549,7 @@ mod tests {
         // Simulate one failed attempt very recently.
         msg.delivery_attempts = 1;
         msg.last_delivery_attempt = now_f64() - 1.0; // 1 s ago, inside the 10 s window.
-        router.send(msg);
+        router.try_send(msg).unwrap();
 
         let actions = router.process_outbound();
         assert!(
@@ -3362,7 +3579,7 @@ mod tests {
         );
         msg.last_delivery_attempt = now_f64() - 1.0;
         router.set_outbound_propagation_node(Some([0xCC; 16]));
-        router.send(msg);
+        router.try_send(msg).unwrap();
 
         let actions = router.process_outbound();
         assert!(
@@ -3388,7 +3605,7 @@ mod tests {
             "Content",
             DeliveryMethod::Direct,
         );
-        router.send(msg);
+        router.try_send(msg).unwrap();
 
         let actions = router.process_outbound();
         assert_eq!(actions.len(), 1);
@@ -3419,7 +3636,7 @@ mod tests {
             DeliveryMethod::Opportunistic,
         );
         msg.sign(&signing_key).unwrap();
-        router.send(msg);
+        router.try_send(msg).unwrap();
 
         router.tick_with_encryptor(|_dest, plaintext| Ok(plaintext.to_vec()));
 
@@ -3881,20 +4098,24 @@ mod tests {
         config.ext.processing_limit = Some(1);
         let mut router = LxmRouter::new(config);
 
-        router.send(LxMessage::new(
-            [0x01; 16],
-            [0; 16],
-            "a",
-            "b",
-            DeliveryMethod::Direct,
-        ));
-        router.send(LxMessage::new(
-            [0x02; 16],
-            [0; 16],
-            "c",
-            "d",
-            DeliveryMethod::Direct,
-        ));
+        router
+            .try_send(LxMessage::new(
+                [0x01; 16],
+                [0; 16],
+                "a",
+                "b",
+                DeliveryMethod::Direct,
+            ))
+            .unwrap();
+        router
+            .try_send(LxMessage::new(
+                [0x02; 16],
+                [0; 16],
+                "c",
+                "d",
+                DeliveryMethod::Direct,
+            ))
+            .unwrap();
 
         let actions = router.process_outbound();
         assert_eq!(actions.len(), 1);
@@ -3922,7 +4143,7 @@ mod tests {
             &large_content,
             DeliveryMethod::Opportunistic,
         );
-        router.send(msg);
+        router.try_send(msg).unwrap();
 
         assert_eq!(router.pending_outbound[0].method, DeliveryMethod::Direct);
     }
@@ -3937,7 +4158,7 @@ mod tests {
             "Content",
             DeliveryMethod::Direct,
         );
-        router.send(msg);
+        router.try_send(msg).unwrap();
 
         let actions = router.process_outbound();
         assert_eq!(actions.len(), 1);
@@ -3964,7 +4185,7 @@ mod tests {
             "Content",
             DeliveryMethod::Propagated,
         );
-        router.send(msg);
+        router.try_send(msg).unwrap();
 
         let actions = router.process_outbound();
         assert_eq!(actions.len(), 1);
@@ -3986,7 +4207,7 @@ mod tests {
             "Content",
             DeliveryMethod::Opportunistic,
         );
-        router.send(msg);
+        router.try_send(msg).unwrap();
 
         let actions = router.process_outbound();
         assert_eq!(actions.len(), 1);
@@ -4014,7 +4235,7 @@ mod tests {
             DeliveryMethod::Direct,
         );
         msg.sign(&signing_key).unwrap();
-        router.send(msg);
+        router.try_send(msg).unwrap();
 
         router.tick();
 

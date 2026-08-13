@@ -2,7 +2,7 @@
 //!
 //! Files:
 //! * `outbound_stamp_costs` — `HashMap<dest_hash, StampCostEntry>`
-//! * `available_tickets` — `Vec<Ticket>`
+//! * `available_tickets` — versioned directional ticket state
 //! * `local_deliveries` — `HashMap<transient_id, timestamp>`
 //! * `locally_processed` — `HashMap<transient_id, timestamp>`
 //!
@@ -16,7 +16,7 @@ use std::io;
 use std::path::Path;
 
 use crate::router::StampCostEntry;
-use crate::ticket::Ticket;
+use crate::ticket::{Ticket, TicketStoreSnapshot};
 use crate::types::PropagationTransientId;
 
 pub const STAMP_COSTS_FILE: &str = "outbound_stamp_costs";
@@ -110,12 +110,23 @@ pub fn load_stamp_costs(dir: &Path) -> io::Result<HashMap<[u8; 16], StampCostEnt
     Ok(read_mpk(&dir.join(STAMP_COSTS_FILE))?.unwrap_or_default())
 }
 
-pub fn save_tickets(dir: &Path, tickets: &[Ticket]) -> io::Result<()> {
-    write_mpk(&dir.join(TICKETS_FILE), &tickets)
+pub fn save_tickets(dir: &Path, tickets: &TicketStoreSnapshot) -> io::Result<()> {
+    write_mpk(&dir.join(TICKETS_FILE), tickets)
 }
 
-pub fn load_tickets(dir: &Path) -> io::Result<Vec<Ticket>> {
-    Ok(read_mpk(&dir.join(TICKETS_FILE))?.unwrap_or_default())
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum PersistedTickets {
+    Directional(TicketStoreSnapshot),
+    Legacy(Vec<Ticket>),
+}
+
+pub fn load_tickets(dir: &Path) -> io::Result<(TicketStoreSnapshot, Option<Vec<Ticket>>)> {
+    Ok(match read_mpk(&dir.join(TICKETS_FILE))? {
+        Some(PersistedTickets::Directional(snapshot)) => (snapshot, None),
+        Some(PersistedTickets::Legacy(tickets)) => (TicketStoreSnapshot::default(), Some(tickets)),
+        None => (TicketStoreSnapshot::default(), None),
+    })
 }
 
 pub fn save_local_deliveries(
@@ -176,12 +187,26 @@ mod tests {
     #[test]
     fn tickets_roundtrip() {
         let tmp = TempDir::new().unwrap();
-        let tickets = vec![Ticket::new([0x01; 16], [0x02; 16], 9_999.0)];
+        let tickets = TicketStoreSnapshot {
+            version: 1,
+            outbound: vec![Ticket::new([0x01; 16], [0x02; 16], 9_999.0)],
+            inbound: vec![Ticket::new([0x03; 16], [0x04; 16], 8_888.0)],
+            last_deliveries: HashMap::from([([0x02; 16], 7_777.0)]),
+        };
         save_tickets(tmp.path(), &tickets).unwrap();
-        let loaded = load_tickets(tmp.path()).unwrap();
-        assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].token, [0x01; 16]);
-        assert_eq!(loaded[0].destination_hash, [0x02; 16]);
+        let (loaded, legacy) = load_tickets(tmp.path()).unwrap();
+        assert!(legacy.is_none());
+        assert_eq!(loaded, tickets);
+    }
+
+    #[test]
+    fn legacy_flat_tickets_are_detected_for_migration() {
+        let tmp = TempDir::new().unwrap();
+        let tickets = vec![Ticket::new([0x01; 16], [0x02; 16], 9_999.0)];
+        write_mpk(&tmp.path().join(TICKETS_FILE), &tickets).unwrap();
+        let (snapshot, legacy) = load_tickets(tmp.path()).unwrap();
+        assert_eq!(snapshot, TicketStoreSnapshot::default());
+        assert_eq!(legacy.unwrap(), tickets);
     }
 
     #[test]
@@ -198,7 +223,9 @@ mod tests {
     fn missing_file_returns_default() {
         let tmp = TempDir::new().unwrap();
         assert!(load_stamp_costs(tmp.path()).unwrap().is_empty());
-        assert!(load_tickets(tmp.path()).unwrap().is_empty());
+        let (tickets, legacy) = load_tickets(tmp.path()).unwrap();
+        assert_eq!(tickets, TicketStoreSnapshot::default());
+        assert!(legacy.is_none());
         assert!(load_local_deliveries(tmp.path()).unwrap().is_empty());
         assert!(load_locally_processed(tmp.path()).unwrap().is_empty());
         assert_eq!(

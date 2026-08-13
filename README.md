@@ -284,7 +284,7 @@ and, where network-backed, through `lxmd-rs --send-method`.
 
 | Method | Behavior |
 | --- | --- |
-| Opportunistic | Single-packet delivery when the packed message fits the Reticulum packet path. Oversized opportunistic messages are downgraded to Direct by the router. |
+| Opportunistic | Single-packet delivery when the packed message fits the Reticulum packet path. Delivery completes only after an authenticated Reticulum proof; bounded retries remain in flight until then. Oversized opportunistic messages are downgraded to Direct by the router. |
 | Direct | Link-backed delivery over a Reticulum Link, with resource transfer for larger content. |
 | Propagated | Store-and-forward delivery through a propagation node, including deposit, retrieve, peer sync, stamps, and tickets. |
 | Paper | Library support for `lxm://` URI generation and ingest. The CLI does not generate QR images. |
@@ -302,6 +302,10 @@ payload           MessagePack([timestamp, title, content, fields, optional_stamp
 application-defined data such as tickets, attachments, location data, or
 application envelopes.
 
+Library callers requesting a reply ticket set `include_ticket`, call
+`LxmRouter::prepare_outbound`, and then sign the message. The router rejects a
+requested ticket that would require changing an already-signed message.
+
 
 ## Feature Status
 
@@ -309,8 +313,8 @@ application envelopes.
 | --- | --- |
 | Message format | Signed LXMF envelopes, custom field maps, standard reply/reaction/comment fields, propagation wrappers, `.lxm` containers, and paper URI encode/decode. |
 | Delivery | Opportunistic, Direct, Propagated, callbacks, failure callbacks, cancellation, progress state, opportunistic-to-direct downgrade, and compression signalling in delivery announces. |
-| Propagation | Disk-backed store, deposit, retrieve, peer sync, autopeer/static peers, weighted culling, duplicate checks, size checks, and stamp checks. |
-| Stamps and tickets | Soft/hard stamp validation, HKDF-expanded workblocks, cached destination stamp costs, propagation tickets, and restart-safe ticket persistence. |
+| Propagation | Transactional disk-backed store, deposit, retrieve, peer sync, autopeer/static peers, weighted culling, duplicate checks, size checks, and stamp checks. |
+| Stamps and tickets | Soft/hard stamp validation, HKDF-expanded workblocks, cached destination stamp costs, automatic reply-ticket issue and signed learning, ticket-backed stamps, and restart-safe directional persistence. |
 | Control | `--status`, `--peers`, `--sync`, and `--break` over the propagation-control link. |
 | Access lists | `ignored` and `allowed` hash-list files in the LXMF config directory. |
 

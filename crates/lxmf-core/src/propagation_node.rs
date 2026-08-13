@@ -159,6 +159,45 @@ pub fn read_planned_messages(
         .collect()
 }
 
+/// One propagation-store admission reserved under the node lock. Persist it
+/// on a blocking worker, then commit the returned value under a short lock.
+#[derive(Debug)]
+pub struct PropagationStoreWritePlan {
+    entry: PropagationEntry,
+    data: Vec<u8>,
+    path: Option<PathBuf>,
+}
+
+impl PropagationStoreWritePlan {
+    pub fn transient_id(&self) -> PropagationTransientId {
+        self.entry.transient_id
+    }
+
+    pub fn size(&self) -> usize {
+        self.entry.size
+    }
+
+    /// Perform the potentially blocking durable write. Disk-backed nodes use
+    /// atomic temp-file replacement; in-memory nodes complete immediately.
+    pub fn persist(self) -> std::io::Result<PersistedPropagationStoreWrite> {
+        if let Some(ref path) = self.path {
+            crate::persist::write_file_atomic(path, &self.data)?;
+        }
+        Ok(PersistedPropagationStoreWrite {
+            entry: self.entry,
+            path: self.path,
+        })
+    }
+}
+
+/// Durable half of a propagation-store admission, ready for an in-memory
+/// commit under the node lock.
+#[derive(Debug)]
+pub struct PersistedPropagationStoreWrite {
+    entry: PropagationEntry,
+    path: Option<PathBuf>,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct SyncOfferCandidateSnapshot {
     transient_id: PropagationTransientId,
@@ -296,6 +335,11 @@ pub struct PropagationNode {
     /// scheduling and offer-preparation revalidation use this to avoid both
     /// stale offers and repeated scans of an unchanged fully-handled store.
     offer_generation: u64,
+    /// IDs and bytes reserved by off-lock store writes. Reservations prevent
+    /// duplicate acceptance and storage-cap oversubscription while I/O is in
+    /// flight.
+    pending_write_ids: HashSet<PropagationTransientId>,
+    pending_write_bytes: usize,
 }
 
 impl PropagationNode {
@@ -309,6 +353,8 @@ impl PropagationNode {
             storage_path: None,
             last_offer_times: HashMap::new(),
             offer_generation: 0,
+            pending_write_ids: HashSet::new(),
+            pending_write_bytes: 0,
         }
     }
 
@@ -368,9 +414,89 @@ impl PropagationNode {
             storage_path: Some(storage_path),
             last_offer_times: HashMap::new(),
             offer_generation: 0,
+            pending_write_ids: HashSet::new(),
+            pending_write_bytes: 0,
         };
         node.load_from_disk()?;
         Ok(node)
+    }
+
+    fn reserve_store_write(
+        &mut self,
+        entry: PropagationEntry,
+        data: Vec<u8>,
+    ) -> Option<PropagationStoreWritePlan> {
+        let transient_id = entry.transient_id;
+        if self.store.contains(&transient_id) || self.pending_write_ids.contains(&transient_id) {
+            return None;
+        }
+        // Python checks the current store size before inserting and permits
+        // the message that crosses the cap; the next admission is rejected
+        // until culling makes room. Include reservations in that current-size
+        // view so concurrent writers cannot all pass the same preflight.
+        let occupied = self
+            .store
+            .total_size()
+            .saturating_add(self.pending_write_bytes);
+        if occupied > self.config.max_storage {
+            return None;
+        }
+
+        self.pending_write_ids.insert(transient_id);
+        self.pending_write_bytes = self.pending_write_bytes.saturating_add(data.len());
+        let path = self
+            .storage_path
+            .as_ref()
+            .map(|dir| dir.join(entry.filename()));
+        Some(PropagationStoreWritePlan { entry, data, path })
+    }
+
+    /// Release a reservation after a failed blocking write.
+    pub fn abort_store_write(&mut self, transient_id: &PropagationTransientId, size: usize) {
+        if self.pending_write_ids.remove(transient_id) {
+            self.pending_write_bytes = self.pending_write_bytes.saturating_sub(size);
+        }
+    }
+
+    /// Commit a successfully persisted admission. The normal path performs no
+    /// filesystem I/O while holding the node lock.
+    pub fn commit_store_write(&mut self, persisted: PersistedPropagationStoreWrite) -> bool {
+        let transient_id = persisted.entry.transient_id;
+        let size = persisted.entry.size;
+        if !self.pending_write_ids.remove(&transient_id) {
+            if let Some(path) = persisted.path {
+                let _ = std::fs::remove_file(path);
+            }
+            return false;
+        }
+        self.pending_write_bytes = self.pending_write_bytes.saturating_sub(size);
+
+        let inserted = self.store.insert(persisted.entry);
+        if inserted {
+            self.advance_offer_generation();
+        } else if let Some(path) = persisted.path {
+            // Reservation loss/duplicate commit is exceptional; cleanup is a
+            // short best-effort operation and never occurs on normal traffic.
+            let _ = std::fs::remove_file(path);
+        }
+        inserted
+    }
+
+    fn persist_reserved(&mut self, plan: PropagationStoreWritePlan) -> bool {
+        let transient_id = plan.transient_id();
+        let size = plan.size();
+        match plan.persist() {
+            Ok(persisted) => self.commit_store_write(persisted),
+            Err(error) => {
+                self.abort_store_write(&transient_id, size);
+                tracing::warn!(
+                    transient_id = %hex::encode(transient_id),
+                    %error,
+                    "failed to persist propagation message"
+                );
+                false
+            }
+        }
     }
 
     /// Returns `true` if the message was stored, `false` on duplicate, overflow,
@@ -384,28 +510,22 @@ impl PropagationNode {
             size = message.content.len(),
         ),
     )]
-    pub fn accept_message(&mut self, message: &LxMessage) -> bool {
-        let hash = match message.hash {
-            Some(h) => h,
-            None => return false,
-        };
+    pub fn plan_accept_message(
+        &mut self,
+        message: &LxMessage,
+    ) -> Option<PropagationStoreWritePlan> {
+        let hash = message.hash?;
 
         let transient_id = message.transient_id.unwrap_or(hash);
         if self.store.contains(&transient_id) {
-            return false;
-        }
-        if self.store.total_size() > self.config.max_storage {
-            return false;
+            return None;
         }
 
-        let packed = match message.pack() {
-            Ok(p) => p,
-            Err(_) => return false,
-        };
+        let packed = message.pack().ok()?;
         let msg_size = packed.len();
 
         if msg_size > self.config.max_message_size {
-            return false;
+            return None;
         }
 
         // Compute stamp value via HKDF workblock over full_hash(packed) using
@@ -426,26 +546,21 @@ impl PropagationNode {
         };
 
         if self.config.min_stamp_cost > 0 && sv < self.config.min_stamp_cost {
-            return false;
+            return None;
         }
 
         let mut entry =
             PropagationEntry::new(transient_id, hash, message.destination_hash, msg_size, sv);
         entry.stored_at = message.timestamp;
 
-        if let Some(ref dir) = self.storage_path {
-            let path = dir.join(entry.filename());
-            if let Err(e) = std::fs::write(&path, &packed) {
-                // In-memory insert still proceeds on disk failure.
-                tracing::warn!(error = %e, "failed to persist propagation message");
-            }
-        }
+        self.reserve_store_write(entry, packed)
+    }
 
-        let inserted = self.store.insert(entry);
-        if inserted {
-            self.advance_offer_generation();
-        }
-        inserted
+    pub fn accept_message(&mut self, message: &LxMessage) -> bool {
+        let Some(plan) = self.plan_accept_message(message) else {
+            return false;
+        };
+        self.persist_reserved(plan)
     }
 
     /// Store an already propagation-packed LXMF blob (`dest_hash || encrypted_data`).
@@ -454,23 +569,24 @@ impl PropagationNode {
     /// [`Self::accept_message`], the node cannot decrypt or unpack this data;
     /// it indexes by the transient ID and serves the raw blob back to the
     /// destination client during `/get`.
-    pub fn accept_propagated_blob(&mut self, lxmf_data: &[u8], stamp_value: u8) -> bool {
+    pub fn plan_accept_propagated_blob(
+        &mut self,
+        lxmf_data: &[u8],
+        stamp_value: u8,
+    ) -> Option<PropagationStoreWritePlan> {
         if lxmf_data.len() < DESTINATION_LENGTH + 1 {
-            return false;
+            return None;
         }
         if self.config.min_stamp_cost > 0 && stamp_value < self.config.min_stamp_cost {
-            return false;
+            return None;
         }
 
         let transient_id = rns_crypto::sha::full_hash(lxmf_data);
         if self.store.contains(&transient_id) {
-            return false;
-        }
-        if self.store.total_size() > self.config.max_storage {
-            return false;
+            return None;
         }
         if lxmf_data.len() > self.config.max_message_size {
-            return false;
+            return None;
         }
 
         let mut destination_hash = [0u8; 16];
@@ -484,18 +600,14 @@ impl PropagationNode {
             stamp_value,
         );
 
-        if let Some(ref dir) = self.storage_path {
-            let path = dir.join(entry.filename());
-            if let Err(e) = std::fs::write(&path, lxmf_data) {
-                tracing::warn!(error = %e, "failed to persist propagated message");
-            }
-        }
+        self.reserve_store_write(entry, lxmf_data.to_vec())
+    }
 
-        let inserted = self.store.insert(entry);
-        if inserted {
-            self.advance_offer_generation();
-        }
-        inserted
+    pub fn accept_propagated_blob(&mut self, lxmf_data: &[u8], stamp_value: u8) -> bool {
+        let Some(plan) = self.plan_accept_propagated_blob(lxmf_data, stamp_value) else {
+            return false;
+        };
+        self.persist_reserved(plan)
     }
 
     /// Store a validated propagated LXMF blob with its propagation-node stamp.
@@ -504,33 +616,30 @@ impl PropagationNode {
     /// `lxmf_data || stamp` on disk so peer sync can forward proof-carrying
     /// data. Client `/get` strips the final 32-byte stamp before returning
     /// messages to recipients.
-    pub fn accept_stamped_propagated_blob(
+    pub fn plan_accept_stamped_propagated_blob(
         &mut self,
         lxmf_data: &[u8],
         stamp_data: &[u8; 32],
         stamp_value: u8,
-    ) -> bool {
+    ) -> Option<PropagationStoreWritePlan> {
         if lxmf_data.len() < DESTINATION_LENGTH + 1 {
-            return false;
+            return None;
         }
         if self.config.min_stamp_cost > 0 && stamp_value < self.config.min_stamp_cost {
-            return false;
+            return None;
         }
 
         let transient_id = rns_crypto::sha::full_hash(lxmf_data);
         if self.store.contains(&transient_id) {
-            return false;
+            return None;
         }
 
         let mut stored_data = Vec::with_capacity(lxmf_data.len() + stamp_data.len());
         stored_data.extend_from_slice(lxmf_data);
         stored_data.extend_from_slice(stamp_data);
 
-        if self.store.total_size() > self.config.max_storage {
-            return false;
-        }
         if stored_data.len() > self.config.max_message_size {
-            return false;
+            return None;
         }
 
         let mut destination_hash = [0u8; 16];
@@ -544,18 +653,21 @@ impl PropagationNode {
             stamp_value,
         );
 
-        if let Some(ref dir) = self.storage_path {
-            let path = dir.join(entry.filename());
-            if let Err(e) = std::fs::write(&path, &stored_data) {
-                tracing::warn!(error = %e, "failed to persist stamped propagated message");
-            }
-        }
+        self.reserve_store_write(entry, stored_data)
+    }
 
-        let inserted = self.store.insert(entry);
-        if inserted {
-            self.advance_offer_generation();
-        }
-        inserted
+    pub fn accept_stamped_propagated_blob(
+        &mut self,
+        lxmf_data: &[u8],
+        stamp_data: &[u8; 32],
+        stamp_value: u8,
+    ) -> bool {
+        let Some(plan) =
+            self.plan_accept_stamped_propagated_blob(lxmf_data, stamp_data, stamp_value)
+        else {
+            return false;
+        };
+        self.persist_reserved(plan)
     }
 
     fn load_from_disk(&mut self) -> std::io::Result<()> {
@@ -1395,6 +1507,44 @@ mod tests {
         let mut node = PropagationNode::new(PropagationNodeConfig::default(), [0xAA; 16]);
         let msg = make_signed_message([0xBB; 16], [0xCC; 16], "Test", "content");
         assert!(msg.hash.is_some());
+        assert!(node.accept_message(&msg));
+        assert_eq!(node.message_count(), 1);
+    }
+
+    #[test]
+    fn store_write_reservation_blocks_duplicates_until_durable_commit() {
+        let mut node = PropagationNode::new(PropagationNodeConfig::default(), [0xAA; 16]);
+        let msg = make_signed_message([0xBB; 16], [0xCC; 16], "Test", "reserved");
+        let plan = node.plan_accept_message(&msg).expect("first reservation");
+        assert_eq!(node.message_count(), 0, "reservation is not served state");
+        assert!(node.plan_accept_message(&msg).is_none());
+
+        let persisted = plan.persist().unwrap();
+        assert!(node.commit_store_write(persisted));
+        assert_eq!(node.message_count(), 1);
+    }
+
+    #[test]
+    fn failed_store_write_is_not_inserted_and_releases_reservation() {
+        let root = tempfile::tempdir().unwrap();
+        let store_dir = root.path().join("store");
+        let mut node = PropagationNode::with_storage(
+            PropagationNodeConfig::default(),
+            [0xAA; 16],
+            store_dir.clone(),
+        )
+        .unwrap();
+        let msg = make_signed_message([0xBB; 16], [0xCC; 16], "Test", "durable");
+        let plan = node.plan_accept_message(&msg).expect("reservation");
+        let transient_id = plan.transient_id();
+        let size = plan.size();
+        std::fs::remove_dir(&store_dir).unwrap();
+
+        assert!(plan.persist().is_err());
+        node.abort_store_write(&transient_id, size);
+        assert_eq!(node.message_count(), 0);
+
+        std::fs::create_dir(&store_dir).unwrap();
         assert!(node.accept_message(&msg));
         assert_eq!(node.message_count(), 1);
     }

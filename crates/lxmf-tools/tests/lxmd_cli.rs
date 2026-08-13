@@ -289,7 +289,7 @@ fn clap_requires_send_argument() {
 }
 
 #[test]
-fn status_and_peers_query_control_and_timeout_without_daemon() {
+fn status_and_peers_fail_before_link_without_an_online_interface() {
     let lxmf_dir = TestDir::new("lxmf");
     let rns_dir = TestDir::new("rns");
     write_rust_identity(&lxmf_dir.path().join("identity"));
@@ -323,12 +323,13 @@ discover_interfaces = No
     assert_eq!(
         output.status.code(),
         Some(200),
-        "expected Python-compatible control timeout, got:\n{}",
+        "expected interface-readiness failure, got:\n{}",
         combined_output(&output)
     );
     assert!(
-        combined_output(&output).contains("Getting lxmd statistics timed out, exiting now"),
-        "expected Python-compatible control timeout text, got:\n{}",
+        combined_output(&output)
+            .contains("No online Reticulum interface became available, exiting now"),
+        "expected specific interface-readiness error, got:\n{}",
         combined_output(&output)
     );
     assert!(

@@ -101,6 +101,10 @@ pub struct LxMessage {
     pub stamp_cost: Option<u8>,
     /// Outbound ticket for stamp bypass (16 bytes).
     pub outbound_ticket: Option<[u8; 16]>,
+    /// Ask the router to include a reply ticket before this message is signed.
+    ///
+    /// Python reference: `LXMessage.include_ticket`.
+    pub include_ticket: bool,
     /// Computed stamp value: leading zero bits, or `COST_TICKET`.
     pub stamp_value: Option<u16>,
     pub unverified_reason: Option<UnverifiedReason>,
@@ -170,6 +174,7 @@ impl LxMessage {
             transient_id: None,
             stamp_cost: None,
             outbound_ticket: None,
+            include_ticket: false,
             stamp_value: None,
             unverified_reason: None,
             representation: DeliveryRepresentation::Unknown,
@@ -551,6 +556,7 @@ impl LxMessage {
             transient_id: None,
             stamp_cost: None,
             outbound_ticket: None,
+            include_ticket: false,
             stamp_value: None,
             unverified_reason: None,
             representation: DeliveryRepresentation::Unknown,
