@@ -15,12 +15,13 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use rns_crypto::ed25519::{Ed25519PrivateKey, Ed25519PublicKey};
-use rns_link::link::{CloseReason, Link};
+use rns_link::link::{CloseReason, Link, LinkAction};
 use rns_protocol::resource::{
     MAX_EFFICIENT_SIZE, MultiSegmentOutbound, OutboundTransfer, ResourceError, TransferAction,
 };
 use rns_transport::link_messages::DestinationEvent;
 use rns_transport::messages::{OutboundRequest, TransportMessage};
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::constants::OFFER_REQUEST_PATH;
@@ -50,7 +51,7 @@ pub enum PeerSyncTerminalState {
     Failed,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PeerSyncTerminalResult {
     pub peer_hash: [u8; 16],
     pub state: PeerSyncTerminalState,
@@ -60,6 +61,13 @@ pub struct PeerSyncTerminalResult {
     /// True only when no cumulative-limit or vanished-file work remains for
     /// this generation.
     pub generation_exhausted: bool,
+    /// Peer accounting deltas matching Python `LXMPeer.offer_response()` and
+    /// `resource_concluded()` semantics.
+    pub offered: u64,
+    pub outgoing: u64,
+    pub tx_bytes: u64,
+    pub link_establishment_rate: Option<f64>,
+    pub sync_transfer_rate: Option<f64>,
 }
 
 #[derive(Debug)]
@@ -113,6 +121,7 @@ pub struct PropagationSyncTask {
     sync_started: Option<Instant>,
     sync_timeout: Duration,
     active_transfer: Option<OutboundTransfer>,
+    active_transfer_requested: bool,
     pending_transfer_segments: VecDeque<OutboundTransfer>,
     active_transfer_ids: Vec<PropagationTransientId>,
     transfer_preparation_rx: Option<oneshot::Receiver<PreparedTransferBatch>>,
@@ -128,6 +137,14 @@ pub struct PropagationSyncTask {
     active_offer_generation: Option<u64>,
     generation_exhausted: bool,
     terminal_result: Option<PeerSyncTerminalResult>,
+    pending_transport: VecDeque<TransportMessage>,
+    preserve_pending_on_cleanup: bool,
+    offered_count: u64,
+    outgoing_count: u64,
+    transfer_data_size: u64,
+    transfer_wire_size: u64,
+    transfer_started: Option<Instant>,
+    link_establishment_rate: Option<f64>,
 }
 
 impl PropagationSyncTask {
@@ -150,6 +167,7 @@ impl PropagationSyncTask {
             sync_started: None,
             sync_timeout: Duration::from_secs(120),
             active_transfer: None,
+            active_transfer_requested: false,
             pending_transfer_segments: VecDeque::new(),
             active_transfer_ids: Vec::new(),
             transfer_preparation_rx: None,
@@ -165,6 +183,14 @@ impl PropagationSyncTask {
             active_offer_generation: None,
             generation_exhausted: false,
             terminal_result: None,
+            pending_transport: VecDeque::new(),
+            preserve_pending_on_cleanup: false,
+            offered_count: 0,
+            outgoing_count: 0,
+            transfer_data_size: 0,
+            transfer_wire_size: 0,
+            transfer_started: None,
+            link_establishment_rate: None,
         }
     }
 
@@ -193,6 +219,7 @@ impl PropagationSyncTask {
             sync_started: None,
             sync_timeout: Duration::from_secs(120),
             active_transfer: None,
+            active_transfer_requested: false,
             pending_transfer_segments: VecDeque::new(),
             active_transfer_ids: Vec::new(),
             transfer_preparation_rx: None,
@@ -208,6 +235,14 @@ impl PropagationSyncTask {
             active_offer_generation: None,
             generation_exhausted: false,
             terminal_result: None,
+            pending_transport: VecDeque::new(),
+            preserve_pending_on_cleanup: false,
+            offered_count: 0,
+            outgoing_count: 0,
+            transfer_data_size: 0,
+            transfer_wire_size: 0,
+            transfer_started: None,
+            link_establishment_rate: None,
         })
     }
 
@@ -232,6 +267,7 @@ impl PropagationSyncTask {
             sync_started: None,
             sync_timeout: Duration::from_secs(120),
             active_transfer: None,
+            active_transfer_requested: false,
             pending_transfer_segments: VecDeque::new(),
             active_transfer_ids: Vec::new(),
             transfer_preparation_rx: None,
@@ -247,6 +283,14 @@ impl PropagationSyncTask {
             active_offer_generation: None,
             generation_exhausted: false,
             terminal_result: None,
+            pending_transport: VecDeque::new(),
+            preserve_pending_on_cleanup: false,
+            offered_count: 0,
+            outgoing_count: 0,
+            transfer_data_size: 0,
+            transfer_wire_size: 0,
+            transfer_started: None,
+            link_establishment_rate: None,
         }
     }
 
@@ -271,7 +315,9 @@ impl PropagationSyncTask {
         }
         self.node_dest_hash = Some(dest_hash);
         self.offer_policy = None;
-        self.start_sync(dest_hash);
+        if !self.start_sync(dest_hash) {
+            return false;
+        }
         self.last_sync = Instant::now();
         true
     }
@@ -284,7 +330,9 @@ impl PropagationSyncTask {
         let dest_hash = policy.peer_hash;
         self.node_dest_hash = Some(dest_hash);
         self.offer_policy = Some(policy);
-        self.start_sync(dest_hash);
+        if !self.start_sync(dest_hash) {
+            return false;
+        }
         self.last_sync = Instant::now();
         true
     }
@@ -334,12 +382,14 @@ impl PropagationSyncTask {
         self.transfer_preparation_rx = None;
         self.ready_transfer_batch = None;
         self.active_transfer = None;
+        self.active_transfer_requested = false;
         self.pending_transfer_segments.clear();
         self.active_transfer_ids.clear();
         self.active_offer_generation = None;
         self.generation_exhausted = false;
         self.handled_updates.clear();
         self.terminal_result = None;
+        self.reset_attempt_accounting();
         self.state = SyncTaskState::Idle;
         true
     }
@@ -353,6 +403,51 @@ impl PropagationSyncTask {
             self.runtime_handle = tokio::runtime::Handle::try_current().ok();
         }
         self.runtime_handle.clone()
+    }
+
+    /// Preserve protocol packet ordering while tolerating temporary pressure
+    /// on the bounded Reticulum transport actor mailbox. A full mailbox is a
+    /// retryable local condition, not packet loss.
+    fn queue_transport(&mut self, message: TransportMessage) -> bool {
+        if !self.pending_transport.is_empty() {
+            self.pending_transport.push_back(message);
+            return true;
+        }
+
+        match self.transport_tx.try_send(message) {
+            Ok(()) => true,
+            Err(TrySendError::Full(message)) => {
+                self.pending_transport.push_back(message);
+                true
+            }
+            Err(TrySendError::Closed(_)) => false,
+        }
+    }
+
+    fn flush_pending_transport(&mut self) -> bool {
+        while let Some(message) = self.pending_transport.pop_front() {
+            match self.transport_tx.try_send(message) {
+                Ok(()) => {}
+                Err(TrySendError::Full(message)) => {
+                    self.pending_transport.push_front(message);
+                    break;
+                }
+                Err(TrySendError::Closed(_)) => {
+                    self.pending_transport.clear();
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    fn reset_attempt_accounting(&mut self) {
+        self.offered_count = 0;
+        self.outgoing_count = 0;
+        self.transfer_data_size = 0;
+        self.transfer_wire_size = 0;
+        self.transfer_started = None;
+        self.link_establishment_rate = None;
     }
 
     pub fn accept_message(&mut self, msg: &crate::message::LxMessage) -> bool {
@@ -490,13 +585,28 @@ impl PropagationSyncTask {
             return;
         }
         let actions = transfer.handle_request(&plaintext);
+        self.active_transfer_requested = true;
 
         for action in actions {
             match action {
-                TransferAction::SendPart(_, part_data) => self
-                    .send_resource_packet(&part_data, rns_wire::context::PacketContext::Resource),
-                TransferAction::SendHmu(hmu_data) => self
-                    .send_resource_packet(&hmu_data, rns_wire::context::PacketContext::ResourceHmu),
+                TransferAction::SendPart(_, part_data) => {
+                    if !self.send_resource_packet(
+                        &part_data,
+                        rns_wire::context::PacketContext::Resource,
+                    ) {
+                        self.fail_active_transfer();
+                        break;
+                    }
+                }
+                TransferAction::SendHmu(hmu_data) => {
+                    if !self.send_resource_packet(
+                        &hmu_data,
+                        rns_wire::context::PacketContext::ResourceHmu,
+                    ) {
+                        self.fail_active_transfer();
+                        break;
+                    }
+                }
                 TransferAction::SendCancel(cancel_type, resource_hash) => {
                     let context = match cancel_type {
                         rns_protocol::resource::CancelType::Icl => {
@@ -506,7 +616,7 @@ impl PropagationSyncTask {
                             rns_wire::context::PacketContext::ResourceRcl
                         }
                     };
-                    self.send_resource_packet(&resource_hash, context);
+                    let _ = self.send_resource_packet(&resource_hash, context);
                     self.fail_active_transfer();
                     break;
                 }
@@ -551,6 +661,7 @@ impl PropagationSyncTask {
 
     fn fail_active_transfer(&mut self) {
         self.active_transfer = None;
+        self.active_transfer_requested = false;
         self.pending_transfer_segments.clear();
         self.active_transfer_ids.clear();
         self.state = SyncTaskState::Failed;
@@ -575,6 +686,7 @@ impl PropagationSyncTask {
 
         if verified {
             self.active_transfer = None;
+            self.active_transfer_requested = false;
             self.pending_transfer_segments.clear();
             self.active_transfer_ids.clear();
             self.transfer_preparation_rx = None;
@@ -591,12 +703,12 @@ impl PropagationSyncTask {
         verify_key: &Ed25519PublicKey,
         ed25519_pub: &[u8; 32],
     ) {
-        let link = match self.link.as_mut() {
-            Some(l) => l,
+        let proof_result = match self.link.as_mut() {
+            Some(link) => link.validate_proof(proof_data, verify_key, ed25519_pub),
             None => return,
         };
 
-        match link.validate_proof(proof_data, verify_key, ed25519_pub) {
+        match proof_result {
             Ok(rtt_data) => {
                 // RTT packet = message 3 of the link handshake.
                 if let Some(link_id) = self.link_id {
@@ -616,18 +728,18 @@ impl PropagationSyncTask {
                     let mut rtt_raw = rtt_header.pack();
                     rtt_raw.extend_from_slice(&rtt_data);
 
-                    let _ =
-                        self.transport_tx
-                            .try_send(TransportMessage::Outbound(OutboundRequest {
-                                raw: Bytes::from(rtt_raw),
-                                destination_hash: link_id,
-                            }));
+                    if !self.queue_transport(TransportMessage::Outbound(OutboundRequest {
+                        raw: Bytes::from(rtt_raw),
+                        destination_hash: link_id,
+                    })) {
+                        self.state = SyncTaskState::Failed;
+                        return;
+                    }
 
                     // Python LXMPeer.py:530-538
-                    let establishment_rate = link.rtt.map(|d| {
-                        let secs = d.as_secs_f64();
-                        if secs > 0.0 { 1.0 / secs } else { 0.0 }
-                    });
+                    let establishment_rate =
+                        self.link.as_ref().and_then(|link| link.establishment_rate);
+                    self.link_establishment_rate = establishment_rate;
                     if let Some(ref mut peer) = self.peer {
                         peer.link_established(link_id, establishment_rate);
                     }
@@ -637,6 +749,7 @@ impl PropagationSyncTask {
                     return;
                 }
                 self.state = SyncTaskState::Offering;
+                self.sync_started = Some(Instant::now());
             }
             Err(_) => {
                 self.state = SyncTaskState::Failed;
@@ -753,12 +866,35 @@ impl PropagationSyncTask {
     }
 
     pub fn tick(&mut self) {
-        if let Some(started) = self.sync_started {
-            if started.elapsed() > self.sync_timeout && self.state != SyncTaskState::Idle {
-                self.cleanup_sync();
-                self.state = SyncTaskState::Failed;
-                return;
-            }
+        if !self.flush_pending_transport() && self.state != SyncTaskState::Idle {
+            self.state = SyncTaskState::Failed;
+        }
+
+        // Link establishment and offer requests retain a bounded phase
+        // timeout. Resource transfers deliberately do not have an absolute
+        // wall-clock deadline: Python RNS advances them by activity/retry
+        // watchdogs and permits a large, healthy sync to run to completion.
+        if matches!(
+            self.state,
+            SyncTaskState::Establishing | SyncTaskState::AwaitingResponse
+        ) && self
+            .sync_started
+            .is_some_and(|started| started.elapsed() > self.sync_timeout)
+        {
+            self.state = SyncTaskState::Failed;
+        }
+
+        if !self.pending_transport.is_empty()
+            && !matches!(self.state, SyncTaskState::Complete | SyncTaskState::Failed)
+        {
+            return;
+        }
+
+        if !matches!(
+            self.state,
+            SyncTaskState::Idle | SyncTaskState::Complete | SyncTaskState::Failed
+        ) {
+            self.drive_link_watchdog();
         }
 
         match self.state {
@@ -769,7 +905,7 @@ impl PropagationSyncTask {
                 {
                     if let Some(node_hash) = self.node_dest_hash {
                         if self.message_count() > 0 {
-                            self.start_sync(node_hash);
+                            let _ = self.start_sync(node_hash);
                         } else {
                             self.last_sync = Instant::now();
                         }
@@ -798,6 +934,22 @@ impl PropagationSyncTask {
                                 .then_some(self.active_offer_generation)
                                 .flatten(),
                             generation_exhausted: complete && self.generation_exhausted,
+                            offered: if complete { self.offered_count } else { 0 },
+                            outgoing: if complete { self.outgoing_count } else { 0 },
+                            tx_bytes: if complete { self.transfer_data_size } else { 0 },
+                            link_establishment_rate: self.link_establishment_rate,
+                            sync_transfer_rate: (complete && self.outgoing_count > 0)
+                                .then(|| {
+                                    self.transfer_started.map(|started| {
+                                        let elapsed = started.elapsed().as_secs_f64();
+                                        if elapsed > 0.0 {
+                                            self.transfer_wire_size as f64 * 8.0 / elapsed
+                                        } else {
+                                            0.0
+                                        }
+                                    })
+                                })
+                                .flatten(),
                         });
                     }
                 }
@@ -805,6 +957,37 @@ impl PropagationSyncTask {
                 self.last_sync = Instant::now();
                 self.state = SyncTaskState::Idle;
             }
+        }
+    }
+
+    fn drive_link_watchdog(&mut self) {
+        let (Some(link_id), Some(link)) = (self.link_id, self.link.as_mut()) else {
+            self.state = SyncTaskState::Failed;
+            return;
+        };
+        let action = link.tick();
+        match action {
+            LinkAction::SendKeepalive | LinkAction::TransitionedToStale => {
+                if !self.queue_plain_link_packet(
+                    link_id,
+                    &[rns_link::constants::KEEPALIVE_REQUEST],
+                    rns_wire::context::PacketContext::Keepalive,
+                ) {
+                    self.state = SyncTaskState::Failed;
+                }
+            }
+            LinkAction::SendTeardownAndClose(teardown_data) => {
+                if !teardown_data.is_empty() {
+                    self.preserve_pending_on_cleanup = self.queue_plain_link_packet(
+                        link_id,
+                        &teardown_data,
+                        rns_wire::context::PacketContext::LinkClose,
+                    );
+                }
+                self.state = SyncTaskState::Failed;
+            }
+            LinkAction::Closed(_) => self.state = SyncTaskState::Failed,
+            LinkAction::None => {}
         }
     }
 
@@ -915,6 +1098,7 @@ impl PropagationSyncTask {
             self.state = SyncTaskState::Complete;
             return;
         }
+        self.offered_count = offer.transient_ids.len() as u64;
         let offer_data = {
             use rmpv::Value;
             let ids: Vec<Value> = offer
@@ -957,14 +1141,16 @@ impl PropagationSyncTask {
                             rns_wire::flags::HeaderType::Header1,
                         );
                         link.update_pending_request_id(&_request_id, packet_request_id);
-                        let _ = self.transport_tx.try_send(TransportMessage::Outbound(
-                            OutboundRequest {
-                                raw: Bytes::from(req_raw),
-                                destination_hash: link_id,
-                            },
-                        ));
+                        if !self.queue_transport(TransportMessage::Outbound(OutboundRequest {
+                            raw: Bytes::from(req_raw),
+                            destination_hash: link_id,
+                        })) {
+                            self.state = SyncTaskState::Failed;
+                            return;
+                        }
                     }
                     self.state = SyncTaskState::AwaitingResponse;
+                    self.sync_started = Some(Instant::now());
                 }
                 Err(_) => {
                     self.state = SyncTaskState::Failed;
@@ -975,12 +1161,16 @@ impl PropagationSyncTask {
         }
     }
 
-    fn start_sync(&mut self, node_hash: [u8; 16]) {
+    fn start_sync(&mut self, node_hash: [u8; 16]) -> bool {
+        self.pending_transport.clear();
+        self.preserve_pending_on_cleanup = false;
+        self.reset_attempt_accounting();
         self.offer_preparation_rx = None;
         self.ready_prepared_offer = None;
         self.transfer_preparation_rx = None;
         self.ready_transfer_batch = None;
         self.active_transfer = None;
+        self.active_transfer_requested = false;
         self.pending_transfer_segments.clear();
         self.active_transfer_ids.clear();
         self.active_offer_generation = None;
@@ -988,16 +1178,17 @@ impl PropagationSyncTask {
         let (link, request_data) = Link::new_initiator(node_hash, 1);
         let link_id = link.link_id;
 
-        if let Err(e) = self
-            .transport_tx
-            .try_send(TransportMessage::RegisterDestination {
-                hash: link_id,
-                app_name: "lxmf.propagation.sync".to_string(),
-                delivery_tx: Some(self.event_tx.clone()),
-            })
-        {
-            tracing::warn!(err = %e,
-                "failed to register propagation sync destination; sync will fail");
+        self.link = Some(link);
+        self.link_id = Some(link_id);
+
+        if !self.queue_transport(TransportMessage::RegisterDestination {
+            hash: link_id,
+            app_name: "lxmf.propagation.sync".to_string(),
+            delivery_tx: Some(self.event_tx.clone()),
+        }) {
+            tracing::warn!("propagation sync transport is closed");
+            self.state = SyncTaskState::Failed;
+            return false;
         }
 
         let flags = rns_wire::flags::PacketFlags {
@@ -1017,21 +1208,22 @@ impl PropagationSyncTask {
         let mut raw = header.pack();
         raw.extend_from_slice(&request_data);
 
-        let _ = self
-            .transport_tx
-            .try_send(TransportMessage::Outbound(OutboundRequest {
-                raw: Bytes::from(raw),
-                destination_hash: node_hash,
-            }));
+        if !self.queue_transport(TransportMessage::Outbound(OutboundRequest {
+            raw: Bytes::from(raw),
+            destination_hash: node_hash,
+        })) {
+            tracing::warn!("propagation sync transport closed before Link request");
+            self.state = SyncTaskState::Failed;
+            return false;
+        }
 
         let mut peer = LxmPeer::new(node_hash);
         peer.begin_sync();
 
-        self.link = Some(link);
-        self.link_id = Some(link_id);
         self.peer = Some(peer);
         self.state = SyncTaskState::Establishing;
         self.sync_started = Some(Instant::now());
+        true
     }
 
     fn drive_transfers(&mut self) {
@@ -1078,6 +1270,7 @@ impl PropagationSyncTask {
                     self.state = SyncTaskState::Failed;
                     return;
                 };
+                let data_size = batch.payload.len() as u64;
                 let Ok(mut transfers) =
                     prepare_outbound_resource_transfers(batch.payload, true, rtt, link_keys)
                 else {
@@ -1088,7 +1281,16 @@ impl PropagationSyncTask {
                     self.state = SyncTaskState::Failed;
                     return;
                 };
+                self.outgoing_count = batch.transient_ids.len() as u64;
+                self.transfer_data_size = data_size;
+                self.transfer_wire_size = first.resource.total_size as u64
+                    + transfers
+                        .iter()
+                        .map(|transfer| transfer.resource.total_size as u64)
+                        .sum::<u64>();
+                self.transfer_started = Some(Instant::now());
                 self.active_transfer = Some(first);
+                self.active_transfer_requested = false;
                 self.pending_transfer_segments = transfers;
                 self.active_transfer_ids = batch.transient_ids;
             } else {
@@ -1099,34 +1301,59 @@ impl PropagationSyncTask {
             }
         }
 
-        if let Some(ref mut transfer) = self.active_transfer {
-            let action = transfer.tick();
+        // Keep a Resource window moving at protocol speed. The daemon's fast
+        // driver calls this frequently, and one call may fill a whole window;
+        // local transport backpressure stops the loop without dropping data.
+        for _ in 0..16 {
+            let Some(transfer) = self.active_transfer.as_mut() else {
+                break;
+            };
+            let action = if transfer.advertised && !self.active_transfer_requested {
+                transfer.check_timeout()
+            } else {
+                transfer.tick()
+            };
             match action {
                 TransferAction::SendAdvertisement(adv_data) => {
-                    self.send_resource_packet(
+                    if !self.send_resource_packet(
                         &adv_data,
                         rns_wire::context::PacketContext::ResourceAdv,
-                    );
+                    ) {
+                        self.fail_active_transfer();
+                    }
+                    // Wait for the receiver's first RESOURCE_REQ. While
+                    // waiting, check_timeout() retries a lost advertisement.
+                    break;
                 }
                 TransferAction::SendPart(_, part_data) => {
-                    self.send_resource_packet(
+                    if !self.send_resource_packet(
                         &part_data,
                         rns_wire::context::PacketContext::Resource,
-                    );
+                    ) {
+                        self.fail_active_transfer();
+                        break;
+                    }
+                    if !self.pending_transport.is_empty() {
+                        break;
+                    }
                 }
                 TransferAction::Complete => {
                     self.complete_active_transfer_segment();
+                    break;
                 }
                 TransferAction::Failed(_) => {
                     self.fail_active_transfer();
+                    break;
                 }
-                _ => {}
+                TransferAction::None => break,
+                _ => break,
             }
         }
     }
 
     fn complete_active_transfer_segment(&mut self) {
         self.active_transfer = None;
+        self.active_transfer_requested = false;
         if let Some(next) = self.pending_transfer_segments.pop_front() {
             self.active_transfer = Some(next);
             return;
@@ -1142,27 +1369,12 @@ impl PropagationSyncTask {
         self.state = SyncTaskState::Complete;
     }
 
-    fn send_resource_packet(&self, data: &[u8], context: rns_wire::context::PacketContext) {
-        let link_id = match self.link_id {
-            Some(id) => id,
-            None => return,
-        };
-        let link = match self.link.as_ref() {
-            Some(l) => l,
-            None => return,
-        };
-
-        // Resource ADVs and control frames use ordinary Link encryption. The
-        // assembled Resource itself was already encrypted before chunking, so
-        // RESOURCE parts must ride raw or their advertised map hashes will no
-        // longer match.
-        let body = if context == rns_wire::context::PacketContext::Resource {
-            data.to_vec()
-        } else if let Ok(encrypted) = link.encrypt(data) {
-            encrypted
-        } else {
-            return;
-        };
+    fn queue_plain_link_packet(
+        &mut self,
+        link_id: [u8; 16],
+        data: &[u8],
+        context: rns_wire::context::PacketContext,
+    ) -> bool {
         let header = rns_wire::header::PacketHeader {
             flags: rns_wire::flags::PacketFlags {
                 header_type: rns_wire::flags::HeaderType::Header1,
@@ -1177,13 +1389,39 @@ impl PropagationSyncTask {
             context,
         };
         let mut raw = header.pack();
-        raw.extend_from_slice(&body);
-        let _ = self
-            .transport_tx
-            .try_send(TransportMessage::Outbound(OutboundRequest {
-                raw: Bytes::from(raw),
-                destination_hash: link_id,
-            }));
+        raw.extend_from_slice(data);
+        self.queue_transport(TransportMessage::Outbound(OutboundRequest {
+            raw: Bytes::from(raw),
+            destination_hash: link_id,
+        }))
+    }
+
+    fn send_resource_packet(
+        &mut self,
+        data: &[u8],
+        context: rns_wire::context::PacketContext,
+    ) -> bool {
+        let link_id = match self.link_id {
+            Some(id) => id,
+            None => return false,
+        };
+        let link = match self.link.as_ref() {
+            Some(l) => l,
+            None => return false,
+        };
+
+        // Resource ADVs and control frames use ordinary Link encryption. The
+        // assembled Resource itself was already encrypted before chunking, so
+        // RESOURCE parts must ride raw or their advertised map hashes will no
+        // longer match.
+        let body = if context == rns_wire::context::PacketContext::Resource {
+            data.to_vec()
+        } else if let Ok(encrypted) = link.encrypt(data) {
+            encrypted
+        } else {
+            return false;
+        };
+        self.queue_plain_link_packet(link_id, &body, context)
     }
 
     fn send_identify(&mut self) -> bool {
@@ -1213,29 +1451,33 @@ impl PropagationSyncTask {
         };
         let mut raw = header.pack();
         raw.extend_from_slice(&identify_data);
-        self.transport_tx
-            .try_send(TransportMessage::Outbound(OutboundRequest {
-                raw: Bytes::from(raw),
-                destination_hash: link_id,
-            }))
-            .is_ok()
+        self.queue_transport(TransportMessage::Outbound(OutboundRequest {
+            raw: Bytes::from(raw),
+            destination_hash: link_id,
+        }))
     }
 
     /// Python LXMPeer.py:540-542.
     fn cleanup_sync(&mut self) {
+        // No transfer packet should survive the attempt it belongs to. The
+        // teardown and deregistration below form a new ordered tail. Preserve
+        // a teardown already emitted by Link::tick() when it closed the link.
+        if !self.preserve_pending_on_cleanup {
+            self.pending_transport.clear();
+        }
+        self.preserve_pending_on_cleanup = false;
         self.send_teardown();
         if let Some(ref mut peer) = self.peer {
             peer.link_closed();
         }
 
         if let Some(link_id) = self.link_id.take() {
-            let _ = self
-                .transport_tx
-                .try_send(TransportMessage::DeregisterDestination { hash: link_id });
+            let _ = self.queue_transport(TransportMessage::DeregisterDestination { hash: link_id });
         }
         self.link = None;
         self.peer = None;
         self.active_transfer = None;
+        self.active_transfer_requested = false;
         self.pending_transfer_segments.clear();
         self.active_transfer_ids.clear();
         self.offer_preparation_rx = None;
@@ -1269,12 +1511,10 @@ impl PropagationSyncTask {
             };
             let mut raw = header.pack();
             raw.extend_from_slice(&teardown_data);
-            let _ = self
-                .transport_tx
-                .try_send(TransportMessage::Outbound(OutboundRequest {
-                    raw: Bytes::from(raw),
-                    destination_hash: link_id,
-                }));
+            let _ = self.queue_transport(TransportMessage::Outbound(OutboundRequest {
+                raw: Bytes::from(raw),
+                destination_hash: link_id,
+            }));
         }
     }
 
@@ -1877,10 +2117,108 @@ mod tests {
         task.sync_timeout = Duration::ZERO;
 
         task.tick();
-        assert_eq!(task.state, SyncTaskState::Failed);
+        assert_eq!(task.state, SyncTaskState::Idle);
+        assert_eq!(
+            task.take_terminal_peer_result().unwrap().state,
+            PeerSyncTerminalState::Failed
+        );
+    }
+
+    #[test]
+    fn healthy_resource_transfer_has_no_absolute_whole_sync_timeout() {
+        let (tx, mut rx) = mpsc::channel(64);
+        let (initiator, _) = active_link_pair([0x31; 16]);
+        let link_id = initiator.link_id;
+        let link_keys = initiator.session_keys().unwrap();
+        let transfer = OutboundTransfer::new_encrypted(
+            vec![0xAB; 4096],
+            false,
+            Duration::from_millis(100),
+            link_keys,
+        )
+        .unwrap();
+        let mut task = PropagationSyncTask::new(tx, [0xAA; 16]);
+        task.link = Some(initiator);
+        task.link_id = Some(link_id);
+        task.active_transfer = Some(transfer);
+        task.state = SyncTaskState::Transferring;
+        task.sync_started = Some(Instant::now() - Duration::from_secs(600));
+        task.sync_timeout = Duration::ZERO;
 
         task.tick();
-        assert_eq!(task.state, SyncTaskState::Idle);
+
+        assert_eq!(task.state, SyncTaskState::Transferring);
+        let TransportMessage::Outbound(advertisement) = rx.try_recv().unwrap() else {
+            panic!("expected Resource advertisement");
+        };
+        let (header, _) = rns_wire::header::PacketHeader::unpack(&advertisement.raw).unwrap();
+        assert_eq!(
+            header.context,
+            rns_wire::context::PacketContext::ResourceAdv
+        );
+    }
+
+    #[test]
+    fn resource_advertisement_is_retried_while_waiting_for_first_request() {
+        let (tx, mut rx) = mpsc::channel(64);
+        let (initiator, _) = active_link_pair([0x32; 16]);
+        let link_id = initiator.link_id;
+        let link_keys = initiator.session_keys().unwrap();
+        let transfer = OutboundTransfer::new_encrypted(
+            vec![0xCD; 4096],
+            false,
+            Duration::from_millis(10),
+            link_keys,
+        )
+        .unwrap();
+        let mut task = PropagationSyncTask::new(tx, [0xAA; 16]);
+        task.link = Some(initiator);
+        task.link_id = Some(link_id);
+        task.active_transfer = Some(transfer);
+        task.state = SyncTaskState::Transferring;
+
+        task.tick();
+        let _first_advertisement = rx.try_recv().unwrap();
+        task.active_transfer.as_mut().unwrap().started_at =
+            Instant::now() - Duration::from_secs(60);
+
+        task.tick();
+
+        let TransportMessage::Outbound(retry) = rx.try_recv().unwrap() else {
+            panic!("expected retried Resource advertisement");
+        };
+        let (header, _) = rns_wire::header::PacketHeader::unpack(&retry.raw).unwrap();
+        assert_eq!(
+            header.context,
+            rns_wire::context::PacketContext::ResourceAdv
+        );
+        assert_eq!(task.active_transfer.as_ref().unwrap().retries, 1);
+    }
+
+    #[test]
+    fn full_transport_mailbox_stages_link_setup_without_packet_loss() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(TransportMessage::DeregisterDestination { hash: [0x01; 16] })
+            .unwrap();
+        let mut task = PropagationSyncTask::new(tx, [0xAA; 16]);
+
+        assert!(task.request_sync_now([0xBB; 16]));
+        assert_eq!(task.pending_transport.len(), 2);
+
+        let _blocker = rx.try_recv().unwrap();
+        task.tick();
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            TransportMessage::RegisterDestination { .. }
+        ));
+        assert_eq!(task.pending_transport.len(), 1);
+
+        task.tick();
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            TransportMessage::Outbound(_)
+        ));
+        assert!(task.pending_transport.is_empty());
     }
 
     #[test]
@@ -2395,6 +2733,11 @@ mod tests {
                 state: PeerSyncTerminalState::Failed,
                 offer_generation: None,
                 generation_exhausted: false,
+                offered: 0,
+                outgoing: 0,
+                tx_bytes: 0,
+                link_establishment_rate: None,
+                sync_transfer_rate: None,
             })
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -2498,6 +2841,11 @@ mod tests {
                 state: PeerSyncTerminalState::Complete,
                 offer_generation: Some(7),
                 generation_exhausted: false,
+                offered: 0,
+                outgoing: 0,
+                tx_bytes: 0,
+                link_establishment_rate: None,
+                sync_transfer_rate: None,
             })
         );
         assert!(task.request_sync_now([0xB2; 16]));
@@ -2510,8 +2858,36 @@ mod tests {
                 state: PeerSyncTerminalState::Failed,
                 offer_generation: None,
                 generation_exhausted: false,
+                offered: 0,
+                outgoing: 0,
+                tx_bytes: 0,
+                link_establishment_rate: None,
+                sync_transfer_rate: None,
             })
         );
+    }
+
+    #[test]
+    fn terminal_result_carries_python_peer_accounting_deltas() {
+        let (tx, _rx) = mpsc::channel(64);
+        let mut task = PropagationSyncTask::new(tx, [0xAA; 16]);
+        task.node_dest_hash = Some([0xC3; 16]);
+        task.offered_count = 11;
+        task.outgoing_count = 7;
+        task.transfer_data_size = 4096;
+        task.transfer_wire_size = 1000;
+        task.transfer_started = Some(Instant::now() - Duration::from_secs(2));
+        task.link_establishment_rate = Some(1234.0);
+        task.state = SyncTaskState::Complete;
+
+        task.tick();
+
+        let result = task.take_terminal_peer_result().unwrap();
+        assert_eq!(result.offered, 11);
+        assert_eq!(result.outgoing, 7);
+        assert_eq!(result.tx_bytes, 4096);
+        assert_eq!(result.link_establishment_rate, Some(1234.0));
+        assert!(result.sync_transfer_rate.is_some_and(|rate| rate > 3_900.0));
     }
 
     #[test]

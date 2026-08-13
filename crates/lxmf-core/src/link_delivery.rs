@@ -31,6 +31,7 @@ use crate::propagation::hex_encode;
 const LINK_MAX_INACTIVITY: Duration = Duration::from_secs(600);
 const BACKCHANNEL_SEND_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const BACKCHANNEL_DELIVERY_TIMEOUT: Duration = Duration::from_secs(360);
+const LINK_PENDING_TRANSPORT_LIMIT: usize = 1024;
 
 /// State of a link-based delivery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -441,6 +442,9 @@ fn start_error_from_reserve(err: TrySendError<()>) -> LinkDeliveryStartError {
 /// packets, and [`Self::tick`] periodically to advance transfers and enforce timeouts.
 pub struct LinkDeliveryManager {
     transport_tx: mpsc::Sender<TransportMessage>,
+    /// Ordered staging for temporary transport backpressure. Resource state
+    /// can advance only after frames are accepted here or by the actor.
+    pending_transport: VecDeque<TransportMessage>,
     /// Reusable upstream-style Direct links keyed by LXMF delivery destination hash.
     direct_links: HashMap<[u8; 16], [u8; 16]>,
     /// Reusable upstream-style inbound backchannels keyed by remote LXMF delivery destination hash.
@@ -468,6 +472,7 @@ impl LinkDeliveryManager {
         let (event_tx, event_rx) = mpsc::channel(256);
         Self {
             transport_tx,
+            pending_transport: VecDeque::new(),
             direct_links: HashMap::new(),
             backchannel_links: HashMap::new(),
             pending: HashMap::new(),
@@ -749,10 +754,17 @@ impl LinkDeliveryManager {
                     "discarding inactive cached Direct link before reuse"
                 );
                 if let Some(mut delivery) = self.pending.remove(&link_id) {
-                    send_link_teardown(&self.transport_tx, &link_id, &mut delivery.link);
-                    let _ = self
-                        .transport_tx
-                        .try_send(TransportMessage::DeregisterDestination { hash: link_id });
+                    send_link_teardown(
+                        &self.transport_tx,
+                        &mut self.pending_transport,
+                        &link_id,
+                        &mut delivery.link,
+                    );
+                    let _ = stage_transport(
+                        &self.transport_tx,
+                        &mut self.pending_transport,
+                        TransportMessage::DeregisterDestination { hash: link_id },
+                    );
                 }
                 self.direct_links.remove(&dest_hash);
             } else if let Some(delivery) = self
@@ -1191,12 +1203,18 @@ impl LinkDeliveryManager {
                 let mut rtt_raw = rtt_header.pack();
                 rtt_raw.extend_from_slice(&rtt_data);
 
-                let _ = self
-                    .transport_tx
-                    .try_send(TransportMessage::Outbound(OutboundRequest {
+                if let Err(reason) = stage_transport(
+                    &self.transport_tx,
+                    &mut self.pending_transport,
+                    TransportMessage::Outbound(OutboundRequest {
                         raw: Bytes::from(rtt_raw),
                         destination_hash: *link_id,
-                    }));
+                    }),
+                ) {
+                    delivery.state = DeliveryState::Failed;
+                    delivery.failure_reason = Some(reason.to_string());
+                    return false;
+                }
 
                 delivery.state = DeliveryState::Identifying;
                 true
@@ -1251,12 +1269,18 @@ impl LinkDeliveryManager {
             };
             let mut proof_raw = proof_header.pack();
             proof_raw.extend_from_slice(&proof_data);
-            let _ = self
-                .transport_tx
-                .try_send(TransportMessage::Outbound(OutboundRequest {
+            if let Err(reason) = stage_transport(
+                &self.transport_tx,
+                &mut self.pending_transport,
+                TransportMessage::Outbound(OutboundRequest {
                     raw: Bytes::from(proof_raw),
                     destination_hash: *link_id,
-                }));
+                }),
+            ) {
+                delivery.state = DeliveryState::Failed;
+                delivery.failure_reason = Some(reason.to_string());
+                return false;
+            }
         }
 
         true
@@ -1265,6 +1289,13 @@ impl LinkDeliveryManager {
     /// Drive pending deliveries forward; call periodically after [`Self::drain_events`].
     pub fn tick(&mut self) -> Vec<DeliveryResult> {
         let mut results = self.tick_backchannels();
+        if let Err(reason) = flush_staged_transport(&self.transport_tx, &mut self.pending_transport)
+        {
+            for delivery in self.pending.values_mut() {
+                delivery.state = DeliveryState::Failed;
+                delivery.failure_reason = Some(reason.to_string());
+            }
+        }
         let mut to_remove = Vec::new();
 
         for (link_id, delivery) in &mut self.pending {
@@ -1281,7 +1312,6 @@ impl LinkDeliveryManager {
                 delivery.state,
                 DeliveryState::Establishing
                     | DeliveryState::Identifying
-                    | DeliveryState::Transferring
                     | DeliveryState::AwaitingProof
             ) {
                 let elapsed = delivery.started_at.elapsed();
@@ -1352,12 +1382,18 @@ impl LinkDeliveryManager {
                                     };
                                     let mut id_raw = id_header.pack();
                                     id_raw.extend_from_slice(&identify_data);
-                                    let _ = self.transport_tx.try_send(TransportMessage::Outbound(
-                                        OutboundRequest {
+                                    if let Err(reason) = stage_transport(
+                                        &self.transport_tx,
+                                        &mut self.pending_transport,
+                                        TransportMessage::Outbound(OutboundRequest {
                                             raw: Bytes::from(id_raw),
                                             destination_hash: *link_id,
-                                        },
-                                    ));
+                                        }),
+                                    ) {
+                                        delivery.state = DeliveryState::Failed;
+                                        delivery.failure_reason = Some(reason.to_string());
+                                        continue;
+                                    }
                                 }
                             }
                         }
@@ -1396,6 +1432,7 @@ impl LinkDeliveryManager {
                                     link_id,
                                     delivery,
                                     &self.transport_tx,
+                                    &mut self.pending_transport,
                                     &packed,
                                 ) {
                                     Some(packet_hash) => {
@@ -1469,10 +1506,19 @@ impl LinkDeliveryManager {
                             let Some(ref mut transfer) = delivery.transfer else {
                                 break;
                             };
-                            let action = transfer.tick();
+                            let action = match transfer.check_timeout() {
+                                TransferAction::None => transfer.tick(),
+                                action => action,
+                            };
                             let reports_resource_progress =
                                 matches!(&action, TransferAction::SendPart(_, _));
-                            match dispatch_action(link_id, delivery, &self.transport_tx, action) {
+                            match dispatch_action(
+                                link_id,
+                                delivery,
+                                &self.transport_tx,
+                                &mut self.pending_transport,
+                                action,
+                            ) {
                                 ActionOutcome::Continue => {
                                     if reports_resource_progress {
                                         maybe_push_resource_progress_event(
@@ -1501,6 +1547,7 @@ impl LinkDeliveryManager {
                                     {
                                         finish_reusable_delivery(
                                             &self.transport_tx,
+                                            &mut self.pending_transport,
                                             &self.identity_pub,
                                             &self.identity_key,
                                             link_id,
@@ -1546,6 +1593,7 @@ impl LinkDeliveryManager {
                         if delivery.reusable && delivery.link.state != LinkState::Closed {
                             finish_reusable_delivery(
                                 &self.transport_tx,
+                                &mut self.pending_transport,
                                 &self.identity_pub,
                                 &self.identity_key,
                                 link_id,
@@ -1633,9 +1681,19 @@ impl LinkDeliveryManager {
                         idle_secs = link_data_idle_for(&delivery.link).as_secs_f64(),
                         "tearing down inactive Direct link"
                     );
-                    send_link_teardown(&self.transport_tx, link_id, &mut delivery.link);
+                    send_link_teardown(
+                        &self.transport_tx,
+                        &mut self.pending_transport,
+                        link_id,
+                        &mut delivery.link,
+                    );
                     remove_session = true;
-                } else if drive_link_action(&self.transport_tx, link_id, delivery.link.tick()) {
+                } else if drive_link_action(
+                    &self.transport_tx,
+                    &mut self.pending_transport,
+                    link_id,
+                    delivery.link.tick(),
+                ) {
                     if !matches!(
                         delivery.state,
                         DeliveryState::Idle | DeliveryState::Complete
@@ -1670,10 +1728,17 @@ impl LinkDeliveryManager {
                 if delivery.reusable {
                     self.direct_links.remove(&delivery.dest_hash);
                 }
-                send_link_teardown(&self.transport_tx, &link_id, &mut delivery.link);
-                let _ = self
-                    .transport_tx
-                    .try_send(TransportMessage::DeregisterDestination { hash: link_id });
+                send_link_teardown(
+                    &self.transport_tx,
+                    &mut self.pending_transport,
+                    &link_id,
+                    &mut delivery.link,
+                );
+                let _ = stage_transport(
+                    &self.transport_tx,
+                    &mut self.pending_transport,
+                    TransportMessage::DeregisterDestination { hash: link_id },
+                );
             }
         }
 
@@ -1860,7 +1925,13 @@ impl LinkDeliveryManager {
             };
             let actions = transfer.handle_request(request_data);
             for action in actions {
-                match dispatch_action(link_id, delivery, &self.transport_tx, action) {
+                match dispatch_action(
+                    link_id,
+                    delivery,
+                    &self.transport_tx,
+                    &mut self.pending_transport,
+                    action,
+                ) {
                     ActionOutcome::Continue | ActionOutcome::Break => {}
                     ActionOutcome::Complete => {
                         break;
@@ -2175,7 +2246,12 @@ impl LinkDeliveryManager {
 
         for (link_id, delivery) in &mut self.pending {
             if delivery.msg_hash == Some(msg_hash) {
-                cancel_current_delivery(&self.transport_tx, link_id, delivery);
+                cancel_current_delivery(
+                    &self.transport_tx,
+                    &mut self.pending_transport,
+                    link_id,
+                    delivery,
+                );
                 if delivery.reusable && delivery.link.is_active() {
                     finish_unsuccessful_reusable_delivery(delivery);
                 } else {
@@ -2198,7 +2274,12 @@ impl LinkDeliveryManager {
 
         if let Some((link_id, dest_hash)) = remove_direct_session {
             if let Some(mut delivery) = self.pending.remove(&link_id) {
-                send_link_teardown(&self.transport_tx, &link_id, &mut delivery.link);
+                send_link_teardown(
+                    &self.transport_tx,
+                    &mut self.pending_transport,
+                    &link_id,
+                    &mut delivery.link,
+                );
             }
             if self.direct_links.get(&dest_hash) == Some(&link_id) {
                 self.direct_links.remove(&dest_hash);
@@ -2548,6 +2629,7 @@ fn maybe_push_resource_progress_event(
 
 fn finish_reusable_delivery(
     transport_tx: &mpsc::Sender<TransportMessage>,
+    pending_transport: &mut VecDeque<TransportMessage>,
     identity_pub: &Option<[u8; 64]>,
     identity_key: &Option<Ed25519PrivateKey>,
     link_id: &[u8; 16],
@@ -2555,8 +2637,14 @@ fn finish_reusable_delivery(
 ) {
     if !delivery.backchannel_identified {
         if let (Some(pub_key), Some(sign_key)) = (identity_pub, identity_key) {
-            delivery.backchannel_identified =
-                send_link_identify(transport_tx, link_id, &delivery.link, pub_key, sign_key);
+            delivery.backchannel_identified = send_link_identify(
+                transport_tx,
+                pending_transport,
+                link_id,
+                &delivery.link,
+                pub_key,
+                sign_key,
+            );
         }
     }
 
@@ -2587,6 +2675,7 @@ fn finish_unsuccessful_reusable_delivery(delivery: &mut PendingDelivery) {
 
 fn cancel_current_delivery(
     transport_tx: &mpsc::Sender<TransportMessage>,
+    pending_transport: &mut VecDeque<TransportMessage>,
     link_id: &[u8; 16],
     delivery: &mut PendingDelivery,
 ) {
@@ -2599,6 +2688,7 @@ fn cancel_current_delivery(
             link_id,
             delivery,
             transport_tx,
+            pending_transport,
             TransferAction::SendCancel(rns_protocol::resource::CancelType::Icl, resource_hash),
         );
     }
@@ -2658,6 +2748,7 @@ fn fail_queued_deliveries(
 
 fn send_link_identify(
     transport_tx: &mpsc::Sender<TransportMessage>,
+    pending_transport: &mut VecDeque<TransportMessage>,
     link_id: &[u8; 16],
     link: &Link,
     identity_pub: &[u8; 64],
@@ -2681,32 +2772,36 @@ fn send_link_identify(
     };
     let mut id_raw = id_header.pack();
     id_raw.extend_from_slice(&identify_data);
-    transport_tx
-        .try_send(TransportMessage::Outbound(OutboundRequest {
+    stage_transport(
+        transport_tx,
+        pending_transport,
+        TransportMessage::Outbound(OutboundRequest {
             raw: Bytes::from(id_raw),
             destination_hash: *link_id,
-        }))
-        .is_ok()
+        }),
+    )
+    .is_ok()
 }
 
 fn drive_link_action(
     transport_tx: &mpsc::Sender<TransportMessage>,
+    pending_transport: &mut VecDeque<TransportMessage>,
     link_id: &[u8; 16],
     action: LinkAction,
 ) -> bool {
     match action {
         LinkAction::SendKeepalive => {
-            send_keepalive_packet(transport_tx, link_id);
+            send_keepalive_packet(transport_tx, pending_transport, link_id);
             false
         }
         LinkAction::TransitionedToStale => {
             // Python sends one more keepalive when an initiator transitions stale.
-            send_keepalive_packet(transport_tx, link_id);
+            send_keepalive_packet(transport_tx, pending_transport, link_id);
             false
         }
         LinkAction::SendTeardownAndClose(teardown_data) => {
             if !teardown_data.is_empty() {
-                send_link_close_payload(transport_tx, link_id, &teardown_data);
+                send_link_close_payload(transport_tx, pending_transport, link_id, &teardown_data);
             }
             true
         }
@@ -2715,7 +2810,11 @@ fn drive_link_action(
     }
 }
 
-fn send_keepalive_packet(transport_tx: &mpsc::Sender<TransportMessage>, link_id: &[u8; 16]) {
+fn send_keepalive_packet(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    pending_transport: &mut VecDeque<TransportMessage>,
+    link_id: &[u8; 16],
+) {
     let header = rns_wire::header::PacketHeader {
         flags: rns_wire::flags::PacketFlags {
             header_type: rns_wire::flags::HeaderType::Header1,
@@ -2731,14 +2830,19 @@ fn send_keepalive_packet(transport_tx: &mpsc::Sender<TransportMessage>, link_id:
     };
     let mut raw = header.pack();
     raw.push(rns_link::constants::KEEPALIVE_REQUEST);
-    let _ = transport_tx.try_send(TransportMessage::Outbound(OutboundRequest {
-        raw: Bytes::from(raw),
-        destination_hash: *link_id,
-    }));
+    let _ = stage_transport(
+        transport_tx,
+        pending_transport,
+        TransportMessage::Outbound(OutboundRequest {
+            raw: Bytes::from(raw),
+            destination_hash: *link_id,
+        }),
+    );
 }
 
 fn send_link_close_payload(
     transport_tx: &mpsc::Sender<TransportMessage>,
+    pending_transport: &mut VecDeque<TransportMessage>,
     link_id: &[u8; 16],
     teardown_data: &[u8],
 ) {
@@ -2757,10 +2861,14 @@ fn send_link_close_payload(
     };
     let mut raw = header.pack();
     raw.extend_from_slice(teardown_data);
-    let _ = transport_tx.try_send(TransportMessage::Outbound(OutboundRequest {
-        raw: Bytes::from(raw),
-        destination_hash: *link_id,
-    }));
+    let _ = stage_transport(
+        transport_tx,
+        pending_transport,
+        TransportMessage::Outbound(OutboundRequest {
+            raw: Bytes::from(raw),
+            destination_hash: *link_id,
+        }),
+    );
 }
 
 fn link_data_idle_for(link: &Link) -> Duration {
@@ -2845,12 +2953,53 @@ enum ActionOutcome {
     Fail(String),
 }
 
+fn stage_transport(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    pending: &mut VecDeque<TransportMessage>,
+    message: TransportMessage,
+) -> Result<(), &'static str> {
+    if pending.is_empty() {
+        match transport_tx.try_send(message) {
+            Ok(()) => return Ok(()),
+            Err(TrySendError::Full(message)) => pending.push_back(message),
+            Err(TrySendError::Closed(_)) => return Err("transport channel closed"),
+        }
+    } else {
+        if pending.len() >= LINK_PENDING_TRANSPORT_LIMIT {
+            return Err("transport staging queue full");
+        }
+        pending.push_back(message);
+    }
+    Ok(())
+}
+
+fn flush_staged_transport(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    pending: &mut VecDeque<TransportMessage>,
+) -> Result<(), &'static str> {
+    while let Some(message) = pending.pop_front() {
+        match transport_tx.try_send(message) {
+            Ok(()) => {}
+            Err(TrySendError::Full(message)) => {
+                pending.push_front(message);
+                break;
+            }
+            Err(TrySendError::Closed(_)) => {
+                pending.clear();
+                return Err("transport channel closed");
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Send a single LXMF packet over an active link and return the full packet hash that the peer
 /// must prove with `LINKPROOF`.
 fn send_link_packet(
     link_id: &[u8; 16],
     delivery: &mut PendingDelivery,
     transport_tx: &mpsc::Sender<TransportMessage>,
+    pending_transport: &mut VecDeque<TransportMessage>,
     packed: &[u8],
 ) -> Option<[u8; 32]> {
     let encrypted = delivery.link.encrypt(packed).ok()?;
@@ -2870,16 +3019,22 @@ fn send_link_packet(
     let mut raw = header.pack();
     raw.extend_from_slice(&encrypted);
     let packet_hash = rns_wire::hash::packet_hash(&raw, rns_wire::flags::HeaderType::Header1);
-    let _ = transport_tx.try_send(TransportMessage::Outbound(OutboundRequest {
-        raw: Bytes::from(raw),
-        destination_hash: *link_id,
-    }));
+    stage_transport(
+        transport_tx,
+        pending_transport,
+        TransportMessage::Outbound(OutboundRequest {
+            raw: Bytes::from(raw),
+            destination_hash: *link_id,
+        }),
+    )
+    .ok()?;
     delivery.link.record_tx(encrypted.len());
     Some(packet_hash)
 }
 
 fn send_link_teardown(
     transport_tx: &mpsc::Sender<TransportMessage>,
+    pending_transport: &mut VecDeque<TransportMessage>,
     link_id: &[u8; 16],
     link: &mut Link,
 ) {
@@ -2901,10 +3056,14 @@ fn send_link_teardown(
     };
     let mut raw = header.pack();
     raw.extend_from_slice(&teardown_data);
-    let _ = transport_tx.try_send(TransportMessage::Outbound(OutboundRequest {
-        raw: Bytes::from(raw),
-        destination_hash: *link_id,
-    }));
+    let _ = stage_transport(
+        transport_tx,
+        pending_transport,
+        TransportMessage::Outbound(OutboundRequest {
+            raw: Bytes::from(raw),
+            destination_hash: *link_id,
+        }),
+    );
 }
 
 /// Serialize a [`TransferAction`] onto the link and enqueue it for transport.
@@ -2916,6 +3075,7 @@ fn dispatch_action(
     link_id: &[u8; 16],
     delivery: &mut PendingDelivery,
     transport_tx: &mpsc::Sender<TransportMessage>,
+    pending_transport: &mut VecDeque<TransportMessage>,
     action: TransferAction,
 ) -> ActionOutcome {
     let base_flags = rns_wire::flags::PacketFlags {
@@ -2935,25 +3095,32 @@ fn dispatch_action(
         destination_hash: *link_id,
         context,
     };
-    let send = |header: rns_wire::header::PacketHeader, body: &[u8]| {
+    let mut send = |header: rns_wire::header::PacketHeader, body: &[u8]| {
         let mut raw = header.pack();
         raw.extend_from_slice(body);
-        let _ = transport_tx.try_send(TransportMessage::Outbound(OutboundRequest {
-            raw: Bytes::from(raw),
-            destination_hash: *link_id,
-        }));
+        stage_transport(
+            transport_tx,
+            pending_transport,
+            TransportMessage::Outbound(OutboundRequest {
+                raw: Bytes::from(raw),
+                destination_hash: *link_id,
+            }),
+        )
     };
 
     match action {
         TransferAction::SendAdvertisement(adv_data) => {
             if let Ok(encrypted) = delivery.link.encrypt(&adv_data) {
-                send(
+                if let Err(reason) = send(
                     make_header(
                         rns_wire::context::PacketContext::ResourceAdv,
                         rns_wire::flags::PacketType::Data,
                     ),
                     &encrypted,
-                );
+                ) {
+                    delivery.state = DeliveryState::Failed;
+                    return ActionOutcome::Fail(reason.to_string());
+                }
                 delivery.link.record_tx(encrypted.len());
             }
             ActionOutcome::Continue
@@ -2961,38 +3128,47 @@ fn dispatch_action(
         TransferAction::SendPart(_, part_data) => {
             // Parts are already ciphertext (pre-chunk blob encryption). `context=Resource`
             // packets are not packet-layer encrypted (Packet.py:201-204).
-            send(
+            if let Err(reason) = send(
                 make_header(
                     rns_wire::context::PacketContext::Resource,
                     rns_wire::flags::PacketType::Data,
                 ),
                 &part_data,
-            );
+            ) {
+                delivery.state = DeliveryState::Failed;
+                return ActionOutcome::Fail(reason.to_string());
+            }
             delivery.link.record_tx(part_data.len());
             ActionOutcome::Continue
         }
         TransferAction::SendHmu(hmu_data) => {
             if let Ok(encrypted) = delivery.link.encrypt(&hmu_data) {
-                send(
+                if let Err(reason) = send(
                     make_header(
                         rns_wire::context::PacketContext::ResourceHmu,
                         rns_wire::flags::PacketType::Data,
                     ),
                     &encrypted,
-                );
+                ) {
+                    delivery.state = DeliveryState::Failed;
+                    return ActionOutcome::Fail(reason.to_string());
+                }
                 delivery.link.record_tx(encrypted.len());
             }
             ActionOutcome::Continue
         }
         TransferAction::SendRequest(req_data) => {
             if let Ok(encrypted) = delivery.link.encrypt(&req_data) {
-                send(
+                if let Err(reason) = send(
                     make_header(
                         rns_wire::context::PacketContext::ResourceReq,
                         rns_wire::flags::PacketType::Data,
                     ),
                     &encrypted,
-                );
+                ) {
+                    delivery.state = DeliveryState::Failed;
+                    return ActionOutcome::Fail(reason.to_string());
+                }
                 delivery.link.record_tx(encrypted.len());
             }
             ActionOutcome::Continue
@@ -3000,13 +3176,16 @@ fn dispatch_action(
         TransferAction::SendProof(proof_data) => {
             // PROOF+RESOURCE_PRF is plaintext on a Proof packet (Packet.py:195-197). Body =
             // resource_hash(32) || proof(32).
-            send(
+            if let Err(reason) = send(
                 make_header(
                     rns_wire::context::PacketContext::ResourcePrf,
                     rns_wire::flags::PacketType::Proof,
                 ),
                 &proof_data,
-            );
+            ) {
+                delivery.state = DeliveryState::Failed;
+                return ActionOutcome::Fail(reason.to_string());
+            }
             delivery.link.record_tx(proof_data.len());
             ActionOutcome::Continue
         }
@@ -3028,10 +3207,13 @@ fn dispatch_action(
                         rns_wire::context::PacketContext::ResourceRcl
                     }
                 };
-                send(
+                if let Err(reason) = send(
                     make_header(context, rns_wire::flags::PacketType::Data),
                     &encrypted,
-                );
+                ) {
+                    delivery.state = DeliveryState::Failed;
+                    return ActionOutcome::Fail(reason.to_string());
+                }
                 delivery.link.record_tx(encrypted.len());
             }
             delivery.state = DeliveryState::Failed;
@@ -4049,6 +4231,103 @@ mod tests {
         assert_eq!(
             delivery.remaining_segments.len(),
             transfer.resource.total_segments - 1
+        );
+    }
+
+    #[test]
+    fn link_handshake_backpressure_stages_rtt_and_delivery_in_order() {
+        let (tx, mut rx) = mpsc::channel(2);
+        let mut mgr = LinkDeliveryManager::new(tx.clone(), None, None);
+        let signing_key = Ed25519PrivateKey::generate();
+        let mut message = LxMessage::new(
+            [0xA0; 16],
+            [0xB0; 16],
+            "backpressure",
+            "payload",
+            crate::constants::DeliveryMethod::Direct,
+        );
+        message.sign(&signing_key).unwrap();
+        let destination_hash = [0xC0; 16];
+        let link_id = mgr.start_delivery(message, destination_hash, 1).unwrap();
+        let request_raw = next_outbound(&mut rx);
+        let (_, request_offset) = rns_wire::header::PacketHeader::unpack(&request_raw).unwrap();
+        let responder_key = Ed25519PrivateKey::generate();
+        let (_responder, proof) = Link::new_responder(
+            &request_raw[request_offset..],
+            &responder_key,
+            destination_hash,
+            1,
+        )
+        .unwrap();
+
+        tx.try_send(TransportMessage::DeregisterDestination { hash: [1; 16] })
+            .unwrap();
+        tx.try_send(TransportMessage::DeregisterDestination { hash: [2; 16] })
+            .unwrap();
+        let responder_public = responder_key.public_key();
+        assert!(mgr.handle_link_proof(
+            &link_id,
+            &proof,
+            &responder_public,
+            &responder_public.to_bytes(),
+        ));
+        assert_eq!(mgr.pending_transport.len(), 1);
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            TransportMessage::DeregisterDestination { hash } if hash == [1; 16]
+        ));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            TransportMessage::DeregisterDestination { hash } if hash == [2; 16]
+        ));
+
+        assert!(mgr.tick().is_empty());
+        let rtt = next_outbound(&mut rx);
+        let (rtt_header, _) = rns_wire::header::PacketHeader::unpack(&rtt).unwrap();
+        assert_eq!(rtt_header.context, rns_wire::context::PacketContext::Lrrtt);
+        let packet = next_outbound(&mut rx);
+        let (packet_header, _) = rns_wire::header::PacketHeader::unpack(&packet).unwrap();
+        assert_eq!(
+            packet_header.context,
+            rns_wire::context::PacketContext::None
+        );
+        assert!(mgr.pending_transport.is_empty());
+    }
+
+    #[test]
+    fn progressive_direct_resource_uses_watchdog_not_absolute_delivery_age() {
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut mgr = LinkDeliveryManager::new(tx, None, None);
+        let signing_key = Ed25519PrivateKey::generate();
+        let mut message = LxMessage::new(
+            [0xA4; 16],
+            [0xB4; 16],
+            "progressive resource",
+            &"x".repeat(4_000),
+            crate::constants::DeliveryMethod::Direct,
+        );
+        message.sign(&signing_key).unwrap();
+        let responder_key = Ed25519PrivateKey::generate();
+        let destination_hash = [0xC4; 16];
+        let (link_id, _responder) =
+            establish_active_delivery(&mut mgr, &mut rx, message, &responder_key, destination_hash);
+        assert!(mgr.tick().is_empty());
+        {
+            let delivery = mgr.pending.get_mut(&link_id).unwrap();
+            assert_eq!(delivery.state, DeliveryState::Transferring);
+            delivery.started_at = Instant::now() - Duration::from_secs(600);
+            delivery.timeout = Duration::ZERO;
+        }
+
+        assert!(mgr.tick().is_empty());
+        let delivery = mgr.pending.get(&link_id).unwrap();
+        assert_eq!(delivery.state, DeliveryState::Transferring);
+        assert!(delivery.transfer.is_some());
+        let advertisement = next_outbound(&mut rx);
+        let (header, _) = rns_wire::header::PacketHeader::unpack(&advertisement).unwrap();
+        assert_eq!(
+            header.context,
+            rns_wire::context::PacketContext::ResourceAdv
         );
     }
 

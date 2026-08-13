@@ -106,6 +106,7 @@ pub(super) enum PnValidationOutcome {
 pub(super) struct PnValidationClaim {
     link_id: LinkId,
     outcome: PnValidationOutcome,
+    peer_destination_hash: Option<[u8; 16]>,
 }
 
 impl PnValidationClaim {
@@ -115,6 +116,10 @@ impl PnValidationClaim {
 
     pub(super) fn outcome(self) -> PnValidationOutcome {
         self.outcome
+    }
+
+    pub(super) fn peer_destination_hash(self) -> Option<[u8; 16]> {
+        self.peer_destination_hash
     }
 
     pub(super) fn should_close_link(self) -> bool {
@@ -590,7 +595,11 @@ impl PnInboundRuntime {
             self.install_untracked_invalid_throttle(pending.peer_destination_hash, now);
         }
 
-        Some(PnValidationClaim { link_id, outcome })
+        Some(PnValidationClaim {
+            link_id,
+            outcome,
+            peer_destination_hash: pending.peer_destination_hash,
+        })
     }
 
     fn install_untracked_invalid_throttle(

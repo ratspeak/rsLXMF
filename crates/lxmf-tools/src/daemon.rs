@@ -71,7 +71,7 @@ impl PythonLxmdConfig {
             delivery_transfer_max_accepted_size: get_float_or_floor(
                 lxmf,
                 "delivery_transfer_max_accepted_size",
-                1000.0,
+                1.0,
                 0.38,
             ),
             on_inbound: lxmf
@@ -227,7 +227,10 @@ impl Default for DaemonConfig {
             enforce_stamps: false,
             message_storage_limit: Some(500_000_000),
             from_static_only: false,
-            delivery_transfer_max_accepted_size: 1000.0,
+            // Current Python lxmd 1.1.0 deliberately narrows the standalone
+            // daemon default to 1 decimal KB. The reusable RouterConfig keeps
+            // its 1000 KB library default, matching Python LXMRouter.
+            delivery_transfer_max_accepted_size: 1.0,
         }
     }
 }
@@ -404,12 +407,12 @@ pub fn create_router_with_transport(
 pub fn execute_on_inbound(command: &str, message_path: &str) -> std::io::Result<()> {
     use std::process::Command;
 
-    let parts: Vec<&str> = command.split_whitespace().collect();
+    let parts = split_command_line(command)?;
     if parts.is_empty() {
         return Ok(());
     }
 
-    let mut cmd = Command::new(parts[0]);
+    let mut cmd = Command::new(&parts[0]);
     for arg in &parts[1..] {
         cmd.arg(arg);
     }
@@ -422,9 +425,150 @@ pub fn execute_on_inbound(command: &str, message_path: &str) -> std::io::Result<
     Ok(())
 }
 
+/// Parse the configured hook using the shell-like quoting supported by
+/// Python's `shlex.split()`, without invoking a shell.
+fn split_command_line(command: &str) -> std::io::Result<Vec<String>> {
+    use std::io::{Error, ErrorKind};
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Quote {
+        None,
+        Single,
+        Double,
+    }
+
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut quote = Quote::None;
+    let mut escaped = false;
+    let mut started = false;
+
+    for ch in command.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            started = true;
+            continue;
+        }
+
+        match quote {
+            Quote::Single => {
+                if ch == '\'' {
+                    quote = Quote::None;
+                } else {
+                    current.push(ch);
+                }
+                started = true;
+            }
+            Quote::Double => {
+                if ch == '"' {
+                    quote = Quote::None;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else {
+                    current.push(ch);
+                }
+                started = true;
+            }
+            Quote::None => match ch {
+                '\'' => {
+                    quote = Quote::Single;
+                    started = true;
+                }
+                '"' => {
+                    quote = Quote::Double;
+                    started = true;
+                }
+                '\\' => {
+                    escaped = true;
+                    started = true;
+                }
+                c if c.is_whitespace() => {
+                    if started {
+                        parts.push(std::mem::take(&mut current));
+                        started = false;
+                    }
+                }
+                _ => {
+                    current.push(ch);
+                    started = true;
+                }
+            },
+        }
+    }
+
+    if escaped || quote != Quote::None {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "unterminated quote or escape in on_inbound command",
+        ));
+    }
+    if started {
+        parts.push(current);
+    }
+    Ok(parts)
+}
+
+/// Persist a received message before invoking the configured hook. Keeping
+/// both operations in one blocking job prevents the hook from racing the
+/// atomic file write and keeps process execution off the async daemon loop.
+pub fn persist_inbound_and_execute(
+    message_path: &std::path::Path,
+    packed: &[u8],
+    command: Option<&str>,
+) -> std::io::Result<()> {
+    lxmf_core::persist::write_file_atomic(message_path, packed)?;
+    if let Some(command) = command {
+        execute_on_inbound(command, &message_path.to_string_lossy())?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn on_inbound_parser_matches_shell_like_quoting_without_a_shell() {
+        assert_eq!(
+            split_command_line("/tmp/a\\ b --label 'two words' \"\" --quoted=\"x y\"").unwrap(),
+            ["/tmp/a b", "--label", "two words", "", "--quoted=x y"]
+        );
+        assert!(split_command_line("hook 'unterminated").is_err());
+        assert!(split_command_line("hook trailing\\").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inbound_hook_observes_fully_persisted_message() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let hook = dir.path().join("hook with spaces.sh");
+        let message = dir.path().join("message.lxm");
+        let observed = dir.path().join("observed");
+        std::fs::write(
+            &hook,
+            "#!/bin/sh\nexpected=$1\nobserved=$2\nmessage=$3\ncmp \"$expected\" \"$message\" && printf ok > \"$observed\"\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&hook).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&hook, permissions).unwrap();
+        let expected = dir.path().join("expected");
+        std::fs::write(&expected, b"complete payload").unwrap();
+
+        let command = format!(
+            "'{}' '{}' '{}'",
+            hook.display(),
+            expected.display(),
+            observed.display()
+        );
+        persist_inbound_and_execute(&message, b"complete payload", Some(&command)).unwrap();
+
+        assert_eq!(std::fs::read(&message).unwrap(), b"complete payload");
+        assert_eq!(std::fs::read(&observed).unwrap(), b"ok");
+    }
 
     #[test]
     fn test_default_config() {
@@ -453,7 +597,7 @@ mod tests {
         assert!(!dc.node_announce_at_start);
         assert_eq!(dc.node_announce_interval, None);
         assert_eq!(dc.message_storage_limit, Some(500_000_000));
-        assert_eq!(dc.delivery_transfer_max_accepted_size, 1000.0);
+        assert_eq!(dc.delivery_transfer_max_accepted_size, 1.0);
         assert!(!dc.from_static_only);
     }
 
@@ -466,7 +610,7 @@ mod tests {
         assert!(!py.peer_announce_at_start);
         assert_eq!(py.peer_announce_interval, None);
         assert_eq!(py.peer_stamp_cost, 12);
-        assert_eq!(py.delivery_transfer_max_accepted_size, 1000.0);
+        assert_eq!(py.delivery_transfer_max_accepted_size, 1.0);
         assert_eq!(py.on_inbound, None);
         assert!(!py.enable_propagation_node);
         assert_eq!(py.node_name, None);
@@ -589,7 +733,7 @@ propagation_transfer_max_accepted_size = 12
         let rc = dc.to_router_config();
         assert!(!rc.propagation_enabled);
         assert_eq!(rc.max_peers, 20);
-        assert_eq!(rc.delivery_limit_kb, 1000.0);
+        assert_eq!(rc.delivery_limit_kb, 1.0);
         assert_eq!(RouterConfig::default().delivery_limit_kb, 1000.0);
         assert_eq!(rc.propagation_limit_kb, 256);
         assert_eq!(rc.sync_limit_kb, 10_240);

@@ -23,6 +23,9 @@ base64 = { workspace = true }
 serde_json = { workspace = true }
 rmpv = { workspace = true }
 
+[dev-dependencies]
+tempfile = { workspace = true }
+
 [[bin]]
 name = "lxmd-rs"
 path = "src/bin/lxmd-rs.rs"

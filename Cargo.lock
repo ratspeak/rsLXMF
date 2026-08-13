@@ -684,6 +684,7 @@ dependencies = [
  "rns-transport",
  "rns-wire",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

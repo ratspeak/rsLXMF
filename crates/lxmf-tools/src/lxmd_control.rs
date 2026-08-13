@@ -193,6 +193,9 @@ pub fn encode_router_control_stats(
             .as_ref()
             .map(|(_, value)| Value::from(*value as u64))
             .unwrap_or(Value::Nil);
+        let unhandled = node
+            .map(|node| node.unhandled_message_count(&peer.handled_messages))
+            .unwrap_or_else(|| peer.unhandled_messages() as usize);
 
         let peer_map = Value::Map(vec![
             (Value::String("type".into()), Value::from(peer_type)),
@@ -269,7 +272,7 @@ pub fn encode_router_control_stats(
                     (Value::String("incoming".into()), Value::from(peer.incoming)),
                     (
                         Value::String("unhandled".into()),
-                        Value::from(peer.unhandled_messages() as u64),
+                        Value::from(unhandled as u64),
                     ),
                 ]),
             ),

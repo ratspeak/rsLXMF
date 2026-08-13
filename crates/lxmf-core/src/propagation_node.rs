@@ -39,8 +39,8 @@ impl Default for PropagationNodeConfig {
             // Disabled by default; set to PROPAGATION_COST for production.
             min_stamp_cost: 0,
             peering_cost: PEERING_COST,
-            max_message_size: DELIVERY_LIMIT * 1024,
-            max_offer_size: SYNC_LIMIT * 1000,
+            max_message_size: DELIVERY_LIMIT * BYTES_PER_KILOBYTE,
+            max_offer_size: SYNC_LIMIT * BYTES_PER_KILOBYTE,
         }
     }
 }
@@ -69,9 +69,16 @@ impl GetRequestAction {
     /// Resolve to response bytes, performing any planned file reads inline.
     /// Blocking; do not call while holding a shared node lock.
     pub fn into_response(self) -> Vec<u8> {
+        self.into_response_with_served_count().0
+    }
+
+    /// Resolve the response and report how many messages were actually read
+    /// and admitted by the client's transfer limit. This lets the daemon keep
+    /// Python-compatible served-message accounting without repeating I/O.
+    pub fn into_response_with_served_count(self) -> (Vec<u8>, u64) {
         match self {
-            GetRequestAction::Respond(bytes) => bytes,
-            GetRequestAction::ServeFiles(plan) => plan.serve(),
+            GetRequestAction::Respond(bytes) => (bytes, 0),
+            GetRequestAction::ServeFiles(plan) => plan.serve_with_count(),
         }
     }
 }
@@ -98,6 +105,10 @@ impl GetServePlan {
     /// over-limit entries skipped (not a transfer abort), stamps stripped
     /// for client download. Unreadable files are skipped.
     pub fn serve(&self) -> Vec<u8> {
+        self.serve_with_count().0
+    }
+
+    fn serve_with_count(&self) -> (Vec<u8>, u64) {
         use rmpv::Value;
 
         const PER_MESSAGE_OVERHEAD: f64 = 16.0;
@@ -121,7 +132,8 @@ impl GetServePlan {
             messages.push(Value::Binary(payload));
         }
 
-        crate::encode_value(&Value::Array(messages))
+        let served = messages.len() as u64;
+        (crate::encode_value(&Value::Array(messages)), served)
     }
 }
 
@@ -268,7 +280,7 @@ fn kilobytes_to_bytes_fail_closed(kilobytes: f64) -> usize {
     if !kilobytes.is_finite() || kilobytes <= 0.0 {
         return 0;
     }
-    (kilobytes * 1000.0).floor() as usize
+    (kilobytes * BYTES_PER_KILOBYTE as f64).floor() as usize
 }
 
 pub struct PropagationNode {
@@ -310,6 +322,31 @@ impl PropagationNode {
 
     pub fn offer_generation(&self) -> u64 {
         self.offer_generation
+    }
+
+    /// Apply the daemon's destination deny policy to the authoritative hosted
+    /// store. The reusable router has its own optional store, so production
+    /// wiring must configure this node explicitly as well.
+    pub fn ignore_destination(&mut self, dest_hash: [u8; 16]) {
+        self.store.ignore_destination(dest_hash);
+    }
+
+    pub fn unignore_destination(&mut self, dest_hash: &[u8; 16]) {
+        self.store.unignore_destination(dest_hash);
+    }
+
+    pub fn is_destination_ignored(&self, dest_hash: &[u8; 16]) -> bool {
+        self.store.is_destination_ignored(dest_hash)
+    }
+
+    /// Apply the daemon's culling-priority policy to the authoritative hosted
+    /// store.
+    pub fn prioritise_destination(&mut self, dest_hash: [u8; 16]) {
+        self.store.prioritise_destination(dest_hash);
+    }
+
+    pub fn unprioritise_destination(&mut self, dest_hash: &[u8; 16]) {
+        self.store.unprioritise_destination(dest_hash);
     }
 
     fn advance_offer_generation(&mut self) {
@@ -697,6 +734,20 @@ impl PropagationNode {
         self.store.len()
     }
 
+    /// Count live store entries not yet handled by one peer. The daemon's
+    /// generation scheduler does not maintain `LxmPeer`'s legacy cached
+    /// unhandled counter, so control status must derive this from the same
+    /// authoritative store used to prepare offers.
+    pub fn unhandled_message_count(
+        &self,
+        handled_messages: &HashSet<PropagationTransientId>,
+    ) -> usize {
+        self.store
+            .entries()
+            .filter(|entry| !handled_messages.contains(&entry.transient_id))
+            .count()
+    }
+
     pub fn total_size(&self) -> usize {
         self.store.total_size()
     }
@@ -957,9 +1008,9 @@ impl PropagationNode {
                 }
             }
 
-            // Wire value is kilobytes ×1000 (Python LXMRouter.py:1471).
+            // Wire value is decimal kilobytes (Python LXMRouter.py:1471).
             let limit_bytes = if arr.len() > 2 {
-                arr[2].as_f64().map(|kb| kb * 1000.0)
+                arr[2].as_f64().map(|kb| kb * BYTES_PER_KILOBYTE as f64)
             } else {
                 None
             };
@@ -1331,7 +1382,9 @@ mod tests {
 
     #[test]
     fn test_new_propagation_node() {
-        let node = PropagationNode::new(PropagationNodeConfig::default(), [0xAA; 16]);
+        let config = PropagationNodeConfig::default();
+        assert_eq!(config.max_message_size, 1_000_000);
+        let node = PropagationNode::new(config, [0xAA; 16]);
         assert_eq!(node.message_count(), 0);
         assert_eq!(node.total_size(), 0);
         assert_eq!(node.dest_hash, [0xAA; 16]);
@@ -1344,6 +1397,35 @@ mod tests {
         assert!(msg.hash.is_some());
         assert!(node.accept_message(&msg));
         assert_eq!(node.message_count(), 1);
+    }
+
+    #[test]
+    fn hosted_node_applies_ignored_destination_policy() {
+        let destination = [0x44; 16];
+        let mut node = PropagationNode::new(PropagationNodeConfig::default(), [0xAA; 16]);
+        node.ignore_destination(destination);
+        assert!(node.is_destination_ignored(&destination));
+
+        let mut blob = destination.to_vec();
+        blob.extend_from_slice(b"encrypted-lxmf");
+        assert!(!node.accept_stamped_propagated_blob(&blob, &[0; 32], 0));
+        assert_eq!(node.message_count(), 0);
+
+        node.unignore_destination(&destination);
+        assert!(node.accept_stamped_propagated_blob(&blob, &[0; 32], 0));
+    }
+
+    #[test]
+    fn unhandled_count_is_derived_from_live_store_and_peer_handled_set() {
+        let mut node = PropagationNode::new(PropagationNodeConfig::default(), [0xAA; 16]);
+        let msg = make_signed_message([0xBB; 16], [0xCC; 16], "Test", "content");
+        let transient_id = msg.transient_id.or(msg.hash).unwrap();
+        assert!(node.accept_message(&msg));
+
+        let mut handled = HashSet::new();
+        assert_eq!(node.unhandled_message_count(&handled), 1);
+        handled.insert(transient_id);
+        assert_eq!(node.unhandled_message_count(&handled), 0);
     }
 
     #[test]
@@ -2720,8 +2802,10 @@ mod tests {
         };
         // Reads resolve after the node borrow ends (embedder drops the lock).
         drop(node);
-        let response: Value = rmpv::decode::read_value(&mut &plan.serve()[..]).unwrap();
+        let (response_bytes, served) = plan.serve_with_count();
+        let response: Value = rmpv::decode::read_value(&mut &response_bytes[..]).unwrap();
         let messages = response.as_array().unwrap();
+        assert_eq!(served, 1);
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].as_slice().unwrap(), blob.as_slice());
 

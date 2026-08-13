@@ -12,12 +12,12 @@
 //! 7. Client processes received messages.
 //! 8. Final `/get` with `[None, received_ids]` purges them from the server.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use rns_crypto::ed25519::{Ed25519PrivateKey, Ed25519PublicKey};
-use rns_link::link::{CloseReason, Link};
+use rns_link::link::{CloseReason, Link, LinkAction};
 use rns_protocol::resource::{
     InboundTransfer, MAX_SEGMENTS, MultiSegmentInbound, RANDOM_HASH_SIZE, ResourceError,
     TransferAction,
@@ -97,8 +97,13 @@ pub struct PropagationClient {
     inbound_resources: HashMap<[u8; 32], InboundTransfer>,
     inbound_split_resources: HashMap<[u8; 32], MultiSegmentInbound>,
     segment_routing: HashMap<[u8; 32], SegmentRoute>,
+    /// Ordered, bounded staging for transport backpressure.
+    pending_transport: VecDeque<TransportMessage>,
     /// KB per transfer; `None` means unlimited.
     delivery_limit: Option<f64>,
+    /// `None` means all messages; Python's `PR_ALL_MESSAGES` value is zero.
+    max_messages: Option<usize>,
+    retain_synced_on_node: bool,
     started_at: Option<Instant>,
     timeout: Duration,
     identified: bool,
@@ -129,7 +134,10 @@ impl PropagationClient {
             inbound_resources: HashMap::new(),
             inbound_split_resources: HashMap::new(),
             segment_routing: HashMap::new(),
+            pending_transport: VecDeque::new(),
             delivery_limit: Some(DELIVERY_LIMIT as f64),
+            max_messages: None,
+            retain_synced_on_node: false,
             started_at: None,
             timeout: Duration::from_secs(120),
             identified: false,
@@ -151,6 +159,17 @@ impl PropagationClient {
 
     pub fn add_local_message_id(&mut self, transient_id: Vec<u8>) {
         self.local_messages.insert(transient_id);
+    }
+
+    pub fn replace_local_message_ids<I>(&mut self, transient_ids: I)
+    where
+        I: IntoIterator<Item = Vec<u8>>,
+    {
+        self.local_messages = transient_ids.into_iter().collect();
+    }
+
+    pub fn set_retain_synced_on_node(&mut self, retain: bool) {
+        self.retain_synced_on_node = retain;
     }
 
     pub fn available_messages(&self) -> &[Vec<u8>] {
@@ -184,6 +203,12 @@ impl PropagationClient {
     }
 
     pub fn start_download(&mut self) -> bool {
+        self.start_download_with_limit(None)
+    }
+
+    /// Start a propagation download, limiting newly requested messages.
+    /// `None` and zero mirror Python's `PR_ALL_MESSAGES`.
+    pub fn start_download_with_limit(&mut self, max_messages: Option<usize>) -> bool {
         let node_hash = match self.outbound_propagation_node {
             Some(h) => h,
             None => return false,
@@ -202,20 +227,21 @@ impl PropagationClient {
         ) {
             self.cleanup();
         }
+        self.flush_pending_transport();
+        if !self.pending_transport.is_empty() {
+            return false;
+        }
 
         let (link, request_data) = Link::new_initiator(node_hash, 1);
         let link_id = link.link_id;
 
-        if let Err(e) = self
-            .transport_tx
-            .try_send(TransportMessage::RegisterDestination {
-                hash: link_id,
-                app_name: "lxmf.propagation.client".to_string(),
-                delivery_tx: Some(self.event_tx.clone()),
-            })
-        {
-            tracing::warn!(err = %e,
-                "failed to register propagation client destination; download will fail");
+        if !self.queue_transport(TransportMessage::RegisterDestination {
+            hash: link_id,
+            app_name: "lxmf.propagation.client".to_string(),
+            delivery_tx: Some(self.event_tx.clone()),
+        }) {
+            tracing::warn!("failed to register propagation client destination");
+            return false;
         }
 
         let flags = rns_wire::flags::PacketFlags {
@@ -235,12 +261,14 @@ impl PropagationClient {
         let mut raw = header.pack();
         raw.extend_from_slice(&request_data);
 
-        let _ = self
-            .transport_tx
-            .try_send(TransportMessage::Outbound(OutboundRequest {
-                raw: Bytes::from(raw),
-                destination_hash: node_hash,
-            }));
+        if !self.queue_transport(TransportMessage::Outbound(OutboundRequest {
+            raw: Bytes::from(raw),
+            destination_hash: node_hash,
+        })) {
+            tracing::warn!("failed to stage propagation client Link request");
+            self.pending_transport.clear();
+            return false;
+        }
 
         self.status = PropagationTransferStatus {
             state: PropagationClientState::LinkEstablishing,
@@ -250,6 +278,7 @@ impl PropagationClient {
         self.link = Some(link);
         self.link_id = Some(link_id);
         self.started_at = Some(Instant::now());
+        self.max_messages = max_messages.filter(|limit| *limit > 0);
         self.identified = false;
         self.available_messages.clear();
         self.received_messages.clear();
@@ -258,6 +287,49 @@ impl PropagationClient {
         self.inbound_split_resources.clear();
         self.segment_routing.clear();
         true
+    }
+
+    /// Cancel an active request and return to the idle state.
+    pub fn cancel_download(&mut self) {
+        self.cleanup();
+        self.status = PropagationTransferStatus::default();
+    }
+
+    const PENDING_TRANSPORT_LIMIT: usize = 256;
+
+    fn queue_transport(&mut self, message: TransportMessage) -> bool {
+        if self.pending_transport.is_empty() {
+            match self.transport_tx.try_send(message) {
+                Ok(()) => return true,
+                Err(mpsc::error::TrySendError::Full(message)) => {
+                    self.pending_transport.push_back(message);
+                    return true;
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => return false,
+            }
+        }
+        if self.pending_transport.len() >= Self::PENDING_TRANSPORT_LIMIT {
+            return false;
+        }
+        self.pending_transport.push_back(message);
+        true
+    }
+
+    fn flush_pending_transport(&mut self) {
+        while let Some(message) = self.pending_transport.pop_front() {
+            match self.transport_tx.try_send(message) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(message)) => {
+                    self.pending_transport.push_front(message);
+                    break;
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    self.pending_transport.clear();
+                    self.status.state = PropagationClientState::Failed;
+                    break;
+                }
+            }
+        }
     }
 
     pub fn drain_events(&mut self, known_identities: &std::collections::HashMap<String, [u8; 64]>) {
@@ -284,6 +356,10 @@ impl PropagationClient {
                     } else {
                         &[]
                     };
+                    if let Some(link) = self.link.as_mut() {
+                        link.record_inbound();
+                        link.record_rx(data.len());
+                    }
 
                     match header.context {
                         rns_wire::context::PacketContext::Lrproof
@@ -397,14 +473,16 @@ impl PropagationClient {
                     let mut rtt_raw = rtt_header.pack();
                     rtt_raw.extend_from_slice(&rtt_data);
 
-                    let _ =
-                        self.transport_tx
-                            .try_send(TransportMessage::Outbound(OutboundRequest {
-                                raw: Bytes::from(rtt_raw),
-                                destination_hash: link_id,
-                            }));
+                    if !self.queue_transport(TransportMessage::Outbound(OutboundRequest {
+                        raw: Bytes::from(rtt_raw),
+                        destination_hash: link_id,
+                    })) {
+                        self.status.state = PropagationClientState::Failed;
+                        return;
+                    }
                 }
                 self.status.state = PropagationClientState::LinkEstablished;
+                self.started_at = Some(Instant::now());
             }
             Err(_) => {
                 self.status.state = PropagationClientState::Failed;
@@ -621,10 +699,13 @@ impl PropagationClient {
             return;
         };
 
-        let Some(transfer) = self.inbound_resources.get_mut(&resource_hash) else {
-            return;
+        let action = {
+            let Some(transfer) = self.inbound_resources.get_mut(&resource_hash) else {
+                return;
+            };
+            transfer.hashmap_update(segment, hashmap_data)
         };
-        match transfer.hashmap_update(segment, hashmap_data) {
+        match action {
             TransferAction::SendRequest(req) => {
                 self.send_encrypted_resource_control(
                     rns_wire::context::PacketContext::ResourceReq,
@@ -661,7 +742,7 @@ impl PropagationClient {
     }
 
     fn complete_resource(&mut self, resource_hash: [u8; 32]) {
-        let assembled = {
+        let (assembled, proof) = {
             let Some(link) = self.link.as_ref() else {
                 return;
             };
@@ -673,16 +754,14 @@ impl PropagationClient {
                 return;
             };
             match transfer.complete(Some(&decrypt_fn)) {
-                Ok((assembled, proof)) => {
-                    self.send_resource_proof(&proof);
-                    assembled
-                }
+                Ok(result) => result,
                 Err(_) => {
                     self.status.state = PropagationClientState::Failed;
                     return;
                 }
             }
         };
+        self.send_resource_proof(&proof);
 
         let route = self.segment_routing.remove(&resource_hash);
         if let Some(link) = self.link.as_mut() {
@@ -743,18 +822,20 @@ impl PropagationClient {
     }
 
     fn send_encrypted_resource_control(
-        &self,
+        &mut self,
         context: rns_wire::context::PacketContext,
         plaintext: &[u8],
     ) {
-        if let Some(link) = self.link.as_ref() {
-            if let Ok(encrypted) = link.encrypt(plaintext) {
-                self.send_link_packet(context, rns_wire::flags::PacketType::Data, &encrypted);
-            }
+        let encrypted = self
+            .link
+            .as_ref()
+            .and_then(|link| link.encrypt(plaintext).ok());
+        if let Some(encrypted) = encrypted {
+            self.send_link_packet(context, rns_wire::flags::PacketType::Data, &encrypted);
         }
     }
 
-    fn send_resource_proof(&self, proof: &[u8]) {
+    fn send_resource_proof(&mut self, proof: &[u8]) {
         self.send_link_packet(
             rns_wire::context::PacketContext::ResourcePrf,
             rns_wire::flags::PacketType::Proof,
@@ -763,7 +844,7 @@ impl PropagationClient {
     }
 
     fn send_link_packet(
-        &self,
+        &mut self,
         context: rns_wire::context::PacketContext,
         packet_type: rns_wire::flags::PacketType,
         payload: &[u8],
@@ -786,12 +867,14 @@ impl PropagationClient {
         };
         let mut raw = header.pack();
         raw.extend_from_slice(payload);
-        let _ = self
-            .transport_tx
-            .try_send(TransportMessage::Outbound(OutboundRequest {
-                raw: Bytes::from(raw),
-                destination_hash: link_id,
-            }));
+        if !self.queue_transport(TransportMessage::Outbound(OutboundRequest {
+            raw: Bytes::from(raw),
+            destination_hash: link_id,
+        })) {
+            self.status.state = PropagationClientState::Failed;
+        } else if let Some(link) = self.link.as_mut() {
+            link.record_tx(payload.len());
+        }
     }
 
     /// Phase 1: parse available transient IDs from the server.
@@ -866,14 +949,66 @@ impl PropagationClient {
     }
 
     pub fn tick(&mut self) {
+        self.flush_pending_transport();
+        if self.status.state == PropagationClientState::Failed {
+            self.cleanup();
+            return;
+        }
+
         if let Some(started) = self.started_at {
             if started.elapsed() > self.timeout
-                && self.status.state != PropagationClientState::Idle
-                && self.status.state != PropagationClientState::Complete
+                && matches!(
+                    self.status.state,
+                    PropagationClientState::LinkEstablishing
+                        | PropagationClientState::ListRequested
+                        | PropagationClientState::GetRequested
+                        | PropagationClientState::PurgeRequested
+                )
             {
                 self.cleanup();
                 self.status.state = PropagationClientState::Failed;
                 return;
+            }
+        }
+
+        let link_action = self.link.as_mut().map(Link::tick);
+        match link_action {
+            Some(LinkAction::SendKeepalive) | Some(LinkAction::TransitionedToStale) => {
+                self.send_link_packet(
+                    rns_wire::context::PacketContext::Keepalive,
+                    rns_wire::flags::PacketType::Data,
+                    &[rns_link::constants::KEEPALIVE_REQUEST],
+                );
+            }
+            Some(LinkAction::SendTeardownAndClose(payload)) => {
+                self.send_link_packet(
+                    rns_wire::context::PacketContext::LinkClose,
+                    rns_wire::flags::PacketType::Data,
+                    &payload,
+                );
+                self.status.state = PropagationClientState::Failed;
+            }
+            Some(LinkAction::Closed(_)) => self.status.state = PropagationClientState::Failed,
+            Some(LinkAction::None) | None => {}
+        }
+
+        if self.status.state == PropagationClientState::Receiving {
+            let mut retry_requests = Vec::new();
+            for transfer in self.inbound_resources.values_mut() {
+                match transfer.check_timeout() {
+                    TransferAction::SendRequest(request) => retry_requests.push(request),
+                    TransferAction::Failed(_) => {
+                        self.status.state = PropagationClientState::Failed;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            for request in retry_requests {
+                self.send_encrypted_resource_control(
+                    rns_wire::context::PacketContext::ResourceReq,
+                    &request,
+                );
             }
         }
 
@@ -883,6 +1018,9 @@ impl PropagationClient {
             PropagationClientState::LinkEstablished => {
                 if !self.identified {
                     self.send_identify();
+                    if self.status.state == PropagationClientState::Failed {
+                        return;
+                    }
                     self.identified = true;
                 }
                 self.send_list_request();
@@ -898,7 +1036,7 @@ impl PropagationClient {
     }
 
     fn send_identify(&mut self) {
-        if let (Some(link), Some(link_id)) = (&mut self.link, self.link_id) {
+        let outbound = if let (Some(link), Some(link_id)) = (&mut self.link, self.link_id) {
             if let (Some(pub_key), Some(sign_key)) = (&self.identity_pub, &self.identity_key) {
                 if let Ok(identify_data) = link.identify(pub_key, sign_key) {
                     let id_header = rns_wire::header::PacketHeader {
@@ -916,13 +1054,22 @@ impl PropagationClient {
                     };
                     let mut id_raw = id_header.pack();
                     id_raw.extend_from_slice(&identify_data);
-                    let _ =
-                        self.transport_tx
-                            .try_send(TransportMessage::Outbound(OutboundRequest {
-                                raw: Bytes::from(id_raw),
-                                destination_hash: link_id,
-                            }));
+                    Some(TransportMessage::Outbound(OutboundRequest {
+                        raw: Bytes::from(id_raw),
+                        destination_hash: link_id,
+                    }))
+                } else {
+                    None
                 }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(outbound) = outbound {
+            if !self.queue_transport(outbound) {
+                self.status.state = PropagationClientState::Failed;
             }
         }
     }
@@ -939,6 +1086,7 @@ impl PropagationClient {
 
         if self.send_get_path_request(&request_data) {
             self.status.state = PropagationClientState::ListRequested;
+            self.started_at = Some(Instant::now());
         } else {
             self.status.state = PropagationClientState::Failed;
         }
@@ -957,6 +1105,7 @@ impl PropagationClient {
             .available_messages
             .iter()
             .filter(|id| !self.local_messages.contains(*id))
+            .take(self.max_messages.unwrap_or(usize::MAX))
             .map(|id| Value::Binary(id.clone()))
             .collect();
 
@@ -964,7 +1113,7 @@ impl PropagationClient {
         let haves: Vec<Value> = self
             .available_messages
             .iter()
-            .filter(|id| self.local_messages.contains(*id))
+            .filter(|id| !self.retain_synced_on_node && self.local_messages.contains(*id))
             .map(|id| Value::Binary(id.clone()))
             .collect();
 
@@ -979,6 +1128,7 @@ impl PropagationClient {
             let buf = crate::encode_value(&array);
             if self.send_get_path_request(&buf) {
                 self.status.state = PropagationClientState::PurgeRequested;
+                self.started_at = Some(Instant::now());
             } else {
                 self.status.state = PropagationClientState::Failed;
             }
@@ -995,6 +1145,7 @@ impl PropagationClient {
 
         if self.send_get_path_request(&buf) {
             self.status.state = PropagationClientState::GetRequested;
+            self.started_at = Some(Instant::now());
         } else {
             self.status.state = PropagationClientState::Failed;
         }
@@ -1016,6 +1167,7 @@ impl PropagationClient {
 
         if self.send_get_path_request(&buf) {
             self.status.state = PropagationClientState::PurgeRequested;
+            self.started_at = Some(Instant::now());
         } else {
             self.status.state = PropagationClientState::Failed;
         }
@@ -1024,7 +1176,7 @@ impl PropagationClient {
     /// Send a msgpack request to the `MESSAGE_GET_PATH` endpoint; returns `true`
     /// if the request was dispatched successfully.
     fn send_get_path_request(&mut self, request_data: &[u8]) -> bool {
-        if let Some(ref mut link) = self.link {
+        let outbound = if let Some(ref mut link) = self.link {
             match link.request(
                 MESSAGE_GET_PATH,
                 Some(request_data),
@@ -1052,27 +1204,31 @@ impl PropagationClient {
                             rns_wire::flags::HeaderType::Header1,
                         );
                         link.update_pending_request_id(&_request_id, packet_request_id);
-                        let _ = self.transport_tx.try_send(TransportMessage::Outbound(
-                            OutboundRequest {
-                                raw: Bytes::from(req_raw),
-                                destination_hash: link_id,
-                            },
-                        ));
-                        return true;
+                        Some(TransportMessage::Outbound(OutboundRequest {
+                            raw: Bytes::from(req_raw),
+                            destination_hash: link_id,
+                        }))
+                    } else {
+                        None
                     }
                 }
-                Err(_) => return false,
+                Err(_) => None,
             }
-        }
-        false
+        } else {
+            None
+        };
+        outbound.is_some_and(|message| self.queue_transport(message))
     }
 
     fn cleanup(&mut self) {
         self.send_teardown();
         if let Some(link_id) = self.link_id.take() {
-            let _ = self
-                .transport_tx
-                .try_send(TransportMessage::DeregisterDestination { hash: link_id });
+            if !self.queue_transport(TransportMessage::DeregisterDestination { hash: link_id }) {
+                tracing::warn!(
+                    link_id = %hex::encode(link_id),
+                    "failed to deregister propagation client Link"
+                );
+            }
         }
         self.link = None;
         self.inbound_resources.clear();
@@ -1198,6 +1354,46 @@ mod tests {
     }
 
     #[test]
+    fn start_download_rejects_a_closed_transport_instead_of_false_success() {
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let mut client = PropagationClient::new(tx, None, None);
+        client.set_propagation_node([0xB0; 16]);
+
+        assert!(!client.start_download());
+        assert_eq!(client.state(), PropagationClientState::Idle);
+        assert!(client.link.is_none());
+        assert!(client.pending_transport.is_empty());
+    }
+
+    #[test]
+    fn start_download_preserves_register_before_request_under_backpressure() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(TransportMessage::DeregisterDestination { hash: [1; 16] })
+            .unwrap();
+        let mut client = PropagationClient::new(tx, None, None);
+        client.set_propagation_node([0xB2; 16]);
+
+        assert!(client.start_download());
+        assert_eq!(client.pending_transport.len(), 2);
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            TransportMessage::DeregisterDestination { .. }
+        ));
+        client.tick();
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            TransportMessage::RegisterDestination { .. }
+        ));
+        client.tick();
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            TransportMessage::Outbound(_)
+        ));
+        assert!(client.pending_transport.is_empty());
+    }
+
+    #[test]
     fn test_start_download_rejects_an_active_transfer() {
         let (tx, mut rx) = mpsc::channel(64);
         let mut client = PropagationClient::new(tx, None, None);
@@ -1230,6 +1426,34 @@ mod tests {
         let mut client = PropagationClient::new(tx, None, None);
         client.set_delivery_limit(512.0);
         assert_eq!(client.delivery_limit, Some(512.0));
+    }
+
+    #[test]
+    fn get_request_honours_max_messages_and_retain_policy() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut client = PropagationClient::new(tx, None, None);
+        let (initiator, responder) = active_link_pair([0xB3; 16]);
+        client.link_id = Some(initiator.link_id);
+        client.link = Some(initiator);
+        client.max_messages = Some(1);
+        client.retain_synced_on_node = true;
+        client.available_messages = vec![vec![1; 32], vec![2; 32], vec![3; 32]];
+        client.local_messages.insert(vec![1; 32]);
+
+        client.send_get_request();
+        let request = match rx.try_recv().unwrap() {
+            TransportMessage::Outbound(request) => request,
+            other => panic!("expected request packet, got {other:?}"),
+        };
+        let (_, offset) = rns_wire::header::PacketHeader::unpack(&request.raw).unwrap();
+        let (_, _, _, request_data) = responder.handle_request(&request.raw[offset..]).unwrap();
+        let value = rmpv::decode::read_value(&mut &request_data[..]).unwrap();
+        let fields = value.as_array().unwrap();
+        assert_eq!(
+            fields[0].as_array().unwrap(),
+            &[rmpv::Value::Binary(vec![2; 32])]
+        );
+        assert!(fields[1].as_array().unwrap().is_empty());
     }
 
     #[test]
@@ -1450,6 +1674,23 @@ mod tests {
         assert_eq!(client.status.state, PropagationClientState::Failed);
         assert!(client.acknowledge_transfer());
         assert_eq!(client.status.state, PropagationClientState::Idle);
+    }
+
+    #[test]
+    fn progressive_resource_phase_is_not_killed_by_absolute_operation_timeout() {
+        let (tx, _rx) = mpsc::channel(16);
+        let mut client = PropagationClient::new(tx, None, None);
+        let (initiator, _responder) = active_link_pair([0xC1; 16]);
+        client.link_id = Some(initiator.link_id);
+        client.link = Some(initiator);
+        client.status.state = PropagationClientState::Receiving;
+        client.started_at = Some(Instant::now() - Duration::from_secs(600));
+        client.timeout = Duration::ZERO;
+
+        client.tick();
+
+        assert_eq!(client.state(), PropagationClientState::Receiving);
+        assert!(client.link.is_some());
     }
 
     #[test]

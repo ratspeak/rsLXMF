@@ -1079,15 +1079,19 @@ impl LxmRouter {
     /// The method does not mutate peer state, allowing a single shared sync
     /// task to accept one policy before the daemon marks that peer started.
     pub fn sync_peer_policies_for_store(&self, offer_generation: u64) -> Vec<OutboundOfferPolicy> {
-        let mut policies = self
+        let eligible = self
             .peers
             .values()
             .filter(|peer| {
-                peer.alive
-                    && peer.state == PeerState::Idle
+                peer.state == PeerState::Idle
                     && peer.should_sync()
                     && peer.needs_offer_generation(offer_generation)
             })
+            .collect::<Vec<_>>();
+        let has_alive = eligible.iter().any(|peer| peer.alive);
+        let mut policies = eligible
+            .into_iter()
+            .filter(|peer| peer.alive == has_alive)
             .map(OutboundOfferPolicy::from)
             .collect::<Vec<_>>();
         policies.sort_by_key(|policy| policy.peer_hash);
@@ -1888,14 +1892,21 @@ impl LxmRouter {
                             {
                                 message.mark_sent();
                                 message.progress = 1.0;
+                            } else {
+                                tracing::warn!(
+                                    dest = %hex::encode(dest_hash),
+                                    "transport backpressure deferred opportunistic LXMF delivery"
+                                );
+                                self.pending_outbound.push(message);
                             }
                         }
                         Err(err) => {
                             tracing::warn!(
                                 dest = %hex::encode(dest_hash),
                                 error = %err,
-                                "cannot execute opportunistic LXMF action"
+                                "cannot execute opportunistic LXMF action; re-queueing"
                             );
+                            self.pending_outbound.push(message);
                         }
                     }
                 }
@@ -2937,6 +2948,38 @@ mod tests {
     }
 
     #[test]
+    fn store_generation_scheduler_falls_back_to_backoff_expired_unresponsive_peers() {
+        let alive_hash = [0x21; 16];
+        let fallback_hash = [0x22; 16];
+        let mut router = LxmRouter::new(RouterConfig::default());
+        let alive = LxmPeer::new(alive_hash);
+        let mut fallback = LxmPeer::new(fallback_hash);
+        fallback.alive = false;
+        fallback.next_sync_attempt = 0.0;
+        assert!(router.add_peer(alive));
+        assert!(router.add_peer(fallback));
+
+        let policies = router.sync_peer_policies_for_store(1);
+        assert_eq!(
+            policies
+                .iter()
+                .map(|policy| policy.peer_hash)
+                .collect::<Vec<_>>(),
+            vec![alive_hash]
+        );
+
+        router.peers.get_mut(&alive_hash).unwrap().begin_sync();
+        let policies = router.sync_peer_policies_for_store(1);
+        assert_eq!(
+            policies
+                .iter()
+                .map(|policy| policy.peer_hash)
+                .collect::<Vec<_>>(),
+            vec![fallback_hash]
+        );
+    }
+
+    #[test]
     fn test_validate_stamp() {
         let router = LxmRouter::new(RouterConfig::default());
         let msg_id = rns_crypto::sha::sha256(b"test message");
@@ -3451,6 +3494,40 @@ mod tests {
             rx.try_recv().is_err(),
             "Direct actions require LinkDeliveryManager and must not be sent as destination packets"
         );
+    }
+
+    #[test]
+    fn opportunistic_transport_backpressure_requeues_instead_of_dropping() {
+        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
+        let dest_hash = [0xA1; 16];
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        tx.try_send(
+            rns_transport::messages::TransportMessage::DeregisterDestination { hash: [0xF0; 16] },
+        )
+        .unwrap();
+        let mut router = LxmRouter::new(RouterConfig::default());
+        router.set_transport(tx);
+        let mut message = LxMessage::new(
+            dest_hash,
+            [0xB1; 16],
+            "defer",
+            "payload",
+            DeliveryMethod::Opportunistic,
+        );
+        message.sign(&key).unwrap();
+        let message_hash = message.hash;
+
+        router.execute_actions_with_encryptor(
+            vec![OutboundAction::DeliverOpportunistic { message, dest_hash }],
+            |_dest, plaintext| Ok(plaintext.to_vec()),
+        );
+
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            rns_transport::messages::TransportMessage::DeregisterDestination { .. }
+        ));
+        assert_eq!(router.pending_outbound.len(), 1);
+        assert_eq!(router.pending_outbound.first().unwrap().hash, message_hash);
     }
 
     #[test]

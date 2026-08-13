@@ -175,6 +175,9 @@ pub const MESSAGE_EXPIRY: u64 = 30 * 24 * 60 * 60;
 pub const STAMP_COST_EXPIRY: u64 = 45 * 24 * 60 * 60;
 /// Delay before announcing propagation node (seconds).
 pub const NODE_ANNOUNCE_DELAY: u64 = 20;
+/// LXMF configuration and announce values use decimal kilobytes, matching
+/// Python's `limit_kb * 1000` accounting.
+pub const BYTES_PER_KILOBYTE: usize = 1000;
 pub const PROPAGATION_LIMIT: usize = 256;
 pub const DELIVERY_LIMIT: usize = 1000;
 /// PROPAGATION_LIMIT * 40, in KB.
