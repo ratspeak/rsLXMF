@@ -1696,7 +1696,8 @@ impl LxmRouter {
             }
 
             // State transitions match Python LXMessage.py:476-499:
-            //   Opportunistic -> Sent immediately (single packet, fire-and-forget).
+            //   Opportunistic -> Sent immediately; the embedding runtime keeps
+            //   receipt ownership until an authenticated packet proof arrives.
             //   Direct / Propagated -> Sending (multi-step).
             match msg.method {
                 DeliveryMethod::Direct => {
