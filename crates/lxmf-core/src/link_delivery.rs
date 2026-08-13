@@ -14,8 +14,8 @@ use rns_crypto::ed25519::{Ed25519PrivateKey, Ed25519PublicKey};
 use rns_link::constants::{ESTABLISHMENT_TIMEOUT_PER_HOP, KEEPALIVE_DEFAULT};
 use rns_link::link::{CloseReason, Link, LinkAction, LinkState};
 use rns_protocol::resource::{
-    MAX_EFFICIENT_SIZE, MultiSegmentOutbound, OutboundResource, OutboundTransfer, ResourceError,
-    TransferAction,
+    LazyMultiSegmentOutbound, MAX_EFFICIENT_SIZE, OutboundResource, OutboundTransfer,
+    ResourceError, TransferAction,
 };
 use rns_transport::link_messages::DestinationEvent;
 use rns_transport::messages::{OutboundRequest, TransportMessage};
@@ -57,9 +57,10 @@ pub struct PendingDelivery {
     pub started_at: Instant,
     /// Resource transfer, populated after the link establishes.
     pub transfer: Option<OutboundTransfer>,
-    /// Remaining Reticulum resource segments for payloads larger than one
-    /// efficient resource. Segment 1 is stored in `transfer`.
-    pub remaining_segments: Vec<OutboundResource>,
+    /// Sequential Reticulum Resource plan for payloads larger than one
+    /// efficient resource. Segment 1 is stored in `transfer`; later segments
+    /// are materialised only after the preceding proof arrives.
+    pub remaining_segments: Option<LazyMultiSegmentOutbound>,
     /// Full packet hash of a single link-packet LXMF delivery awaiting LINKPROOF.
     pub packet_proof_hash: Option<[u8; 32]>,
     /// Link establishment timeout. This intentionally excludes keepalive time:
@@ -129,7 +130,7 @@ impl PendingDelivery {
         self.packed_override = next.packed_override;
         self.auto_compress = next.auto_compress;
         self.transfer = None;
-        self.remaining_segments.clear();
+        self.remaining_segments = None;
         self.packet_proof_hash = None;
         self.started_at = Instant::now();
         self.msg_hash = next.msg_hash;
@@ -965,7 +966,7 @@ impl LinkDeliveryManager {
                 state: DeliveryState::Establishing,
                 started_at: Instant::now(),
                 transfer: None,
-                remaining_segments: Vec::new(),
+                remaining_segments: None,
                 packet_proof_hash: None,
                 establishment_timeout: Duration::from_secs_f64(establishment_timeout_secs),
                 timeout: Duration::from_secs_f64(timeout_secs),
@@ -1622,11 +1623,12 @@ impl LinkDeliveryManager {
                             Some(delivery.message.progress),
                             Some(reason.clone()),
                         ));
+                        let message = take_current_delivery_message(delivery);
                         results.push(DeliveryResult::Rejected {
                             link_id: *link_id,
                             msg_hash: delivery.msg_hash,
                             dest_hash: delivery.dest_hash,
-                            message: delivery.message.clone(),
+                            message,
                             reason,
                         });
                         if delivery.reusable && delivery.link.state != LinkState::Closed {
@@ -1982,13 +1984,34 @@ impl LinkDeliveryManager {
                     Some(progress),
                     None,
                 ));
-                if delivery.remaining_segments.is_empty() {
-                    delivery.state = DeliveryState::Complete;
-                } else {
-                    let rtt = delivery.link.rtt.unwrap_or(Duration::from_millis(500));
-                    let next_segment = delivery.remaining_segments.remove(0);
-                    delivery.transfer = Some(OutboundTransfer::from_prebuilt(next_segment, rtt));
-                    delivery.state = DeliveryState::Transferring;
+                let rtt = delivery.link.rtt.unwrap_or(Duration::from_millis(500));
+                let next_segment = delivery
+                    .remaining_segments
+                    .as_mut()
+                    .map(|remaining| next_resource_segment(&delivery.link, remaining))
+                    .transpose();
+                match next_segment {
+                    Ok(Some(Some(segment))) => {
+                        let exhausted = delivery
+                            .remaining_segments
+                            .as_ref()
+                            .is_none_or(|remaining| remaining.remaining_segments() == 0);
+                        if exhausted {
+                            delivery.remaining_segments = None;
+                        }
+                        delivery.transfer = Some(OutboundTransfer::from_prebuilt(segment, rtt));
+                        delivery.state = DeliveryState::Transferring;
+                    }
+                    Ok(Some(None)) | Ok(None) => {
+                        delivery.remaining_segments = None;
+                        delivery.state = DeliveryState::Complete;
+                    }
+                    Err(_) => {
+                        delivery.remaining_segments = None;
+                        delivery.state = DeliveryState::Failed;
+                        delivery.failure_reason =
+                            Some("resource transfer build failed".to_string());
+                    }
                 }
                 true
             } else {
@@ -2016,7 +2039,7 @@ impl LinkDeliveryManager {
             if let Some(ref mut transfer) = delivery.transfer {
                 if transfer.resource.resource_hash == rejected_hash {
                     transfer.handle_cancel();
-                    delivery.remaining_segments.clear();
+                    delivery.remaining_segments = None;
                     delivery.message.mark_rejected();
                     delivery.state = DeliveryState::Rejected;
                     delivery.failure_reason = Some("resource rejected".to_string());
@@ -2054,7 +2077,7 @@ impl LinkDeliveryManager {
                 return true;
             }
             delivery.transfer = None;
-            delivery.remaining_segments.clear();
+            delivery.remaining_segments = None;
             delivery.packet_proof_hash = None;
             delivery.state = DeliveryState::Failed;
             delivery.failure_reason = Some("link closed".to_string());
@@ -2649,7 +2672,7 @@ fn finish_reusable_delivery(
     }
 
     delivery.transfer = None;
-    delivery.remaining_segments.clear();
+    delivery.remaining_segments = None;
     delivery.packet_proof_hash = None;
     delivery.failure_reason = None;
 
@@ -2662,7 +2685,7 @@ fn finish_reusable_delivery(
 
 fn finish_unsuccessful_reusable_delivery(delivery: &mut PendingDelivery) {
     delivery.transfer = None;
-    delivery.remaining_segments.clear();
+    delivery.remaining_segments = None;
     delivery.packet_proof_hash = None;
     delivery.failure_reason = None;
 
@@ -2702,7 +2725,7 @@ fn push_failed_delivery_and_queue(
     reason: &str,
 ) {
     delivery.transfer = None;
-    delivery.remaining_segments.clear();
+    delivery.remaining_segments = None;
     delivery.packet_proof_hash = None;
     events.push_back(delivery_event(
         LxmfDeliveryEventKind::Failed,
@@ -2711,14 +2734,29 @@ fn push_failed_delivery_and_queue(
         Some(delivery.message.progress),
         Some(reason.to_string()),
     ));
+    let message = take_current_delivery_message(delivery);
     results.push(DeliveryResult::Failed {
         link_id,
         msg_hash: delivery.msg_hash,
         dest_hash: delivery.dest_hash,
-        message: delivery.message.clone(),
+        message,
         reason: reason.to_string(),
     });
     fail_queued_deliveries(results, events, link_id, delivery, reason);
+}
+
+/// Move the potentially large attachment-bearing message into its terminal
+/// result. Reusable Link sessions retain only a tiny placeholder until the
+/// next queued message replaces it, avoiding a full deep clone on failure.
+fn take_current_delivery_message(delivery: &mut PendingDelivery) -> LxMessage {
+    let placeholder = LxMessage::new(
+        delivery.dest_hash,
+        delivery.message.source_hash,
+        "",
+        "",
+        delivery.message.method,
+    );
+    std::mem::replace(&mut delivery.message, placeholder)
 }
 
 fn fail_queued_deliveries(
@@ -2887,7 +2925,7 @@ fn build_resource_transfer(
     packed: Vec<u8>,
     auto_compress: bool,
     rtt: Duration,
-) -> Result<(OutboundTransfer, Vec<OutboundResource>), ResourceError> {
+) -> Result<(OutboundTransfer, Option<LazyMultiSegmentOutbound>), ResourceError> {
     if packed.len() <= MAX_EFFICIENT_SIZE {
         let transfer = match link.session_keys() {
             Some(keys) => {
@@ -2895,27 +2933,30 @@ fn build_resource_transfer(
             }
             None => OutboundTransfer::new(packed, auto_compress, rtt)?,
         };
-        return Ok((transfer, Vec::new()));
+        return Ok((transfer, None));
     }
 
-    let multi = match link.session_keys() {
+    let mut remaining = LazyMultiSegmentOutbound::new(packed, auto_compress)?;
+    let first = next_resource_segment(link, &mut remaining)?.ok_or(ResourceError::Incomplete)?;
+    let remaining = (remaining.remaining_segments() > 0).then_some(remaining);
+    Ok((OutboundTransfer::from_prebuilt(first, rtt), remaining))
+}
+
+fn next_resource_segment(
+    link: &Link,
+    remaining: &mut LazyMultiSegmentOutbound,
+) -> Result<Option<OutboundResource>, ResourceError> {
+    match link.session_keys() {
         Some(keys) => {
             let keys = keys.clone();
             let encrypt_fn = |plaintext: &[u8]| -> Vec<u8> {
                 rns_link::encryption::link_encrypt(&keys, plaintext)
                     .unwrap_or_else(|_| plaintext.to_vec())
             };
-            MultiSegmentOutbound::with_encrypt(packed, auto_compress, Some(&encrypt_fn))?
+            remaining.next_segment(Some(&encrypt_fn))
         }
-        None => MultiSegmentOutbound::new(packed, auto_compress)?,
-    };
-
-    let mut segments = multi.segments.into_iter();
-    let first = segments.next().ok_or(ResourceError::Incomplete)?;
-    Ok((
-        OutboundTransfer::from_prebuilt(first, rtt),
-        segments.collect(),
-    ))
+        None => remaining.next_segment(None),
+    }
 }
 
 /// Result of a delivery tick.
@@ -4229,7 +4270,10 @@ mod tests {
         assert_eq!(transfer.resource.segment_index, 1);
         assert!(transfer.resource.total_segments >= 2);
         assert_eq!(
-            delivery.remaining_segments.len(),
+            delivery
+                .remaining_segments
+                .as_ref()
+                .map_or(0, LazyMultiSegmentOutbound::remaining_segments),
             transfer.resource.total_segments - 1
         );
     }
@@ -4476,7 +4520,7 @@ mod tests {
             proof.extend_from_slice(&transfer.resource.resource_hash);
             proof.extend_from_slice(&transfer.resource.expected_proof);
             terminal_proofs.push(proof);
-            if delivery.remaining_segments.is_empty() {
+            if delivery.remaining_segments.is_none() {
                 break;
             }
             let proof = terminal_proofs.pop().unwrap();

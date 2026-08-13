@@ -21,11 +21,13 @@
 //! (LXMessage.py:380-383).
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rns_crypto::sha::{full_hash, sha256, truncated_hash};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::constants::*;
 use crate::types::PropagationTransientId;
@@ -259,8 +261,85 @@ impl LxMessage {
         Ok(())
     }
 
+    /// Encode and install the native LXMF image field without first cloning
+    /// `image_bytes` into an intermediate `rmpv::Value` tree.
+    ///
+    /// The wire value remains exactly `[format, image_bytes]`.
+    pub fn set_image_field(
+        &mut self,
+        format: &str,
+        image_bytes: &[u8],
+    ) -> Result<(), MessageError> {
+        let encoded = rmp_serde::to_vec(&ImageFieldRef {
+            format,
+            bytes: image_bytes,
+        })
+        .map_err(|error| MessageError::PackFailed(error.to_string()))?;
+        self.fields.insert(FIELD_IMAGE, encoded);
+        self.msgpack_field_ids.insert(FIELD_IMAGE);
+        Ok(())
+    }
+
+    /// Encode and install one native LXMF file attachment without first
+    /// cloning `file_bytes` into an intermediate `rmpv::Value` tree.
+    ///
+    /// The wire value remains exactly `[[file_name, file_bytes]]`.
+    pub fn set_file_attachment_field(
+        &mut self,
+        file_name: &str,
+        file_bytes: &[u8],
+    ) -> Result<(), MessageError> {
+        let encoded = rmp_serde::to_vec(&FileAttachmentsFieldRef {
+            file_name,
+            bytes: file_bytes,
+        })
+        .map_err(|error| MessageError::PackFailed(error.to_string()))?;
+        self.fields.insert(FIELD_FILE_ATTACHMENTS, encoded);
+        self.msgpack_field_ids.insert(FIELD_FILE_ATTACHMENTS);
+        Ok(())
+    }
+
     pub fn get_field(&self, field_id: u8) -> Option<&Vec<u8>> {
         self.fields.get(&field_id)
+    }
+
+    /// Decode the first native LXMF file attachment while borrowing its bytes
+    /// from this message. Only the small filename is allocated.
+    pub fn first_file_attachment(&self) -> Result<Option<(String, &[u8])>, MessageError> {
+        let Some(field) = self.fields.get(&FIELD_FILE_ATTACHMENTS) else {
+            return Ok(None);
+        };
+        let mut input = field.as_slice();
+        if read_msgpack_array_len(&mut input)? == 0 {
+            return Ok(None);
+        }
+        if read_msgpack_array_len(&mut input)? < 2 {
+            return Err(MessageError::UnpackFailed(
+                "file attachment entry requires name and data".to_string(),
+            ));
+        }
+        let file_name =
+            String::from_utf8_lossy(read_msgpack_string_or_binary(&mut input)?).into_owned();
+        let data = read_msgpack_binary(&mut input)?;
+        Ok(Some((file_name, data)))
+    }
+
+    /// Decode the native LXMF image field while borrowing its image bytes
+    /// from this message. Only the short format string is allocated.
+    pub fn image_attachment(&self) -> Result<Option<(String, &[u8])>, MessageError> {
+        let Some(field) = self.fields.get(&FIELD_IMAGE) else {
+            return Ok(None);
+        };
+        let mut input = field.as_slice();
+        if read_msgpack_array_len(&mut input)? < 2 {
+            return Err(MessageError::UnpackFailed(
+                "image field requires format and data".to_string(),
+            ));
+        }
+        let format =
+            String::from_utf8_lossy(read_msgpack_string_or_binary(&mut input)?).into_owned();
+        let data = read_msgpack_binary(&mut input)?;
+        Ok(Some((format, data)))
     }
 
     /// Pack the payload as `msgpack([timestamp, title, content, fields, ?stamp])`.
@@ -276,35 +355,109 @@ impl LxMessage {
         self.pack_payload_inner(None)
     }
 
-    /// Borrow-serialize the payload — used by both [`Self::pack_payload`] and
-    /// [`Self::pack_payload_for_signing`] to avoid cloning `title`, `content`,
-    /// and `fields` for every msgpack pass. The on-wire bytes are identical
-    /// to what serializing an owned [`MessagePayload`] would produce.
+    /// Stream the payload directly into one output buffer. Structured LXMF
+    /// fields are already complete MessagePack values, so writing their bytes
+    /// verbatim avoids decoding a potentially large attachment into an owned
+    /// `rmpv::Value` tree merely to encode it again.
     fn pack_payload_inner(&self, stamp: Option<&[u8]>) -> Result<Vec<u8>, MessageError> {
-        let payload = MessagePayloadRef {
-            timestamp: self.timestamp,
-            title: &self.title,
-            content: &self.content,
-            fields: &self.fields,
-            msgpack_field_ids: &self.msgpack_field_ids,
-            stamp,
-        };
-        rmp_serde::to_vec(&payload).map_err(|e| MessageError::PackFailed(e.to_string()))
+        let capacity = self
+            .title
+            .len()
+            .checked_add(self.content.len())
+            .and_then(|length| {
+                self.fields
+                    .values()
+                    .try_fold(length, |total, field| total.checked_add(field.len()))
+            })
+            .and_then(|length| length.checked_add(stamp.map_or(0, <[u8]>::len)))
+            .and_then(|length| length.checked_add(64))
+            .ok_or_else(|| MessageError::PackFailed("packed length overflow".to_string()))?;
+        let mut output = Vec::with_capacity(capacity);
+        self.write_payload(&mut output, stamp)?;
+        Ok(output)
+    }
+
+    fn packed_payload_len(&self, stamp: Option<&[u8]>) -> Result<usize, MessageError> {
+        let mut counter = CountingWriter::default();
+        self.write_payload(&mut counter, stamp)?;
+        Ok(counter.bytes)
+    }
+
+    fn write_payload<W: Write>(
+        &self,
+        writer: &mut W,
+        stamp: Option<&[u8]>,
+    ) -> Result<(), MessageError> {
+        fn length(value: usize, what: &str) -> Result<u32, MessageError> {
+            u32::try_from(value)
+                .map_err(|_| MessageError::PackFailed(format!("{what} exceeds MessagePack limits")))
+        }
+
+        fn packed(error: impl std::fmt::Display) -> MessageError {
+            MessageError::PackFailed(error.to_string())
+        }
+
+        rmp::encode::write_array_len(writer, if stamp.is_some() { 5 } else { 4 })
+            .map_err(packed)?;
+        rmp::encode::write_f64(writer, self.timestamp).map_err(packed)?;
+        rmp::encode::write_bin_len(writer, length(self.title.len(), "title")?).map_err(packed)?;
+        writer.write_all(self.title.as_bytes()).map_err(packed)?;
+        rmp::encode::write_bin_len(writer, length(self.content.len(), "content")?)
+            .map_err(packed)?;
+        writer.write_all(self.content.as_bytes()).map_err(packed)?;
+        rmp::encode::write_map_len(writer, length(self.fields.len(), "field count")?)
+            .map_err(packed)?;
+        for (field_id, field) in &self.fields {
+            rmp::encode::write_uint(writer, u64::from(*field_id)).map_err(packed)?;
+            if self.msgpack_field_ids.contains(field_id) {
+                writer.write_all(field).map_err(packed)?;
+            } else {
+                rmp::encode::write_bin_len(writer, length(field.len(), "field")?)
+                    .map_err(packed)?;
+                writer.write_all(field).map_err(packed)?;
+            }
+        }
+        if let Some(stamp) = stamp {
+            rmp::encode::write_bin_len(writer, length(stamp.len(), "stamp")?).map_err(packed)?;
+            writer.write_all(stamp).map_err(packed)?;
+        }
+        Ok(())
+    }
+
+    /// Exact full wire length without allocating the packed message. This is
+    /// used for application envelope admission before the router constructs
+    /// the one contiguous signing/Resource buffer.
+    pub fn packed_len(&self) -> Result<usize, MessageError> {
+        self.signature.ok_or(MessageError::NotSigned)?;
+        let payload = self.packed_payload_len(self.stamp.as_deref())?;
+        (DESTINATION_LENGTH * 2 + SIGNATURE_LENGTH)
+            .checked_add(payload)
+            .ok_or_else(|| MessageError::PackFailed("packed length overflow".to_string()))
     }
 
     /// Pack the full message for wire transmission as
     /// `dest_hash || src_hash || signature || payload` (Python/C++ Propagated format).
     pub fn pack(&self) -> Result<Vec<u8>, MessageError> {
         let sig = self.signature.ok_or(MessageError::NotSigned)?;
-        let payload = self.pack_payload()?;
-
+        let payload_len = self.packed_payload_len(self.stamp.as_deref())?;
         let mut packed =
-            Vec::with_capacity(DESTINATION_LENGTH * 2 + SIGNATURE_LENGTH + payload.len());
+            Vec::with_capacity(DESTINATION_LENGTH * 2 + SIGNATURE_LENGTH + payload_len);
         packed.extend_from_slice(&self.destination_hash);
         packed.extend_from_slice(&self.source_hash);
         packed.extend_from_slice(&sig);
-        packed.extend_from_slice(&payload);
+        self.write_payload(&mut packed, self.stamp.as_deref())?;
         Ok(packed)
+    }
+
+    fn signed_data_for_signing(&self) -> Result<(Vec<u8>, [u8; 32]), MessageError> {
+        let payload_len = self.packed_payload_len(None)?;
+        let mut signed_data = Vec::with_capacity(DESTINATION_LENGTH * 2 + payload_len + 32);
+        signed_data.extend_from_slice(&self.destination_hash);
+        signed_data.extend_from_slice(&self.source_hash);
+        self.write_payload(&mut signed_data, None)?;
+        let message_hash = sha256(&signed_data);
+        signed_data.extend_from_slice(&message_hash);
+        Ok((signed_data, message_hash))
     }
 
     fn message_id_from_payload(
@@ -312,13 +465,16 @@ impl LxMessage {
         source_hash: &[u8; 16],
         payload: &[u8],
     ) -> [u8; 32] {
-        let payload_for_hash =
-            Self::strip_stamp_from_payload(payload).unwrap_or_else(|| payload.to_vec());
-        let mut hashed_part = Vec::with_capacity(DESTINATION_LENGTH * 2 + payload_for_hash.len());
-        hashed_part.extend_from_slice(destination_hash);
-        hashed_part.extend_from_slice(source_hash);
-        hashed_part.extend_from_slice(&payload_for_hash);
-        sha256(&hashed_part)
+        let mut hasher = Sha256::new();
+        hasher.update(destination_hash);
+        hasher.update(source_hash);
+        if let Some(body) = first_four_msgpack_array_body(payload) {
+            hasher.update([0x94]);
+            hasher.update(body);
+        } else {
+            hasher.update(payload);
+        }
+        hasher.finalize().into()
     }
 
     /// Pack a message for propagation delivery.
@@ -529,7 +685,7 @@ impl LxMessage {
         signature.copy_from_slice(&data[32..96]);
 
         let payload_data = &data[96..];
-        let payload = Self::unpack_payload_rmpv(payload_data)?;
+        let payload = Self::unpack_payload_streamed(payload_data)?;
 
         let hash = Self::message_id_from_payload(&dest_hash, &src_hash, payload_data);
 
@@ -577,81 +733,83 @@ impl LxMessage {
         Ok(msg)
     }
 
-    /// Parse a msgpack payload via `rmpv`.
-    ///
-    /// LXMF fields can hold complex types (e.g. `FIELD_IMAGE` arrays, nested arrays for
-    /// `FIELD_FILE_ATTACHMENTS`) that `rmp_serde`'s strict typing rejects. `rmpv` accepts any
-    /// msgpack type and re-serializes complex values to bytes.
-    fn unpack_payload_rmpv(payload_data: &[u8]) -> Result<MessagePayload, MessageError> {
-        use std::io::Cursor;
-        let value = rmpv::decode::read_value(&mut Cursor::new(payload_data))
-            .map_err(|e| MessageError::UnpackFailed(format!("msgpack decode: {e}")))?;
-        let arr = value
-            .as_array()
-            .ok_or_else(|| MessageError::UnpackFailed("payload is not an array".into()))?;
-        if arr.len() < 4 {
+    /// Parse the payload without constructing an owned `rmpv::Value` tree.
+    /// Complex field values are copied once from their exact encoded range;
+    /// large attachment bytes are never duplicated during structural decode.
+    fn unpack_payload_streamed(payload_data: &[u8]) -> Result<MessagePayload, MessageError> {
+        let mut input = payload_data;
+        let item_count = read_msgpack_array_len(&mut input)?;
+        if item_count < 4 {
             return Err(MessageError::UnpackFailed(format!(
-                "payload array too short: {}",
-                arr.len()
+                "payload array too short: {item_count}"
             )));
         }
 
-        let timestamp = arr[0]
-            .as_f64()
-            .ok_or_else(|| MessageError::UnpackFailed("timestamp is not float".into()))?;
-
-        let title = match &arr[1] {
-            rmpv::Value::Binary(b) => String::from_utf8_lossy(b).into_owned(),
-            rmpv::Value::String(s) => s.as_str().unwrap_or("").to_string(),
-            _ => String::new(),
-        };
-
-        let content = match &arr[2] {
-            rmpv::Value::Binary(b) => String::from_utf8_lossy(b).into_owned(),
-            rmpv::Value::String(s) => s.as_str().unwrap_or("").to_string(),
-            _ => String::new(),
-        };
+        let timestamp = read_msgpack_float(&mut input)?;
+        let title = read_msgpack_text_or_empty(&mut input)?;
+        let content = read_msgpack_text_or_empty(&mut input)?;
 
         let mut fields = BTreeMap::new();
         let mut msgpack_field_ids = BTreeSet::new();
-        if let Some(map_entries) = arr[3].as_map() {
-            for (k, v) in map_entries {
-                // Field keys >= 0x80 pack as negative fixint; accept either encoding.
-                let key = k
-                    .as_u64()
-                    .map(|v| v as u8)
-                    .or_else(|| k.as_i64().map(|v| v as u8))
-                    .unwrap_or(0);
-                let value_bytes = match v {
-                    rmpv::Value::Binary(b) => b.clone(),
-                    other => {
-                        let mut buf = Vec::new();
-                        rmpv::encode::write_value(&mut buf, other).map_err(|e| {
-                            MessageError::UnpackFailed(format!("field re-serialize: {e}"))
-                        })?;
-                        msgpack_field_ids.insert(key);
-                        buf
-                    }
+        if input
+            .first()
+            .is_some_and(|marker| msgpack_marker_is_map(*marker))
+        {
+            let field_count = read_msgpack_map_len(&mut input)?;
+            for _ in 0..field_count {
+                let key = read_msgpack_integer_u8(&mut input)?;
+                let value_bytes = if input
+                    .first()
+                    .is_some_and(|marker| matches!(*marker, 0xc4..=0xc6))
+                {
+                    read_msgpack_binary(&mut input)?.to_vec()
+                } else {
+                    let encoded = input;
+                    skip_msgpack_value(&mut input, 0)?;
+                    let consumed = encoded.len() - input.len();
+                    msgpack_field_ids.insert(key);
+                    encoded[..consumed].to_vec()
                 };
                 fields.insert(key, value_bytes);
             }
+        } else {
+            skip_msgpack_value(&mut input, 0)?;
         }
 
-        let stamp = if arr.len() > 4 {
-            match &arr[4] {
-                rmpv::Value::Binary(b) if b.len() == TICKET_LENGTH || b.len() == 32 => {
-                    Some(b.clone())
+        let stamp = if item_count > 4 {
+            match input.first().copied() {
+                Some(0xc4..=0xc6) => {
+                    let bytes = read_msgpack_binary(&mut input)?;
+                    (bytes.len() == TICKET_LENGTH || bytes.len() == 32).then(|| bytes.to_vec())
                 }
-                // Older Rust builds encoded fixed-size stamps as an array of integers.
-                rmpv::Value::Array(elems) if elems.len() == TICKET_LENGTH || elems.len() == 32 => {
-                    let mut s = Vec::with_capacity(elems.len());
-                    for elem in elems {
-                        s.push(elem.as_u64().unwrap_or(0) as u8);
+                Some(0x90..=0x9f | 0xdc | 0xdd) => {
+                    let count = read_msgpack_array_len(&mut input)? as usize;
+                    if count == TICKET_LENGTH || count == 32 {
+                        let mut bytes = Vec::with_capacity(count);
+                        for _ in 0..count {
+                            bytes.push(read_msgpack_integer_u8(&mut input)?);
+                        }
+                        Some(bytes)
+                    } else {
+                        for _ in 0..count {
+                            skip_msgpack_value(&mut input, 0)?;
+                        }
+                        None
                     }
-                    Some(s)
                 }
-                rmpv::Value::Nil => None,
-                _ => None,
+                Some(0xc0) => {
+                    take_msgpack(&mut input, 1)?;
+                    None
+                }
+                Some(_) => {
+                    skip_msgpack_value(&mut input, 0)?;
+                    None
+                }
+                None => {
+                    return Err(MessageError::UnpackFailed(
+                        "missing MessagePack stamp".to_string(),
+                    ));
+                }
             }
         } else {
             None
@@ -665,22 +823,6 @@ impl LxMessage {
             msgpack_field_ids,
             stamp,
         })
-    }
-
-    /// Strip the stamp (5th element) from a wire payload to reproduce the bytes Python signed.
-    ///
-    /// Returns `None` if the payload already has no stamp — caller should use it as-is.
-    fn strip_stamp_from_payload(payload: &[u8]) -> Option<Vec<u8>> {
-        use std::io::Cursor;
-        let value = rmpv::decode::read_value(&mut Cursor::new(payload)).ok()?;
-        let arr = value.as_array()?;
-        if arr.len() <= 4 {
-            return None;
-        }
-        let stripped = rmpv::Value::Array(arr[..4].to_vec());
-        let mut buf = Vec::new();
-        rmpv::encode::write_value(&mut buf, &stripped).ok()?;
-        Some(buf)
     }
 
     /// Alias for [`Self::unpack`]; all formats share the same
@@ -707,14 +849,7 @@ impl LxMessage {
         &mut self,
         signing_key: &rns_crypto::ed25519::Ed25519PrivateKey,
     ) -> Result<(), MessageError> {
-        let payload = self.pack_payload_for_signing()?;
-
-        let mut signed_data = Vec::with_capacity(32 + payload.len() + 32);
-        signed_data.extend_from_slice(&self.destination_hash);
-        signed_data.extend_from_slice(&self.source_hash);
-        signed_data.extend_from_slice(&payload);
-        let message_hash = sha256(&signed_data);
-        signed_data.extend_from_slice(&message_hash);
+        let (signed_data, message_hash) = self.signed_data_for_signing()?;
 
         self.signature = Some(signing_key.sign(&signed_data));
         self.hash = Some(message_hash);
@@ -732,14 +867,7 @@ impl LxMessage {
         F: FnOnce(&[u8]) -> Result<[u8; 64], E>,
         E: std::fmt::Display,
     {
-        let payload = self.pack_payload_for_signing()?;
-
-        let mut signed_data = Vec::with_capacity(32 + payload.len() + 32);
-        signed_data.extend_from_slice(&self.destination_hash);
-        signed_data.extend_from_slice(&self.source_hash);
-        signed_data.extend_from_slice(&payload);
-        let message_hash = sha256(&signed_data);
-        signed_data.extend_from_slice(&message_hash);
+        let (signed_data, message_hash) = self.signed_data_for_signing()?;
 
         let signature = sign_fn(&signed_data)
             .map_err(|e| MessageError::PackFailed(format!("signing failed: {e}")))?;
@@ -759,30 +887,36 @@ impl LxMessage {
             None => return false,
         };
 
-        // For inbound messages with complex fields, use the original wire payload bytes (with
-        // stamp stripped) to avoid re-serialization mismatches. Python does the same via
-        // LXMessage.py:742-745.
-        let payload = if let Some(ref wp) = self.wire_payload {
-            match Self::strip_stamp_from_payload(wp) {
-                Some(p) => p,
-                None => wp.clone(),
-            }
-        } else {
-            match self.pack_payload_for_signing() {
-                Ok(p) => p,
-                Err(_) => return false,
-            }
-        };
-
-        let mut signed_data = Vec::with_capacity(32 + payload.len() + 32);
+        // Build the signed bytes once. Inbound wire payloads are borrowed and
+        // their fifth stamp element is omitted by slicing the first four
+        // encoded elements, avoiding an owned MessagePack value tree.
+        let payload_capacity = self
+            .wire_payload
+            .as_ref()
+            .map_or_else(|| self.packed_payload_len(None).unwrap_or(0), Vec::len);
+        let mut signed_data = Vec::with_capacity(64 + payload_capacity);
         signed_data.extend_from_slice(&self.destination_hash);
         signed_data.extend_from_slice(&self.source_hash);
-        signed_data.extend_from_slice(&payload);
+        if let Some(wire_payload) = self.wire_payload.as_deref() {
+            if let Some(body) = first_four_msgpack_array_body(wire_payload) {
+                signed_data.push(0x94);
+                signed_data.extend_from_slice(body);
+            } else {
+                signed_data.extend_from_slice(wire_payload);
+            }
+        } else if self.write_payload(&mut signed_data, None).is_err() {
+            return false;
+        }
         let message_hash = sha256(&signed_data);
         signed_data.extend_from_slice(&message_hash);
 
         let valid = verify_key.verify(&signed_data, &sig).is_ok();
         self.signature_validated = valid;
+        if valid {
+            // Fields now own the canonical values needed by the application;
+            // the full duplicate wire payload is no longer needed.
+            self.wire_payload = None;
+        }
         valid
     }
 
@@ -1084,6 +1218,295 @@ impl LxMessage {
     }
 }
 
+fn read_msgpack_array_len(input: &mut &[u8]) -> Result<u32, MessageError> {
+    let marker = take_msgpack(input, 1)?[0];
+    match marker {
+        0x90..=0x9f => Ok(u32::from(marker & 0x0f)),
+        0xdc => Ok(u32::from(u16::from_be_bytes(
+            take_msgpack(input, 2)?.try_into().expect("exact length"),
+        ))),
+        0xdd => Ok(u32::from_be_bytes(
+            take_msgpack(input, 4)?.try_into().expect("exact length"),
+        )),
+        _ => Err(MessageError::UnpackFailed(
+            "expected MessagePack array".to_string(),
+        )),
+    }
+}
+
+fn read_msgpack_string_or_binary<'a>(input: &mut &'a [u8]) -> Result<&'a [u8], MessageError> {
+    let marker = take_msgpack(input, 1)?[0];
+    let length = match marker {
+        0xa0..=0xbf => usize::from(marker & 0x1f),
+        0xd9 | 0xc4 => usize::from(take_msgpack(input, 1)?[0]),
+        0xda | 0xc5 => usize::from(u16::from_be_bytes(
+            take_msgpack(input, 2)?.try_into().expect("exact length"),
+        )),
+        0xdb | 0xc6 => usize::try_from(u32::from_be_bytes(
+            take_msgpack(input, 4)?.try_into().expect("exact length"),
+        ))
+        .map_err(|_| MessageError::UnpackFailed("field length overflow".to_string()))?,
+        _ => {
+            return Err(MessageError::UnpackFailed(
+                "expected MessagePack string or binary value".to_string(),
+            ));
+        }
+    };
+    take_msgpack(input, length)
+}
+
+fn read_msgpack_binary<'a>(input: &mut &'a [u8]) -> Result<&'a [u8], MessageError> {
+    let marker = take_msgpack(input, 1)?[0];
+    let length = match marker {
+        0xc4 => usize::from(take_msgpack(input, 1)?[0]),
+        0xc5 => usize::from(u16::from_be_bytes(
+            take_msgpack(input, 2)?.try_into().expect("exact length"),
+        )),
+        0xc6 => usize::try_from(u32::from_be_bytes(
+            take_msgpack(input, 4)?.try_into().expect("exact length"),
+        ))
+        .map_err(|_| MessageError::UnpackFailed("field length overflow".to_string()))?,
+        _ => {
+            return Err(MessageError::UnpackFailed(
+                "expected MessagePack binary value".to_string(),
+            ));
+        }
+    };
+    take_msgpack(input, length)
+}
+
+fn take_msgpack<'a>(input: &mut &'a [u8], length: usize) -> Result<&'a [u8], MessageError> {
+    if input.len() < length {
+        return Err(MessageError::UnpackFailed(
+            "truncated MessagePack attachment field".to_string(),
+        ));
+    }
+    let (value, remaining) = input.split_at(length);
+    *input = remaining;
+    Ok(value)
+}
+
+fn first_four_msgpack_array_body(payload: &[u8]) -> Option<&[u8]> {
+    let mut input = payload;
+    let count = read_msgpack_array_len(&mut input).ok()?;
+    if count <= 4 {
+        return None;
+    }
+    let body = input;
+    for _ in 0..4 {
+        skip_msgpack_value(&mut input, 0).ok()?;
+    }
+    Some(&body[..body.len() - input.len()])
+}
+
+fn read_msgpack_float(input: &mut &[u8]) -> Result<f64, MessageError> {
+    match take_msgpack(input, 1)?[0] {
+        0xca => Ok(f64::from(f32::from_bits(u32::from_be_bytes(
+            take_msgpack(input, 4)?.try_into().expect("exact length"),
+        )))),
+        0xcb => Ok(f64::from_bits(u64::from_be_bytes(
+            take_msgpack(input, 8)?.try_into().expect("exact length"),
+        ))),
+        _ => Err(MessageError::UnpackFailed(
+            "timestamp is not float".to_string(),
+        )),
+    }
+}
+
+fn read_msgpack_text_or_empty(input: &mut &[u8]) -> Result<String, MessageError> {
+    if input
+        .first()
+        .is_some_and(|marker| matches!(*marker, 0xa0..=0xbf | 0xc4..=0xc6 | 0xd9..=0xdb))
+    {
+        return Ok(String::from_utf8_lossy(read_msgpack_string_or_binary(input)?).into_owned());
+    }
+    skip_msgpack_value(input, 0)?;
+    Ok(String::new())
+}
+
+const fn msgpack_marker_is_map(marker: u8) -> bool {
+    matches!(marker, 0x80..=0x8f | 0xde | 0xdf)
+}
+
+fn read_msgpack_map_len(input: &mut &[u8]) -> Result<u32, MessageError> {
+    match take_msgpack(input, 1)?[0] {
+        marker @ 0x80..=0x8f => Ok(u32::from(marker & 0x0f)),
+        0xde => Ok(u32::from(u16::from_be_bytes(
+            take_msgpack(input, 2)?.try_into().expect("exact length"),
+        ))),
+        0xdf => Ok(u32::from_be_bytes(
+            take_msgpack(input, 4)?.try_into().expect("exact length"),
+        )),
+        _ => Err(MessageError::UnpackFailed(
+            "expected MessagePack map".to_string(),
+        )),
+    }
+}
+
+fn read_msgpack_integer_u8(input: &mut &[u8]) -> Result<u8, MessageError> {
+    let marker = take_msgpack(input, 1)?[0];
+    let value = match marker {
+        0x00..=0x7f => u64::from(marker),
+        0xe0..=0xff => i64::from(marker as i8) as u64,
+        0xcc => u64::from(take_msgpack(input, 1)?[0]),
+        0xcd => u64::from(u16::from_be_bytes(
+            take_msgpack(input, 2)?.try_into().expect("exact length"),
+        )),
+        0xce => u64::from(u32::from_be_bytes(
+            take_msgpack(input, 4)?.try_into().expect("exact length"),
+        )),
+        0xcf => u64::from_be_bytes(take_msgpack(input, 8)?.try_into().expect("exact length")),
+        0xd0 => i64::from(i8::from_be_bytes(
+            take_msgpack(input, 1)?.try_into().expect("exact length"),
+        )) as u64,
+        0xd1 => i64::from(i16::from_be_bytes(
+            take_msgpack(input, 2)?.try_into().expect("exact length"),
+        )) as u64,
+        0xd2 => i64::from(i32::from_be_bytes(
+            take_msgpack(input, 4)?.try_into().expect("exact length"),
+        )) as u64,
+        0xd3 => {
+            i64::from_be_bytes(take_msgpack(input, 8)?.try_into().expect("exact length")) as u64
+        }
+        _ => {
+            return Err(MessageError::UnpackFailed(
+                "expected MessagePack integer".to_string(),
+            ));
+        }
+    };
+    Ok(value as u8)
+}
+
+fn skip_msgpack_value(input: &mut &[u8], depth: usize) -> Result<(), MessageError> {
+    if depth >= 64 {
+        return Err(MessageError::UnpackFailed(
+            "MessagePack nesting exceeds limit".to_string(),
+        ));
+    }
+    let marker = take_msgpack(input, 1)?[0];
+    match marker {
+        0x00..=0x7f | 0xc0 | 0xc2..=0xc3 | 0xe0..=0xff => Ok(()),
+        0x80..=0x8f => skip_msgpack_values(input, depth, u32::from(marker & 0x0f) * 2),
+        0x90..=0x9f => skip_msgpack_values(input, depth, u32::from(marker & 0x0f)),
+        0xa0..=0xbf => {
+            take_msgpack(input, usize::from(marker & 0x1f))?;
+            Ok(())
+        }
+        0xc1 => Err(MessageError::UnpackFailed(
+            "reserved MessagePack marker".to_string(),
+        )),
+        0xc4 | 0xd9 => {
+            let length = usize::from(take_msgpack(input, 1)?[0]);
+            take_msgpack(input, length)?;
+            Ok(())
+        }
+        0xc5 | 0xda => {
+            let length = usize::from(u16::from_be_bytes(
+                take_msgpack(input, 2)?.try_into().expect("exact length"),
+            ));
+            take_msgpack(input, length)?;
+            Ok(())
+        }
+        0xc6 | 0xdb => {
+            let length = usize::try_from(u32::from_be_bytes(
+                take_msgpack(input, 4)?.try_into().expect("exact length"),
+            ))
+            .map_err(|_| MessageError::UnpackFailed("value length overflow".to_string()))?;
+            take_msgpack(input, length)?;
+            Ok(())
+        }
+        0xc7 => {
+            let length = usize::from(take_msgpack(input, 1)?[0]);
+            take_msgpack(input, length.saturating_add(1))?;
+            Ok(())
+        }
+        0xc8 => {
+            let length = usize::from(u16::from_be_bytes(
+                take_msgpack(input, 2)?.try_into().expect("exact length"),
+            ));
+            take_msgpack(input, length.saturating_add(1))?;
+            Ok(())
+        }
+        0xc9 => {
+            let length = usize::try_from(u32::from_be_bytes(
+                take_msgpack(input, 4)?.try_into().expect("exact length"),
+            ))
+            .map_err(|_| MessageError::UnpackFailed("extension length overflow".to_string()))?;
+            take_msgpack(input, length.saturating_add(1))?;
+            Ok(())
+        }
+        0xca => {
+            take_msgpack(input, 4)?;
+            Ok(())
+        }
+        0xcb | 0xcf | 0xd3 => {
+            take_msgpack(input, 8)?;
+            Ok(())
+        }
+        0xcc | 0xd0 => {
+            take_msgpack(input, 1)?;
+            Ok(())
+        }
+        0xcd | 0xd1 => {
+            take_msgpack(input, 2)?;
+            Ok(())
+        }
+        0xce | 0xd2 => {
+            take_msgpack(input, 4)?;
+            Ok(())
+        }
+        0xd4 => {
+            take_msgpack(input, 2)?;
+            Ok(())
+        }
+        0xd5 => {
+            take_msgpack(input, 3)?;
+            Ok(())
+        }
+        0xd6 => {
+            take_msgpack(input, 5)?;
+            Ok(())
+        }
+        0xd7 => {
+            take_msgpack(input, 9)?;
+            Ok(())
+        }
+        0xd8 => {
+            take_msgpack(input, 17)?;
+            Ok(())
+        }
+        0xdc => {
+            let count = u32::from(u16::from_be_bytes(
+                take_msgpack(input, 2)?.try_into().expect("exact length"),
+            ));
+            skip_msgpack_values(input, depth, count)
+        }
+        0xdd => {
+            let count =
+                u32::from_be_bytes(take_msgpack(input, 4)?.try_into().expect("exact length"));
+            skip_msgpack_values(input, depth, count)
+        }
+        0xde => {
+            let count = u32::from(u16::from_be_bytes(
+                take_msgpack(input, 2)?.try_into().expect("exact length"),
+            ));
+            skip_msgpack_values(input, depth, count.saturating_mul(2))
+        }
+        0xdf => {
+            let count =
+                u32::from_be_bytes(take_msgpack(input, 4)?.try_into().expect("exact length"));
+            skip_msgpack_values(input, depth, count.saturating_mul(2))
+        }
+    }
+}
+
+fn skip_msgpack_values(input: &mut &[u8], depth: usize, count: u32) -> Result<(), MessageError> {
+    for _ in 0..count {
+        skip_msgpack_value(input, depth + 1)?;
+    }
+    Ok(())
+}
+
 /// Container format for on-disk message storage. Python parity: `packed_container` dict.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MessageContainer {
@@ -1165,54 +1588,77 @@ fn deserialize_optional_bytes<'de, D: serde::Deserializer<'de>>(
     deserializer.deserialize_option(OptionalBytesVisitor)
 }
 
-/// Borrowing twin of [`MessagePayload`] used by `pack_payload` /
-/// `pack_payload_for_signing` to avoid cloning `title`, `content`, and
-/// `fields` on every msgpack pass. Produces byte-identical output to
-/// serializing an owned [`MessagePayload`] with the same field values.
-struct MessagePayloadRef<'a> {
-    timestamp: f64,
-    title: &'a str,
-    content: &'a str,
-    fields: &'a BTreeMap<u8, Vec<u8>>,
-    msgpack_field_ids: &'a BTreeSet<u8>,
-    stamp: Option<&'a [u8]>,
-}
-
-impl serde::Serialize for MessagePayloadRef<'_> {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeStruct;
-        let len = if self.stamp.is_some() { 5 } else { 4 };
-        let mut s = serializer.serialize_struct("MessagePayload", len)?;
-        s.serialize_field("timestamp", &self.timestamp)?;
-        s.serialize_field("title", &BinStr(self.title))?;
-        s.serialize_field("content", &BinStr(self.content))?;
-        s.serialize_field(
-            "fields",
-            &FieldMapRef {
-                fields: self.fields,
-                msgpack_field_ids: self.msgpack_field_ids,
-            },
-        )?;
-        if let Some(stamp) = self.stamp {
-            s.serialize_field("stamp", &BinBytes(stamp))?;
-        }
-        s.end()
-    }
-}
-
-struct BinStr<'a>(&'a str);
-
-impl serde::Serialize for BinStr<'_> {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_bytes(self.0.as_bytes())
-    }
-}
-
 struct BinBytes<'a>(&'a [u8]);
+
+#[derive(Default)]
+struct CountingWriter {
+    bytes: usize,
+}
+
+impl Write for CountingWriter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.bytes = self
+            .bytes
+            .checked_add(buffer.len())
+            .ok_or_else(|| std::io::Error::other("serialized length overflow"))?;
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 
 impl serde::Serialize for BinBytes<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_bytes(self.0)
+    }
+}
+
+struct ImageFieldRef<'a> {
+    format: &'a str,
+    bytes: &'a [u8],
+}
+
+impl serde::Serialize for ImageFieldRef<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeTuple;
+        let mut tuple = serializer.serialize_tuple(2)?;
+        tuple.serialize_element(self.format)?;
+        tuple.serialize_element(&BinBytes(self.bytes))?;
+        tuple.end()
+    }
+}
+
+struct FileAttachmentsFieldRef<'a> {
+    file_name: &'a str,
+    bytes: &'a [u8],
+}
+
+impl serde::Serialize for FileAttachmentsFieldRef<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::{SerializeSeq, SerializeTuple};
+
+        struct AttachmentRef<'a> {
+            file_name: &'a str,
+            bytes: &'a [u8],
+        }
+
+        impl serde::Serialize for AttachmentRef<'_> {
+            fn serialize<T: serde::Serializer>(&self, serializer: T) -> Result<T::Ok, T::Error> {
+                let mut tuple = serializer.serialize_tuple(2)?;
+                tuple.serialize_element(self.file_name)?;
+                tuple.serialize_element(&BinBytes(self.bytes))?;
+                tuple.end()
+            }
+        }
+
+        let mut attachments = serializer.serialize_seq(Some(1))?;
+        attachments.serialize_element(&AttachmentRef {
+            file_name: self.file_name,
+            bytes: self.bytes,
+        })?;
+        attachments.end()
     }
 }
 
@@ -1241,77 +1687,6 @@ impl serde::Serialize for PropagationEntriesRef<'_> {
             seq.serialize_element(&BinBytes(entry))?;
         }
         seq.end()
-    }
-}
-
-struct MsgpackFieldValue<'a>(&'a [u8]);
-
-impl serde::Serialize for MsgpackFieldValue<'_> {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::Error;
-        let value = rmpv::decode::read_value(&mut std::io::Cursor::new(self.0))
-            .map_err(S::Error::custom)?;
-        RmpvValueRef(&value).serialize(serializer)
-    }
-}
-
-struct RmpvValueRef<'a>(&'a rmpv::Value);
-
-impl serde::Serialize for RmpvValueRef<'_> {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::{Error, SerializeMap, SerializeSeq};
-        match self.0 {
-            rmpv::Value::Nil => serializer.serialize_none(),
-            rmpv::Value::Boolean(v) => serializer.serialize_bool(*v),
-            rmpv::Value::Integer(v) => {
-                if let Some(n) = v.as_i64() {
-                    serializer.serialize_i64(n)
-                } else if let Some(n) = v.as_u64() {
-                    serializer.serialize_u64(n)
-                } else {
-                    Err(S::Error::custom("integer outside i64/u64 range"))
-                }
-            }
-            rmpv::Value::F32(v) => serializer.serialize_f32(*v),
-            rmpv::Value::F64(v) => serializer.serialize_f64(*v),
-            rmpv::Value::String(v) => serializer.serialize_str(v.as_str().unwrap_or("")),
-            rmpv::Value::Binary(v) => serializer.serialize_bytes(v),
-            rmpv::Value::Array(values) => {
-                let mut seq = serializer.serialize_seq(Some(values.len()))?;
-                for value in values {
-                    seq.serialize_element(&RmpvValueRef(value))?;
-                }
-                seq.end()
-            }
-            rmpv::Value::Map(values) => {
-                let mut map = serializer.serialize_map(Some(values.len()))?;
-                for (key, value) in values {
-                    map.serialize_entry(&RmpvValueRef(key), &RmpvValueRef(value))?;
-                }
-                map.end()
-            }
-            rmpv::Value::Ext(_, _) => Err(S::Error::custom("msgpack ext fields are unsupported")),
-        }
-    }
-}
-
-struct FieldMapRef<'a> {
-    fields: &'a BTreeMap<u8, Vec<u8>>,
-    msgpack_field_ids: &'a BTreeSet<u8>,
-}
-
-impl serde::Serialize for FieldMapRef<'_> {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeMap;
-        let mut m = serializer.serialize_map(Some(self.fields.len()))?;
-        for (k, v) in self.fields {
-            if self.msgpack_field_ids.contains(k) {
-                m.serialize_entry(k, &MsgpackFieldValue(v))?;
-            } else {
-                m.serialize_entry(k, &BinBytes(v))?;
-            }
-        }
-        m.end()
     }
 }
 
@@ -1588,9 +1963,9 @@ mod tests {
     }
 
     #[test]
-    fn test_payload_ref_byte_identical_to_owned() {
-        // Borrowing serializer must produce the same bytes as the owned one
-        // for every (with-stamp / without-stamp) variant the code emits.
+    fn test_streamed_payload_byte_identical_to_owned() {
+        // The direct writer must produce the same bytes as the serde model for
+        // every ordinary-field stamp variant the protocol emits.
         let mut fields = BTreeMap::new();
         fields.insert(FIELD_IMAGE, b"\x00\x01\x02\x03".to_vec());
         fields.insert(FIELD_AUDIO, b"audio-bytes".to_vec());
@@ -1605,20 +1980,22 @@ mod tests {
                 msgpack_field_ids: BTreeSet::new(),
                 stamp: stamp.clone(),
             };
-            let borrowed = MessagePayloadRef {
-                timestamp: 1700000000.0,
-                title: "title",
-                content: "content body \u{1F600}",
-                fields: &fields,
-                msgpack_field_ids: &BTreeSet::new(),
-                stamp: stamp.as_deref(),
-            };
             let owned_bytes = rmp_serde::to_vec(&owned).unwrap();
-            let borrowed_bytes = rmp_serde::to_vec(&borrowed).unwrap();
+            let mut message = LxMessage::new(
+                [0xAA; 16],
+                [0xBB; 16],
+                "title",
+                "content body \u{1F600}",
+                DeliveryMethod::Direct,
+            );
+            message.timestamp = 1700000000.0;
+            message.fields = fields.clone();
+            message.stamp = stamp.clone();
+            let streamed_bytes = message.pack_payload().unwrap();
             assert_eq!(
                 owned_bytes,
-                borrowed_bytes,
-                "borrow-serializer drifted for stamp={:?}",
+                streamed_bytes,
+                "streamed serializer drifted for stamp={:?}",
                 stamp.is_some()
             );
         }
@@ -1802,6 +2179,106 @@ mod tests {
             Some(&attachment_bytes)
         );
         assert!(unpacked.msgpack_field_ids.contains(&FIELD_FILE_ATTACHMENTS));
+    }
+
+    #[test]
+    fn typed_image_field_matches_existing_msgpack_wire_value() {
+        let image_bytes = [0x89, b'P', b'N', b'G'];
+        let expected_value = rmpv::Value::Array(vec![
+            rmpv::Value::String("png".into()),
+            rmpv::Value::Binary(image_bytes.to_vec()),
+        ]);
+        let mut expected = Vec::new();
+        rmpv::encode::write_value(&mut expected, &expected_value).unwrap();
+
+        let mut msg = LxMessage::new([0; 16], [0; 16], "", "", DeliveryMethod::Direct);
+        msg.set_image_field("png", &image_bytes).unwrap();
+
+        assert_eq!(msg.get_field(FIELD_IMAGE), Some(&expected));
+        assert!(msg.msgpack_field_ids.contains(&FIELD_IMAGE));
+    }
+
+    #[test]
+    fn typed_file_attachment_matches_existing_msgpack_wire_value() {
+        let file_bytes = b"hello";
+        let expected_value = rmpv::Value::Array(vec![rmpv::Value::Array(vec![
+            rmpv::Value::String("note.txt".into()),
+            rmpv::Value::Binary(file_bytes.to_vec()),
+        ])]);
+        let mut expected = Vec::new();
+        rmpv::encode::write_value(&mut expected, &expected_value).unwrap();
+
+        let mut msg = LxMessage::new([0; 16], [0; 16], "", "", DeliveryMethod::Direct);
+        msg.set_file_attachment_field("note.txt", file_bytes)
+            .unwrap();
+
+        assert_eq!(msg.get_field(FIELD_FILE_ATTACHMENTS), Some(&expected));
+        assert!(msg.msgpack_field_ids.contains(&FIELD_FILE_ATTACHMENTS));
+    }
+
+    #[test]
+    fn native_attachment_decoders_borrow_large_payload_bytes() {
+        let file_bytes = vec![0x5a; 2 * 1024 * 1024];
+        let mut msg = LxMessage::new([0; 16], [0; 16], "", "", DeliveryMethod::Direct);
+        msg.set_file_attachment_field("large.bin", &file_bytes)
+            .unwrap();
+        let encoded = msg.get_field(FIELD_FILE_ATTACHMENTS).unwrap();
+        let encoded_start = encoded.as_ptr() as usize;
+        let encoded_end = encoded_start + encoded.len();
+        let (name, borrowed) = msg.first_file_attachment().unwrap().unwrap();
+        assert_eq!(name, "large.bin");
+        assert_eq!(borrowed, file_bytes);
+        assert!((encoded_start..encoded_end).contains(&(borrowed.as_ptr() as usize)));
+
+        msg.set_image_field("webp", &file_bytes).unwrap();
+        let encoded = msg.get_field(FIELD_IMAGE).unwrap();
+        let encoded_start = encoded.as_ptr() as usize;
+        let encoded_end = encoded_start + encoded.len();
+        let (format, borrowed) = msg.image_attachment().unwrap().unwrap();
+        assert_eq!(format, "webp");
+        assert_eq!(borrowed, file_bytes);
+        assert!((encoded_start..encoded_end).contains(&(borrowed.as_ptr() as usize)));
+    }
+
+    #[test]
+    fn verified_inbound_attachment_releases_duplicate_wire_payload() {
+        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
+        let mut outbound = LxMessage::new(
+            [0x11; 16],
+            [0x22; 16],
+            "",
+            "large inbound",
+            DeliveryMethod::Direct,
+        );
+        outbound
+            .set_file_attachment_field("large.bin", &vec![0x77; 2 * 1024 * 1024])
+            .unwrap();
+        outbound.sign(&key).unwrap();
+        outbound.stamp = Some(vec![0x44; TICKET_LENGTH]);
+        let packed = outbound.pack().unwrap();
+
+        let mut inbound = LxMessage::unpack(&packed).unwrap();
+        assert!(inbound.wire_payload.is_some());
+        assert!(inbound.verify(&key.public_key()));
+        assert!(inbound.wire_payload.is_none());
+        let (name, data) = inbound.first_file_attachment().unwrap().unwrap();
+        assert_eq!(name, "large.bin");
+        assert_eq!(data.len(), 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn exact_packed_len_matches_wire_without_allocating_a_second_message() {
+        let mut msg = LxMessage::new(
+            [0x11; 16],
+            [0x22; 16],
+            "title",
+            "content",
+            DeliveryMethod::Direct,
+        );
+        msg.set_file_attachment_field("large.bin", &vec![0x5a; 2 * 1024 * 1024])
+            .unwrap();
+        msg.signature = Some([0x33; 64]);
+        assert_eq!(msg.packed_len().unwrap(), msg.pack().unwrap().len());
     }
 
     #[test]
