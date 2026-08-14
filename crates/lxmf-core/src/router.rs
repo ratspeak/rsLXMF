@@ -1978,15 +1978,19 @@ impl LxmRouter {
                             let mut raw = header.pack();
                             raw.extend_from_slice(&packet_payload);
 
-                            if transport_tx
+                            let dispatched = transport_tx
                                 .try_send(rns_transport::messages::TransportMessage::Outbound(
                                     rns_transport::messages::OutboundRequest {
                                         raw: Bytes::from(raw),
                                         destination_hash: dest_hash,
                                     },
                                 ))
-                                .is_ok()
-                                && message.state == MessageState::Sending
+                                .is_ok();
+                            if dispatched
+                                && matches!(
+                                    message.state,
+                                    MessageState::Sending | MessageState::Sent
+                                )
                             {
                                 message.mark_sent();
                                 message.progress = 1.0;
@@ -3643,6 +3647,10 @@ mod tests {
 
         let received = rx.try_recv();
         assert!(received.is_ok(), "expected outbound packet from tick()");
+        assert!(
+            router.pending_outbound.is_empty(),
+            "a successful fire-and-forget tick must not requeue the sent packet"
+        );
     }
 
     #[test]

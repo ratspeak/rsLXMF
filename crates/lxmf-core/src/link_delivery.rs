@@ -7,6 +7,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -14,15 +15,16 @@ use rns_crypto::ed25519::{Ed25519PrivateKey, Ed25519PublicKey};
 use rns_link::constants::{ESTABLISHMENT_TIMEOUT_PER_HOP, KEEPALIVE_DEFAULT};
 use rns_link::link::{CloseReason, Link, LinkAction, LinkState};
 use rns_protocol::resource::{
-    LazyMultiSegmentOutbound, MAX_EFFICIENT_SIZE, OutboundResource, OutboundTransfer,
-    ResourceError, TransferAction,
+    InboundTransfer, LazyMultiSegmentOutbound, MAX_EFFICIENT_SIZE, MAX_RESOURCE_SIZE, MAX_SEGMENTS,
+    MultiSegmentInbound, OutboundResource, OutboundTransfer, ResourceError, TransferAction,
 };
+use rns_protocol::resource_adv::ResourceAdvertisement;
 use rns_transport::link_messages::DestinationEvent;
 use rns_transport::messages::{OutboundRequest, TransportMessage};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::constants::{DeliveryRepresentation, LXMF_OVERHEAD};
+use crate::constants::{BYTES_PER_KILOBYTE, DELIVERY_LIMIT, DeliveryRepresentation, LXMF_OVERHEAD};
 use crate::message::LxMessage;
 use crate::propagation::hex_encode;
 
@@ -31,7 +33,26 @@ use crate::propagation::hex_encode;
 const LINK_MAX_INACTIVITY: Duration = Duration::from_secs(600);
 const BACKCHANNEL_SEND_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const BACKCHANNEL_DELIVERY_TIMEOUT: Duration = Duration::from_secs(360);
+const BACKCHANNEL_EARLY_PROOF_LIMIT: usize = 256;
 const LINK_PENDING_TRANSPORT_LIMIT: usize = 1024;
+
+type InboundResourceAcceptHandler =
+    Arc<dyn Fn([u8; 16], &ResourceAdvertisement) -> bool + Send + Sync>;
+type InboundResourceConcludedHandler = Arc<dyn Fn([u8; 16], [u8; 32]) + Send + Sync>;
+
+#[derive(Debug, Clone, Copy)]
+struct InboundSegmentRoute {
+    original_hash: [u8; 32],
+    segment_index: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct InboundResourceLifecycle {
+    data_size: usize,
+    total_segments: usize,
+    next_segment: usize,
+    inter_segment_deadline: Option<Instant>,
+}
 
 /// State of a link-based delivery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,6 +99,14 @@ pub struct PendingDelivery {
     /// delivery, making the link usable as a peer backchannel.
     pub backchannel_identified: bool,
     queued: VecDeque<QueuedDelivery>,
+    /// Resources arriving in the reverse direction on this initiator-owned
+    /// reusable Link. Ordinary Link packets and Resources must share the same
+    /// Link owner; otherwise a peer can reply with packets but every larger
+    /// reply advertisement is silently dropped.
+    inbound_resources: HashMap<[u8; 32], InboundTransfer>,
+    inbound_split_resources: HashMap<[u8; 32], MultiSegmentInbound>,
+    inbound_segment_routing: HashMap<[u8; 32], InboundSegmentRoute>,
+    inbound_resource_lifecycles: HashMap<[u8; 32], InboundResourceLifecycle>,
 }
 
 /// Message payload waiting for an existing Direct link to become active/idle.
@@ -153,12 +182,28 @@ enum BackchannelProofKey {
     Resource([u8; 16], [u8; 32]),
 }
 
+impl BackchannelProofKey {
+    fn link_id(self) -> [u8; 16] {
+        match self {
+            Self::Packet(link_id, _) | Self::Resource(link_id, _) => link_id,
+        }
+    }
+}
+
 struct PendingBackchannelStart {
     receiver: oneshot::Receiver<Result<BackchannelSendReceipt, BackchannelSendError>>,
     message: LxMessage,
     dest_hash: [u8; 16],
     link_id: [u8; 16],
     requested_at: Instant,
+    /// Explicit cancellation cannot discard this owner until the asynchronous
+    /// send receipt identifies whether the external send was a non-recallable
+    /// Packet or a cancellable Resource.
+    cancelled: bool,
+    /// A validated proof may be observed before the send receipt and then be
+    /// followed by Link closure on a separate adapter channel. Keep the receipt
+    /// owner for its original bounded window so the exact proof can still win.
+    closed_reason: Option<String>,
 }
 
 struct PendingBackchannelDelivery {
@@ -167,6 +212,13 @@ struct PendingBackchannelDelivery {
     link_id: [u8; 16],
     representation: DeliveryRepresentation,
     started_at: Instant,
+    link_closed: bool,
+}
+
+struct EarlyBackchannelResourceConclusion {
+    conclusion: BackchannelResourceConclusion,
+    reason: String,
+    observed_at: Instant,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -227,6 +279,25 @@ pub enum BackchannelSendReceipt {
         link_id: [u8; 16],
         resource_hash: [u8; 32],
     },
+}
+
+/// Terminal state for an externally-owned outbound backchannel Resource.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackchannelResourceConclusion {
+    /// The receiver explicitly rejected the Resource. The authenticated Link
+    /// remains eligible for a later delivery, matching native Direct Resource
+    /// rejection semantics.
+    Rejected,
+    /// The Resource failed or was cancelled below LXMF. The cached backchannel
+    /// is no longer considered reusable.
+    Failed,
+}
+
+/// Exact external Resource cancellation requested by LXMF ownership cleanup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackchannelResourceCancelRequest {
+    pub link_id: [u8; 16],
+    pub resource_hash: [u8; 32],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -455,8 +526,22 @@ pub struct LinkDeliveryManager {
     /// Unbounded: inbound link data is proved to the peer on receipt, so
     /// local delivery must not drop.
     inbound_packet_tx: Option<mpsc::UnboundedSender<(Vec<u8>, [u8; 16])>>,
+    /// Maximum decoded size accepted for a reverse Resource on an
+    /// initiator-owned reusable Link. Defaults to the LXMF delivery limit and
+    /// can be tightened or expanded by the embedding router.
+    inbound_resource_limit_bytes: usize,
+    inbound_resource_accept_handler: Option<InboundResourceAcceptHandler>,
+    inbound_resource_concluded_handler: Option<InboundResourceConcludedHandler>,
     pending_backchannel_starts: Vec<PendingBackchannelStart>,
     pending_backchannel_deliveries: HashMap<BackchannelProofKey, PendingBackchannelDelivery>,
+    pending_backchannel_resource_cancellations: VecDeque<BackchannelResourceCancelRequest>,
+    /// Authenticated proofs can cross the async application adapter before
+    /// the corresponding send receipt is observed. Retain only exact proof
+    /// keys for Links that still have a pending send receipt, then reconcile
+    /// them when that receipt installs delivery ownership.
+    early_backchannel_proofs: HashMap<BackchannelProofKey, Instant>,
+    early_backchannel_resource_conclusions:
+        HashMap<BackchannelProofKey, EarlyBackchannelResourceConclusion>,
     identity_pub: Option<[u8; 64]>,
     identity_key: Option<Ed25519PrivateKey>,
     event_tx: mpsc::Sender<DestinationEvent>,
@@ -479,8 +564,14 @@ impl LinkDeliveryManager {
             pending: HashMap::new(),
             backchannel_tx: None,
             inbound_packet_tx: None,
+            inbound_resource_limit_bytes: DELIVERY_LIMIT * BYTES_PER_KILOBYTE,
+            inbound_resource_accept_handler: None,
+            inbound_resource_concluded_handler: None,
             pending_backchannel_starts: Vec::new(),
             pending_backchannel_deliveries: HashMap::new(),
+            pending_backchannel_resource_cancellations: VecDeque::new(),
+            early_backchannel_proofs: HashMap::new(),
+            early_backchannel_resource_conclusions: HashMap::new(),
             identity_pub,
             identity_key,
             event_tx,
@@ -502,6 +593,24 @@ impl LinkDeliveryManager {
     /// responder-side LinkManager.
     pub fn set_inbound_packet_sender(&mut self, tx: mpsc::UnboundedSender<(Vec<u8>, [u8; 16])>) {
         self.inbound_packet_tx = Some(tx);
+    }
+
+    pub fn set_inbound_resource_limit_bytes(&mut self, limit: usize) {
+        self.inbound_resource_limit_bytes = limit.min(MAX_RESOURCE_SIZE);
+    }
+
+    pub fn set_inbound_resource_accept_handler<F>(&mut self, handler: F)
+    where
+        F: Fn([u8; 16], &ResourceAdvertisement) -> bool + Send + Sync + 'static,
+    {
+        self.inbound_resource_accept_handler = Some(Arc::new(handler));
+    }
+
+    pub fn set_inbound_resource_concluded_handler<F>(&mut self, handler: F)
+    where
+        F: Fn([u8; 16], [u8; 32]) + Send + Sync + 'static,
+    {
+        self.inbound_resource_concluded_handler = Some(Arc::new(handler));
     }
 
     /// Register an inbound authenticated Link as a reusable backchannel for a
@@ -527,6 +636,11 @@ impl LinkDeliveryManager {
         reason: &str,
     ) -> Vec<DeliveryResult> {
         let mut results = Vec::new();
+        let has_early_settlement = self
+            .early_backchannel_proofs
+            .keys()
+            .chain(self.early_backchannel_resource_conclusions.keys())
+            .any(|key| key.link_id() == link_id);
         let removed_destinations: Vec<_> = self
             .backchannel_links
             .iter()
@@ -537,13 +651,23 @@ impl LinkDeliveryManager {
         }
 
         let starts = std::mem::take(&mut self.pending_backchannel_starts);
-        for start in starts {
+        for mut start in starts {
             if start.link_id == link_id {
-                results.push(fail_backchannel_start(
-                    &mut self.delivery_events,
-                    start,
-                    reason.to_string(),
-                ));
+                if start.cancelled || has_early_settlement {
+                    // The Link is unavailable for all new work immediately, but
+                    // authenticated settlement event already observed on another
+                    // adapter channel must be allowed to meet its exact receipt.
+                    // A cancelled start likewise needs the receipt to learn
+                    // whether an external Resource must be cancelled.
+                    start.closed_reason = Some(reason.to_string());
+                    self.pending_backchannel_starts.push(start);
+                } else {
+                    results.push(fail_backchannel_start(
+                        &mut self.delivery_events,
+                        start,
+                        reason.to_string(),
+                    ));
+                }
             } else {
                 self.pending_backchannel_starts.push(start);
             }
@@ -578,12 +702,24 @@ impl LinkDeliveryManager {
                 });
             }
         }
+        self.prune_early_backchannel_settlement();
 
-        if !removed_destinations.is_empty() || !results.is_empty() {
+        if !removed_destinations.is_empty()
+            || !results.is_empty()
+            || self
+                .pending_backchannel_starts
+                .iter()
+                .any(|start| start.link_id == link_id)
+        {
             tracing::debug!(
                 link_id = %hex_encode(&link_id),
                 removed_backchannels = removed_destinations.len(),
                 failed_deliveries = results.len(),
+                settling_receipts = self
+                    .pending_backchannel_starts
+                    .iter()
+                    .filter(|start| start.link_id == link_id)
+                    .count(),
                 reason,
                 "removed closed LXMF backchannel Link"
             );
@@ -648,7 +784,7 @@ impl LinkDeliveryManager {
                 message: Box::new(message),
             });
         };
-        let Some(command_tx) = self.backchannel_tx.as_ref() else {
+        let Some(command_tx) = self.backchannel_tx.clone() else {
             return Err(BackchannelStartFailure {
                 error: BackchannelStartError::SenderUnavailable,
                 message: Box::new(message),
@@ -679,44 +815,8 @@ impl LinkDeliveryManager {
             auto_compress,
             result_tx,
         };
-
-        match command_tx.try_send(command) {
-            Ok(()) => {
-                tracing::info!(
-                    link_id = %hex_encode(&link_id),
-                    dest = %hex_encode(&dest_hash),
-                    "routing Direct LXMF message over authenticated backchannel Link"
-                );
-                self.delivery_events.push_back(LxmfDeliveryEvent {
-                    kind: LxmfDeliveryEventKind::BackchannelLinkReused,
-                    method: LxmfDeliveryEventMethod::Direct,
-                    link_id,
-                    dest_hash,
-                    msg_hash,
-                    attempts,
-                    progress: Some(0.05),
-                    representation: DeliveryRepresentation::Unknown,
-                    link_state: LinkState::Active,
-                    delivery_state: DeliveryState::Transferring,
-                    queued_deliveries: self.pending_backchannel_starts.len(),
-                    in_flight_deliveries: self.pending_backchannel_deliveries.len() + 1,
-                    reason: None,
-                });
-                self.pending_backchannel_starts
-                    .push(PendingBackchannelStart {
-                        receiver: result_rx,
-                        message,
-                        dest_hash,
-                        link_id,
-                        requested_at: Instant::now(),
-                    });
-                Ok(BackchannelStartReport {
-                    link_id,
-                    dest_hash,
-                    queued_deliveries: self.pending_backchannel_starts.len(),
-                    in_flight_deliveries: self.pending_backchannel_deliveries.len() + 1,
-                })
-            }
+        let command_permit = match command_tx.try_reserve_owned() {
+            Ok(permit) => permit,
             Err(err) => {
                 self.backchannel_links.remove(&dest_hash);
                 let error = match err {
@@ -727,14 +827,53 @@ impl LinkDeliveryManager {
                     link_id = %hex_encode(&link_id),
                     dest = %hex_encode(&dest_hash),
                     error = %error,
-                    "failed to queue LXMF backchannel send command"
+                    "failed to reserve LXMF backchannel send command"
                 );
-                Err(BackchannelStartFailure {
+                return Err(BackchannelStartFailure {
                     error,
                     message: Box::new(message),
-                })
+                });
             }
-        }
+        };
+
+        tracing::info!(
+            link_id = %hex_encode(&link_id),
+            dest = %hex_encode(&dest_hash),
+            "routing Direct LXMF message over authenticated backchannel Link"
+        );
+        self.delivery_events.push_back(LxmfDeliveryEvent {
+            kind: LxmfDeliveryEventKind::BackchannelLinkReused,
+            method: LxmfDeliveryEventMethod::Direct,
+            link_id,
+            dest_hash,
+            msg_hash,
+            attempts,
+            progress: Some(0.05),
+            representation: DeliveryRepresentation::Unknown,
+            link_state: LinkState::Active,
+            delivery_state: DeliveryState::Transferring,
+            queued_deliveries: self.pending_backchannel_starts.len(),
+            in_flight_deliveries: self.pending_backchannel_deliveries.len() + 1,
+            reason: None,
+        });
+        self.pending_backchannel_starts
+            .push(PendingBackchannelStart {
+                receiver: result_rx,
+                message,
+                dest_hash,
+                link_id,
+                requested_at: Instant::now(),
+                cancelled: false,
+                closed_reason: None,
+            });
+        let report = BackchannelStartReport {
+            link_id,
+            dest_hash,
+            queued_deliveries: self.pending_backchannel_starts.len(),
+            in_flight_deliveries: self.pending_backchannel_deliveries.len() + 1,
+        };
+        command_permit.send(command);
+        Ok(report)
     }
 
     fn start_direct_delivery(
@@ -975,6 +1114,10 @@ impl LinkDeliveryManager {
                 reusable,
                 backchannel_identified: false,
                 queued: VecDeque::new(),
+                inbound_resources: HashMap::new(),
+                inbound_split_resources: HashMap::new(),
+                inbound_segment_routing: HashMap::new(),
+                inbound_resource_lifecycles: HashMap::new(),
             },
         );
         if reusable {
@@ -1112,13 +1255,25 @@ impl LinkDeliveryManager {
                                 data,
                             );
                         }
+                        rns_wire::context::PacketContext::ResourceAdv
+                            if header.flags.packet_type == rns_wire::flags::PacketType::Data =>
+                        {
+                            self.handle_inbound_resource_advertisement(&link_id, data);
+                        }
+                        rns_wire::context::PacketContext::Resource
+                            if header.flags.packet_type == rns_wire::flags::PacketType::Data =>
+                        {
+                            self.handle_inbound_resource_part(&link_id, data);
+                        }
                         rns_wire::context::PacketContext::ResourceHmu => {
                             let plaintext = self
                                 .pending
                                 .get(&link_id)
                                 .and_then(|d| d.link.decrypt(data).ok());
                             if let Some(pt) = plaintext {
-                                self.handle_hmu(&link_id, &pt);
+                                if !self.handle_inbound_resource_hmu(&link_id, &pt) {
+                                    self.handle_hmu(&link_id, &pt);
+                                }
                             }
                         }
                         rns_wire::context::PacketContext::ResourceReq => {
@@ -1146,6 +1301,15 @@ impl LinkDeliveryManager {
                                 .and_then(|d| d.link.decrypt(data).ok());
                             if let Some(pt) = plaintext {
                                 self.handle_resource_reject(&link_id, &pt);
+                            }
+                        }
+                        rns_wire::context::PacketContext::ResourceIcl => {
+                            let plaintext = self
+                                .pending
+                                .get(&link_id)
+                                .and_then(|d| d.link.decrypt(data).ok());
+                            if let Some(pt) = plaintext {
+                                self.handle_inbound_resource_cancel(&link_id, &pt);
                             }
                         }
                         rns_wire::context::PacketContext::Keepalive => {
@@ -1287,6 +1451,399 @@ impl LinkDeliveryManager {
         true
     }
 
+    fn handle_inbound_resource_advertisement(
+        &mut self,
+        link_id: &[u8; 16],
+        encrypted_data: &[u8],
+    ) -> bool {
+        let accept_handler = self.inbound_resource_accept_handler.clone();
+        let concluded_handler = self.inbound_resource_concluded_handler.clone();
+        let Some(delivery) = self.pending.get_mut(link_id) else {
+            return false;
+        };
+        if !delivery.reusable || !delivery.link.is_active() {
+            return false;
+        }
+
+        delivery.link.record_inbound();
+        delivery.link.record_rx(encrypted_data.len());
+        let Ok(plaintext) = delivery.link.decrypt(encrypted_data) else {
+            return false;
+        };
+        let Ok(adv) = ResourceAdvertisement::unpack(&plaintext) else {
+            return false;
+        };
+
+        let is_split = adv.flags.split || adv.total_segments > 1;
+        let resource_id = if is_split {
+            adv.original_hash
+        } else {
+            adv.resource_hash
+        };
+        let structurally_valid = adv.total_segments > 0
+            && adv.total_segments <= MAX_SEGMENTS
+            && adv.segment_index > 0
+            && adv.segment_index <= adv.total_segments
+            && !adv.flags.is_request
+            && !adv.flags.is_response;
+        let lifecycle_valid = delivery
+            .inbound_resource_lifecycles
+            .get(&resource_id)
+            .map(|lifecycle| {
+                lifecycle.data_size == adv.data_size
+                    && lifecycle.total_segments == adv.total_segments
+                    && lifecycle.next_segment == adv.segment_index
+            })
+            .unwrap_or(adv.segment_index == 1);
+        let competing_resource = !delivery.inbound_resource_lifecycles.is_empty()
+            && !delivery
+                .inbound_resource_lifecycles
+                .contains_key(&resource_id);
+        if !structurally_valid
+            || !lifecycle_valid
+            || competing_resource
+            || adv.data_size == 0
+            || adv.data_size > self.inbound_resource_limit_bytes
+        {
+            let _ = dispatch_inbound_resource_action(
+                link_id,
+                delivery,
+                &self.transport_tx,
+                &mut self.pending_transport,
+                TransferAction::SendCancel(
+                    rns_protocol::resource::CancelType::Rcl,
+                    adv.resource_hash,
+                ),
+            );
+            tracing::warn!(
+                link_id = %hex_encode(link_id),
+                resource = %hex_encode(&resource_id[..8]),
+                data_size = adv.data_size,
+                limit = self.inbound_resource_limit_bytes,
+                "rejected reverse Resource advertisement on reusable Direct link"
+            );
+            return false;
+        }
+
+        if let Some(transfer) = delivery.inbound_resources.get_mut(&adv.resource_hash) {
+            // A retransmitted advertisement can mean the original request was
+            // lost. Re-issue the exact current request without allocating a
+            // second owner or refreshing transfer state.
+            let action = transfer.request_next();
+            return dispatch_inbound_resource_action(
+                link_id,
+                delivery,
+                &self.transport_tx,
+                &mut self.pending_transport,
+                action,
+            )
+            .is_ok();
+        }
+
+        if !inbound_resource_accepted(accept_handler.as_ref(), *link_id, &adv) {
+            let _ = dispatch_inbound_resource_action(
+                link_id,
+                delivery,
+                &self.transport_tx,
+                &mut self.pending_transport,
+                TransferAction::SendCancel(
+                    rns_protocol::resource::CancelType::Rcl,
+                    adv.resource_hash,
+                ),
+            );
+            return false;
+        }
+
+        let map_hashes = adv.get_map_hashes();
+        let mut random_hash = [0u8; rns_protocol::resource::RANDOM_HASH_SIZE];
+        let copy_len = adv.random_hash.len().min(random_hash.len());
+        random_hash[..copy_len].copy_from_slice(&adv.random_hash[..copy_len]);
+        let rtt = delivery.link.rtt.unwrap_or(Duration::from_millis(500));
+        let Ok(mut transfer) = InboundTransfer::from_advertisement(
+            adv.num_parts,
+            adv.transfer_size,
+            adv.data_size,
+            random_hash,
+            adv.resource_hash,
+            adv.flags,
+            map_hashes,
+            rtt,
+        ) else {
+            let _ = dispatch_inbound_resource_action(
+                link_id,
+                delivery,
+                &self.transport_tx,
+                &mut self.pending_transport,
+                TransferAction::SendCancel(
+                    rns_protocol::resource::CancelType::Rcl,
+                    adv.resource_hash,
+                ),
+            );
+            notify_inbound_resource_concluded(concluded_handler.as_ref(), *link_id, resource_id);
+            return false;
+        };
+
+        let action = transfer.request_next();
+        delivery
+            .inbound_resources
+            .insert(adv.resource_hash, transfer);
+        delivery.link.track_incoming_resource(adv.resource_hash);
+        delivery
+            .inbound_resource_lifecycles
+            .entry(resource_id)
+            .or_insert(InboundResourceLifecycle {
+                data_size: adv.data_size,
+                total_segments: adv.total_segments,
+                next_segment: 1,
+                inter_segment_deadline: None,
+            });
+        if let Some(lifecycle) = delivery.inbound_resource_lifecycles.get_mut(&resource_id) {
+            lifecycle.inter_segment_deadline = None;
+        }
+        if is_split {
+            delivery
+                .inbound_split_resources
+                .entry(adv.original_hash)
+                .or_insert_with(|| MultiSegmentInbound::new(adv.total_segments, adv.original_hash));
+            delivery.inbound_segment_routing.insert(
+                adv.resource_hash,
+                InboundSegmentRoute {
+                    original_hash: adv.original_hash,
+                    segment_index: adv.segment_index,
+                },
+            );
+        }
+
+        if let Err(reason) = dispatch_inbound_resource_action(
+            link_id,
+            delivery,
+            &self.transport_tx,
+            &mut self.pending_transport,
+            action,
+        ) {
+            let resource_id = drop_inbound_resource(delivery, adv.resource_hash);
+            notify_inbound_resource_concluded(concluded_handler.as_ref(), *link_id, resource_id);
+            tracing::warn!(
+                link_id = %hex_encode(link_id),
+                resource = %hex_encode(&resource_id[..8]),
+                reason,
+                "could not retain initial reverse Resource request"
+            );
+            return false;
+        }
+
+        tracing::info!(
+            link_id = %hex_encode(link_id),
+            resource = %hex_encode(&resource_id[..8]),
+            segment = adv.segment_index,
+            total_segments = adv.total_segments,
+            "accepted reverse Resource on reusable Direct link"
+        );
+        true
+    }
+
+    fn handle_inbound_resource_part(&mut self, link_id: &[u8; 16], data: &[u8]) -> bool {
+        let concluded_handler = self.inbound_resource_concluded_handler.clone();
+        let Some(delivery) = self.pending.get_mut(link_id) else {
+            return false;
+        };
+        if !delivery.reusable || !delivery.link.is_active() {
+            return false;
+        }
+        delivery.link.record_inbound();
+        delivery.link.record_rx(data.len());
+
+        let mut selected = None;
+        let mut action = TransferAction::None;
+        for (resource_hash, transfer) in &mut delivery.inbound_resources {
+            let before = transfer.resource.received_count();
+            let candidate = transfer.receive_part(data.to_vec());
+            if transfer.resource.received_count() > before
+                || matches!(candidate, TransferAction::Complete)
+            {
+                selected = Some(*resource_hash);
+                action = candidate;
+                break;
+            }
+        }
+        let Some(resource_hash) = selected else {
+            return false;
+        };
+
+        if !matches!(action, TransferAction::Complete) {
+            if !matches!(action, TransferAction::None)
+                && dispatch_inbound_resource_action(
+                    link_id,
+                    delivery,
+                    &self.transport_tx,
+                    &mut self.pending_transport,
+                    action,
+                )
+                .is_err()
+            {
+                let resource_id = drop_inbound_resource(delivery, resource_hash);
+                notify_inbound_resource_concluded(
+                    concluded_handler.as_ref(),
+                    *link_id,
+                    resource_id,
+                );
+                return false;
+            }
+            return true;
+        }
+
+        let completion = {
+            let link = &delivery.link;
+            let decrypt = |ciphertext: &[u8]| {
+                link.decrypt(ciphertext)
+                    .map_err(|_| ResourceError::DecryptFailed)
+            };
+            delivery
+                .inbound_resources
+                .get_mut(&resource_hash)
+                .map(|transfer| transfer.complete(Some(&decrypt)))
+        };
+        let Some(Ok((assembled, proof))) = completion else {
+            let _ = dispatch_inbound_resource_action(
+                link_id,
+                delivery,
+                &self.transport_tx,
+                &mut self.pending_transport,
+                TransferAction::SendCancel(rns_protocol::resource::CancelType::Rcl, resource_hash),
+            );
+            let resource_id = drop_inbound_resource(delivery, resource_hash);
+            notify_inbound_resource_concluded(concluded_handler.as_ref(), *link_id, resource_id);
+            return false;
+        };
+
+        // Retain the authenticated Resource proof before publishing plaintext
+        // to the application. This mirrors packet delivery and prevents local
+        // acceptance from outrunning sender confirmation under backpressure.
+        if dispatch_inbound_resource_action(
+            link_id,
+            delivery,
+            &self.transport_tx,
+            &mut self.pending_transport,
+            TransferAction::SendProof(proof),
+        )
+        .is_err()
+        {
+            let resource_id = drop_inbound_resource(delivery, resource_hash);
+            notify_inbound_resource_concluded(concluded_handler.as_ref(), *link_id, resource_id);
+            return false;
+        }
+
+        let payload = if let Some(route) = delivery
+            .inbound_segment_routing
+            .get(&resource_hash)
+            .copied()
+        {
+            let assembled_payload = delivery
+                .inbound_split_resources
+                .get_mut(&route.original_hash)
+                .and_then(|coordinator| {
+                    coordinator
+                        .set_segment_data(route.segment_index, assembled)
+                        .ok()?;
+                    if coordinator.is_complete() {
+                        coordinator.reassemble().ok()
+                    } else {
+                        None
+                    }
+                });
+            delivery.link.untrack_resource(&resource_hash);
+            delivery.inbound_resources.remove(&resource_hash);
+            delivery.inbound_segment_routing.remove(&resource_hash);
+            let split_wait_timeout = inbound_split_wait_timeout(&delivery.link);
+            if let Some(lifecycle) = delivery
+                .inbound_resource_lifecycles
+                .get_mut(&route.original_hash)
+            {
+                lifecycle.next_segment = lifecycle.next_segment.saturating_add(1);
+                if assembled_payload.is_none() {
+                    lifecycle.inter_segment_deadline = Some(Instant::now() + split_wait_timeout);
+                }
+            }
+            if assembled_payload.is_some() {
+                delivery
+                    .inbound_resource_lifecycles
+                    .remove(&route.original_hash);
+                delivery
+                    .inbound_split_resources
+                    .remove(&route.original_hash);
+                notify_inbound_resource_concluded(
+                    concluded_handler.as_ref(),
+                    *link_id,
+                    route.original_hash,
+                );
+            }
+            assembled_payload
+        } else {
+            let resource_id = drop_inbound_resource(delivery, resource_hash);
+            notify_inbound_resource_concluded(concluded_handler.as_ref(), *link_id, resource_id);
+            Some(assembled)
+        };
+
+        if let (Some(payload), Some(tx)) = (payload, self.inbound_packet_tx.as_ref()) {
+            let _ = tx.send((payload, *link_id));
+        }
+        true
+    }
+
+    fn handle_inbound_resource_hmu(&mut self, link_id: &[u8; 16], data: &[u8]) -> bool {
+        let concluded_handler = self.inbound_resource_concluded_handler.clone();
+        let Ok((resource_hash, segment, hashmap)) =
+            rns_protocol::resource::parse_hashmap_update(data)
+        else {
+            return false;
+        };
+        let Some(delivery) = self.pending.get_mut(link_id) else {
+            return false;
+        };
+        let Some(transfer) = delivery.inbound_resources.get_mut(&resource_hash) else {
+            return false;
+        };
+        let action = transfer.hashmap_update(segment, &hashmap);
+        let cancelled = matches!(
+            action,
+            TransferAction::SendCancel(rns_protocol::resource::CancelType::Rcl, _)
+        );
+        let retained = dispatch_inbound_resource_action(
+            link_id,
+            delivery,
+            &self.transport_tx,
+            &mut self.pending_transport,
+            action,
+        )
+        .is_ok();
+        if cancelled || !retained {
+            let resource_id = drop_inbound_resource(delivery, resource_hash);
+            notify_inbound_resource_concluded(concluded_handler.as_ref(), *link_id, resource_id);
+        }
+        retained
+    }
+
+    fn handle_inbound_resource_cancel(&mut self, link_id: &[u8; 16], data: &[u8]) -> bool {
+        let concluded_handler = self.inbound_resource_concluded_handler.clone();
+        if data.len() < 32 {
+            return false;
+        }
+        let mut resource_hash = [0u8; 32];
+        resource_hash.copy_from_slice(&data[..32]);
+        let Some(delivery) = self.pending.get_mut(link_id) else {
+            return false;
+        };
+        if !delivery.inbound_resources.contains_key(&resource_hash) {
+            return false;
+        }
+        if let Some(transfer) = delivery.inbound_resources.get_mut(&resource_hash) {
+            transfer.handle_cancel();
+        }
+        let resource_id = drop_inbound_resource(delivery, resource_hash);
+        notify_inbound_resource_concluded(concluded_handler.as_ref(), *link_id, resource_id);
+        true
+    }
+
     /// Drive pending deliveries forward; call periodically after [`Self::drain_events`].
     pub fn tick(&mut self) -> Vec<DeliveryResult> {
         let mut results = self.tick_backchannels();
@@ -1301,6 +1858,16 @@ impl LinkDeliveryManager {
 
         for (link_id, delivery) in &mut self.pending {
             let mut remove_session = false;
+
+            if delivery.reusable && delivery.link.is_active() {
+                drive_inbound_resource_watchdogs(
+                    link_id,
+                    delivery,
+                    &self.transport_tx,
+                    &mut self.pending_transport,
+                    self.inbound_resource_concluded_handler.as_ref(),
+                );
+            }
 
             if delivery.state == DeliveryState::Idle
                 && !delivery.queued.is_empty()
@@ -1727,6 +2294,13 @@ impl LinkDeliveryManager {
 
         for link_id in to_remove {
             if let Some(mut delivery) = self.pending.remove(&link_id) {
+                for resource_id in drop_all_inbound_resources(&mut delivery) {
+                    notify_inbound_resource_concluded(
+                        self.inbound_resource_concluded_handler.as_ref(),
+                        link_id,
+                        resource_id,
+                    );
+                }
                 if delivery.reusable {
                     self.direct_links.remove(&delivery.dest_hash);
                 }
@@ -1749,6 +2323,7 @@ impl LinkDeliveryManager {
 
     fn tick_backchannels(&mut self) -> Vec<DeliveryResult> {
         let mut results = Vec::new();
+        self.prune_early_backchannel_settlement();
 
         let starts = std::mem::take(&mut self.pending_backchannel_starts);
         let mut still_waiting = Vec::new();
@@ -1775,6 +2350,36 @@ impl LinkDeliveryManager {
                             LxmfDeliveryEventKind::TransferStarted,
                         ),
                     };
+
+                    if start.cancelled {
+                        self.early_backchannel_proofs.remove(&key);
+                        self.early_backchannel_resource_conclusions.remove(&key);
+                        if let BackchannelProofKey::Resource(link_id, resource_hash) = key {
+                            self.pending_backchannel_resource_cancellations.push_back(
+                                BackchannelResourceCancelRequest {
+                                    link_id,
+                                    resource_hash,
+                                },
+                            );
+                        }
+                        continue;
+                    }
+
+                    let proof_observed = self.early_backchannel_proofs.remove(&key).is_some();
+                    let early_conclusion = self.early_backchannel_resource_conclusions.remove(&key);
+                    let settlement_observed = proof_observed || early_conclusion.is_some();
+                    if let Some(reason) =
+                        start.closed_reason.clone().filter(|_| !settlement_observed)
+                    {
+                        results.push(fail_backchannel_start(
+                            &mut self.delivery_events,
+                            start,
+                            reason,
+                        ));
+                        continue;
+                    }
+
+                    let link_closed = start.closed_reason.is_some();
                     self.delivery_events.push_back(backchannel_delivery_event(
                         BackchannelDeliveryEventInput {
                             kind,
@@ -1784,7 +2389,11 @@ impl LinkDeliveryManager {
                             representation,
                             progress: Some(progress),
                             reason: None,
-                            link_state: LinkState::Active,
+                            link_state: if link_closed {
+                                LinkState::Closed
+                            } else {
+                                LinkState::Active
+                            },
                             delivery_state: DeliveryState::AwaitingProof,
                         },
                     ));
@@ -1796,12 +2405,29 @@ impl LinkDeliveryManager {
                             link_id: start.link_id,
                             representation,
                             started_at: Instant::now(),
+                            link_closed,
                         },
                     );
+                    if let Some(early_conclusion) = early_conclusion {
+                        if let Some(result) = self.finish_backchannel_resource_conclusion(
+                            key,
+                            early_conclusion.conclusion,
+                            early_conclusion.reason,
+                        ) {
+                            results.push(result);
+                        }
+                    } else if proof_observed {
+                        if let Some(result) = self.complete_backchannel_delivery(key) {
+                            results.push(result);
+                        }
+                    }
                 }
                 Ok(Err(err)) => {
                     let reason = err.to_string();
                     self.backchannel_links.remove(&start.dest_hash);
+                    if start.cancelled {
+                        continue;
+                    }
                     tracing::warn!(
                         link_id = %hex_encode(&start.link_id),
                         dest = %hex_encode(&start.dest_hash),
@@ -1816,8 +2442,14 @@ impl LinkDeliveryManager {
                 }
                 Err(oneshot::error::TryRecvError::Empty) => {
                     if start.requested_at.elapsed() > BACKCHANNEL_SEND_COMMAND_TIMEOUT {
-                        let reason = "backchannel send command timeout".to_string();
+                        let reason = start
+                            .closed_reason
+                            .clone()
+                            .unwrap_or_else(|| "backchannel send command timeout".to_string());
                         self.backchannel_links.remove(&start.dest_hash);
+                        if start.cancelled {
+                            continue;
+                        }
                         tracing::warn!(
                             link_id = %hex_encode(&start.link_id),
                             dest = %hex_encode(&start.dest_hash),
@@ -1835,6 +2467,9 @@ impl LinkDeliveryManager {
                 Err(oneshot::error::TryRecvError::Closed) => {
                     let reason = "backchannel send command closed".to_string();
                     self.backchannel_links.remove(&start.dest_hash);
+                    if start.cancelled {
+                        continue;
+                    }
                     results.push(fail_backchannel_start(
                         &mut self.delivery_events,
                         start,
@@ -1844,6 +2479,7 @@ impl LinkDeliveryManager {
             }
         }
         self.pending_backchannel_starts = still_waiting;
+        self.prune_early_backchannel_settlement();
 
         let expired: Vec<_> = self
             .pending_backchannel_deliveries
@@ -2056,6 +2692,7 @@ impl LinkDeliveryManager {
         link_id: &[u8; 16],
         encrypted_teardown: Option<&[u8]>,
     ) -> bool {
+        let concluded_handler = self.inbound_resource_concluded_handler.clone();
         let Some(delivery) = self.pending.get_mut(link_id) else {
             return false;
         };
@@ -2069,6 +2706,13 @@ impl LinkDeliveryManager {
         };
 
         if verified {
+            for resource_id in drop_all_inbound_resources(delivery) {
+                notify_inbound_resource_concluded(
+                    concluded_handler.as_ref(),
+                    *link_id,
+                    resource_id,
+                );
+            }
             if delivery.state == DeliveryState::Complete {
                 return true;
             }
@@ -2120,11 +2764,100 @@ impl LinkDeliveryManager {
         self.complete_backchannel_delivery(BackchannelProofKey::Resource(link_id, resource_hash))
     }
 
+    /// Apply a terminal conclusion from a Resource transfer owned by the
+    /// embedding runtime's authenticated backchannel Link.
+    pub fn handle_backchannel_resource_conclusion(
+        &mut self,
+        link_id: [u8; 16],
+        resource_hash: [u8; 32],
+        conclusion: BackchannelResourceConclusion,
+        reason: impl Into<String>,
+    ) -> Option<DeliveryResult> {
+        let key = BackchannelProofKey::Resource(link_id, resource_hash);
+        let reason = reason.into();
+        if !self.pending_backchannel_deliveries.contains_key(&key) {
+            self.remember_early_backchannel_resource_conclusion(key, conclusion, reason);
+            return None;
+        }
+        self.finish_backchannel_resource_conclusion(key, conclusion, reason)
+    }
+
+    fn finish_backchannel_resource_conclusion(
+        &mut self,
+        key: BackchannelProofKey,
+        conclusion: BackchannelResourceConclusion,
+        reason: String,
+    ) -> Option<DeliveryResult> {
+        let mut delivery = self.pending_backchannel_deliveries.remove(&key)?;
+        self.early_backchannel_proofs.remove(&key);
+        self.early_backchannel_resource_conclusions.remove(&key);
+
+        match conclusion {
+            BackchannelResourceConclusion::Rejected => {
+                delivery.message.mark_rejected();
+                self.delivery_events.push_back(backchannel_delivery_event(
+                    BackchannelDeliveryEventInput {
+                        kind: LxmfDeliveryEventKind::Rejected,
+                        message: &delivery.message,
+                        dest_hash: delivery.dest_hash,
+                        link_id: delivery.link_id,
+                        representation: DeliveryRepresentation::Resource,
+                        progress: Some(delivery.message.progress),
+                        reason: Some(reason.clone()),
+                        link_state: if delivery.link_closed {
+                            LinkState::Closed
+                        } else {
+                            LinkState::Active
+                        },
+                        delivery_state: DeliveryState::Rejected,
+                    },
+                ));
+                Some(DeliveryResult::Rejected {
+                    link_id: delivery.link_id,
+                    msg_hash: delivery.message.hash,
+                    dest_hash: delivery.dest_hash,
+                    message: delivery.message,
+                    reason,
+                })
+            }
+            BackchannelResourceConclusion::Failed => {
+                if self.backchannel_links.get(&delivery.dest_hash) == Some(&delivery.link_id) {
+                    self.backchannel_links.remove(&delivery.dest_hash);
+                }
+                self.delivery_events.push_back(backchannel_delivery_event(
+                    BackchannelDeliveryEventInput {
+                        kind: LxmfDeliveryEventKind::Failed,
+                        message: &delivery.message,
+                        dest_hash: delivery.dest_hash,
+                        link_id: delivery.link_id,
+                        representation: DeliveryRepresentation::Resource,
+                        progress: Some(delivery.message.progress),
+                        reason: Some(reason.clone()),
+                        link_state: LinkState::Closed,
+                        delivery_state: DeliveryState::Failed,
+                    },
+                ));
+                Some(DeliveryResult::Failed {
+                    link_id: delivery.link_id,
+                    msg_hash: delivery.message.hash,
+                    dest_hash: delivery.dest_hash,
+                    message: delivery.message,
+                    reason,
+                })
+            }
+        }
+    }
+
     fn complete_backchannel_delivery(
         &mut self,
         key: BackchannelProofKey,
     ) -> Option<DeliveryResult> {
-        let delivery = self.pending_backchannel_deliveries.remove(&key)?;
+        let Some(delivery) = self.pending_backchannel_deliveries.remove(&key) else {
+            self.remember_early_backchannel_proof(key);
+            return None;
+        };
+        self.early_backchannel_proofs.remove(&key);
+        self.early_backchannel_resource_conclusions.remove(&key);
         self.delivery_events
             .push_back(backchannel_delivery_event(BackchannelDeliveryEventInput {
                 kind: LxmfDeliveryEventKind::Delivered,
@@ -2134,7 +2867,11 @@ impl LinkDeliveryManager {
                 representation: delivery.representation,
                 progress: Some(1.0),
                 reason: None,
-                link_state: LinkState::Active,
+                link_state: if delivery.link_closed {
+                    LinkState::Closed
+                } else {
+                    LinkState::Active
+                },
                 delivery_state: DeliveryState::Complete,
             }));
         tracing::info!(
@@ -2147,6 +2884,112 @@ impl LinkDeliveryManager {
             link_id: delivery.link_id,
             msg_hash: delivery.message.hash,
         })
+    }
+
+    fn remember_early_backchannel_proof(&mut self, key: BackchannelProofKey) {
+        let link_id = key.link_id();
+        if !self
+            .pending_backchannel_starts
+            .iter()
+            .any(|start| start.link_id == link_id)
+        {
+            return;
+        }
+
+        self.prune_early_backchannel_settlement();
+        if self.early_backchannel_proofs.contains_key(&key) {
+            return;
+        }
+        self.make_room_for_early_backchannel_settlement();
+        self.early_backchannel_proofs.insert(key, Instant::now());
+    }
+
+    fn remember_early_backchannel_resource_conclusion(
+        &mut self,
+        key: BackchannelProofKey,
+        conclusion: BackchannelResourceConclusion,
+        reason: String,
+    ) {
+        let link_id = key.link_id();
+        if !self
+            .pending_backchannel_starts
+            .iter()
+            .any(|start| start.link_id == link_id)
+        {
+            return;
+        }
+
+        self.prune_early_backchannel_settlement();
+        if self
+            .early_backchannel_resource_conclusions
+            .contains_key(&key)
+        {
+            // A duplicate terminal notification must not extend settlement TTL
+            // or replace the actor's first ordered conclusion.
+            return;
+        }
+        self.make_room_for_early_backchannel_settlement();
+        self.early_backchannel_resource_conclusions.insert(
+            key,
+            EarlyBackchannelResourceConclusion {
+                conclusion,
+                reason,
+                observed_at: Instant::now(),
+            },
+        );
+    }
+
+    fn make_room_for_early_backchannel_settlement(&mut self) {
+        while self.early_backchannel_proofs.len()
+            + self.early_backchannel_resource_conclusions.len()
+            >= BACKCHANNEL_EARLY_PROOF_LIMIT
+        {
+            let oldest_proof = self
+                .early_backchannel_proofs
+                .iter()
+                .min_by_key(|(_, observed_at)| *observed_at)
+                .map(|(key, observed_at)| (*key, *observed_at));
+            let oldest_conclusion = self
+                .early_backchannel_resource_conclusions
+                .iter()
+                .min_by_key(|(_, conclusion)| conclusion.observed_at)
+                .map(|(key, conclusion)| (*key, conclusion.observed_at));
+            match (oldest_proof, oldest_conclusion) {
+                (Some((key, proof_at)), Some((conclusion_key, conclusion_at))) => {
+                    if proof_at <= conclusion_at {
+                        self.early_backchannel_proofs.remove(&key);
+                    } else {
+                        self.early_backchannel_resource_conclusions
+                            .remove(&conclusion_key);
+                    }
+                }
+                (Some((key, _)), None) => {
+                    self.early_backchannel_proofs.remove(&key);
+                }
+                (None, Some((key, _))) => {
+                    self.early_backchannel_resource_conclusions.remove(&key);
+                }
+                (None, None) => break,
+            }
+        }
+    }
+
+    fn prune_early_backchannel_settlement(&mut self) {
+        let now = Instant::now();
+        let pending_links = self
+            .pending_backchannel_starts
+            .iter()
+            .map(|start| start.link_id)
+            .collect::<Vec<_>>();
+        self.early_backchannel_proofs.retain(|key, observed_at| {
+            now.duration_since(*observed_at) <= BACKCHANNEL_SEND_COMMAND_TIMEOUT
+                && pending_links.contains(&key.link_id())
+        });
+        self.early_backchannel_resource_conclusions
+            .retain(|key, conclusion| {
+                now.duration_since(conclusion.observed_at) <= BACKCHANNEL_SEND_COMMAND_TIMEOUT
+                    && pending_links.contains(&key.link_id())
+            });
     }
 
     pub fn pending_count(&self) -> usize {
@@ -2227,6 +3070,7 @@ impl LinkDeliveryManager {
                 start,
                 reason.to_string(),
             ));
+            self.prune_early_backchannel_settlement();
             return results;
         }
 
@@ -2313,12 +3157,15 @@ impl LinkDeliveryManager {
             return true;
         }
 
-        if let Some(pos) = self
+        if let Some(start) = self
             .pending_backchannel_starts
-            .iter()
-            .position(|start| start.message.hash == Some(msg_hash))
+            .iter_mut()
+            .find(|start| start.message.hash == Some(msg_hash))
         {
-            self.pending_backchannel_starts.remove(pos);
+            if start.cancelled {
+                return false;
+            }
+            start.cancelled = true;
             return true;
         }
 
@@ -2328,6 +3175,15 @@ impl LinkDeliveryManager {
             .find_map(|(key, delivery)| (delivery.message.hash == Some(msg_hash)).then_some(*key));
         if let Some(key) = pending_key {
             self.pending_backchannel_deliveries.remove(&key);
+            self.early_backchannel_proofs.remove(&key);
+            if let BackchannelProofKey::Resource(link_id, resource_hash) = key {
+                self.pending_backchannel_resource_cancellations.push_back(
+                    BackchannelResourceCancelRequest {
+                        link_id,
+                        resource_hash,
+                    },
+                );
+            }
             return true;
         }
 
@@ -2336,6 +3192,16 @@ impl LinkDeliveryManager {
 
     pub fn take_delivery_events(&mut self) -> Vec<LxmfDeliveryEvent> {
         self.delivery_events.drain(..).collect()
+    }
+
+    /// Drain exact cancellation requests for Resources owned by an embedding
+    /// runtime's authenticated backchannel Link.
+    pub fn take_backchannel_resource_cancellations(
+        &mut self,
+    ) -> Vec<BackchannelResourceCancelRequest> {
+        self.pending_backchannel_resource_cancellations
+            .drain(..)
+            .collect()
     }
 
     pub fn message_delivery_snapshot(&self, msg_hash: [u8; 32]) -> Option<MessageDeliverySnapshot> {
@@ -3034,6 +3900,252 @@ fn flush_staged_transport(
     Ok(())
 }
 
+fn inbound_resource_accepted(
+    handler: Option<&InboundResourceAcceptHandler>,
+    link_id: [u8; 16],
+    advertisement: &ResourceAdvertisement,
+) -> bool {
+    handler.is_none_or(|handler| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            handler(link_id, advertisement)
+        }))
+        .unwrap_or_else(|_| {
+            tracing::error!(
+                link_id = %hex_encode(&link_id),
+                resource = %hex_encode(&advertisement.resource_hash[..8]),
+                "reverse Resource admission callback panicked"
+            );
+            false
+        })
+    })
+}
+
+fn notify_inbound_resource_concluded(
+    handler: Option<&InboundResourceConcludedHandler>,
+    link_id: [u8; 16],
+    resource_id: [u8; 32],
+) {
+    let Some(handler) = handler else {
+        return;
+    };
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        handler(link_id, resource_id)
+    }))
+    .is_err()
+    {
+        tracing::error!(
+            link_id = %hex_encode(&link_id),
+            resource = %hex_encode(&resource_id[..8]),
+            "reverse Resource conclusion callback panicked"
+        );
+    }
+}
+
+fn dispatch_inbound_resource_action(
+    link_id: &[u8; 16],
+    delivery: &mut PendingDelivery,
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    pending_transport: &mut VecDeque<TransportMessage>,
+    action: TransferAction,
+) -> Result<(), &'static str> {
+    let (context, payload, encrypted, packet_type) = match action {
+        TransferAction::SendProof(payload) => (
+            rns_wire::context::PacketContext::ResourcePrf,
+            payload,
+            false,
+            rns_wire::flags::PacketType::Proof,
+        ),
+        TransferAction::SendHmu(payload) => (
+            rns_wire::context::PacketContext::ResourceHmu,
+            payload,
+            true,
+            rns_wire::flags::PacketType::Data,
+        ),
+        TransferAction::SendRequest(payload) => (
+            rns_wire::context::PacketContext::ResourceReq,
+            payload,
+            true,
+            rns_wire::flags::PacketType::Data,
+        ),
+        TransferAction::SendCancel(cancel_type, resource_hash) => (
+            match cancel_type {
+                rns_protocol::resource::CancelType::Icl => {
+                    rns_wire::context::PacketContext::ResourceIcl
+                }
+                rns_protocol::resource::CancelType::Rcl => {
+                    rns_wire::context::PacketContext::ResourceRcl
+                }
+            },
+            resource_hash.to_vec(),
+            true,
+            rns_wire::flags::PacketType::Data,
+        ),
+        TransferAction::None | TransferAction::Complete | TransferAction::Failed(_) => {
+            return Ok(());
+        }
+        TransferAction::SendAdvertisement(_) | TransferAction::SendPart(_, _) => {
+            return Err("invalid inbound Resource action");
+        }
+    };
+    let body = if encrypted {
+        delivery
+            .link
+            .encrypt(&payload)
+            .map_err(|_| "link Resource encryption failed")?
+    } else {
+        payload
+    };
+    let header = rns_wire::header::PacketHeader {
+        flags: rns_wire::flags::PacketFlags {
+            header_type: rns_wire::flags::HeaderType::Header1,
+            context_flag: false,
+            transport_type: rns_wire::flags::TransportType::Broadcast,
+            destination_type: rns_wire::flags::DestinationType::Link,
+            packet_type,
+        },
+        hops: 0,
+        transport_id: None,
+        destination_hash: *link_id,
+        context,
+    };
+    let mut raw = header.pack();
+    raw.extend_from_slice(&body);
+    stage_transport(
+        transport_tx,
+        pending_transport,
+        TransportMessage::Outbound(OutboundRequest {
+            raw: Bytes::from(raw),
+            destination_hash: *link_id,
+        }),
+    )?;
+    delivery.link.record_tx(body.len());
+    Ok(())
+}
+
+fn drop_inbound_resource(delivery: &mut PendingDelivery, resource_hash: [u8; 32]) -> [u8; 32] {
+    let resource_id = delivery
+        .inbound_segment_routing
+        .get(&resource_hash)
+        .map(|route| route.original_hash)
+        .unwrap_or(resource_hash);
+    let segment_hashes: Vec<[u8; 32]> = delivery
+        .inbound_segment_routing
+        .iter()
+        .filter_map(|(segment_hash, route)| {
+            (route.original_hash == resource_id).then_some(*segment_hash)
+        })
+        .collect();
+    if segment_hashes.is_empty() {
+        delivery.inbound_resources.remove(&resource_hash);
+        delivery.link.untrack_resource(&resource_hash);
+    } else {
+        for segment_hash in segment_hashes {
+            delivery.inbound_resources.remove(&segment_hash);
+            delivery.inbound_segment_routing.remove(&segment_hash);
+            delivery.link.untrack_resource(&segment_hash);
+        }
+    }
+    delivery.inbound_split_resources.remove(&resource_id);
+    delivery.inbound_resource_lifecycles.remove(&resource_id);
+    resource_id
+}
+
+fn drop_all_inbound_resources(delivery: &mut PendingDelivery) -> Vec<[u8; 32]> {
+    let resource_ids: Vec<[u8; 32]> = delivery
+        .inbound_resource_lifecycles
+        .keys()
+        .copied()
+        .collect();
+    let segment_hashes: Vec<[u8; 32]> = delivery.inbound_resources.keys().copied().collect();
+    for segment_hash in segment_hashes {
+        delivery.link.untrack_resource(&segment_hash);
+    }
+    delivery.inbound_resources.clear();
+    delivery.inbound_segment_routing.clear();
+    delivery.inbound_split_resources.clear();
+    delivery.inbound_resource_lifecycles.clear();
+    resource_ids
+}
+
+fn drive_inbound_resource_watchdogs(
+    link_id: &[u8; 16],
+    delivery: &mut PendingDelivery,
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    pending_transport: &mut VecDeque<TransportMessage>,
+    concluded_handler: Option<&InboundResourceConcludedHandler>,
+) {
+    let actions: Vec<([u8; 32], TransferAction)> = delivery
+        .inbound_resources
+        .iter_mut()
+        .filter_map(|(resource_hash, transfer)| {
+            let action = transfer.check_timeout();
+            (!matches!(action, TransferAction::None)).then_some((*resource_hash, action))
+        })
+        .collect();
+    for (resource_hash, action) in actions {
+        if !delivery.inbound_resources.contains_key(&resource_hash) {
+            continue;
+        }
+        match action {
+            TransferAction::Failed(reason) => {
+                tracing::warn!(
+                    link_id = %hex_encode(link_id),
+                    resource = %hex_encode(&resource_hash[..8]),
+                    %reason,
+                    "reverse Resource receive watchdog exhausted"
+                );
+                let resource_id = drop_inbound_resource(delivery, resource_hash);
+                notify_inbound_resource_concluded(concluded_handler, *link_id, resource_id);
+            }
+            retry => {
+                if dispatch_inbound_resource_action(
+                    link_id,
+                    delivery,
+                    transport_tx,
+                    pending_transport,
+                    retry,
+                )
+                .is_err()
+                {
+                    let resource_id = drop_inbound_resource(delivery, resource_hash);
+                    notify_inbound_resource_concluded(concluded_handler, *link_id, resource_id);
+                }
+            }
+        }
+    }
+
+    let now = Instant::now();
+    let expired: Vec<[u8; 32]> = delivery
+        .inbound_resource_lifecycles
+        .iter()
+        .filter_map(|(resource_id, lifecycle)| {
+            lifecycle
+                .inter_segment_deadline
+                .is_some_and(|deadline| now >= deadline)
+                .then_some(*resource_id)
+        })
+        .collect();
+    for resource_id in expired {
+        tracing::warn!(
+            link_id = %hex_encode(link_id),
+            resource = %hex_encode(&resource_id[..8]),
+            "timed out waiting for the next reverse Resource segment"
+        );
+        let resource_id = drop_inbound_resource(delivery, resource_id);
+        notify_inbound_resource_concluded(concluded_handler, *link_id, resource_id);
+    }
+}
+
+fn inbound_split_wait_timeout(link: &Link) -> Duration {
+    let rtt = link.rtt.unwrap_or(Duration::from_millis(500)).as_secs_f64();
+    let advertisement_attempt = rtt * rns_link::constants::TRAFFIC_TIMEOUT_FACTOR
+        + rns_protocol::resource::PROCESSING_GRACE;
+    let retry_horizon = advertisement_attempt
+        * (rns_protocol::resource::MAX_ADV_RETRIES + 1) as f64
+        + rns_protocol::resource::SENDER_GRACE_TIME;
+    Duration::from_secs_f64(retry_horizon.max(30.0))
+}
+
 /// Send a single LXMF packet over an active link and return the full packet hash that the peer
 /// must prove with `LINKPROOF`.
 fn send_link_packet(
@@ -3268,6 +4380,7 @@ fn dispatch_action(
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn next_outbound(rx: &mut mpsc::Receiver<TransportMessage>) -> Vec<u8> {
         while let Ok(message) = rx.try_recv() {
@@ -3488,6 +4601,528 @@ mod tests {
         }));
         assert_eq!(mgr.pending_count(), 0);
         assert_eq!(mgr.stats().backchannel_sessions, 1);
+    }
+
+    #[test]
+    fn backchannel_packet_proof_before_send_receipt_completes_and_releases_link() {
+        let (tx, _rx) = mpsc::channel(16);
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
+        let mut mgr = LinkDeliveryManager::new(tx, None, None);
+        mgr.set_backchannel_sender(cmd_tx);
+
+        let dest_hash = [0xD8; 16];
+        let link_id = [0xE8; 16];
+        let packet_hash = [0xF8; 32];
+        mgr.register_backchannel(dest_hash, link_id);
+
+        let sign_key = Ed25519PrivateKey::generate();
+        let mut msg = LxMessage::new(
+            [0xAA; 16],
+            [0xBB; 16],
+            "Backchannel",
+            "proof raced receipt",
+            crate::constants::DeliveryMethod::Direct,
+        );
+        msg.sign(&sign_key).unwrap();
+        let msg_hash = msg.hash;
+
+        mgr.start_backchannel_delivery(msg, dest_hash).unwrap();
+        let command = cmd_rx.try_recv().expect("backchannel send command");
+
+        assert!(
+            mgr.handle_backchannel_packet_proof(link_id, packet_hash)
+                .is_none(),
+            "the receipt still owns the message until its exact proof key is known"
+        );
+        assert_eq!(mgr.early_backchannel_proofs.len(), 1);
+        assert!(
+            command
+                .result_tx
+                .send(Ok(BackchannelSendReceipt::Packet {
+                    link_id,
+                    packet_hash,
+                }))
+                .is_ok()
+        );
+
+        let results = mgr.tick();
+        assert!(matches!(
+            results.as_slice(),
+            [DeliveryResult::Complete {
+                link_id: id,
+                msg_hash: hash,
+            }] if *id == link_id && *hash == msg_hash
+        ));
+        let events = mgr.take_delivery_events();
+        assert!(events.iter().any(|event| {
+            event.kind == LxmfDeliveryEventKind::AwaitingProof
+                && event.representation == DeliveryRepresentation::Packet
+        }));
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == LxmfDeliveryEventKind::Delivered)
+        );
+        assert!(mgr.early_backchannel_proofs.is_empty());
+        assert_eq!(mgr.pending_count(), 0);
+
+        let mut next = LxMessage::new(
+            [0xAA; 16],
+            [0xBB; 16],
+            "Backchannel",
+            "next delivery is not blocked",
+            crate::constants::DeliveryMethod::Direct,
+        );
+        next.sign(&sign_key).unwrap();
+        mgr.start_backchannel_delivery(next, dest_hash).unwrap();
+        assert!(cmd_rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn backchannel_proof_before_close_and_receipt_completes_without_reusing_closed_link() {
+        let (tx, _rx) = mpsc::channel(16);
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
+        let mut mgr = LinkDeliveryManager::new(tx, None, None);
+        mgr.set_backchannel_sender(cmd_tx);
+
+        let dest_hash = [0xD9; 16];
+        let link_id = [0xE9; 16];
+        let packet_hash = [0xF9; 32];
+        mgr.register_backchannel(dest_hash, link_id);
+
+        let sign_key = Ed25519PrivateKey::generate();
+        let mut msg = LxMessage::new(
+            [0xAA; 16],
+            [0xBB; 16],
+            "Backchannel",
+            "proof then close then receipt",
+            crate::constants::DeliveryMethod::Direct,
+        );
+        msg.sign(&sign_key).unwrap();
+        let msg_hash = msg.hash;
+
+        mgr.start_backchannel_delivery(msg, dest_hash).unwrap();
+        let command = cmd_rx.try_recv().expect("backchannel send command");
+        assert!(
+            mgr.handle_backchannel_packet_proof(link_id, packet_hash)
+                .is_none()
+        );
+        assert!(mgr.fail_backchannel_link(link_id, "link closed").is_empty());
+        assert!(!mgr.delivery_link_available(&dest_hash));
+        assert_eq!(mgr.pending_count(), 1);
+        assert_eq!(mgr.early_backchannel_proofs.len(), 1);
+
+        command
+            .result_tx
+            .send(Ok(BackchannelSendReceipt::Packet {
+                link_id,
+                packet_hash,
+            }))
+            .unwrap();
+        let results = mgr.tick();
+        assert!(matches!(
+            results.as_slice(),
+            [DeliveryResult::Complete {
+                link_id: id,
+                msg_hash: hash,
+            }] if *id == link_id && *hash == msg_hash
+        ));
+        assert_eq!(
+            mgr.take_delivery_events()
+                .iter()
+                .filter(|event| event.kind == LxmfDeliveryEventKind::Delivered)
+                .count(),
+            1
+        );
+        assert!(
+            mgr.handle_backchannel_packet_proof(link_id, packet_hash)
+                .is_none()
+        );
+        assert!(mgr.tick().is_empty());
+        assert_eq!(mgr.pending_count(), 0);
+        assert!(!mgr.delivery_link_available(&dest_hash));
+        assert!(mgr.early_backchannel_proofs.is_empty());
+    }
+
+    #[test]
+    fn cancel_backchannel_before_resource_receipt_queues_exact_external_cancel_once() {
+        let (tx, _rx) = mpsc::channel(16);
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
+        let mut mgr = LinkDeliveryManager::new(tx, None, None);
+        mgr.set_backchannel_sender(cmd_tx);
+
+        let dest_hash = [0xDA; 16];
+        let link_id = [0xEA; 16];
+        let resource_hash = [0xFA; 32];
+        mgr.register_backchannel(dest_hash, link_id);
+
+        let sign_key = Ed25519PrivateKey::generate();
+        let mut msg = LxMessage::new(
+            [0xAA; 16],
+            [0xBB; 16],
+            "Backchannel",
+            "cancel before resource receipt",
+            crate::constants::DeliveryMethod::Direct,
+        );
+        msg.sign(&sign_key).unwrap();
+        let msg_hash = msg.hash.unwrap();
+
+        mgr.start_backchannel_delivery(msg, dest_hash).unwrap();
+        let command = cmd_rx.try_recv().expect("backchannel send command");
+        assert!(mgr.cancel_delivery_by_message_hash(msg_hash));
+        assert!(!mgr.cancel_delivery_by_message_hash(msg_hash));
+        assert!(mgr.take_backchannel_resource_cancellations().is_empty());
+
+        command
+            .result_tx
+            .send(Ok(BackchannelSendReceipt::Resource {
+                link_id,
+                resource_hash,
+            }))
+            .unwrap();
+        assert!(mgr.tick().is_empty());
+        assert_eq!(mgr.pending_count(), 0);
+        assert_eq!(
+            mgr.take_backchannel_resource_cancellations(),
+            vec![BackchannelResourceCancelRequest {
+                link_id,
+                resource_hash,
+            }]
+        );
+        assert!(mgr.take_backchannel_resource_cancellations().is_empty());
+        assert!(mgr.delivery_link_available(&dest_hash));
+    }
+
+    #[test]
+    fn cancel_backchannel_before_packet_receipt_discards_non_recallable_send() {
+        let (tx, _rx) = mpsc::channel(16);
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
+        let mut mgr = LinkDeliveryManager::new(tx, None, None);
+        mgr.set_backchannel_sender(cmd_tx);
+
+        let dest_hash = [0xDD; 16];
+        let link_id = [0xED; 16];
+        let packet_hash = [0xFD; 32];
+        mgr.register_backchannel(dest_hash, link_id);
+
+        let sign_key = Ed25519PrivateKey::generate();
+        let mut msg = LxMessage::new(
+            [0xAA; 16],
+            [0xBB; 16],
+            "Backchannel",
+            "cancel before packet receipt",
+            crate::constants::DeliveryMethod::Direct,
+        );
+        msg.sign(&sign_key).unwrap();
+        let msg_hash = msg.hash.unwrap();
+
+        mgr.start_backchannel_delivery(msg, dest_hash).unwrap();
+        let command = cmd_rx.try_recv().expect("backchannel send command");
+        assert!(mgr.cancel_delivery_by_message_hash(msg_hash));
+        command
+            .result_tx
+            .send(Ok(BackchannelSendReceipt::Packet {
+                link_id,
+                packet_hash,
+            }))
+            .unwrap();
+
+        assert!(mgr.tick().is_empty());
+        assert_eq!(mgr.pending_count(), 0);
+        assert!(mgr.take_backchannel_resource_cancellations().is_empty());
+        assert!(
+            mgr.handle_backchannel_packet_proof(link_id, packet_hash)
+                .is_none()
+        );
+        assert!(mgr.delivery_link_available(&dest_hash));
+    }
+
+    #[test]
+    fn cancel_installed_backchannel_resource_queues_exact_external_cancel_once() {
+        let (tx, _rx) = mpsc::channel(16);
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
+        let mut mgr = LinkDeliveryManager::new(tx, None, None);
+        mgr.set_backchannel_sender(cmd_tx);
+
+        let dest_hash = [0xDB; 16];
+        let link_id = [0xEB; 16];
+        let resource_hash = [0xFB; 32];
+        mgr.register_backchannel(dest_hash, link_id);
+
+        let sign_key = Ed25519PrivateKey::generate();
+        let mut msg = LxMessage::new(
+            [0xAA; 16],
+            [0xBB; 16],
+            "Backchannel",
+            "cancel installed resource",
+            crate::constants::DeliveryMethod::Direct,
+        );
+        msg.sign(&sign_key).unwrap();
+        let msg_hash = msg.hash.unwrap();
+
+        mgr.start_backchannel_delivery(msg, dest_hash).unwrap();
+        cmd_rx
+            .try_recv()
+            .expect("backchannel send command")
+            .result_tx
+            .send(Ok(BackchannelSendReceipt::Resource {
+                link_id,
+                resource_hash,
+            }))
+            .unwrap();
+        assert!(mgr.tick().is_empty());
+        assert_eq!(mgr.stats().pending_backchannel_deliveries, 1);
+
+        assert!(mgr.cancel_delivery_by_message_hash(msg_hash));
+        assert!(!mgr.cancel_delivery_by_message_hash(msg_hash));
+        assert_eq!(
+            mgr.take_backchannel_resource_cancellations(),
+            vec![BackchannelResourceCancelRequest {
+                link_id,
+                resource_hash,
+            }]
+        );
+        assert!(mgr.take_backchannel_resource_cancellations().is_empty());
+        assert_eq!(mgr.pending_count(), 0);
+        assert!(mgr.delivery_link_available(&dest_hash));
+    }
+
+    #[test]
+    fn rejected_backchannel_resource_returns_rejected_and_preserves_link() {
+        let (tx, _rx) = mpsc::channel(16);
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
+        let mut mgr = LinkDeliveryManager::new(tx, None, None);
+        mgr.set_backchannel_sender(cmd_tx);
+
+        let dest_hash = [0xDC; 16];
+        let link_id = [0xEC; 16];
+        let resource_hash = [0xFC; 32];
+        mgr.register_backchannel(dest_hash, link_id);
+
+        let sign_key = Ed25519PrivateKey::generate();
+        let mut msg = LxMessage::new(
+            [0xAA; 16],
+            [0xBB; 16],
+            "Backchannel",
+            "resource rejected",
+            crate::constants::DeliveryMethod::Direct,
+        );
+        msg.sign(&sign_key).unwrap();
+        let msg_hash = msg.hash;
+
+        mgr.start_backchannel_delivery(msg, dest_hash).unwrap();
+        cmd_rx
+            .try_recv()
+            .expect("backchannel send command")
+            .result_tx
+            .send(Ok(BackchannelSendReceipt::Resource {
+                link_id,
+                resource_hash,
+            }))
+            .unwrap();
+        assert!(mgr.tick().is_empty());
+
+        let result = mgr
+            .handle_backchannel_resource_conclusion(
+                link_id,
+                resource_hash,
+                BackchannelResourceConclusion::Rejected,
+                "resource rejected",
+            )
+            .expect("exact Resource conclusion");
+        assert!(matches!(
+            result,
+            DeliveryResult::Rejected {
+                link_id: id,
+                msg_hash: hash,
+                dest_hash: dest,
+                reason,
+                ..
+            } if id == link_id
+                && hash == msg_hash
+                && dest == dest_hash
+                && reason == "resource rejected"
+        ));
+        assert!(
+            mgr.handle_backchannel_resource_conclusion(
+                link_id,
+                resource_hash,
+                BackchannelResourceConclusion::Rejected,
+                "duplicate",
+            )
+            .is_none()
+        );
+        assert_eq!(mgr.pending_count(), 0);
+        assert!(mgr.delivery_link_available(&dest_hash));
+        assert!(mgr.take_delivery_events().iter().any(|event| {
+            event.kind == LxmfDeliveryEventKind::Rejected
+                && event.reason.as_deref() == Some("resource rejected")
+        }));
+    }
+
+    #[test]
+    fn backchannel_resource_rejection_before_receipt_reconciles_exactly_once() {
+        let (tx, _rx) = mpsc::channel(16);
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
+        let mut mgr = LinkDeliveryManager::new(tx, None, None);
+        mgr.set_backchannel_sender(cmd_tx);
+
+        let dest_hash = [0xC1; 16];
+        let link_id = [0xD1; 16];
+        let resource_hash = [0xE1; 32];
+        let key = BackchannelProofKey::Resource(link_id, resource_hash);
+        mgr.register_backchannel(dest_hash, link_id);
+
+        let sign_key = Ed25519PrivateKey::generate();
+        let mut msg = LxMessage::new(
+            [0xAA; 16],
+            [0xBB; 16],
+            "Backchannel",
+            "rejection before resource receipt",
+            crate::constants::DeliveryMethod::Direct,
+        );
+        msg.sign(&sign_key).unwrap();
+        let msg_hash = msg.hash;
+
+        mgr.start_backchannel_delivery(msg, dest_hash).unwrap();
+        let command = cmd_rx.try_recv().expect("backchannel send command");
+        assert!(
+            mgr.handle_backchannel_resource_conclusion(
+                link_id,
+                resource_hash,
+                BackchannelResourceConclusion::Rejected,
+                "early rejection",
+            )
+            .is_none()
+        );
+        let first_observed_at = mgr
+            .early_backchannel_resource_conclusions
+            .get(&key)
+            .expect("staged early conclusion")
+            .observed_at;
+
+        assert!(
+            mgr.handle_backchannel_resource_conclusion(
+                link_id,
+                resource_hash,
+                BackchannelResourceConclusion::Failed,
+                "duplicate must not replace first conclusion",
+            )
+            .is_none()
+        );
+        let staged = mgr
+            .early_backchannel_resource_conclusions
+            .get(&key)
+            .expect("first conclusion remains staged");
+        assert_eq!(staged.observed_at, first_observed_at);
+        assert_eq!(staged.conclusion, BackchannelResourceConclusion::Rejected);
+        assert_eq!(staged.reason, "early rejection");
+
+        command
+            .result_tx
+            .send(Ok(BackchannelSendReceipt::Resource {
+                link_id,
+                resource_hash,
+            }))
+            .unwrap();
+        let results = mgr.tick();
+        assert!(matches!(
+            results.as_slice(),
+            [DeliveryResult::Rejected {
+                link_id: id,
+                msg_hash: hash,
+                dest_hash: dest,
+                reason,
+                ..
+            }] if *id == link_id
+                && *hash == msg_hash
+                && *dest == dest_hash
+                && reason == "early rejection"
+        ));
+        assert_eq!(mgr.pending_count(), 0);
+        assert!(mgr.early_backchannel_resource_conclusions.is_empty());
+        assert!(mgr.delivery_link_available(&dest_hash));
+
+        assert!(
+            mgr.handle_backchannel_resource_conclusion(
+                link_id,
+                resource_hash,
+                BackchannelResourceConclusion::Rejected,
+                "late duplicate",
+            )
+            .is_none()
+        );
+        assert!(mgr.early_backchannel_resource_conclusions.is_empty());
+        assert!(mgr.tick().is_empty());
+    }
+
+    #[test]
+    fn backchannel_resource_rejection_before_close_and_receipt_wins_exactly() {
+        let (tx, _rx) = mpsc::channel(16);
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
+        let mut mgr = LinkDeliveryManager::new(tx, None, None);
+        mgr.set_backchannel_sender(cmd_tx);
+
+        let dest_hash = [0xC2; 16];
+        let link_id = [0xD2; 16];
+        let resource_hash = [0xE2; 32];
+        mgr.register_backchannel(dest_hash, link_id);
+
+        let sign_key = Ed25519PrivateKey::generate();
+        let mut msg = LxMessage::new(
+            [0xAA; 16],
+            [0xBB; 16],
+            "Backchannel",
+            "rejection then close then receipt",
+            crate::constants::DeliveryMethod::Direct,
+        );
+        msg.sign(&sign_key).unwrap();
+        let msg_hash = msg.hash;
+
+        mgr.start_backchannel_delivery(msg, dest_hash).unwrap();
+        let command = cmd_rx.try_recv().expect("backchannel send command");
+        assert!(
+            mgr.handle_backchannel_resource_conclusion(
+                link_id,
+                resource_hash,
+                BackchannelResourceConclusion::Rejected,
+                "receiver rejected resource",
+            )
+            .is_none()
+        );
+        assert!(mgr.fail_backchannel_link(link_id, "link closed").is_empty());
+        assert_eq!(mgr.pending_count(), 1);
+        assert!(!mgr.delivery_link_available(&dest_hash));
+
+        command
+            .result_tx
+            .send(Ok(BackchannelSendReceipt::Resource {
+                link_id,
+                resource_hash,
+            }))
+            .unwrap();
+        let results = mgr.tick();
+        assert!(matches!(
+            results.as_slice(),
+            [DeliveryResult::Rejected {
+                link_id: id,
+                msg_hash: hash,
+                dest_hash: dest,
+                reason,
+                ..
+            }] if *id == link_id
+                && *hash == msg_hash
+                && *dest == dest_hash
+                && reason == "receiver rejected resource"
+        ));
+        assert_eq!(mgr.pending_count(), 0);
+        assert!(mgr.early_backchannel_resource_conclusions.is_empty());
+        assert!(!mgr.delivery_link_available(&dest_hash));
+        assert!(mgr.take_delivery_events().iter().any(|event| {
+            event.kind == LxmfDeliveryEventKind::Rejected
+                && event.link_state == LinkState::Closed
+                && event.reason.as_deref() == Some("receiver rejected resource")
+        }));
     }
 
     #[test]
@@ -4050,6 +5685,384 @@ mod tests {
             responder_link.validate_packet_proof(&packet_hash, &proof_raw[proof_offset..]),
             "initiator-side proof must be signed with the link key"
         );
+    }
+
+    #[test]
+    fn reusable_initiator_link_receives_reverse_resource_and_proves_before_delivery() {
+        let (tx, mut rx) = mpsc::channel(512);
+        let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel();
+        let mut mgr = LinkDeliveryManager::new(tx, None, None);
+        mgr.set_inbound_packet_sender(inbound_tx);
+        let admissions = Arc::new(AtomicUsize::new(0));
+        let conclusions = Arc::new(AtomicUsize::new(0));
+        let admission_counter = Arc::clone(&admissions);
+        mgr.set_inbound_resource_accept_handler(move |_, _| {
+            admission_counter.fetch_add(1, Ordering::Relaxed);
+            true
+        });
+        let conclusion_counter = Arc::clone(&conclusions);
+        mgr.set_inbound_resource_concluded_handler(move |_, _| {
+            conclusion_counter.fetch_add(1, Ordering::Relaxed);
+        });
+
+        let responder_key = Ed25519PrivateKey::generate();
+        let sign_key = Ed25519PrivateKey::generate();
+        let dest_hash = [0xE7; 16];
+        let mut msg = LxMessage::new(
+            [0xAA; 16],
+            [0xBB; 16],
+            "Initial",
+            "establish reusable link",
+            crate::constants::DeliveryMethod::Direct,
+        );
+        msg.sign(&sign_key).unwrap();
+        let (link_id, responder_link) =
+            establish_active_delivery(&mut mgr, &mut rx, msg, &responder_key, dest_hash);
+        assert!(mgr.tick().is_empty());
+        complete_next_link_packet(&mut mgr, &mut rx, link_id, &responder_link, &responder_key);
+        assert!(
+            mgr.tick()
+                .iter()
+                .any(|result| matches!(result, DeliveryResult::Complete { .. }))
+        );
+        while rx.try_recv().is_ok() {}
+
+        let payload = vec![0x5A; 4_096];
+        let (mut transfer, remaining) = build_resource_transfer(
+            &responder_link,
+            payload.clone(),
+            false,
+            Duration::from_millis(25),
+        )
+        .unwrap();
+        assert!(remaining.is_none());
+        let resource_hash = transfer.resource.resource_hash;
+        let TransferAction::SendAdvertisement(advertisement) = transfer.tick() else {
+            panic!("first Resource action must be an advertisement");
+        };
+        let encrypted_advertisement = responder_link.encrypt(&advertisement).unwrap();
+        mgr.event_tx
+            .try_send(DestinationEvent::InboundPacket {
+                raw: link_data_packet(
+                    link_id,
+                    rns_wire::context::PacketContext::ResourceAdv,
+                    &encrypted_advertisement,
+                ),
+                interface_id: 0,
+                metrics: Default::default(),
+            })
+            .unwrap();
+        mgr.drain_events(&HashMap::new());
+
+        assert!(
+            mgr.pending[&link_id]
+                .inbound_resources
+                .contains_key(&resource_hash)
+        );
+        assert!(inbound_rx.try_recv().is_err());
+
+        let mut proof_seen = false;
+        for _ in 0..128 {
+            let raw = next_outbound(&mut rx);
+            let (header, offset) = rns_wire::header::PacketHeader::unpack(&raw).unwrap();
+            match header.context {
+                rns_wire::context::PacketContext::ResourceReq => {
+                    let request = responder_link.decrypt(&raw[offset..]).unwrap();
+                    for action in transfer.handle_request(&request) {
+                        if let TransferAction::SendPart(_, part) = action {
+                            mgr.event_tx
+                                .try_send(DestinationEvent::InboundPacket {
+                                    raw: link_data_packet(
+                                        link_id,
+                                        rns_wire::context::PacketContext::Resource,
+                                        &part,
+                                    ),
+                                    interface_id: 0,
+                                    metrics: Default::default(),
+                                })
+                                .unwrap();
+                        }
+                    }
+                    mgr.drain_events(&HashMap::new());
+                }
+                rns_wire::context::PacketContext::ResourcePrf => {
+                    assert_eq!(header.flags.packet_type, rns_wire::flags::PacketType::Proof);
+                    assert!(transfer.handle_proof(&raw[offset..]));
+                    proof_seen = true;
+                    break;
+                }
+                other => panic!("unexpected reverse Resource control packet: {other:?}"),
+            }
+        }
+        assert!(proof_seen);
+        let (delivered, delivered_link_id) = inbound_rx.try_recv().unwrap();
+        assert_eq!(delivered, payload);
+        assert_eq!(delivered_link_id, link_id);
+        assert!(inbound_rx.try_recv().is_err());
+        assert!(mgr.pending[&link_id].inbound_resources.is_empty());
+        assert_eq!(admissions.load(Ordering::Relaxed), 1);
+        assert_eq!(conclusions.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn reusable_initiator_link_rejects_oversize_reverse_resource() {
+        let (tx, mut rx) = mpsc::channel(128);
+        let mut mgr = LinkDeliveryManager::new(tx, None, None);
+        mgr.set_inbound_resource_limit_bytes(64);
+
+        let responder_key = Ed25519PrivateKey::generate();
+        let sign_key = Ed25519PrivateKey::generate();
+        let dest_hash = [0xE8; 16];
+        let mut msg = LxMessage::new(
+            [0xAA; 16],
+            [0xBB; 16],
+            "Initial",
+            "establish reusable link",
+            crate::constants::DeliveryMethod::Direct,
+        );
+        msg.sign(&sign_key).unwrap();
+        let (link_id, responder_link) =
+            establish_active_delivery(&mut mgr, &mut rx, msg, &responder_key, dest_hash);
+        assert!(mgr.tick().is_empty());
+        complete_next_link_packet(&mut mgr, &mut rx, link_id, &responder_link, &responder_key);
+        let _ = mgr.tick();
+        while rx.try_recv().is_ok() {}
+
+        let (mut transfer, _) = build_resource_transfer(
+            &responder_link,
+            vec![0x44; 128],
+            false,
+            Duration::from_millis(25),
+        )
+        .unwrap();
+        let resource_hash = transfer.resource.resource_hash;
+        let TransferAction::SendAdvertisement(advertisement) = transfer.tick() else {
+            unreachable!();
+        };
+        let encrypted = responder_link.encrypt(&advertisement).unwrap();
+        mgr.event_tx
+            .try_send(DestinationEvent::InboundPacket {
+                raw: link_data_packet(
+                    link_id,
+                    rns_wire::context::PacketContext::ResourceAdv,
+                    &encrypted,
+                ),
+                interface_id: 0,
+                metrics: Default::default(),
+            })
+            .unwrap();
+        mgr.drain_events(&HashMap::new());
+
+        let reject = next_outbound(&mut rx);
+        let (header, offset) = rns_wire::header::PacketHeader::unpack(&reject).unwrap();
+        assert_eq!(
+            header.context,
+            rns_wire::context::PacketContext::ResourceRcl
+        );
+        assert_eq!(
+            responder_link.decrypt(&reject[offset..]).unwrap(),
+            resource_hash
+        );
+        assert!(mgr.pending[&link_id].inbound_resources.is_empty());
+    }
+
+    #[test]
+    fn reusable_initiator_link_releases_reverse_resource_on_sender_cancel() {
+        let (tx, mut rx) = mpsc::channel(128);
+        let mut mgr = LinkDeliveryManager::new(tx, None, None);
+        let responder_key = Ed25519PrivateKey::generate();
+        let sign_key = Ed25519PrivateKey::generate();
+        let dest_hash = [0xE9; 16];
+        let mut msg = LxMessage::new(
+            [0xAA; 16],
+            [0xBB; 16],
+            "Initial",
+            "establish reusable link",
+            crate::constants::DeliveryMethod::Direct,
+        );
+        msg.sign(&sign_key).unwrap();
+        let (link_id, responder_link) =
+            establish_active_delivery(&mut mgr, &mut rx, msg, &responder_key, dest_hash);
+        assert!(mgr.tick().is_empty());
+        complete_next_link_packet(&mut mgr, &mut rx, link_id, &responder_link, &responder_key);
+        let _ = mgr.tick();
+        while rx.try_recv().is_ok() {}
+
+        let (mut transfer, _) = build_resource_transfer(
+            &responder_link,
+            vec![0x33; 4_096],
+            false,
+            Duration::from_millis(25),
+        )
+        .unwrap();
+        let resource_hash = transfer.resource.resource_hash;
+        let TransferAction::SendAdvertisement(advertisement) = transfer.tick() else {
+            unreachable!();
+        };
+        let encrypted_advertisement = responder_link.encrypt(&advertisement).unwrap();
+        mgr.event_tx
+            .try_send(DestinationEvent::InboundPacket {
+                raw: link_data_packet(
+                    link_id,
+                    rns_wire::context::PacketContext::ResourceAdv,
+                    &encrypted_advertisement,
+                ),
+                interface_id: 0,
+                metrics: Default::default(),
+            })
+            .unwrap();
+        mgr.drain_events(&HashMap::new());
+        assert!(
+            mgr.pending[&link_id]
+                .inbound_resources
+                .contains_key(&resource_hash)
+        );
+        let _ = next_outbound(&mut rx);
+
+        let encrypted_cancel = responder_link.encrypt(&resource_hash).unwrap();
+        mgr.event_tx
+            .try_send(DestinationEvent::InboundPacket {
+                raw: link_data_packet(
+                    link_id,
+                    rns_wire::context::PacketContext::ResourceIcl,
+                    &encrypted_cancel,
+                ),
+                interface_id: 0,
+                metrics: Default::default(),
+            })
+            .unwrap();
+        mgr.drain_events(&HashMap::new());
+        assert!(mgr.pending[&link_id].inbound_resources.is_empty());
+        assert!(mgr.pending[&link_id].inbound_resource_lifecycles.is_empty());
+    }
+
+    #[test]
+    fn reusable_initiator_link_withholds_reverse_resource_if_proof_cannot_be_retained() {
+        let (tx, mut rx) = mpsc::channel(128);
+        let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel();
+        let mut mgr = LinkDeliveryManager::new(tx, None, None);
+        mgr.set_inbound_packet_sender(inbound_tx);
+        let responder_key = Ed25519PrivateKey::generate();
+        let sign_key = Ed25519PrivateKey::generate();
+        let dest_hash = [0xEA; 16];
+        let mut msg = LxMessage::new(
+            [0xAA; 16],
+            [0xBB; 16],
+            "Initial",
+            "establish reusable link",
+            crate::constants::DeliveryMethod::Direct,
+        );
+        msg.sign(&sign_key).unwrap();
+        let (link_id, responder_link) =
+            establish_active_delivery(&mut mgr, &mut rx, msg, &responder_key, dest_hash);
+        assert!(mgr.tick().is_empty());
+        complete_next_link_packet(&mut mgr, &mut rx, link_id, &responder_link, &responder_key);
+        let _ = mgr.tick();
+        while rx.try_recv().is_ok() {}
+
+        let (mut transfer, _) = build_resource_transfer(
+            &responder_link,
+            vec![0x22; 128],
+            false,
+            Duration::from_millis(25),
+        )
+        .unwrap();
+        let resource_hash = transfer.resource.resource_hash;
+        let TransferAction::SendAdvertisement(advertisement) = transfer.tick() else {
+            unreachable!();
+        };
+        mgr.event_tx
+            .try_send(DestinationEvent::InboundPacket {
+                raw: link_data_packet(
+                    link_id,
+                    rns_wire::context::PacketContext::ResourceAdv,
+                    &responder_link.encrypt(&advertisement).unwrap(),
+                ),
+                interface_id: 0,
+                metrics: Default::default(),
+            })
+            .unwrap();
+        mgr.drain_events(&HashMap::new());
+        let request = next_outbound(&mut rx);
+        let (_, offset) = rns_wire::header::PacketHeader::unpack(&request).unwrap();
+        let plaintext_request = responder_link.decrypt(&request[offset..]).unwrap();
+        let part = transfer
+            .handle_request(&plaintext_request)
+            .into_iter()
+            .find_map(|action| match action {
+                TransferAction::SendPart(_, part) => Some(part),
+                _ => None,
+            })
+            .expect("single requested Resource part");
+
+        for index in 0..LINK_PENDING_TRANSPORT_LIMIT {
+            mgr.pending_transport
+                .push_back(TransportMessage::DeregisterDestination {
+                    hash: [(index & 0xFF) as u8; 16],
+                });
+        }
+        mgr.event_tx
+            .try_send(DestinationEvent::InboundPacket {
+                raw: link_data_packet(link_id, rns_wire::context::PacketContext::Resource, &part),
+                interface_id: 0,
+                metrics: Default::default(),
+            })
+            .unwrap();
+        mgr.drain_events(&HashMap::new());
+
+        assert!(inbound_rx.try_recv().is_err());
+        assert!(
+            !mgr.pending[&link_id]
+                .inbound_resources
+                .contains_key(&resource_hash)
+        );
+    }
+
+    #[test]
+    fn reusable_initiator_link_expires_abandoned_split_resource_between_segments() {
+        let (tx, mut rx) = mpsc::channel(128);
+        let conclusions = Arc::new(AtomicUsize::new(0));
+        let conclusion_counter = Arc::clone(&conclusions);
+        let mut mgr = LinkDeliveryManager::new(tx, None, None);
+        mgr.set_inbound_resource_concluded_handler(move |_, _| {
+            conclusion_counter.fetch_add(1, Ordering::Relaxed);
+        });
+        let responder_key = Ed25519PrivateKey::generate();
+        let sign_key = Ed25519PrivateKey::generate();
+        let dest_hash = [0xEB; 16];
+        let mut msg = LxMessage::new(
+            [0xAA; 16],
+            [0xBB; 16],
+            "Initial",
+            "establish reusable link",
+            crate::constants::DeliveryMethod::Direct,
+        );
+        msg.sign(&sign_key).unwrap();
+        let (link_id, responder_link) =
+            establish_active_delivery(&mut mgr, &mut rx, msg, &responder_key, dest_hash);
+        assert!(mgr.tick().is_empty());
+        complete_next_link_packet(&mut mgr, &mut rx, link_id, &responder_link, &responder_key);
+        let _ = mgr.tick();
+
+        let resource_id = [0xD4; 32];
+        let delivery = mgr.pending.get_mut(&link_id).unwrap();
+        delivery
+            .inbound_split_resources
+            .insert(resource_id, MultiSegmentInbound::new(2, resource_id));
+        delivery.inbound_resource_lifecycles.insert(
+            resource_id,
+            InboundResourceLifecycle {
+                data_size: MAX_EFFICIENT_SIZE + 1,
+                total_segments: 2,
+                next_segment: 2,
+                inter_segment_deadline: Some(Instant::now() - Duration::from_millis(1)),
+            },
+        );
+
+        let _ = mgr.tick();
+        assert!(mgr.pending[&link_id].inbound_resource_lifecycles.is_empty());
+        assert!(mgr.pending[&link_id].inbound_split_resources.is_empty());
+        assert_eq!(conclusions.load(Ordering::Relaxed), 1);
     }
 
     #[test]
