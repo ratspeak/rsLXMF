@@ -35,6 +35,16 @@ use crate::types::PropagationTransientId;
 /// Shared handler invoked on per-message state transitions.
 pub type MessageCallback = Arc<dyn Fn(&LxMessage) + Send + Sync>;
 
+/// A native LXMF audio field borrowed from its enclosing message.
+///
+/// LXMF represents audio as `[mode, bytes]`, where `mode` is one of the
+/// `AM_*` constants and `bytes` is the encoded audio payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioField<'a> {
+    pub mode: u8,
+    pub bytes: &'a [u8],
+}
+
 /// Per-message delivery and failure callbacks.
 ///
 /// Invoked by [`LxMessage::notify_delivered`] / [`LxMessage::notify_failed`] when the router
@@ -280,6 +290,23 @@ impl LxMessage {
         Ok(())
     }
 
+    /// Encode and install the native LXMF audio field without cloning
+    /// `audio_bytes` into an intermediate `rmpv::Value` tree.
+    ///
+    /// The wire value is exactly `[mode, audio_bytes]`. Audio is independent
+    /// of [`FIELD_FILE_ATTACHMENTS`]; this method never adds or changes a file
+    /// attachment field.
+    pub fn set_audio_field(&mut self, mode: u8, audio_bytes: &[u8]) -> Result<(), MessageError> {
+        let encoded = rmp_serde::to_vec(&AudioFieldRef {
+            mode,
+            bytes: audio_bytes,
+        })
+        .map_err(|error| MessageError::PackFailed(error.to_string()))?;
+        self.fields.insert(FIELD_AUDIO, encoded);
+        self.msgpack_field_ids.insert(FIELD_AUDIO);
+        Ok(())
+    }
+
     /// Encode and install one native LXMF file attachment without first
     /// cloning `file_bytes` into an intermediate `rmpv::Value` tree.
     ///
@@ -340,6 +367,33 @@ impl LxMessage {
             String::from_utf8_lossy(read_msgpack_string_or_binary(&mut input)?).into_owned();
         let data = read_msgpack_binary(&mut input)?;
         Ok(Some((format, data)))
+    }
+
+    /// Decode the native LXMF audio field while borrowing its audio bytes.
+    ///
+    /// The field must be exactly `[mode, bytes]`, with an integer mode in
+    /// `0..=255` and a MessagePack binary payload. A malformed audio field is
+    /// reported only by this accessor; it does not invalidate the enclosing
+    /// message or its other fields.
+    pub fn audio_field(&self) -> Result<Option<AudioField<'_>>, MessageError> {
+        let Some(field) = self.fields.get(&FIELD_AUDIO) else {
+            return Ok(None);
+        };
+        let mut input = field.as_slice();
+        let item_count = read_msgpack_array_len(&mut input)?;
+        if item_count != 2 {
+            return Err(MessageError::UnpackFailed(
+                "audio field requires exactly mode and data".to_string(),
+            ));
+        }
+        let mode = read_msgpack_integer_u8_strict(&mut input)?;
+        let bytes = read_msgpack_binary(&mut input)?;
+        if !input.is_empty() {
+            return Err(MessageError::UnpackFailed(
+                "audio field has trailing bytes".to_string(),
+            ));
+        }
+        Ok(Some(AudioField { mode, bytes }))
     }
 
     /// Pack the payload as `msgpack([timestamp, title, content, fields, ?stamp])`.
@@ -1377,6 +1431,49 @@ fn read_msgpack_integer_u8(input: &mut &[u8]) -> Result<u8, MessageError> {
     Ok(value as u8)
 }
 
+/// Read any MessagePack integer representation whose value is in `0..=255`.
+///
+/// The general payload decoder retains its historical narrowing behaviour in
+/// `read_msgpack_integer_u8`; native audio modes need strict range validation
+/// so malformed or future wider values cannot alias a known `AM_*` mode.
+fn read_msgpack_integer_u8_strict(input: &mut &[u8]) -> Result<u8, MessageError> {
+    let marker = take_msgpack(input, 1)?[0];
+    let value = match marker {
+        0x00..=0x7f => i128::from(marker),
+        0xe0..=0xff => i128::from(marker as i8),
+        0xcc => i128::from(take_msgpack(input, 1)?[0]),
+        0xcd => i128::from(u16::from_be_bytes(
+            take_msgpack(input, 2)?.try_into().expect("exact length"),
+        )),
+        0xce => i128::from(u32::from_be_bytes(
+            take_msgpack(input, 4)?.try_into().expect("exact length"),
+        )),
+        0xcf => i128::from(u64::from_be_bytes(
+            take_msgpack(input, 8)?.try_into().expect("exact length"),
+        )),
+        0xd0 => i128::from(i8::from_be_bytes(
+            take_msgpack(input, 1)?.try_into().expect("exact length"),
+        )),
+        0xd1 => i128::from(i16::from_be_bytes(
+            take_msgpack(input, 2)?.try_into().expect("exact length"),
+        )),
+        0xd2 => i128::from(i32::from_be_bytes(
+            take_msgpack(input, 4)?.try_into().expect("exact length"),
+        )),
+        0xd3 => i128::from(i64::from_be_bytes(
+            take_msgpack(input, 8)?.try_into().expect("exact length"),
+        )),
+        _ => {
+            return Err(MessageError::UnpackFailed(
+                "audio mode is not a MessagePack integer".to_string(),
+            ));
+        }
+    };
+    u8::try_from(value).map_err(|_| {
+        MessageError::UnpackFailed("audio mode is outside the range 0..=255".to_string())
+    })
+}
+
 fn skip_msgpack_value(input: &mut &[u8], depth: usize) -> Result<(), MessageError> {
     if depth >= 64 {
         return Err(MessageError::UnpackFailed(
@@ -1625,6 +1722,21 @@ impl serde::Serialize for ImageFieldRef<'_> {
         use serde::ser::SerializeTuple;
         let mut tuple = serializer.serialize_tuple(2)?;
         tuple.serialize_element(self.format)?;
+        tuple.serialize_element(&BinBytes(self.bytes))?;
+        tuple.end()
+    }
+}
+
+struct AudioFieldRef<'a> {
+    mode: u8,
+    bytes: &'a [u8],
+}
+
+impl serde::Serialize for AudioFieldRef<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeTuple;
+        let mut tuple = serializer.serialize_tuple(2)?;
+        tuple.serialize_element(&self.mode)?;
         tuple.serialize_element(&BinBytes(self.bytes))?;
         tuple.end()
     }
@@ -2196,6 +2308,129 @@ mod tests {
 
         assert_eq!(msg.get_field(FIELD_IMAGE), Some(&expected));
         assert!(msg.msgpack_field_ids.contains(&FIELD_IMAGE));
+    }
+
+    #[test]
+    fn typed_audio_field_has_exact_native_wire_value_and_borrows_bytes() {
+        let audio_bytes = [0x4f, 0x67, 0x67, 0x53];
+        let expected = vec![
+            0x92,
+            AM_OPUS_OGG,
+            0xc4,
+            audio_bytes.len() as u8,
+            audio_bytes[0],
+            audio_bytes[1],
+            audio_bytes[2],
+            audio_bytes[3],
+        ];
+
+        let mut msg = LxMessage::new([0; 16], [0; 16], "", "", DeliveryMethod::Direct);
+        msg.set_audio_field(AM_OPUS_OGG, &audio_bytes).unwrap();
+
+        assert_eq!(msg.get_field(FIELD_AUDIO), Some(&expected));
+        assert!(msg.msgpack_field_ids.contains(&FIELD_AUDIO));
+        assert!(!msg.fields.contains_key(&FIELD_FILE_ATTACHMENTS));
+
+        let encoded = msg.get_field(FIELD_AUDIO).unwrap();
+        let encoded_start = encoded.as_ptr() as usize;
+        let encoded_end = encoded_start + encoded.len();
+        let audio = msg.audio_field().unwrap().unwrap();
+        assert_eq!(audio.mode, AM_OPUS_OGG);
+        assert_eq!(audio.bytes, audio_bytes);
+        assert!((encoded_start..encoded_end).contains(&(audio.bytes.as_ptr() as usize)));
+    }
+
+    #[test]
+    fn typed_audio_field_survives_signed_pack_and_unpack() {
+        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
+        let audio_bytes = b"OggS\0typed-audio";
+        let mut outbound = LxMessage::new(
+            [0x11; 16],
+            [0x22; 16],
+            "",
+            "Voice message",
+            DeliveryMethod::Direct,
+        );
+        outbound.set_audio_field(AM_OPUS_OGG, audio_bytes).unwrap();
+        outbound.sign(&key).unwrap();
+
+        let packed = outbound.pack().unwrap();
+        let inbound = LxMessage::unpack(&packed).unwrap();
+        let audio = inbound.audio_field().unwrap().unwrap();
+        assert_eq!(audio.mode, AM_OPUS_OGG);
+        assert_eq!(audio.bytes, audio_bytes);
+        assert_eq!(inbound.content, "Voice message");
+        assert!(inbound.msgpack_field_ids.contains(&FIELD_AUDIO));
+        assert!(!inbound.fields.contains_key(&FIELD_FILE_ATTACHMENTS));
+        assert_eq!(inbound.hash, outbound.hash);
+    }
+
+    #[test]
+    fn audio_field_strictly_validates_shape_mode_and_binary_data() {
+        let malformed = [
+            ("not an array", vec![0xc0]),
+            ("too few elements", vec![0x91, AM_OPUS_OGG]),
+            (
+                "too many elements",
+                vec![0x93, AM_OPUS_OGG, 0xc4, 0x00, 0xc0],
+            ),
+            ("negative mode", vec![0x92, 0xff, 0xc4, 0x00]),
+            ("mode above u8", vec![0x92, 0xcd, 0x01, 0x00, 0xc4, 0x00]),
+            ("mode is not integer", vec![0x92, 0xc0, 0xc4, 0x00]),
+            ("data is not binary", vec![0x92, AM_OPUS_OGG, 0xa0]),
+            ("truncated data", vec![0x92, AM_OPUS_OGG, 0xc4]),
+            ("trailing bytes", vec![0x92, AM_OPUS_OGG, 0xc4, 0x00, 0xc0]),
+        ];
+
+        for (case, encoded) in malformed {
+            let mut msg = LxMessage::new(
+                [0; 16],
+                [0; 16],
+                "",
+                "message remains usable",
+                DeliveryMethod::Direct,
+            );
+            msg.fields.insert(FIELD_AUDIO, encoded);
+            assert!(msg.audio_field().is_err(), "accepted {case}");
+            assert_eq!(msg.content, "message remains usable", "changed {case}");
+        }
+
+        // Any integer encoding is accepted when its value is in range; audio
+        // modes are value-constrained, not encoding-canonicalized.
+        let mut msg = LxMessage::new([0; 16], [0; 16], "", "", DeliveryMethod::Direct);
+        msg.fields
+            .insert(FIELD_AUDIO, vec![0x92, 0xcd, 0x00, 0xff, 0xc4, 0x00]);
+        assert_eq!(
+            msg.audio_field().unwrap(),
+            Some(AudioField {
+                mode: u8::MAX,
+                bytes: &[]
+            })
+        );
+    }
+
+    #[test]
+    fn malformed_audio_field_does_not_invalidate_enclosing_wire_message() {
+        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
+        let malformed = vec![0x93, AM_OPUS_OGG, 0xc4, 0x00, 0xc0];
+        let mut outbound = LxMessage::new(
+            [0x11; 16],
+            [0x22; 16],
+            "",
+            "still delivered",
+            DeliveryMethod::Direct,
+        );
+        outbound
+            .set_msgpack_field(FIELD_AUDIO, malformed.clone())
+            .unwrap();
+        outbound.sign(&key).unwrap();
+
+        let packed = outbound.pack().unwrap();
+        let mut inbound = LxMessage::unpack(&packed).unwrap();
+        assert_eq!(inbound.content, "still delivered");
+        assert_eq!(inbound.get_field(FIELD_AUDIO), Some(&malformed));
+        assert!(inbound.audio_field().is_err());
+        assert!(inbound.verify(&key.public_key()));
     }
 
     #[test]
