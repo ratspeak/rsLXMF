@@ -902,6 +902,10 @@ fn backchannel_error_from_runtime(
         rns_runtime::link_manager::LinkSendError::NoSessionKeys => {
             BackchannelSendError::NoSessionKeys
         }
+        err @ (rns_runtime::link_manager::LinkSendError::IdentityUnavailable
+        | rns_runtime::link_manager::LinkSendError::IdentificationUnavailable) => {
+            BackchannelSendError::Other(err.to_string())
+        }
         rns_runtime::link_manager::LinkSendError::TransportUnavailable => {
             BackchannelSendError::TransportUnavailable
         }
