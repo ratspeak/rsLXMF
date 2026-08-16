@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Bound Direct-delivery, propagation-download, and propagation-sync Link
+  initiators to the authenticated LRPROOF ingress interface before LRRTT,
+  routed all established-Link traffic through ordered typed endpoints, and
+  made reverse delivery proofs durable before plaintext publication.
+- Bounded propagation-sync transport staging, scoped Link endpoint failures
+  to their owning operation, and prevented Resource responses from becoming
+  visible when their delivery proof cannot be retained.
 - Added automatic pre-sign reply-ticket issue, signature-gated inbound
   learning, directional migration-safe persistence, and proof-gated delivery
   accounting, with live Python restart/reply interoperability.
