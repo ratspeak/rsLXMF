@@ -20,7 +20,10 @@ use rns_protocol::resource::{
     MAX_EFFICIENT_SIZE, MultiSegmentOutbound, OutboundTransfer, ResourceError, TransferAction,
 };
 use rns_transport::link_messages::DestinationEvent;
-use rns_transport::messages::{OutboundRequest, TransportMessage};
+use rns_transport::messages::{
+    InterfaceId, LinkEndpointBindResult, LinkEndpointBinding, LinkEndpointLifecycleEvent,
+    LinkEndpointRole, OutboundRequest, TransportMessage,
+};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot};
 
@@ -77,6 +80,12 @@ struct PreparedTransferBatch {
     payload: Vec<u8>,
 }
 
+struct PendingEndpointBind {
+    interface_id: InterfaceId,
+    rtt_request: OutboundRequest,
+    result_rx: oneshot::Receiver<LinkEndpointBindResult>,
+}
+
 fn prepare_outbound_resource_transfers(
     payload: Vec<u8>,
     auto_compress: bool,
@@ -115,6 +124,10 @@ pub struct PropagationSyncTask {
     pub propagation_node: Arc<Mutex<PropagationNode>>,
     link: Option<Link>,
     link_id: Option<[u8; 16]>,
+    attached_interface: Option<InterfaceId>,
+    pending_endpoint_bind: Option<PendingEndpointBind>,
+    endpoint_lifecycle_tx: mpsc::UnboundedSender<LinkEndpointLifecycleEvent>,
+    endpoint_lifecycle_rx: mpsc::UnboundedReceiver<LinkEndpointLifecycleEvent>,
     pub state: SyncTaskState,
     last_sync: Instant,
     sync_interval: Duration,
@@ -150,6 +163,7 @@ pub struct PropagationSyncTask {
 impl PropagationSyncTask {
     pub fn new(transport_tx: mpsc::Sender<TransportMessage>, dest_hash: [u8; 16]) -> Self {
         let (event_tx, event_rx) = mpsc::channel(256);
+        let (endpoint_lifecycle_tx, endpoint_lifecycle_rx) = mpsc::unbounded_channel();
         Self {
             transport_tx,
             event_tx,
@@ -161,6 +175,10 @@ impl PropagationSyncTask {
             ))),
             link: None,
             link_id: None,
+            attached_interface: None,
+            pending_endpoint_bind: None,
+            endpoint_lifecycle_tx,
+            endpoint_lifecycle_rx,
             state: SyncTaskState::Idle,
             last_sync: Instant::now(),
             sync_interval: Duration::from_secs(300),
@@ -201,6 +219,7 @@ impl PropagationSyncTask {
         storage_path: std::path::PathBuf,
     ) -> std::io::Result<Self> {
         let (event_tx, event_rx) = mpsc::channel(256);
+        let (endpoint_lifecycle_tx, endpoint_lifecycle_rx) = mpsc::unbounded_channel();
         Ok(Self {
             transport_tx,
             event_tx,
@@ -213,6 +232,10 @@ impl PropagationSyncTask {
             )?)),
             link: None,
             link_id: None,
+            attached_interface: None,
+            pending_endpoint_bind: None,
+            endpoint_lifecycle_tx,
+            endpoint_lifecycle_rx,
             state: SyncTaskState::Idle,
             last_sync: Instant::now(),
             sync_interval: Duration::from_secs(300),
@@ -253,6 +276,7 @@ impl PropagationSyncTask {
         propagation_node: Arc<Mutex<PropagationNode>>,
     ) -> Self {
         let (event_tx, event_rx) = mpsc::channel(256);
+        let (endpoint_lifecycle_tx, endpoint_lifecycle_rx) = mpsc::unbounded_channel();
         Self {
             transport_tx,
             event_tx,
@@ -261,6 +285,10 @@ impl PropagationSyncTask {
             propagation_node,
             link: None,
             link_id: None,
+            attached_interface: None,
+            pending_endpoint_bind: None,
+            endpoint_lifecycle_tx,
+            endpoint_lifecycle_rx,
             state: SyncTaskState::Idle,
             last_sync: Instant::now(),
             sync_interval: Duration::from_secs(300),
@@ -408,8 +436,14 @@ impl PropagationSyncTask {
     /// Preserve protocol packet ordering while tolerating temporary pressure
     /// on the bounded Reticulum transport actor mailbox. A full mailbox is a
     /// retryable local condition, not packet loss.
+    const PENDING_TRANSPORT_LIMIT: usize = 256;
+
     fn queue_transport(&mut self, message: TransportMessage) -> bool {
         if !self.pending_transport.is_empty() {
+            if self.pending_transport.len() >= Self::PENDING_TRANSPORT_LIMIT {
+                self.state = SyncTaskState::Failed;
+                return false;
+            }
             self.pending_transport.push_back(message);
             return true;
         }
@@ -417,6 +451,10 @@ impl PropagationSyncTask {
         match self.transport_tx.try_send(message) {
             Ok(()) => true,
             Err(TrySendError::Full(message)) => {
+                if self.pending_transport.len() >= Self::PENDING_TRANSPORT_LIMIT {
+                    self.state = SyncTaskState::Failed;
+                    return false;
+                }
                 self.pending_transport.push_back(message);
                 true
             }
@@ -441,6 +479,73 @@ impl PropagationSyncTask {
         true
     }
 
+    fn queue_link_endpoint(&mut self, request: OutboundRequest) -> bool {
+        let Some(link_id) = self.link_id else {
+            return false;
+        };
+        let (result_tx, _result_rx) = oneshot::channel();
+        self.queue_transport(TransportMessage::SendLinkEndpoint {
+            link_id,
+            role: LinkEndpointRole::Initiator,
+            request,
+            result_tx,
+        })
+    }
+
+    fn poll_endpoint_control(&mut self) {
+        while let Ok(event) = self.endpoint_lifecycle_rx.try_recv() {
+            if self.link_id == Some(event.binding.link_id)
+                && event.binding.role == LinkEndpointRole::Initiator
+            {
+                tracing::warn!(
+                    link_id = %hex::encode(event.binding.link_id),
+                    interface_id = event.binding.interface_id,
+                    reason = ?event.reason,
+                    dropped_packets = event.dropped_packets,
+                    "propagation sync Link endpoint terminated"
+                );
+                self.attached_interface = None;
+                self.pending_endpoint_bind = None;
+                self.state = SyncTaskState::Failed;
+            }
+        }
+
+        let Some(mut pending) = self.pending_endpoint_bind.take() else {
+            return;
+        };
+        match pending.result_rx.try_recv() {
+            Ok(LinkEndpointBindResult::Bound | LinkEndpointBindResult::AlreadyBound) => {
+                self.attached_interface = Some(pending.interface_id);
+                if !self.queue_link_endpoint(pending.rtt_request) {
+                    self.state = SyncTaskState::Failed;
+                    return;
+                }
+                let establishment_rate =
+                    self.link.as_ref().and_then(|link| link.establishment_rate);
+                self.link_establishment_rate = establishment_rate;
+                if let (Some(peer), Some(link_id)) = (self.peer.as_mut(), self.link_id) {
+                    peer.link_established(link_id, establishment_rate);
+                }
+                if !self.send_identify() {
+                    self.state = SyncTaskState::Failed;
+                    return;
+                }
+                self.state = SyncTaskState::Offering;
+                self.sync_started = Some(Instant::now());
+            }
+            Ok(
+                LinkEndpointBindResult::Conflict { .. }
+                | LinkEndpointBindResult::InterfaceUnavailable,
+            )
+            | Err(oneshot::error::TryRecvError::Closed) => {
+                self.state = SyncTaskState::Failed;
+            }
+            Err(oneshot::error::TryRecvError::Empty) => {
+                self.pending_endpoint_bind = Some(pending);
+            }
+        }
+    }
+
     fn reset_attempt_accounting(&mut self) {
         self.offered_count = 0;
         self.outgoing_count = 0;
@@ -461,6 +566,7 @@ impl PropagationSyncTask {
     ///
     /// `known_identities` maps dest_hash_hex -> 64-byte public key, used for link proof validation.
     pub fn drain_events(&mut self, known_identities: &HashMap<String, [u8; 64]>) {
+        self.poll_endpoint_control();
         let mut events = Vec::new();
         while let Ok(event) = self.event_rx.try_recv() {
             events.push(event);
@@ -471,12 +577,36 @@ impl PropagationSyncTask {
                 DestinationEvent::LinkClosed { link_id } => {
                     self.handle_link_closed(link_id, None);
                 }
-                DestinationEvent::InboundPacket { raw, .. } => {
+                DestinationEvent::InboundPacket {
+                    raw, interface_id, ..
+                } => {
                     let (header, data_offset) = match rns_wire::header::PacketHeader::unpack(&raw) {
                         Ok(h) => h,
                         Err(_) => continue,
                     };
                     if self.link_id != Some(header.destination_hash) {
+                        continue;
+                    }
+                    let is_link_proof = matches!(
+                        header.context,
+                        rns_wire::context::PacketContext::Lrproof
+                            | rns_wire::context::PacketContext::None
+                    ) && (header.flags.packet_type
+                        == rns_wire::flags::PacketType::Proof
+                        || header.context == rns_wire::context::PacketContext::Lrproof);
+                    if is_link_proof {
+                        if self.pending_endpoint_bind.is_some()
+                            || self.state != SyncTaskState::Establishing
+                        {
+                            continue;
+                        }
+                    } else if self.attached_interface != Some(interface_id) {
+                        tracing::warn!(
+                            link_id = %hex::encode(header.destination_hash),
+                            interface_id,
+                            attached_interface = ?self.attached_interface,
+                            "rejected propagation sync packet from wrong Link interface"
+                        );
                         continue;
                     }
                     let data = if raw.len() > data_offset {
@@ -502,7 +632,12 @@ impl PropagationSyncTask {
                                     if let Ok(verify_key) =
                                         Ed25519PublicKey::from_bytes(&ed25519_bytes)
                                     {
-                                        self.handle_link_proof(data, &verify_key, &ed25519_bytes);
+                                        self.handle_link_proof(
+                                            data,
+                                            &verify_key,
+                                            &ed25519_bytes,
+                                            interface_id,
+                                        );
                                     }
                                 }
                             }
@@ -702,57 +837,54 @@ impl PropagationSyncTask {
         proof_data: &[u8],
         verify_key: &Ed25519PublicKey,
         ed25519_pub: &[u8; 32],
+        interface_id: InterfaceId,
     ) {
         let proof_result = match self.link.as_mut() {
             Some(link) => link.validate_proof(proof_data, verify_key, ed25519_pub),
             None => return,
         };
 
-        match proof_result {
-            Ok(rtt_data) => {
-                // RTT packet = message 3 of the link handshake.
-                if let Some(link_id) = self.link_id {
-                    let rtt_header = rns_wire::header::PacketHeader {
-                        flags: rns_wire::flags::PacketFlags {
-                            header_type: rns_wire::flags::HeaderType::Header1,
-                            context_flag: false,
-                            transport_type: rns_wire::flags::TransportType::Broadcast,
-                            destination_type: rns_wire::flags::DestinationType::Link,
-                            packet_type: rns_wire::flags::PacketType::Data,
-                        },
-                        hops: 0,
-                        transport_id: None,
-                        destination_hash: link_id,
-                        context: rns_wire::context::PacketContext::Lrrtt,
-                    };
-                    let mut rtt_raw = rtt_header.pack();
-                    rtt_raw.extend_from_slice(&rtt_data);
+        if let Ok(rtt_data) = proof_result {
+            // RTT packet = message 3 of the link handshake.
+            if let Some(link_id) = self.link_id {
+                let rtt_header = rns_wire::header::PacketHeader {
+                    flags: rns_wire::flags::PacketFlags {
+                        header_type: rns_wire::flags::HeaderType::Header1,
+                        context_flag: false,
+                        transport_type: rns_wire::flags::TransportType::Broadcast,
+                        destination_type: rns_wire::flags::DestinationType::Link,
+                        packet_type: rns_wire::flags::PacketType::Data,
+                    },
+                    hops: 0,
+                    transport_id: None,
+                    destination_hash: link_id,
+                    context: rns_wire::context::PacketContext::Lrrtt,
+                };
+                let mut rtt_raw = rtt_header.pack();
+                rtt_raw.extend_from_slice(&rtt_data);
 
-                    if !self.queue_transport(TransportMessage::Outbound(OutboundRequest {
-                        raw: Bytes::from(rtt_raw),
-                        destination_hash: link_id,
-                    })) {
-                        self.state = SyncTaskState::Failed;
-                        return;
-                    }
-
-                    // Python LXMPeer.py:530-538
-                    let establishment_rate =
-                        self.link.as_ref().and_then(|link| link.establishment_rate);
-                    self.link_establishment_rate = establishment_rate;
-                    if let Some(ref mut peer) = self.peer {
-                        peer.link_established(link_id, establishment_rate);
-                    }
-                }
-                if !self.send_identify() {
+                let rtt_request = OutboundRequest {
+                    raw: Bytes::from(rtt_raw),
+                    destination_hash: link_id,
+                };
+                let (result_tx, result_rx) = oneshot::channel();
+                if !self.queue_transport(TransportMessage::BindLinkEndpoint {
+                    binding: LinkEndpointBinding {
+                        link_id,
+                        interface_id,
+                        role: LinkEndpointRole::Initiator,
+                    },
+                    lifecycle_tx: self.endpoint_lifecycle_tx.clone(),
+                    result_tx,
+                }) {
                     self.state = SyncTaskState::Failed;
                     return;
                 }
-                self.state = SyncTaskState::Offering;
-                self.sync_started = Some(Instant::now());
-            }
-            Err(_) => {
-                self.state = SyncTaskState::Failed;
+                self.pending_endpoint_bind = Some(PendingEndpointBind {
+                    interface_id,
+                    rtt_request,
+                    result_rx,
+                });
             }
         }
     }
@@ -869,6 +1001,7 @@ impl PropagationSyncTask {
         if !self.flush_pending_transport() && self.state != SyncTaskState::Idle {
             self.state = SyncTaskState::Failed;
         }
+        self.poll_endpoint_control();
 
         // Link establishment and offer requests retain a bounded phase
         // timeout. Resource transfers deliberately do not have an absolute
@@ -978,7 +1111,7 @@ impl PropagationSyncTask {
             }
             LinkAction::SendTeardownAndClose(teardown_data) => {
                 if !teardown_data.is_empty() {
-                    self.preserve_pending_on_cleanup = self.queue_plain_link_packet(
+                    self.preserve_pending_on_cleanup = self.queue_final_link_packet(
                         link_id,
                         &teardown_data,
                         rns_wire::context::PacketContext::LinkClose,
@@ -1141,10 +1274,10 @@ impl PropagationSyncTask {
                             rns_wire::flags::HeaderType::Header1,
                         );
                         link.update_pending_request_id(&_request_id, packet_request_id);
-                        if !self.queue_transport(TransportMessage::Outbound(OutboundRequest {
+                        if !self.queue_link_endpoint(OutboundRequest {
                             raw: Bytes::from(req_raw),
                             destination_hash: link_id,
-                        })) {
+                        }) {
                             self.state = SyncTaskState::Failed;
                             return;
                         }
@@ -1180,6 +1313,8 @@ impl PropagationSyncTask {
 
         self.link = Some(link);
         self.link_id = Some(link_id);
+        self.attached_interface = None;
+        self.pending_endpoint_bind = None;
 
         if !self.queue_transport(TransportMessage::RegisterDestination {
             hash: link_id,
@@ -1390,10 +1525,43 @@ impl PropagationSyncTask {
         };
         let mut raw = header.pack();
         raw.extend_from_slice(data);
-        self.queue_transport(TransportMessage::Outbound(OutboundRequest {
+        self.queue_link_endpoint(OutboundRequest {
             raw: Bytes::from(raw),
             destination_hash: link_id,
-        }))
+        })
+    }
+
+    fn queue_final_link_packet(
+        &mut self,
+        link_id: [u8; 16],
+        data: &[u8],
+        context: rns_wire::context::PacketContext,
+    ) -> bool {
+        let header = rns_wire::header::PacketHeader {
+            flags: rns_wire::flags::PacketFlags {
+                header_type: rns_wire::flags::HeaderType::Header1,
+                context_flag: false,
+                transport_type: rns_wire::flags::TransportType::Broadcast,
+                destination_type: rns_wire::flags::DestinationType::Link,
+                packet_type: rns_wire::flags::PacketType::Data,
+            },
+            hops: 0,
+            transport_id: None,
+            destination_hash: link_id,
+            context,
+        };
+        let mut raw = header.pack();
+        raw.extend_from_slice(data);
+        let (result_tx, _result_rx) = oneshot::channel();
+        self.queue_transport(TransportMessage::SendLinkEndpointAndUnbind {
+            link_id,
+            role: LinkEndpointRole::Initiator,
+            request: OutboundRequest {
+                raw: Bytes::from(raw),
+                destination_hash: link_id,
+            },
+            result_tx,
+        })
     }
 
     fn send_resource_packet(
@@ -1451,10 +1619,10 @@ impl PropagationSyncTask {
         };
         let mut raw = header.pack();
         raw.extend_from_slice(&identify_data);
-        self.queue_transport(TransportMessage::Outbound(OutboundRequest {
+        self.queue_link_endpoint(OutboundRequest {
             raw: Bytes::from(raw),
             destination_hash: link_id,
-        }))
+        })
     }
 
     /// Python LXMPeer.py:540-542.
@@ -1462,18 +1630,30 @@ impl PropagationSyncTask {
         // No transfer packet should survive the attempt it belongs to. The
         // teardown and deregistration below form a new ordered tail. Preserve
         // a teardown already emitted by Link::tick() when it closed the link.
-        if !self.preserve_pending_on_cleanup {
+        let endpoint_release_queued = self.preserve_pending_on_cleanup;
+        if !endpoint_release_queued {
             self.pending_transport.clear();
         }
         self.preserve_pending_on_cleanup = false;
-        self.send_teardown();
+        let graceful_release = endpoint_release_queued || self.send_teardown();
         if let Some(ref mut peer) = self.peer {
             peer.link_closed();
         }
 
         if let Some(link_id) = self.link_id.take() {
-            let _ = self.queue_transport(TransportMessage::DeregisterDestination { hash: link_id });
+            if !graceful_release {
+                let (result_tx, _result_rx) = oneshot::channel();
+                let _ = self.queue_transport(TransportMessage::UnbindLinkEndpoint {
+                    link_id,
+                    role: LinkEndpointRole::Initiator,
+                    result_tx,
+                });
+                let _ =
+                    self.queue_transport(TransportMessage::DeregisterDestination { hash: link_id });
+            }
         }
+        self.attached_interface = None;
+        self.pending_endpoint_bind = None;
         self.link = None;
         self.peer = None;
         self.active_transfer = None;
@@ -1487,34 +1667,22 @@ impl PropagationSyncTask {
         self.sync_started = None;
     }
 
-    fn send_teardown(&mut self) {
+    fn send_teardown(&mut self) -> bool {
         let Some(link_id) = self.link_id else {
-            return;
+            return false;
         };
         let teardown_data = self
             .link
             .as_mut()
             .and_then(|link| link.teardown(CloseReason::InitiatorClosed));
         if let Some(teardown_data) = teardown_data {
-            let header = rns_wire::header::PacketHeader {
-                flags: rns_wire::flags::PacketFlags {
-                    header_type: rns_wire::flags::HeaderType::Header1,
-                    context_flag: false,
-                    transport_type: rns_wire::flags::TransportType::Broadcast,
-                    destination_type: rns_wire::flags::DestinationType::Link,
-                    packet_type: rns_wire::flags::PacketType::Data,
-                },
-                hops: 0,
-                transport_id: None,
-                destination_hash: link_id,
-                context: rns_wire::context::PacketContext::LinkClose,
-            };
-            let mut raw = header.pack();
-            raw.extend_from_slice(&teardown_data);
-            let _ = self.queue_transport(TransportMessage::Outbound(OutboundRequest {
-                raw: Bytes::from(raw),
-                destination_hash: link_id,
-            }));
+            self.queue_final_link_packet(
+                link_id,
+                &teardown_data,
+                rns_wire::context::PacketContext::LinkClose,
+            )
+        } else {
+            false
         }
     }
 
@@ -1547,6 +1715,17 @@ impl PropagationSyncTask {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn next_link_request(rx: &mut mpsc::Receiver<TransportMessage>) -> OutboundRequest {
+        while let Ok(message) = rx.try_recv() {
+            match message {
+                TransportMessage::Outbound(request)
+                | TransportMessage::SendLinkEndpoint { request, .. } => return request,
+                _ => {}
+            }
+        }
+        panic!("expected Link packet");
+    }
 
     fn active_link_pair(dest_hash: [u8; 16]) -> (Link, Link) {
         let responder_key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
@@ -1630,12 +1809,11 @@ mod tests {
         let mut task = PropagationSyncTask::new(tx, [0xAA; 16]);
         task.link_id = Some(link_id);
         task.link = Some(initiator);
+        task.attached_interface = Some(0);
 
         let resource_part = b"already-encrypted-resource-part";
         task.send_resource_packet(resource_part, rns_wire::context::PacketContext::Resource);
-        let TransportMessage::Outbound(part_request) = rx.try_recv().unwrap() else {
-            panic!("expected outbound Resource packet");
-        };
+        let part_request = next_link_request(&mut rx);
         let (part_header, part_offset) =
             rns_wire::header::PacketHeader::unpack(&part_request.raw).unwrap();
         assert_eq!(
@@ -1646,9 +1824,7 @@ mod tests {
 
         let advertisement = b"resource-advertisement";
         task.send_resource_packet(advertisement, rns_wire::context::PacketContext::ResourceAdv);
-        let TransportMessage::Outbound(adv_request) = rx.try_recv().unwrap() else {
-            panic!("expected outbound Resource advertisement");
-        };
+        let adv_request = next_link_request(&mut rx);
         let (adv_header, adv_offset) =
             rns_wire::header::PacketHeader::unpack(&adv_request.raw).unwrap();
         assert_eq!(
@@ -1705,6 +1881,7 @@ mod tests {
         let mut task = PropagationSyncTask::new(tx, [0xAA; 16]);
         task.link_id = Some(link_id);
         task.link = Some(initiator);
+        task.attached_interface = Some(0);
         task.active_transfer = Some(transfer);
         task.state = SyncTaskState::Transferring;
         let mut stale_request = request.clone();
@@ -1728,9 +1905,7 @@ mod tests {
 
         task.drain_events(&HashMap::new());
 
-        let TransportMessage::Outbound(response) = rx.try_recv().unwrap() else {
-            panic!("expected requested Resource part");
-        };
+        let response = next_link_request(&mut rx);
         let (header, offset) = rns_wire::header::PacketHeader::unpack(&response.raw).unwrap();
         assert_eq!(header.context, rns_wire::context::PacketContext::Resource);
         assert_eq!(&response.raw[offset..], expected_part);
@@ -1767,6 +1942,7 @@ mod tests {
         let mut task = PropagationSyncTask::new(tx, [0xAA; 16]);
         task.link_id = Some(link_id);
         task.link = Some(initiator);
+        task.attached_interface = Some(0);
         task.active_transfer = Some(transfer);
         task.state = SyncTaskState::Transferring;
         deliver_encrypted_resource_control(
@@ -1778,9 +1954,7 @@ mod tests {
 
         task.drain_events(&HashMap::new());
 
-        let TransportMessage::Outbound(response) = rx.try_recv().unwrap() else {
-            panic!("expected Resource hashmap update");
-        };
+        let response = next_link_request(&mut rx);
         let (header, offset) = rns_wire::header::PacketHeader::unpack(&response.raw).unwrap();
         assert_eq!(
             header.context,
@@ -1814,6 +1988,7 @@ mod tests {
         let mut task = PropagationSyncTask::new(tx, [0xAA; 16]);
         task.link_id = Some(link_id);
         task.link = Some(initiator);
+        task.attached_interface = Some(0);
         task.active_transfer = Some(transfer);
         task.active_transfer_ids = vec![[0x66; 32]];
         task.state = SyncTaskState::Transferring;
@@ -1826,9 +2001,7 @@ mod tests {
 
         task.drain_events(&HashMap::new());
 
-        let TransportMessage::Outbound(response) = rx.try_recv().unwrap() else {
-            panic!("expected initiator Resource cancel");
-        };
+        let response = next_link_request(&mut rx);
         let (header, offset) = rns_wire::header::PacketHeader::unpack(&response.raw).unwrap();
         assert_eq!(
             header.context,
@@ -1864,6 +2037,7 @@ mod tests {
             let mut task = PropagationSyncTask::new(tx, [0xAA; 16]);
             task.link_id = Some(link_id);
             task.link = Some(initiator);
+            task.attached_interface = Some(0);
             task.active_transfer = Some(transfer);
             task.active_transfer_ids = vec![[0x77; 32]];
             task.state = SyncTaskState::Transferring;
@@ -2140,6 +2314,7 @@ mod tests {
         let mut task = PropagationSyncTask::new(tx, [0xAA; 16]);
         task.link = Some(initiator);
         task.link_id = Some(link_id);
+        task.attached_interface = Some(0);
         task.active_transfer = Some(transfer);
         task.state = SyncTaskState::Transferring;
         task.sync_started = Some(Instant::now() - Duration::from_secs(600));
@@ -2148,9 +2323,7 @@ mod tests {
         task.tick();
 
         assert_eq!(task.state, SyncTaskState::Transferring);
-        let TransportMessage::Outbound(advertisement) = rx.try_recv().unwrap() else {
-            panic!("expected Resource advertisement");
-        };
+        let advertisement = next_link_request(&mut rx);
         let (header, _) = rns_wire::header::PacketHeader::unpack(&advertisement.raw).unwrap();
         assert_eq!(
             header.context,
@@ -2174,6 +2347,7 @@ mod tests {
         let mut task = PropagationSyncTask::new(tx, [0xAA; 16]);
         task.link = Some(initiator);
         task.link_id = Some(link_id);
+        task.attached_interface = Some(0);
         task.active_transfer = Some(transfer);
         task.state = SyncTaskState::Transferring;
 
@@ -2184,9 +2358,7 @@ mod tests {
 
         task.tick();
 
-        let TransportMessage::Outbound(retry) = rx.try_recv().unwrap() else {
-            panic!("expected retried Resource advertisement");
-        };
+        let retry = next_link_request(&mut rx);
         let (header, _) = rns_wire::header::PacketHeader::unpack(&retry.raw).unwrap();
         assert_eq!(
             header.context,
@@ -2222,6 +2394,106 @@ mod tests {
     }
 
     #[test]
+    fn propagation_sync_staging_is_finite_fifo_and_overflow_fails_only_task() {
+        let (tx, _rx) = mpsc::channel(1);
+        tx.try_send(TransportMessage::DeregisterDestination { hash: [0; 16] })
+            .unwrap();
+        let mut task = PropagationSyncTask::new(tx, [0xAA; 16]);
+        task.state = SyncTaskState::Offering;
+        for index in 0..PropagationSyncTask::PENDING_TRANSPORT_LIMIT {
+            assert!(
+                task.queue_transport(TransportMessage::DeregisterDestination {
+                    hash: [(index & 0xff) as u8; 16],
+                })
+            );
+        }
+        let first_hash = match task.pending_transport.front().unwrap() {
+            TransportMessage::DeregisterDestination { hash } => *hash,
+            _ => unreachable!(),
+        };
+
+        assert!(
+            !task.queue_transport(TransportMessage::DeregisterDestination { hash: [0xFF; 16] })
+        );
+        assert_eq!(task.pending_transport.len(), 256);
+        assert_eq!(first_hash, [0; 16]);
+        assert_eq!(task.state, SyncTaskState::Failed);
+    }
+
+    #[test]
+    fn invalid_sync_lrproof_allows_later_valid_interface_binding() {
+        let (tx, mut rx) = mpsc::channel(64);
+        let node_hash = [0xB5; 16];
+        let (link, request_data) = Link::new_initiator(node_hash, 1);
+        let responder_key = Ed25519PrivateKey::generate();
+        let responder_public = responder_key.public_key();
+        let (_responder, proof) =
+            Link::new_responder(&request_data, &responder_key, node_hash, 1).unwrap();
+        let mut task = PropagationSyncTask::new(tx, [0xAA; 16]);
+        task.node_dest_hash = Some(node_hash);
+        task.link_id = Some(link.link_id);
+        task.link = Some(link);
+        task.peer = Some(LxmPeer::new(node_hash));
+        task.state = SyncTaskState::Establishing;
+
+        task.handle_link_proof(
+            &[0u8; 99],
+            &responder_public,
+            &responder_public.to_bytes(),
+            11,
+        );
+        assert_eq!(task.state, SyncTaskState::Establishing);
+        assert!(task.pending_endpoint_bind.is_none());
+        assert!(rx.try_recv().is_err());
+
+        task.handle_link_proof(&proof, &responder_public, &responder_public.to_bytes(), 12);
+        let TransportMessage::BindLinkEndpoint { binding, .. } = rx.try_recv().unwrap() else {
+            panic!("valid proof must bind before post-proof traffic");
+        };
+        assert_eq!(binding.interface_id, 12);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn propagation_sync_rejects_wrong_interface_before_decrypt_or_state_change() {
+        let (tx, _rx) = mpsc::channel(8);
+        let (initiator, responder) = active_link_pair([0x48; 16]);
+        let link_id = initiator.link_id;
+        let mut transfers = prepare_outbound_resource_transfers(
+            b"wrong interface cancel".to_vec(),
+            false,
+            Duration::from_millis(500),
+            initiator.session_keys().unwrap(),
+        )
+        .unwrap();
+        let transfer = transfers.pop_front().unwrap();
+        let resource_hash = transfer.resource.resource_hash;
+        let mut task = PropagationSyncTask::new(tx, [0xAA; 16]);
+        task.link_id = Some(link_id);
+        task.link = Some(initiator);
+        task.attached_interface = Some(4);
+        task.active_transfer = Some(transfer);
+        task.active_transfer_ids = vec![[0x77; 32]];
+        task.state = SyncTaskState::Transferring;
+        let encrypted = responder.encrypt(&resource_hash).unwrap();
+        task.event_tx
+            .try_send(DestinationEvent::InboundPacket {
+                raw: link_data_packet(
+                    link_id,
+                    rns_wire::context::PacketContext::ResourceRcl,
+                    &encrypted,
+                ),
+                interface_id: 5,
+                metrics: Default::default(),
+            })
+            .unwrap();
+
+        task.drain_events(&HashMap::new());
+        assert_eq!(task.state, SyncTaskState::Transferring);
+        assert!(task.active_transfer.is_some());
+    }
+
+    #[test]
     fn test_cleanup_deregisters() {
         let (tx, mut rx) = mpsc::channel(64);
         let mut task = PropagationSyncTask::new(tx, [0xAA; 16]);
@@ -2245,11 +2517,11 @@ mod tests {
         task.state = SyncTaskState::Complete;
         task.tick();
 
-        let dereg = rx.try_recv();
-        assert!(matches!(
-            dereg.unwrap(),
-            TransportMessage::DeregisterDestination { .. }
-        ));
+        let mut saw_deregister = false;
+        while let Ok(message) = rx.try_recv() {
+            saw_deregister |= matches!(message, TransportMessage::DeregisterDestination { .. });
+        }
+        assert!(saw_deregister);
     }
 
     #[test]
@@ -2262,6 +2534,7 @@ mod tests {
         task.set_node(node_hash);
         task.link = Some(link);
         task.link_id = Some(link_id);
+        task.attached_interface = Some(0);
         task.state = SyncTaskState::AwaitingResponse;
         task.sync_started = Some(Instant::now());
         let mut peer = LxmPeer::new(node_hash);
@@ -2289,10 +2562,14 @@ mod tests {
         task.tick();
         assert_eq!(task.state, SyncTaskState::Idle);
         assert!(task.link.is_none());
-        assert!(matches!(
-            rx.try_recv().unwrap(),
-            TransportMessage::DeregisterDestination { hash } if hash == link_id
-        ));
+        let mut saw_deregister = false;
+        while let Ok(message) = rx.try_recv() {
+            saw_deregister |= matches!(
+                message,
+                TransportMessage::DeregisterDestination { hash } if hash == link_id
+            );
+        }
+        assert!(saw_deregister);
     }
 
     #[test]
@@ -2305,6 +2582,7 @@ mod tests {
         task.set_node(node_hash);
         task.link = Some(link);
         task.link_id = Some(link_id);
+        task.attached_interface = Some(0);
         task.state = SyncTaskState::AwaitingResponse;
 
         task.event_tx
@@ -2923,13 +3201,21 @@ mod tests {
         assert!(task.accept_message(&message));
         task.offer_policy = Some(OutboundOfferPolicy::unrestricted(node_hash));
 
-        task.handle_link_proof(&proof_data, &responder_pub, &responder_pub.to_bytes());
+        task.handle_link_proof(&proof_data, &responder_pub, &responder_pub.to_bytes(), 0);
+        let bind = rx.try_recv().expect("endpoint bind");
+        let TransportMessage::BindLinkEndpoint { result_tx, .. } = bind else {
+            panic!("expected endpoint bind");
+        };
+        result_tx.send(LinkEndpointBindResult::Bound).unwrap();
+        task.poll_endpoint_control();
         task.send_offer_request();
 
         let mut contexts = Vec::new();
-        while let Ok(TransportMessage::Outbound(request)) = rx.try_recv() {
-            let (header, _) = rns_wire::header::PacketHeader::unpack(&request.raw).unwrap();
-            contexts.push(header.context);
+        while let Ok(message) = rx.try_recv() {
+            if let TransportMessage::SendLinkEndpoint { request, .. } = message {
+                let (header, _) = rns_wire::header::PacketHeader::unpack(&request.raw).unwrap();
+                contexts.push(header.context);
+            }
         }
         assert_eq!(
             contexts,

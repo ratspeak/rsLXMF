@@ -24,8 +24,11 @@ use rns_protocol::resource::{
 };
 use rns_protocol::resource_adv::ResourceAdvertisement;
 use rns_transport::link_messages::DestinationEvent;
-use rns_transport::messages::{OutboundRequest, TransportMessage};
-use tokio::sync::mpsc;
+use rns_transport::messages::{
+    InterfaceId, LinkEndpointBindResult, LinkEndpointBinding, LinkEndpointLifecycleEvent,
+    LinkEndpointRole, OutboundRequest, TransportMessage,
+};
+use tokio::sync::{mpsc, oneshot};
 
 use crate::constants::*;
 use crate::propagation::hex_encode;
@@ -74,6 +77,12 @@ struct SegmentRoute {
     segment_index: usize,
 }
 
+struct PendingEndpointBind {
+    interface_id: InterfaceId,
+    rtt_request: OutboundRequest,
+    result_rx: oneshot::Receiver<LinkEndpointBindResult>,
+}
+
 pub struct PropagationClient {
     transport_tx: mpsc::Sender<TransportMessage>,
     event_tx: mpsc::Sender<DestinationEvent>,
@@ -81,6 +90,11 @@ pub struct PropagationClient {
     outbound_propagation_node: Option<[u8; 16]>,
     link: Option<Link>,
     link_id: Option<[u8; 16]>,
+    attached_interface: Option<InterfaceId>,
+    endpoint_release_queued: bool,
+    pending_endpoint_bind: Option<PendingEndpointBind>,
+    endpoint_lifecycle_tx: mpsc::UnboundedSender<LinkEndpointLifecycleEvent>,
+    endpoint_lifecycle_rx: mpsc::UnboundedReceiver<LinkEndpointLifecycleEvent>,
     status: PropagationTransferStatus,
     /// Request phase whose response is currently arriving as a Resource.
     receiving_for: Option<PropagationClientState>,
@@ -116,6 +130,7 @@ impl PropagationClient {
         identity_key: Option<Ed25519PrivateKey>,
     ) -> Self {
         let (event_tx, event_rx) = mpsc::channel(256);
+        let (endpoint_lifecycle_tx, endpoint_lifecycle_rx) = mpsc::unbounded_channel();
         Self {
             transport_tx,
             event_tx,
@@ -123,6 +138,11 @@ impl PropagationClient {
             outbound_propagation_node: None,
             link: None,
             link_id: None,
+            attached_interface: None,
+            endpoint_release_queued: false,
+            pending_endpoint_bind: None,
+            endpoint_lifecycle_tx,
+            endpoint_lifecycle_rx,
             status: PropagationTransferStatus::default(),
             receiving_for: None,
             identity_pub,
@@ -277,6 +297,9 @@ impl PropagationClient {
         self.receiving_for = None;
         self.link = Some(link);
         self.link_id = Some(link_id);
+        self.attached_interface = None;
+        self.endpoint_release_queued = false;
+        self.pending_endpoint_bind = None;
         self.started_at = Some(Instant::now());
         self.max_messages = max_messages.filter(|limit| *limit > 0);
         self.identified = false;
@@ -332,7 +355,78 @@ impl PropagationClient {
         }
     }
 
+    fn queue_link_endpoint(&mut self, request: OutboundRequest) -> bool {
+        let Some(link_id) = self.link_id else {
+            return false;
+        };
+        let (result_tx, _result_rx) = oneshot::channel();
+        self.queue_transport(TransportMessage::SendLinkEndpoint {
+            link_id,
+            role: LinkEndpointRole::Initiator,
+            request,
+            result_tx,
+        })
+    }
+
+    fn queue_link_endpoint_and_unbind(&mut self, request: OutboundRequest) -> bool {
+        let Some(link_id) = self.link_id else {
+            return false;
+        };
+        let (result_tx, _result_rx) = oneshot::channel();
+        self.queue_transport(TransportMessage::SendLinkEndpointAndUnbind {
+            link_id,
+            role: LinkEndpointRole::Initiator,
+            request,
+            result_tx,
+        })
+    }
+
+    fn poll_endpoint_control(&mut self) {
+        while let Ok(event) = self.endpoint_lifecycle_rx.try_recv() {
+            if self.link_id == Some(event.binding.link_id)
+                && event.binding.role == LinkEndpointRole::Initiator
+            {
+                tracing::warn!(
+                    link_id = %hex::encode(event.binding.link_id),
+                    interface_id = event.binding.interface_id,
+                    reason = ?event.reason,
+                    dropped_packets = event.dropped_packets,
+                    "propagation client Link endpoint terminated"
+                );
+                self.attached_interface = None;
+                self.pending_endpoint_bind = None;
+                self.status.state = PropagationClientState::Failed;
+            }
+        }
+
+        let Some(mut pending) = self.pending_endpoint_bind.take() else {
+            return;
+        };
+        match pending.result_rx.try_recv() {
+            Ok(LinkEndpointBindResult::Bound | LinkEndpointBindResult::AlreadyBound) => {
+                self.attached_interface = Some(pending.interface_id);
+                if self.queue_link_endpoint(pending.rtt_request) {
+                    self.status.state = PropagationClientState::LinkEstablished;
+                    self.started_at = Some(Instant::now());
+                } else {
+                    self.status.state = PropagationClientState::Failed;
+                }
+            }
+            Ok(
+                LinkEndpointBindResult::Conflict { .. }
+                | LinkEndpointBindResult::InterfaceUnavailable,
+            )
+            | Err(oneshot::error::TryRecvError::Closed) => {
+                self.status.state = PropagationClientState::Failed;
+            }
+            Err(oneshot::error::TryRecvError::Empty) => {
+                self.pending_endpoint_bind = Some(pending);
+            }
+        }
+    }
+
     pub fn drain_events(&mut self, known_identities: &std::collections::HashMap<String, [u8; 64]>) {
+        self.poll_endpoint_control();
         let mut events = Vec::new();
         while let Ok(event) = self.event_rx.try_recv() {
             events.push(event);
@@ -343,12 +437,36 @@ impl PropagationClient {
                 DestinationEvent::LinkClosed { link_id } => {
                     self.handle_link_closed(link_id, None);
                 }
-                DestinationEvent::InboundPacket { raw, .. } => {
+                DestinationEvent::InboundPacket {
+                    raw, interface_id, ..
+                } => {
                     let (header, data_offset) = match rns_wire::header::PacketHeader::unpack(&raw) {
                         Ok(h) => h,
                         Err(_) => continue,
                     };
                     if self.link_id != Some(header.destination_hash) {
+                        continue;
+                    }
+                    let is_link_proof = matches!(
+                        header.context,
+                        rns_wire::context::PacketContext::Lrproof
+                            | rns_wire::context::PacketContext::None
+                    ) && (header.flags.packet_type
+                        == rns_wire::flags::PacketType::Proof
+                        || header.context == rns_wire::context::PacketContext::Lrproof);
+                    if is_link_proof {
+                        if self.pending_endpoint_bind.is_some()
+                            || self.status.state != PropagationClientState::LinkEstablishing
+                        {
+                            continue;
+                        }
+                    } else if self.attached_interface != Some(interface_id) {
+                        tracing::warn!(
+                            link_id = %hex::encode(header.destination_hash),
+                            interface_id,
+                            attached_interface = ?self.attached_interface,
+                            "rejected propagation client packet from wrong Link interface"
+                        );
                         continue;
                     }
                     let data = if raw.len() > data_offset {
@@ -379,7 +497,12 @@ impl PropagationClient {
                                     if let Ok(verify_key) =
                                         Ed25519PublicKey::from_bytes(&ed25519_bytes)
                                     {
-                                        self.handle_link_proof(data, &verify_key, &ed25519_bytes);
+                                        self.handle_link_proof(
+                                            data,
+                                            &verify_key,
+                                            &ed25519_bytes,
+                                            interface_id,
+                                        );
                                     }
                                 }
                             }
@@ -448,44 +571,53 @@ impl PropagationClient {
         proof_data: &[u8],
         verify_key: &Ed25519PublicKey,
         ed25519_pub: &[u8; 32],
+        interface_id: InterfaceId,
     ) {
         let link = match self.link.as_mut() {
             Some(l) => l,
             None => return,
         };
 
-        match link.validate_proof(proof_data, verify_key, ed25519_pub) {
-            Ok(rtt_data) => {
-                if let Some(link_id) = self.link_id {
-                    let rtt_header = rns_wire::header::PacketHeader {
-                        flags: rns_wire::flags::PacketFlags {
-                            header_type: rns_wire::flags::HeaderType::Header1,
-                            context_flag: false,
-                            transport_type: rns_wire::flags::TransportType::Broadcast,
-                            destination_type: rns_wire::flags::DestinationType::Link,
-                            packet_type: rns_wire::flags::PacketType::Data,
-                        },
-                        hops: 0,
-                        transport_id: None,
-                        destination_hash: link_id,
-                        context: rns_wire::context::PacketContext::Lrrtt,
-                    };
-                    let mut rtt_raw = rtt_header.pack();
-                    rtt_raw.extend_from_slice(&rtt_data);
+        if let Ok(rtt_data) = link.validate_proof(proof_data, verify_key, ed25519_pub) {
+            if let Some(link_id) = self.link_id {
+                let rtt_header = rns_wire::header::PacketHeader {
+                    flags: rns_wire::flags::PacketFlags {
+                        header_type: rns_wire::flags::HeaderType::Header1,
+                        context_flag: false,
+                        transport_type: rns_wire::flags::TransportType::Broadcast,
+                        destination_type: rns_wire::flags::DestinationType::Link,
+                        packet_type: rns_wire::flags::PacketType::Data,
+                    },
+                    hops: 0,
+                    transport_id: None,
+                    destination_hash: link_id,
+                    context: rns_wire::context::PacketContext::Lrrtt,
+                };
+                let mut rtt_raw = rtt_header.pack();
+                rtt_raw.extend_from_slice(&rtt_data);
 
-                    if !self.queue_transport(TransportMessage::Outbound(OutboundRequest {
-                        raw: Bytes::from(rtt_raw),
-                        destination_hash: link_id,
-                    })) {
-                        self.status.state = PropagationClientState::Failed;
-                        return;
-                    }
+                let rtt_request = OutboundRequest {
+                    raw: Bytes::from(rtt_raw),
+                    destination_hash: link_id,
+                };
+                let (result_tx, result_rx) = oneshot::channel();
+                if !self.queue_transport(TransportMessage::BindLinkEndpoint {
+                    binding: LinkEndpointBinding {
+                        link_id,
+                        interface_id,
+                        role: LinkEndpointRole::Initiator,
+                    },
+                    lifecycle_tx: self.endpoint_lifecycle_tx.clone(),
+                    result_tx,
+                }) {
+                    self.status.state = PropagationClientState::Failed;
+                    return;
                 }
-                self.status.state = PropagationClientState::LinkEstablished;
-                self.started_at = Some(Instant::now());
-            }
-            Err(_) => {
-                self.status.state = PropagationClientState::Failed;
+                self.pending_endpoint_bind = Some(PendingEndpointBind {
+                    interface_id,
+                    rtt_request,
+                    result_rx,
+                });
             }
         }
     }
@@ -761,7 +893,10 @@ impl PropagationClient {
                 }
             }
         };
-        self.send_resource_proof(&proof);
+        if !self.send_resource_proof(&proof) {
+            self.status.state = PropagationClientState::Failed;
+            return;
+        }
 
         let route = self.segment_routing.remove(&resource_hash);
         if let Some(link) = self.link.as_mut() {
@@ -835,12 +970,12 @@ impl PropagationClient {
         }
     }
 
-    fn send_resource_proof(&mut self, proof: &[u8]) {
+    fn send_resource_proof(&mut self, proof: &[u8]) -> bool {
         self.send_link_packet(
             rns_wire::context::PacketContext::ResourcePrf,
             rns_wire::flags::PacketType::Proof,
             proof,
-        );
+        )
     }
 
     fn send_link_packet(
@@ -848,9 +983,9 @@ impl PropagationClient {
         context: rns_wire::context::PacketContext,
         packet_type: rns_wire::flags::PacketType,
         payload: &[u8],
-    ) {
+    ) -> bool {
         let Some(link_id) = self.link_id else {
-            return;
+            return false;
         };
         let header = rns_wire::header::PacketHeader {
             flags: rns_wire::flags::PacketFlags {
@@ -867,14 +1002,48 @@ impl PropagationClient {
         };
         let mut raw = header.pack();
         raw.extend_from_slice(payload);
-        if !self.queue_transport(TransportMessage::Outbound(OutboundRequest {
+        if !self.queue_link_endpoint(OutboundRequest {
             raw: Bytes::from(raw),
             destination_hash: link_id,
-        })) {
+        }) {
             self.status.state = PropagationClientState::Failed;
+            false
         } else if let Some(link) = self.link.as_mut() {
             link.record_tx(payload.len());
+            true
+        } else {
+            false
         }
+    }
+
+    fn send_final_link_packet(
+        &mut self,
+        context: rns_wire::context::PacketContext,
+        packet_type: rns_wire::flags::PacketType,
+        payload: &[u8],
+    ) -> bool {
+        let Some(link_id) = self.link_id else {
+            return false;
+        };
+        let header = rns_wire::header::PacketHeader {
+            flags: rns_wire::flags::PacketFlags {
+                header_type: rns_wire::flags::HeaderType::Header1,
+                context_flag: false,
+                transport_type: rns_wire::flags::TransportType::Broadcast,
+                destination_type: rns_wire::flags::DestinationType::Link,
+                packet_type,
+            },
+            hops: 0,
+            transport_id: None,
+            destination_hash: link_id,
+            context,
+        };
+        let mut raw = header.pack();
+        raw.extend_from_slice(payload);
+        self.queue_link_endpoint_and_unbind(OutboundRequest {
+            raw: Bytes::from(raw),
+            destination_hash: link_id,
+        })
     }
 
     /// Phase 1: parse available transient IDs from the server.
@@ -950,6 +1119,7 @@ impl PropagationClient {
 
     pub fn tick(&mut self) {
         self.flush_pending_transport();
+        self.poll_endpoint_control();
         if self.status.state == PropagationClientState::Failed {
             self.cleanup();
             return;
@@ -981,7 +1151,7 @@ impl PropagationClient {
                 );
             }
             Some(LinkAction::SendTeardownAndClose(payload)) => {
-                self.send_link_packet(
+                self.endpoint_release_queued = self.send_final_link_packet(
                     rns_wire::context::PacketContext::LinkClose,
                     rns_wire::flags::PacketType::Data,
                     &payload,
@@ -1054,10 +1224,10 @@ impl PropagationClient {
                     };
                     let mut id_raw = id_header.pack();
                     id_raw.extend_from_slice(&identify_data);
-                    Some(TransportMessage::Outbound(OutboundRequest {
+                    Some(OutboundRequest {
                         raw: Bytes::from(id_raw),
                         destination_hash: link_id,
-                    }))
+                    })
                 } else {
                     None
                 }
@@ -1068,7 +1238,7 @@ impl PropagationClient {
             None
         };
         if let Some(outbound) = outbound {
-            if !self.queue_transport(outbound) {
+            if !self.queue_link_endpoint(outbound) {
                 self.status.state = PropagationClientState::Failed;
             }
         }
@@ -1204,10 +1374,10 @@ impl PropagationClient {
                             rns_wire::flags::HeaderType::Header1,
                         );
                         link.update_pending_request_id(&_request_id, packet_request_id);
-                        Some(TransportMessage::Outbound(OutboundRequest {
+                        Some(OutboundRequest {
                             raw: Bytes::from(req_raw),
                             destination_hash: link_id,
-                        }))
+                        })
                     } else {
                         None
                     }
@@ -1217,19 +1387,31 @@ impl PropagationClient {
         } else {
             None
         };
-        outbound.is_some_and(|message| self.queue_transport(message))
+        outbound.is_some_and(|request| self.queue_link_endpoint(request))
     }
 
     fn cleanup(&mut self) {
-        self.send_teardown();
+        let graceful_release = self.endpoint_release_queued || self.send_teardown();
         if let Some(link_id) = self.link_id.take() {
-            if !self.queue_transport(TransportMessage::DeregisterDestination { hash: link_id }) {
-                tracing::warn!(
-                    link_id = %hex::encode(link_id),
-                    "failed to deregister propagation client Link"
-                );
+            if !graceful_release {
+                let (result_tx, _result_rx) = oneshot::channel();
+                let _ = self.queue_transport(TransportMessage::UnbindLinkEndpoint {
+                    link_id,
+                    role: LinkEndpointRole::Initiator,
+                    result_tx,
+                });
+                if !self.queue_transport(TransportMessage::DeregisterDestination { hash: link_id })
+                {
+                    tracing::warn!(
+                        link_id = %hex::encode(link_id),
+                        "failed to deregister propagation client Link"
+                    );
+                }
             }
         }
+        self.attached_interface = None;
+        self.endpoint_release_queued = false;
+        self.pending_endpoint_bind = None;
         self.link = None;
         self.inbound_resources.clear();
         self.inbound_split_resources.clear();
@@ -1238,16 +1420,16 @@ impl PropagationClient {
         self.started_at = None;
     }
 
-    fn send_teardown(&mut self) {
+    fn send_teardown(&mut self) -> bool {
         let Some(link_id) = self.link_id else {
-            return;
+            return false;
         };
         let teardown_data = self
             .link
             .as_mut()
             .and_then(|link| link.teardown(CloseReason::InitiatorClosed));
         if let Some(teardown_data) = teardown_data {
-            self.send_link_packet(
+            let retained = self.send_final_link_packet(
                 rns_wire::context::PacketContext::LinkClose,
                 rns_wire::flags::PacketType::Data,
                 &teardown_data,
@@ -1256,6 +1438,9 @@ impl PropagationClient {
                 link_id = hex::encode(link_id),
                 "propagation client link closed"
             );
+            retained
+        } else {
+            false
         }
     }
 
@@ -1268,6 +1453,17 @@ impl PropagationClient {
 mod tests {
     use super::*;
     use rns_protocol::resource::OutboundTransfer;
+
+    fn next_link_request(rx: &mut mpsc::Receiver<TransportMessage>) -> OutboundRequest {
+        while let Ok(message) = rx.try_recv() {
+            match message {
+                TransportMessage::Outbound(request)
+                | TransportMessage::SendLinkEndpoint { request, .. } => return request,
+                _ => {}
+            }
+        }
+        panic!("expected Link packet");
+    }
 
     fn active_link_pair(dest_hash: [u8; 16]) -> (Link, Link) {
         let responder_key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
@@ -1394,6 +1590,51 @@ mod tests {
     }
 
     #[test]
+    fn invalid_client_lrproof_allows_later_valid_binding_before_lrrtt() {
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut client = PropagationClient::new(tx, None, None);
+        let node_hash = [0xB4; 16];
+        let (link, request_data) = Link::new_initiator(node_hash, 1);
+        let link_id = link.link_id;
+        let responder_key = Ed25519PrivateKey::generate();
+        let responder_public = responder_key.public_key();
+        let (_responder, proof) =
+            Link::new_responder(&request_data, &responder_key, node_hash, 1).unwrap();
+        client.link = Some(link);
+        client.link_id = Some(link_id);
+        client.status.state = PropagationClientState::LinkEstablishing;
+
+        client.handle_link_proof(
+            &[0u8; 99],
+            &responder_public,
+            &responder_public.to_bytes(),
+            7,
+        );
+        assert_eq!(client.state(), PropagationClientState::LinkEstablishing);
+        assert!(client.pending_endpoint_bind.is_none());
+        assert!(rx.try_recv().is_err());
+
+        client.handle_link_proof(&proof, &responder_public, &responder_public.to_bytes(), 8);
+        let TransportMessage::BindLinkEndpoint {
+            binding, result_tx, ..
+        } = rx.try_recv().unwrap()
+        else {
+            panic!("valid proof must bind before LRRTT");
+        };
+        assert_eq!(binding.interface_id, 8);
+        assert!(rx.try_recv().is_err());
+        result_tx.send(LinkEndpointBindResult::Bound).unwrap();
+        client.poll_endpoint_control();
+        let TransportMessage::SendLinkEndpoint { request, role, .. } = rx.try_recv().unwrap()
+        else {
+            panic!("bound endpoint must carry LRRTT");
+        };
+        assert_eq!(role, LinkEndpointRole::Initiator);
+        let (header, _) = rns_wire::header::PacketHeader::unpack(&request.raw).unwrap();
+        assert_eq!(header.context, rns_wire::context::PacketContext::Lrrtt);
+    }
+
+    #[test]
     fn test_start_download_rejects_an_active_transfer() {
         let (tx, mut rx) = mpsc::channel(64);
         let mut client = PropagationClient::new(tx, None, None);
@@ -1441,10 +1682,7 @@ mod tests {
         client.local_messages.insert(vec![1; 32]);
 
         client.send_get_request();
-        let request = match rx.try_recv().unwrap() {
-            TransportMessage::Outbound(request) => request,
-            other => panic!("expected request packet, got {other:?}"),
-        };
+        let request = next_link_request(&mut rx);
         let (_, offset) = rns_wire::header::PacketHeader::unpack(&request.raw).unwrap();
         let (_, _, _, request_data) = responder.handle_request(&request.raw[offset..]).unwrap();
         let value = rmpv::decode::read_value(&mut &request_data[..]).unwrap();
@@ -1621,10 +1859,7 @@ mod tests {
             Some(PropagationClientState::GetRequested)
         );
 
-        let request = match rx.try_recv().unwrap() {
-            TransportMessage::Outbound(request) => request,
-            other => panic!("expected Resource request, got {other:?}"),
-        };
+        let request = next_link_request(&mut rx);
         let (_, offset) = rns_wire::header::PacketHeader::unpack(&request.raw).unwrap();
         let request_data = responder.decrypt(&request.raw[offset..]).unwrap();
         let first_part = sender
@@ -1642,6 +1877,51 @@ mod tests {
         let first_progress = client.status.progress;
         client.handle_resource_part(&first_part);
         assert!(client.status.progress >= first_progress);
+    }
+
+    #[test]
+    fn resource_response_is_not_published_when_its_proof_cannot_be_retained() {
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut client = PropagationClient::new(tx, None, None);
+        let (initiator, responder) = active_link_pair([0xE5; 16]);
+        client.link_id = Some(initiator.link_id);
+        client.link = Some(initiator);
+        client.attached_interface = Some(0);
+        client.status.state = PropagationClientState::GetRequested;
+
+        let response = rmpv::Value::Array(vec![rmpv::Value::Binary(vec![0xAB; 32])]);
+        let payload = crate::encode_value(&response);
+        let mut sender = OutboundTransfer::new_encrypted(
+            payload,
+            false,
+            Duration::from_millis(50),
+            responder.session_keys().unwrap(),
+        )
+        .unwrap();
+        sender.resource.flags.is_response = true;
+        let advertisement = match sender.tick() {
+            TransferAction::SendAdvertisement(data) => data,
+            other => panic!("expected Resource advertisement, got {other:?}"),
+        };
+        client.handle_resource_advertisement(&responder.encrypt(&advertisement).unwrap());
+        let request = next_link_request(&mut rx);
+        let (_, offset) = rns_wire::header::PacketHeader::unpack(&request.raw).unwrap();
+        let request_data = responder.decrypt(&request.raw[offset..]).unwrap();
+        let parts: Vec<Vec<u8>> = sender
+            .handle_request(&request_data)
+            .into_iter()
+            .filter_map(|action| match action {
+                TransferAction::SendPart(_, data) => Some(data),
+                _ => None,
+            })
+            .collect();
+        drop(rx);
+        for part in parts {
+            client.handle_resource_part(&part);
+        }
+
+        assert_eq!(client.state(), PropagationClientState::Failed);
+        assert!(client.received_messages.is_empty());
     }
 
     #[test]
@@ -1704,11 +1984,11 @@ mod tests {
         client.status.state = PropagationClientState::Complete;
         client.tick();
 
-        let dereg = rx.try_recv();
-        assert!(matches!(
-            dereg.unwrap(),
-            TransportMessage::DeregisterDestination { .. }
-        ));
+        let mut saw_deregister = false;
+        while let Ok(message) = rx.try_recv() {
+            saw_deregister |= matches!(message, TransportMessage::DeregisterDestination { .. });
+        }
+        assert!(saw_deregister);
     }
 
     #[test]
@@ -1720,6 +2000,7 @@ mod tests {
         let link_id = link.link_id;
         client.link = Some(link);
         client.link_id = Some(link_id);
+        client.attached_interface = Some(0);
         client.status.state = PropagationClientState::ListRequested;
         client.started_at = Some(Instant::now());
 
@@ -1745,10 +2026,14 @@ mod tests {
         client.tick();
         assert_eq!(client.status.state, PropagationClientState::Failed);
         assert!(client.link.is_none());
-        assert!(matches!(
-            rx.try_recv().unwrap(),
-            TransportMessage::DeregisterDestination { hash } if hash == link_id
-        ));
+        let mut saw_deregister = false;
+        while let Ok(message) = rx.try_recv() {
+            saw_deregister |= matches!(
+                message,
+                TransportMessage::DeregisterDestination { hash } if hash == link_id
+            );
+        }
+        assert!(saw_deregister);
         assert!(client.acknowledge_transfer());
         assert_eq!(client.status.state, PropagationClientState::Idle);
     }
@@ -1762,6 +2047,7 @@ mod tests {
         let link_id = link.link_id;
         client.link = Some(link);
         client.link_id = Some(link_id);
+        client.attached_interface = Some(0);
         client.status.state = PropagationClientState::ListRequested;
 
         client
@@ -1776,5 +2062,37 @@ mod tests {
         client.drain_events(&std::collections::HashMap::new());
         assert_eq!(client.status.state, PropagationClientState::ListRequested);
         assert!(client.link.is_some());
+    }
+
+    #[test]
+    fn client_rejects_authenticated_packet_from_wrong_interface_before_state_change() {
+        let (tx, _rx) = mpsc::channel(64);
+        let mut client = PropagationClient::new(tx, None, None);
+        let node_hash = [0xE6; 16];
+        let (link, mut responder) = active_link_pair(node_hash);
+        let link_id = link.link_id;
+        client.link = Some(link);
+        client.link_id = Some(link_id);
+        client.attached_interface = Some(4);
+        client.status.state = PropagationClientState::ListRequested;
+        let close_body = responder
+            .teardown(CloseReason::InitiatorClosed)
+            .expect("active responder teardown");
+        client
+            .event_tx
+            .try_send(DestinationEvent::InboundPacket {
+                raw: link_data_packet(
+                    link_id,
+                    rns_wire::context::PacketContext::LinkClose,
+                    &close_body,
+                ),
+                interface_id: 5,
+                metrics: Default::default(),
+            })
+            .unwrap();
+
+        client.drain_events(&std::collections::HashMap::new());
+        assert_eq!(client.state(), PropagationClientState::ListRequested);
+        assert!(client.link.as_ref().is_some_and(Link::is_active));
     }
 }
