@@ -20,7 +20,10 @@ use rns_protocol::resource::{
 };
 use rns_protocol::resource_adv::ResourceAdvertisement;
 use rns_transport::link_messages::DestinationEvent;
-use rns_transport::messages::{OutboundRequest, TransportMessage};
+use rns_transport::messages::{
+    InterfaceId, LinkEndpointBindResult, LinkEndpointBinding, LinkEndpointLifecycleEvent,
+    LinkEndpointRole, OutboundRequest, TransportMessage,
+};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot};
 
@@ -52,6 +55,12 @@ struct InboundResourceLifecycle {
     total_segments: usize,
     next_segment: usize,
     inter_segment_deadline: Option<Instant>,
+}
+
+struct PendingEndpointBind {
+    interface_id: InterfaceId,
+    rtt_request: OutboundRequest,
+    result_rx: oneshot::Receiver<LinkEndpointBindResult>,
 }
 
 /// State of a link-based delivery.
@@ -92,6 +101,10 @@ pub struct PendingDelivery {
     pub timeout: Duration,
     pub msg_hash: Option<[u8; 32]>,
     pub failure_reason: Option<String>,
+    /// Immutable ingress/egress interface learned from the authenticated
+    /// LRPROOF. No established-Link traffic is accepted before this is set.
+    attached_interface: Option<InterfaceId>,
+    endpoint_release_queued: bool,
     /// Keep successful Direct links open for additional messages. Propagation
     /// deposits currently keep the old one-shot behavior.
     pub reusable: bool,
@@ -517,6 +530,9 @@ pub struct LinkDeliveryManager {
     /// Ordered staging for temporary transport backpressure. Resource state
     /// can advance only after frames are accepted here or by the actor.
     pending_transport: VecDeque<TransportMessage>,
+    pending_endpoint_binds: HashMap<[u8; 16], PendingEndpointBind>,
+    endpoint_lifecycle_tx: mpsc::UnboundedSender<LinkEndpointLifecycleEvent>,
+    endpoint_lifecycle_rx: mpsc::UnboundedReceiver<LinkEndpointLifecycleEvent>,
     /// Reusable upstream-style Direct links keyed by LXMF delivery destination hash.
     direct_links: HashMap<[u8; 16], [u8; 16]>,
     /// Reusable upstream-style inbound backchannels keyed by remote LXMF delivery destination hash.
@@ -556,9 +572,13 @@ impl LinkDeliveryManager {
         identity_key: Option<Ed25519PrivateKey>,
     ) -> Self {
         let (event_tx, event_rx) = mpsc::channel(256);
+        let (endpoint_lifecycle_tx, endpoint_lifecycle_rx) = mpsc::unbounded_channel();
         Self {
             transport_tx,
             pending_transport: VecDeque::new(),
+            pending_endpoint_binds: HashMap::new(),
+            endpoint_lifecycle_tx,
+            endpoint_lifecycle_rx,
             direct_links: HashMap::new(),
             backchannel_links: HashMap::new(),
             pending: HashMap::new(),
@@ -894,18 +914,26 @@ impl LinkDeliveryManager {
                     "discarding inactive cached Direct link before reuse"
                 );
                 if let Some(mut delivery) = self.pending.remove(&link_id) {
-                    send_link_teardown(
+                    let graceful_release = send_link_teardown(
                         &self.transport_tx,
                         &mut self.pending_transport,
                         &link_id,
                         &mut delivery.link,
                     );
-                    let _ = stage_transport(
-                        &self.transport_tx,
-                        &mut self.pending_transport,
-                        TransportMessage::DeregisterDestination { hash: link_id },
-                    );
+                    if !graceful_release {
+                        let _ = stage_link_endpoint_unbind(
+                            &self.transport_tx,
+                            &mut self.pending_transport,
+                            link_id,
+                        );
+                        let _ = stage_transport(
+                            &self.transport_tx,
+                            &mut self.pending_transport,
+                            TransportMessage::DeregisterDestination { hash: link_id },
+                        );
+                    }
                 }
+                self.pending_endpoint_binds.remove(&link_id);
                 self.direct_links.remove(&dest_hash);
             } else if let Some(delivery) = self
                 .pending
@@ -1111,6 +1139,8 @@ impl LinkDeliveryManager {
                 timeout: Duration::from_secs_f64(timeout_secs),
                 msg_hash,
                 failure_reason: None,
+                attached_interface: None,
+                endpoint_release_queued: false,
                 reusable,
                 backchannel_identified: false,
                 queued: VecDeque::new(),
@@ -1140,11 +1170,91 @@ impl LinkDeliveryManager {
         Ok(link_id)
     }
 
+    fn poll_endpoint_control(&mut self) {
+        while let Ok(event) = self.endpoint_lifecycle_rx.try_recv() {
+            if event.binding.role != LinkEndpointRole::Initiator {
+                continue;
+            }
+            if let Some(delivery) = self.pending.get_mut(&event.binding.link_id) {
+                if delivery.attached_interface == Some(event.binding.interface_id)
+                    || self
+                        .pending_endpoint_binds
+                        .get(&event.binding.link_id)
+                        .is_some_and(|pending| pending.interface_id == event.binding.interface_id)
+                {
+                    tracing::warn!(
+                        link_id = %hex_encode(&event.binding.link_id),
+                        interface_id = event.binding.interface_id,
+                        reason = ?event.reason,
+                        dropped_packets = event.dropped_packets,
+                        "Direct Link endpoint terminated"
+                    );
+                    delivery.attached_interface = None;
+                    delivery.state = DeliveryState::Failed;
+                    delivery.failure_reason =
+                        Some(format!("Link endpoint terminated: {:?}", event.reason));
+                    self.pending_endpoint_binds.remove(&event.binding.link_id);
+                }
+            }
+        }
+
+        let link_ids: Vec<[u8; 16]> = self.pending_endpoint_binds.keys().copied().collect();
+        for link_id in link_ids {
+            let outcome = {
+                let Some(pending) = self.pending_endpoint_binds.get_mut(&link_id) else {
+                    continue;
+                };
+                match pending.result_rx.try_recv() {
+                    Ok(result) => Some(Ok(result)),
+                    Err(oneshot::error::TryRecvError::Closed) => Some(Err(())),
+                    Err(oneshot::error::TryRecvError::Empty) => None,
+                }
+            };
+            let Some(outcome) = outcome else {
+                continue;
+            };
+            let Some(pending) = self.pending_endpoint_binds.remove(&link_id) else {
+                continue;
+            };
+            match outcome {
+                Ok(LinkEndpointBindResult::Bound | LinkEndpointBindResult::AlreadyBound) => {
+                    if let Some(delivery) = self.pending.get_mut(&link_id) {
+                        delivery.attached_interface = Some(pending.interface_id);
+                    }
+                    if let Err(reason) = stage_link_endpoint(
+                        &self.transport_tx,
+                        &mut self.pending_transport,
+                        link_id,
+                        pending.rtt_request,
+                    ) {
+                        if let Some(delivery) = self.pending.get_mut(&link_id) {
+                            delivery.state = DeliveryState::Failed;
+                            delivery.failure_reason = Some(reason.to_string());
+                        }
+                    } else if let Some(delivery) = self.pending.get_mut(&link_id) {
+                        delivery.state = DeliveryState::Identifying;
+                    }
+                }
+                Ok(
+                    LinkEndpointBindResult::Conflict { .. }
+                    | LinkEndpointBindResult::InterfaceUnavailable,
+                )
+                | Err(()) => {
+                    if let Some(delivery) = self.pending.get_mut(&link_id) {
+                        delivery.state = DeliveryState::Failed;
+                        delivery.failure_reason = Some("Link endpoint binding failed".to_string());
+                    }
+                }
+            }
+        }
+    }
+
     /// Drain inbound transport events and dispatch by packet context.
     ///
     /// Call before [`Self::tick`] each cycle. Routes `LRPROOF`, `ResourceHmu`, `ResourceReq`,
     /// and `ResourcePrf` contexts to their handlers.
     pub fn drain_events(&mut self, known_identities: &HashMap<String, [u8; 64]>) {
+        self.poll_endpoint_control();
         let mut events = Vec::new();
         while let Ok(event) = self.event_rx.try_recv() {
             events.push(event);
@@ -1155,7 +1265,9 @@ impl LinkDeliveryManager {
                 DestinationEvent::LinkClosed { link_id } => {
                     self.handle_link_closed(&link_id, None);
                 }
-                DestinationEvent::InboundPacket { raw, .. } => {
+                DestinationEvent::InboundPacket {
+                    raw, interface_id, ..
+                } => {
                     let (header, data_offset) = match rns_wire::header::PacketHeader::unpack(&raw) {
                         Ok(h) => h,
                         Err(_) => continue,
@@ -1166,6 +1278,35 @@ impl LinkDeliveryManager {
                         &[]
                     };
                     let link_id = header.destination_hash;
+                    let is_link_proof =
+                        matches!(
+                            header.context,
+                            rns_wire::context::PacketContext::Lrproof
+                                | rns_wire::context::PacketContext::None
+                        ) && header.flags.packet_type == rns_wire::flags::PacketType::Proof
+                            && self.pending.get(&link_id).is_some_and(|delivery| {
+                                delivery.state == DeliveryState::Establishing
+                            });
+                    if is_link_proof {
+                        if self.pending_endpoint_binds.contains_key(&link_id) {
+                            continue;
+                        }
+                    } else if self
+                        .pending
+                        .get(&link_id)
+                        .is_none_or(|delivery| delivery.attached_interface != Some(interface_id))
+                    {
+                        tracing::warn!(
+                            link_id = %hex_encode(&link_id),
+                            interface_id,
+                            attached_interface = ?self
+                                .pending
+                                .get(&link_id)
+                                .and_then(|delivery| delivery.attached_interface),
+                            "rejected Direct Link packet from wrong interface"
+                        );
+                        continue;
+                    }
 
                     match header.context {
                         rns_wire::context::PacketContext::Lrproof
@@ -1187,6 +1328,7 @@ impl LinkDeliveryManager {
                                             data,
                                             &verify_key,
                                             &ed25519_bytes,
+                                            interface_id,
                                         );
                                     }
                                 } else {
@@ -1228,6 +1370,7 @@ impl LinkDeliveryManager {
                                                 data,
                                                 &verify_key,
                                                 &ed25519_bytes,
+                                                interface_id,
                                             );
                                         }
                                     } else {
@@ -1336,6 +1479,7 @@ impl LinkDeliveryManager {
         proof_data: &[u8],
         identity_verify_key: &Ed25519PublicKey,
         identity_ed25519_pub: &[u8; 32],
+        interface_id: InterfaceId,
     ) -> bool {
         let Some(delivery) = self.pending.get_mut(link_id) else {
             return false;
@@ -1368,28 +1512,39 @@ impl LinkDeliveryManager {
                 let mut rtt_raw = rtt_header.pack();
                 rtt_raw.extend_from_slice(&rtt_data);
 
+                let rtt_request = OutboundRequest {
+                    raw: Bytes::from(rtt_raw),
+                    destination_hash: *link_id,
+                };
+                let (result_tx, result_rx) = oneshot::channel();
                 if let Err(reason) = stage_transport(
                     &self.transport_tx,
                     &mut self.pending_transport,
-                    TransportMessage::Outbound(OutboundRequest {
-                        raw: Bytes::from(rtt_raw),
-                        destination_hash: *link_id,
-                    }),
+                    TransportMessage::BindLinkEndpoint {
+                        binding: LinkEndpointBinding {
+                            link_id: *link_id,
+                            interface_id,
+                            role: LinkEndpointRole::Initiator,
+                        },
+                        lifecycle_tx: self.endpoint_lifecycle_tx.clone(),
+                        result_tx,
+                    },
                 ) {
                     delivery.state = DeliveryState::Failed;
                     delivery.failure_reason = Some(reason.to_string());
                     return false;
                 }
-
-                delivery.state = DeliveryState::Identifying;
+                self.pending_endpoint_binds.insert(
+                    *link_id,
+                    PendingEndpointBind {
+                        interface_id,
+                        rtt_request,
+                        result_rx,
+                    },
+                );
                 true
             }
-            Err(e) => {
-                let _ = e;
-                delivery.state = DeliveryState::Failed;
-                delivery.failure_reason = Some("link proof validation failed".to_string());
-                false
-            }
+            Err(_) => false,
         }
     }
 
@@ -1407,6 +1562,39 @@ impl LinkDeliveryManager {
             return false;
         }
 
+        let packet_hash = rns_wire::hash::packet_hash(raw, header_type);
+        let Ok(proof_data) = delivery.link.prove_packet_with_local_signer(&packet_hash) else {
+            return false;
+        };
+        let proof_header = rns_wire::header::PacketHeader {
+            flags: rns_wire::flags::PacketFlags {
+                header_type: rns_wire::flags::HeaderType::Header1,
+                context_flag: false,
+                transport_type: rns_wire::flags::TransportType::Broadcast,
+                destination_type: rns_wire::flags::DestinationType::Link,
+                packet_type: rns_wire::flags::PacketType::Proof,
+            },
+            hops: 0,
+            transport_id: None,
+            destination_hash: *link_id,
+            context: rns_wire::context::PacketContext::LinkProof,
+        };
+        let mut proof_raw = proof_header.pack();
+        proof_raw.extend_from_slice(&proof_data);
+        if let Err(reason) = stage_link_endpoint(
+            &self.transport_tx,
+            &mut self.pending_transport,
+            *link_id,
+            OutboundRequest {
+                raw: Bytes::from(proof_raw),
+                destination_hash: *link_id,
+            },
+        ) {
+            delivery.state = DeliveryState::Failed;
+            delivery.failure_reason = Some(reason.to_string());
+            return false;
+        }
+
         delivery.link.record_inbound();
         delivery.link.record_rx(encrypted_data.len());
         let Ok(plaintext) = delivery.link.decrypt(encrypted_data) else {
@@ -1415,37 +1603,6 @@ impl LinkDeliveryManager {
 
         if let Some(ref tx) = self.inbound_packet_tx {
             let _ = tx.send((plaintext, *link_id));
-        }
-
-        let packet_hash = rns_wire::hash::packet_hash(raw, header_type);
-        if let Ok(proof_data) = delivery.link.prove_packet_with_link_key(&packet_hash) {
-            let proof_header = rns_wire::header::PacketHeader {
-                flags: rns_wire::flags::PacketFlags {
-                    header_type: rns_wire::flags::HeaderType::Header1,
-                    context_flag: false,
-                    transport_type: rns_wire::flags::TransportType::Broadcast,
-                    destination_type: rns_wire::flags::DestinationType::Link,
-                    packet_type: rns_wire::flags::PacketType::Proof,
-                },
-                hops: 0,
-                transport_id: None,
-                destination_hash: *link_id,
-                context: rns_wire::context::PacketContext::LinkProof,
-            };
-            let mut proof_raw = proof_header.pack();
-            proof_raw.extend_from_slice(&proof_data);
-            if let Err(reason) = stage_transport(
-                &self.transport_tx,
-                &mut self.pending_transport,
-                TransportMessage::Outbound(OutboundRequest {
-                    raw: Bytes::from(proof_raw),
-                    destination_hash: *link_id,
-                }),
-            ) {
-                delivery.state = DeliveryState::Failed;
-                delivery.failure_reason = Some(reason.to_string());
-                return false;
-            }
         }
 
         true
@@ -1847,6 +2004,7 @@ impl LinkDeliveryManager {
     /// Drive pending deliveries forward; call periodically after [`Self::drain_events`].
     pub fn tick(&mut self) -> Vec<DeliveryResult> {
         let mut results = self.tick_backchannels();
+        self.poll_endpoint_control();
         if let Err(reason) = flush_staged_transport(&self.transport_tx, &mut self.pending_transport)
         {
             for delivery in self.pending.values_mut() {
@@ -1950,13 +2108,14 @@ impl LinkDeliveryManager {
                                     };
                                     let mut id_raw = id_header.pack();
                                     id_raw.extend_from_slice(&identify_data);
-                                    if let Err(reason) = stage_transport(
+                                    if let Err(reason) = stage_link_endpoint(
                                         &self.transport_tx,
                                         &mut self.pending_transport,
-                                        TransportMessage::Outbound(OutboundRequest {
+                                        *link_id,
+                                        OutboundRequest {
                                             raw: Bytes::from(id_raw),
                                             destination_hash: *link_id,
-                                        }),
+                                        },
                                     ) {
                                         delivery.state = DeliveryState::Failed;
                                         delivery.failure_reason = Some(reason.to_string());
@@ -2250,7 +2409,7 @@ impl LinkDeliveryManager {
                         idle_secs = link_data_idle_for(&delivery.link).as_secs_f64(),
                         "tearing down inactive Direct link"
                     );
-                    send_link_teardown(
+                    delivery.endpoint_release_queued = send_link_teardown(
                         &self.transport_tx,
                         &mut self.pending_transport,
                         link_id,
@@ -2262,6 +2421,7 @@ impl LinkDeliveryManager {
                     &mut self.pending_transport,
                     link_id,
                     delivery.link.tick(),
+                    &mut delivery.endpoint_release_queued,
                 ) {
                     if !matches!(
                         delivery.state,
@@ -2293,6 +2453,7 @@ impl LinkDeliveryManager {
         }
 
         for link_id in to_remove {
+            self.pending_endpoint_binds.remove(&link_id);
             if let Some(mut delivery) = self.pending.remove(&link_id) {
                 for resource_id in drop_all_inbound_resources(&mut delivery) {
                     notify_inbound_resource_concluded(
@@ -2304,17 +2465,25 @@ impl LinkDeliveryManager {
                 if delivery.reusable {
                     self.direct_links.remove(&delivery.dest_hash);
                 }
-                send_link_teardown(
-                    &self.transport_tx,
-                    &mut self.pending_transport,
-                    &link_id,
-                    &mut delivery.link,
-                );
-                let _ = stage_transport(
-                    &self.transport_tx,
-                    &mut self.pending_transport,
-                    TransportMessage::DeregisterDestination { hash: link_id },
-                );
+                let graceful_release = delivery.endpoint_release_queued
+                    || send_link_teardown(
+                        &self.transport_tx,
+                        &mut self.pending_transport,
+                        &link_id,
+                        &mut delivery.link,
+                    );
+                if !graceful_release {
+                    let _ = stage_link_endpoint_unbind(
+                        &self.transport_tx,
+                        &mut self.pending_transport,
+                        link_id,
+                    );
+                    let _ = stage_transport(
+                        &self.transport_tx,
+                        &mut self.pending_transport,
+                        TransportMessage::DeregisterDestination { hash: link_id },
+                    );
+                }
             }
         }
 
@@ -3048,7 +3217,28 @@ impl LinkDeliveryManager {
         }
 
         if let Some((link_id, dest_hash)) = remove_direct_session {
-            self.pending.remove(&link_id);
+            let mut graceful_release = false;
+            if let Some(mut delivery) = self.pending.remove(&link_id) {
+                graceful_release = send_link_teardown(
+                    &self.transport_tx,
+                    &mut self.pending_transport,
+                    &link_id,
+                    &mut delivery.link,
+                );
+            }
+            self.pending_endpoint_binds.remove(&link_id);
+            if !graceful_release {
+                let _ = stage_link_endpoint_unbind(
+                    &self.transport_tx,
+                    &mut self.pending_transport,
+                    link_id,
+                );
+                let _ = stage_transport(
+                    &self.transport_tx,
+                    &mut self.pending_transport,
+                    TransportMessage::DeregisterDestination { hash: link_id },
+                );
+            }
             if self.direct_links.get(&dest_hash) == Some(&link_id) {
                 self.direct_links.remove(&dest_hash);
             }
@@ -3140,12 +3330,26 @@ impl LinkDeliveryManager {
         }
 
         if let Some((link_id, dest_hash)) = remove_direct_session {
+            let mut graceful_release = false;
             if let Some(mut delivery) = self.pending.remove(&link_id) {
-                send_link_teardown(
+                graceful_release = send_link_teardown(
                     &self.transport_tx,
                     &mut self.pending_transport,
                     &link_id,
                     &mut delivery.link,
+                );
+            }
+            self.pending_endpoint_binds.remove(&link_id);
+            if !graceful_release {
+                let _ = stage_link_endpoint_unbind(
+                    &self.transport_tx,
+                    &mut self.pending_transport,
+                    link_id,
+                );
+                let _ = stage_transport(
+                    &self.transport_tx,
+                    &mut self.pending_transport,
+                    TransportMessage::DeregisterDestination { hash: link_id },
                 );
             }
             if self.direct_links.get(&dest_hash) == Some(&link_id) {
@@ -3676,13 +3880,14 @@ fn send_link_identify(
     };
     let mut id_raw = id_header.pack();
     id_raw.extend_from_slice(&identify_data);
-    stage_transport(
+    stage_link_endpoint(
         transport_tx,
         pending_transport,
-        TransportMessage::Outbound(OutboundRequest {
+        *link_id,
+        OutboundRequest {
             raw: Bytes::from(id_raw),
             destination_hash: *link_id,
-        }),
+        },
     )
     .is_ok()
 }
@@ -3692,6 +3897,7 @@ fn drive_link_action(
     pending_transport: &mut VecDeque<TransportMessage>,
     link_id: &[u8; 16],
     action: LinkAction,
+    endpoint_release_queued: &mut bool,
 ) -> bool {
     match action {
         LinkAction::SendKeepalive => {
@@ -3705,7 +3911,12 @@ fn drive_link_action(
         }
         LinkAction::SendTeardownAndClose(teardown_data) => {
             if !teardown_data.is_empty() {
-                send_link_close_payload(transport_tx, pending_transport, link_id, &teardown_data);
+                *endpoint_release_queued = send_link_close_payload(
+                    transport_tx,
+                    pending_transport,
+                    link_id,
+                    &teardown_data,
+                );
             }
             true
         }
@@ -3734,13 +3945,14 @@ fn send_keepalive_packet(
     };
     let mut raw = header.pack();
     raw.push(rns_link::constants::KEEPALIVE_REQUEST);
-    let _ = stage_transport(
+    let _ = stage_link_endpoint(
         transport_tx,
         pending_transport,
-        TransportMessage::Outbound(OutboundRequest {
+        *link_id,
+        OutboundRequest {
             raw: Bytes::from(raw),
             destination_hash: *link_id,
-        }),
+        },
     );
 }
 
@@ -3749,7 +3961,7 @@ fn send_link_close_payload(
     pending_transport: &mut VecDeque<TransportMessage>,
     link_id: &[u8; 16],
     teardown_data: &[u8],
-) {
+) -> bool {
     let header = rns_wire::header::PacketHeader {
         flags: rns_wire::flags::PacketFlags {
             header_type: rns_wire::flags::HeaderType::Header1,
@@ -3765,14 +3977,16 @@ fn send_link_close_payload(
     };
     let mut raw = header.pack();
     raw.extend_from_slice(teardown_data);
-    let _ = stage_transport(
+    stage_link_endpoint_and_unbind(
         transport_tx,
         pending_transport,
-        TransportMessage::Outbound(OutboundRequest {
+        *link_id,
+        OutboundRequest {
             raw: Bytes::from(raw),
             destination_hash: *link_id,
-        }),
-    );
+        },
+    )
+    .is_ok()
 }
 
 fn link_data_idle_for(link: &Link) -> Duration {
@@ -3878,6 +4092,61 @@ fn stage_transport(
         pending.push_back(message);
     }
     Ok(())
+}
+
+fn stage_link_endpoint(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    pending: &mut VecDeque<TransportMessage>,
+    link_id: [u8; 16],
+    request: OutboundRequest,
+) -> Result<(), &'static str> {
+    let (result_tx, _result_rx) = oneshot::channel();
+    stage_transport(
+        transport_tx,
+        pending,
+        TransportMessage::SendLinkEndpoint {
+            link_id,
+            role: LinkEndpointRole::Initiator,
+            request,
+            result_tx,
+        },
+    )
+}
+
+fn stage_link_endpoint_unbind(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    pending: &mut VecDeque<TransportMessage>,
+    link_id: [u8; 16],
+) -> Result<(), &'static str> {
+    let (result_tx, _result_rx) = oneshot::channel();
+    stage_transport(
+        transport_tx,
+        pending,
+        TransportMessage::UnbindLinkEndpoint {
+            link_id,
+            role: LinkEndpointRole::Initiator,
+            result_tx,
+        },
+    )
+}
+
+fn stage_link_endpoint_and_unbind(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    pending: &mut VecDeque<TransportMessage>,
+    link_id: [u8; 16],
+    request: OutboundRequest,
+) -> Result<(), &'static str> {
+    let (result_tx, _result_rx) = oneshot::channel();
+    stage_transport(
+        transport_tx,
+        pending,
+        TransportMessage::SendLinkEndpointAndUnbind {
+            link_id,
+            role: LinkEndpointRole::Initiator,
+            request,
+            result_tx,
+        },
+    )
 }
 
 fn flush_staged_transport(
@@ -4010,13 +4279,14 @@ fn dispatch_inbound_resource_action(
     };
     let mut raw = header.pack();
     raw.extend_from_slice(&body);
-    stage_transport(
+    stage_link_endpoint(
         transport_tx,
         pending_transport,
-        TransportMessage::Outbound(OutboundRequest {
+        *link_id,
+        OutboundRequest {
             raw: Bytes::from(raw),
             destination_hash: *link_id,
-        }),
+        },
     )?;
     delivery.link.record_tx(body.len());
     Ok(())
@@ -4172,13 +4442,14 @@ fn send_link_packet(
     let mut raw = header.pack();
     raw.extend_from_slice(&encrypted);
     let packet_hash = rns_wire::hash::packet_hash(&raw, rns_wire::flags::HeaderType::Header1);
-    stage_transport(
+    stage_link_endpoint(
         transport_tx,
         pending_transport,
-        TransportMessage::Outbound(OutboundRequest {
+        *link_id,
+        OutboundRequest {
             raw: Bytes::from(raw),
             destination_hash: *link_id,
-        }),
+        },
     )
     .ok()?;
     delivery.link.record_tx(encrypted.len());
@@ -4190,9 +4461,9 @@ fn send_link_teardown(
     pending_transport: &mut VecDeque<TransportMessage>,
     link_id: &[u8; 16],
     link: &mut Link,
-) {
+) -> bool {
     let Some(teardown_data) = link.teardown(CloseReason::InitiatorClosed) else {
-        return;
+        return false;
     };
     let header = rns_wire::header::PacketHeader {
         flags: rns_wire::flags::PacketFlags {
@@ -4209,14 +4480,16 @@ fn send_link_teardown(
     };
     let mut raw = header.pack();
     raw.extend_from_slice(&teardown_data);
-    let _ = stage_transport(
+    stage_link_endpoint_and_unbind(
         transport_tx,
         pending_transport,
-        TransportMessage::Outbound(OutboundRequest {
+        *link_id,
+        OutboundRequest {
             raw: Bytes::from(raw),
             destination_hash: *link_id,
-        }),
-    );
+        },
+    )
+    .is_ok()
 }
 
 /// Serialize a [`TransferAction`] onto the link and enqueue it for transport.
@@ -4251,13 +4524,14 @@ fn dispatch_action(
     let mut send = |header: rns_wire::header::PacketHeader, body: &[u8]| {
         let mut raw = header.pack();
         raw.extend_from_slice(body);
-        stage_transport(
+        stage_link_endpoint(
             transport_tx,
             pending_transport,
-            TransportMessage::Outbound(OutboundRequest {
+            *link_id,
+            OutboundRequest {
                 raw: Bytes::from(raw),
                 destination_hash: *link_id,
-            }),
+            },
         )
     };
 
@@ -4384,8 +4658,12 @@ mod tests {
 
     fn next_outbound(rx: &mut mpsc::Receiver<TransportMessage>) -> Vec<u8> {
         while let Ok(message) = rx.try_recv() {
-            if let TransportMessage::Outbound(request) = message {
-                return request.raw.to_vec();
+            match message {
+                TransportMessage::Outbound(request)
+                | TransportMessage::SendLinkEndpoint { request, .. } => {
+                    return request.raw.to_vec();
+                }
+                _ => {}
             }
         }
         panic!("expected outbound transport message");
@@ -4416,8 +4694,21 @@ mod tests {
             &link_id,
             &proof_data,
             &responder_pub,
-            &responder_pub.to_bytes()
+            &responder_pub.to_bytes(),
+            0,
         ));
+
+        let bind = rx.try_recv().expect("endpoint binding request");
+        let TransportMessage::BindLinkEndpoint {
+            binding, result_tx, ..
+        } = bind
+        else {
+            panic!("expected endpoint binding request");
+        };
+        assert_eq!(binding.link_id, link_id);
+        assert_eq!(binding.interface_id, 0);
+        result_tx.send(LinkEndpointBindResult::Bound).unwrap();
+        mgr.poll_endpoint_control();
 
         let rtt_raw = next_outbound(rx);
         let (rtt_header, rtt_offset) = rns_wire::header::PacketHeader::unpack(&rtt_raw).unwrap();
@@ -4472,7 +4763,7 @@ mod tests {
         rx: &mut mpsc::Receiver<TransportMessage>,
         link_id: [u8; 16],
         responder_link: &Link,
-        responder_key: &Ed25519PrivateKey,
+        _responder_key: &Ed25519PrivateKey,
     ) {
         let packet_raw = next_outbound(rx);
         let (packet_header, _) = rns_wire::header::PacketHeader::unpack(&packet_raw).unwrap();
@@ -4492,7 +4783,7 @@ mod tests {
 
         let packet_hash = rns_wire::hash::packet_hash(&packet_raw, packet_header.flags.header_type);
         let proof_data = responder_link
-            .prove_packet(&packet_hash, responder_key)
+            .prove_packet_with_local_signer(&packet_hash)
             .unwrap();
         let proof_header = rns_wire::header::PacketHeader {
             flags: rns_wire::flags::PacketFlags {
@@ -6216,12 +6507,11 @@ mod tests {
         )));
         assert_eq!(mgr.pending_count(), 0);
 
-        let deregister = rx.try_recv();
-        assert!(deregister.is_ok(), "DeregisterDestination should be queued");
-        assert!(matches!(
-            deregister.unwrap(),
-            TransportMessage::DeregisterDestination { .. }
-        ));
+        let mut saw_deregister = false;
+        while let Ok(message) = rx.try_recv() {
+            saw_deregister |= matches!(message, TransportMessage::DeregisterDestination { .. });
+        }
+        assert!(saw_deregister, "DeregisterDestination should be queued");
     }
 
     #[test]
@@ -6327,6 +6617,7 @@ mod tests {
             &proof,
             &responder_public,
             &responder_public.to_bytes(),
+            0,
         ));
         assert_eq!(mgr.pending_transport.len(), 1);
         assert!(matches!(
@@ -6339,6 +6630,12 @@ mod tests {
         ));
 
         assert!(mgr.tick().is_empty());
+        let bind = rx.try_recv().expect("staged endpoint bind");
+        let TransportMessage::BindLinkEndpoint { result_tx, .. } = bind else {
+            panic!("expected endpoint bind before LRRTT");
+        };
+        result_tx.send(LinkEndpointBindResult::Bound).unwrap();
+        assert!(mgr.tick().is_empty());
         let rtt = next_outbound(&mut rx);
         let (rtt_header, _) = rns_wire::header::PacketHeader::unpack(&rtt).unwrap();
         assert_eq!(rtt_header.context, rns_wire::context::PacketContext::Lrrtt);
@@ -6349,6 +6646,192 @@ mod tests {
             rns_wire::context::PacketContext::None
         );
         assert!(mgr.pending_transport.is_empty());
+    }
+
+    #[test]
+    fn direct_rejects_wrong_interface_before_proof_or_plaintext_publication() {
+        let (tx, mut rx) = mpsc::channel(512);
+        let mut mgr = LinkDeliveryManager::new(tx, None, None);
+        let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel();
+        mgr.set_inbound_packet_sender(inbound_tx);
+        let signing_key = Ed25519PrivateKey::generate();
+        let mut message = LxMessage::new(
+            [0xA1; 16],
+            [0xB1; 16],
+            "interface",
+            "gate",
+            crate::constants::DeliveryMethod::Direct,
+        );
+        message.sign(&signing_key).unwrap();
+        let responder_key = Ed25519PrivateKey::generate();
+        let (link_id, responder) =
+            establish_active_delivery(&mut mgr, &mut rx, message, &responder_key, [0xC1; 16]);
+        let _ = mgr.tick();
+        while rx.try_recv().is_ok() {}
+
+        let encrypted = responder.encrypt(b"wrong-interface").unwrap();
+        mgr.event_tx
+            .try_send(DestinationEvent::InboundPacket {
+                raw: link_data_packet(link_id, rns_wire::context::PacketContext::None, &encrypted),
+                interface_id: 99,
+                metrics: Default::default(),
+            })
+            .unwrap();
+        mgr.drain_events(&HashMap::new());
+
+        assert!(inbound_rx.try_recv().is_err());
+        assert!(rx.try_recv().is_err());
+        assert_ne!(
+            mgr.pending.get(&link_id).unwrap().state,
+            DeliveryState::Failed
+        );
+    }
+
+    #[test]
+    fn direct_withholds_plaintext_when_reverse_packet_proof_cannot_be_retained() {
+        let (tx, mut rx) = mpsc::channel(512);
+        let mut mgr = LinkDeliveryManager::new(tx, None, None);
+        let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel();
+        mgr.set_inbound_packet_sender(inbound_tx);
+        let signing_key = Ed25519PrivateKey::generate();
+        let mut message = LxMessage::new(
+            [0xA2; 16],
+            [0xB2; 16],
+            "proof",
+            "before plaintext",
+            crate::constants::DeliveryMethod::Direct,
+        );
+        message.sign(&signing_key).unwrap();
+        let responder_key = Ed25519PrivateKey::generate();
+        let (link_id, responder) =
+            establish_active_delivery(&mut mgr, &mut rx, message, &responder_key, [0xC2; 16]);
+        let _ = mgr.tick();
+        while rx.try_recv().is_ok() {}
+        drop(rx);
+
+        let encrypted = responder.encrypt(b"must-not-publish").unwrap();
+        mgr.event_tx
+            .try_send(DestinationEvent::InboundPacket {
+                raw: link_data_packet(link_id, rns_wire::context::PacketContext::None, &encrypted),
+                interface_id: 0,
+                metrics: Default::default(),
+            })
+            .unwrap();
+        mgr.drain_events(&HashMap::new());
+
+        assert!(inbound_rx.try_recv().is_err());
+        assert_eq!(
+            mgr.pending.get(&link_id).unwrap().state,
+            DeliveryState::Failed
+        );
+    }
+
+    #[test]
+    fn invalid_direct_lrproof_does_not_block_later_valid_interface_binding() {
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut mgr = LinkDeliveryManager::new(tx, None, None);
+        let message = LxMessage::new(
+            [0xA3; 16],
+            [0xB3; 16],
+            "proof",
+            "retry",
+            crate::constants::DeliveryMethod::Direct,
+        );
+        let destination_hash = [0xC3; 16];
+        let link_id = mgr.start_delivery(message, destination_hash, 1).unwrap();
+        let request_raw = next_outbound(&mut rx);
+        let (_, request_offset) = rns_wire::header::PacketHeader::unpack(&request_raw).unwrap();
+        let responder_key = Ed25519PrivateKey::generate();
+        let (_responder, proof) = Link::new_responder(
+            &request_raw[request_offset..],
+            &responder_key,
+            destination_hash,
+            1,
+        )
+        .unwrap();
+        let responder_public = responder_key.public_key();
+
+        assert!(!mgr.handle_link_proof(
+            &link_id,
+            &[0u8; 99],
+            &responder_public,
+            &responder_public.to_bytes(),
+            7,
+        ));
+        assert_eq!(
+            mgr.pending.get(&link_id).unwrap().state,
+            DeliveryState::Establishing
+        );
+        assert!(mgr.pending_endpoint_binds.is_empty());
+
+        assert!(mgr.handle_link_proof(
+            &link_id,
+            &proof,
+            &responder_public,
+            &responder_public.to_bytes(),
+            8,
+        ));
+        let TransportMessage::BindLinkEndpoint { binding, .. } = rx.try_recv().unwrap() else {
+            panic!("valid proof must bind its ingress interface");
+        };
+        assert_eq!(binding.interface_id, 8);
+    }
+
+    #[test]
+    fn endpoint_lifecycle_failure_is_scoped_to_its_direct_owner() {
+        let (tx, mut rx) = mpsc::channel(128);
+        let mut mgr = LinkDeliveryManager::new(tx, None, None);
+        let responder_key = Ed25519PrivateKey::generate();
+        let first = establish_active_delivery(
+            &mut mgr,
+            &mut rx,
+            LxMessage::new(
+                [1; 16],
+                [2; 16],
+                "first",
+                "owner",
+                crate::constants::DeliveryMethod::Direct,
+            ),
+            &responder_key,
+            [3; 16],
+        )
+        .0;
+        let second = establish_active_delivery(
+            &mut mgr,
+            &mut rx,
+            LxMessage::new(
+                [4; 16],
+                [5; 16],
+                "second",
+                "owner",
+                crate::constants::DeliveryMethod::Direct,
+            ),
+            &responder_key,
+            [6; 16],
+        )
+        .0;
+
+        mgr.endpoint_lifecycle_tx
+            .send(LinkEndpointLifecycleEvent {
+                binding: LinkEndpointBinding {
+                    link_id: first,
+                    interface_id: 0,
+                    role: LinkEndpointRole::Initiator,
+                },
+                reason: rns_transport::messages::LinkEndpointTerminalReason::InterfaceRemoved,
+                dropped_packets: 1,
+            })
+            .unwrap();
+        mgr.poll_endpoint_control();
+
+        assert_eq!(
+            mgr.pending.get(&first).unwrap().state,
+            DeliveryState::Failed
+        );
+        assert_ne!(
+            mgr.pending.get(&second).unwrap().state,
+            DeliveryState::Failed
+        );
     }
 
     #[test]
@@ -6463,8 +6946,10 @@ mod tests {
 
         let mut saw_icl = false;
         while let Ok(message) = rx.try_recv() {
-            let TransportMessage::Outbound(request) = message else {
-                continue;
+            let request = match message {
+                TransportMessage::Outbound(request)
+                | TransportMessage::SendLinkEndpoint { request, .. } => request,
+                _ => continue,
             };
             let (header, _) = rns_wire::header::PacketHeader::unpack(&request.raw).unwrap();
             if header.context == rns_wire::context::PacketContext::ResourceIcl {
@@ -6650,10 +7135,14 @@ mod tests {
             DeliveryResult::Failed { reason, .. } if reason == "link closed"
         )));
         assert_eq!(mgr.pending_count(), 0);
-        assert!(matches!(
-            rx.try_recv().unwrap(),
-            TransportMessage::DeregisterDestination { hash } if hash == link_id
-        ));
+        let mut saw_deregister = false;
+        while let Ok(message) = rx.try_recv() {
+            saw_deregister |= matches!(
+                message,
+                TransportMessage::DeregisterDestination { hash } if hash == link_id
+            );
+        }
+        assert!(saw_deregister);
     }
 
     #[test]
@@ -6751,7 +7240,7 @@ mod tests {
         assert_eq!(delivery.packet_proof_hash, Some(packet_hash));
 
         let proof_data = responder_link
-            .prove_packet(&packet_hash, &responder_key)
+            .prove_packet_with_local_signer(&packet_hash)
             .unwrap();
         let proof_header = rns_wire::header::PacketHeader {
             flags: rns_wire::flags::PacketFlags {
