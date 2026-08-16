@@ -9,6 +9,9 @@
 - Bounded propagation-sync transport staging, scoped Link endpoint failures
   to their owning operation, and prevented Resource responses from becoming
   visible when their delivery proof cannot be retained.
+- Made typed Link sends fail closed on rejected transport admission, delayed
+  reverse plaintext and propagation responses until their proofs are reliably
+  admitted, and made failed graceful closes unbind before deregistration.
 - Added automatic pre-sign reply-ticket issue, signature-gated inbound
   learning, directional migration-safe persistence, and proof-gated delivery
   accounting, with live Python restart/reply interoperability.

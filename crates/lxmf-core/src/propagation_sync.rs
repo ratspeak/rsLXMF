@@ -22,7 +22,8 @@ use rns_protocol::resource::{
 use rns_transport::link_messages::DestinationEvent;
 use rns_transport::messages::{
     InterfaceId, LinkEndpointBindResult, LinkEndpointBinding, LinkEndpointLifecycleEvent,
-    LinkEndpointRole, OutboundRequest, TransportMessage,
+    LinkEndpointRole, LinkEndpointSendResult, LinkEndpointUnbindResult, OutboundRequest,
+    TransportMessage,
 };
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot};
@@ -86,6 +87,17 @@ struct PendingEndpointBind {
     result_rx: oneshot::Receiver<LinkEndpointBindResult>,
 }
 
+struct PendingEndpointSend {
+    link_id: [u8; 16],
+    final_send: bool,
+    result_rx: oneshot::Receiver<LinkEndpointSendResult>,
+}
+
+struct PendingEndpointCleanup {
+    link_id: [u8; 16],
+    result_rx: oneshot::Receiver<LinkEndpointUnbindResult>,
+}
+
 fn prepare_outbound_resource_transfers(
     payload: Vec<u8>,
     auto_compress: bool,
@@ -126,6 +138,8 @@ pub struct PropagationSyncTask {
     link_id: Option<[u8; 16]>,
     attached_interface: Option<InterfaceId>,
     pending_endpoint_bind: Option<PendingEndpointBind>,
+    pending_endpoint_sends: Vec<PendingEndpointSend>,
+    pending_endpoint_cleanups: Vec<PendingEndpointCleanup>,
     endpoint_lifecycle_tx: mpsc::UnboundedSender<LinkEndpointLifecycleEvent>,
     endpoint_lifecycle_rx: mpsc::UnboundedReceiver<LinkEndpointLifecycleEvent>,
     pub state: SyncTaskState,
@@ -177,6 +191,8 @@ impl PropagationSyncTask {
             link_id: None,
             attached_interface: None,
             pending_endpoint_bind: None,
+            pending_endpoint_sends: Vec::new(),
+            pending_endpoint_cleanups: Vec::new(),
             endpoint_lifecycle_tx,
             endpoint_lifecycle_rx,
             state: SyncTaskState::Idle,
@@ -234,6 +250,8 @@ impl PropagationSyncTask {
             link_id: None,
             attached_interface: None,
             pending_endpoint_bind: None,
+            pending_endpoint_sends: Vec::new(),
+            pending_endpoint_cleanups: Vec::new(),
             endpoint_lifecycle_tx,
             endpoint_lifecycle_rx,
             state: SyncTaskState::Idle,
@@ -287,6 +305,8 @@ impl PropagationSyncTask {
             link_id: None,
             attached_interface: None,
             pending_endpoint_bind: None,
+            pending_endpoint_sends: Vec::new(),
+            pending_endpoint_cleanups: Vec::new(),
             endpoint_lifecycle_tx,
             endpoint_lifecycle_rx,
             state: SyncTaskState::Idle,
@@ -483,16 +503,89 @@ impl PropagationSyncTask {
         let Some(link_id) = self.link_id else {
             return false;
         };
-        let (result_tx, _result_rx) = oneshot::channel();
-        self.queue_transport(TransportMessage::SendLinkEndpoint {
+        let (result_tx, result_rx) = oneshot::channel();
+        if !self.queue_transport(TransportMessage::SendLinkEndpoint {
             link_id,
             role: LinkEndpointRole::Initiator,
             request,
             result_tx,
-        })
+        }) {
+            return false;
+        }
+        self.pending_endpoint_sends.push(PendingEndpointSend {
+            link_id,
+            final_send: false,
+            result_rx,
+        });
+        true
+    }
+
+    fn queue_endpoint_cleanup(&mut self, link_id: [u8; 16]) {
+        let (result_tx, result_rx) = oneshot::channel();
+        if self.queue_transport(TransportMessage::UnbindLinkEndpoint {
+            link_id,
+            role: LinkEndpointRole::Initiator,
+            result_tx,
+        }) {
+            self.pending_endpoint_cleanups
+                .push(PendingEndpointCleanup { link_id, result_rx });
+        }
+    }
+
+    fn poll_endpoint_send_results(&mut self) {
+        let mut still_pending = Vec::new();
+        let mut endpoint_sends = std::mem::take(&mut self.pending_endpoint_sends);
+        for mut pending in endpoint_sends.drain(..) {
+            match pending.result_rx.try_recv() {
+                Ok(LinkEndpointSendResult::Sent | LinkEndpointSendResult::Queued { .. }) => {}
+                Ok(result) => {
+                    tracing::warn!(
+                        link_id = %hex::encode(pending.link_id),
+                        ?result,
+                        final_send = pending.final_send,
+                        "propagation sync Link endpoint send rejected"
+                    );
+                    if self.link_id == Some(pending.link_id) {
+                        self.state = SyncTaskState::Failed;
+                    }
+                    if pending.final_send {
+                        self.queue_endpoint_cleanup(pending.link_id);
+                    }
+                }
+                Err(oneshot::error::TryRecvError::Closed) => {
+                    if self.link_id == Some(pending.link_id) {
+                        self.state = SyncTaskState::Failed;
+                    }
+                }
+                Err(oneshot::error::TryRecvError::Empty) => still_pending.push(pending),
+            }
+        }
+        self.pending_endpoint_sends = still_pending;
+
+        let mut cleanup_pending = Vec::new();
+        let mut cleanups = std::mem::take(&mut self.pending_endpoint_cleanups);
+        for mut pending in cleanups.drain(..) {
+            match pending.result_rx.try_recv() {
+                Ok(LinkEndpointUnbindResult::Unbound | LinkEndpointUnbindResult::NotBound) => {
+                    let _ = self.queue_transport(TransportMessage::DeregisterDestination {
+                        hash: pending.link_id,
+                    });
+                }
+                Ok(LinkEndpointUnbindResult::RoleMismatch) => {
+                    tracing::warn!(
+                        link_id = %hex::encode(pending.link_id),
+                        "refusing to deregister a propagation sync Link owned by the opposite role"
+                    );
+                }
+                Err(oneshot::error::TryRecvError::Closed) => {}
+                Err(oneshot::error::TryRecvError::Empty) => cleanup_pending.push(pending),
+            }
+        }
+        self.pending_endpoint_cleanups = cleanup_pending;
     }
 
     fn poll_endpoint_control(&mut self) {
+        self.poll_endpoint_send_results();
         while let Ok(event) = self.endpoint_lifecycle_rx.try_recv() {
             if self.link_id == Some(event.binding.link_id)
                 && event.binding.role == LinkEndpointRole::Initiator
@@ -1552,8 +1645,8 @@ impl PropagationSyncTask {
         };
         let mut raw = header.pack();
         raw.extend_from_slice(data);
-        let (result_tx, _result_rx) = oneshot::channel();
-        self.queue_transport(TransportMessage::SendLinkEndpointAndUnbind {
+        let (result_tx, result_rx) = oneshot::channel();
+        if !self.queue_transport(TransportMessage::SendLinkEndpointAndUnbind {
             link_id,
             role: LinkEndpointRole::Initiator,
             request: OutboundRequest {
@@ -1561,7 +1654,15 @@ impl PropagationSyncTask {
                 destination_hash: link_id,
             },
             result_tx,
-        })
+        }) {
+            return false;
+        }
+        self.pending_endpoint_sends.push(PendingEndpointSend {
+            link_id,
+            final_send: true,
+            result_rx,
+        });
+        true
     }
 
     fn send_resource_packet(
@@ -1642,14 +1743,7 @@ impl PropagationSyncTask {
 
         if let Some(link_id) = self.link_id.take() {
             if !graceful_release {
-                let (result_tx, _result_rx) = oneshot::channel();
-                let _ = self.queue_transport(TransportMessage::UnbindLinkEndpoint {
-                    link_id,
-                    role: LinkEndpointRole::Initiator,
-                    result_tx,
-                });
-                let _ =
-                    self.queue_transport(TransportMessage::DeregisterDestination { hash: link_id });
+                self.queue_endpoint_cleanup(link_id);
             }
         }
         self.attached_interface = None;
@@ -1719,12 +1813,38 @@ mod tests {
     fn next_link_request(rx: &mut mpsc::Receiver<TransportMessage>) -> OutboundRequest {
         while let Ok(message) = rx.try_recv() {
             match message {
-                TransportMessage::Outbound(request)
-                | TransportMessage::SendLinkEndpoint { request, .. } => return request,
+                TransportMessage::Outbound(request) => return request,
+                TransportMessage::SendLinkEndpoint {
+                    request, result_tx, ..
+                } => {
+                    let _ = result_tx.send(LinkEndpointSendResult::Sent);
+                    return request;
+                }
                 _ => {}
             }
         }
         panic!("expected Link packet");
+    }
+
+    fn complete_sync_cleanup(
+        task: &mut PropagationSyncTask,
+        rx: &mut mpsc::Receiver<TransportMessage>,
+    ) -> bool {
+        let mut saw_deregister = false;
+        while let Ok(message) = rx.try_recv() {
+            match message {
+                TransportMessage::UnbindLinkEndpoint { result_tx, .. } => {
+                    let _ = result_tx.send(LinkEndpointUnbindResult::Unbound);
+                }
+                TransportMessage::DeregisterDestination { .. } => saw_deregister = true,
+                _ => {}
+            }
+        }
+        task.poll_endpoint_control();
+        while let Ok(message) = rx.try_recv() {
+            saw_deregister |= matches!(message, TransportMessage::DeregisterDestination { .. });
+        }
+        saw_deregister
     }
 
     fn active_link_pair(dest_hash: [u8; 16]) -> (Link, Link) {
@@ -2517,11 +2637,34 @@ mod tests {
         task.state = SyncTaskState::Complete;
         task.tick();
 
-        let mut saw_deregister = false;
-        while let Ok(message) = rx.try_recv() {
-            saw_deregister |= matches!(message, TransportMessage::DeregisterDestination { .. });
-        }
+        let saw_deregister = complete_sync_cleanup(&mut task, &mut rx);
         assert!(saw_deregister);
+    }
+
+    #[test]
+    fn rejected_endpoint_send_fails_the_sync_owner() {
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut task = PropagationSyncTask::new(tx, [0xAA; 16]);
+        let link_id = [0xD8; 16];
+        task.link_id = Some(link_id);
+        task.state = SyncTaskState::Offering;
+
+        assert!(task.queue_plain_link_packet(
+            link_id,
+            &[0x01],
+            rns_wire::context::PacketContext::Keepalive,
+        ));
+        let TransportMessage::SendLinkEndpoint { result_tx, .. } =
+            rx.try_recv().expect("sync Link packet")
+        else {
+            panic!("expected typed sync Link send");
+        };
+        result_tx
+            .send(LinkEndpointSendResult::RoleMismatch)
+            .unwrap();
+        task.poll_endpoint_control();
+
+        assert_eq!(task.state, SyncTaskState::Failed);
     }
 
     #[test]
@@ -2562,13 +2705,7 @@ mod tests {
         task.tick();
         assert_eq!(task.state, SyncTaskState::Idle);
         assert!(task.link.is_none());
-        let mut saw_deregister = false;
-        while let Ok(message) = rx.try_recv() {
-            saw_deregister |= matches!(
-                message,
-                TransportMessage::DeregisterDestination { hash } if hash == link_id
-            );
-        }
+        let saw_deregister = complete_sync_cleanup(&mut task, &mut rx);
         assert!(saw_deregister);
     }
 

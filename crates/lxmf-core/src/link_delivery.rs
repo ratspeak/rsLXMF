@@ -22,7 +22,8 @@ use rns_protocol::resource_adv::ResourceAdvertisement;
 use rns_transport::link_messages::DestinationEvent;
 use rns_transport::messages::{
     InterfaceId, LinkEndpointBindResult, LinkEndpointBinding, LinkEndpointLifecycleEvent,
-    LinkEndpointRole, OutboundRequest, TransportMessage,
+    LinkEndpointRole, LinkEndpointSendResult, LinkEndpointUnbindResult, OutboundRequest,
+    TransportMessage,
 };
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot};
@@ -61,6 +62,23 @@ struct PendingEndpointBind {
     interface_id: InterfaceId,
     rtt_request: OutboundRequest,
     result_rx: oneshot::Receiver<LinkEndpointBindResult>,
+}
+
+enum EndpointSendSuccess {
+    None,
+    PublishInboundPacket(Vec<u8>),
+}
+
+struct PendingEndpointSend {
+    link_id: [u8; 16],
+    final_send: bool,
+    success: EndpointSendSuccess,
+    result_rx: oneshot::Receiver<LinkEndpointSendResult>,
+}
+
+struct PendingEndpointCleanup {
+    link_id: [u8; 16],
+    result_rx: oneshot::Receiver<LinkEndpointUnbindResult>,
 }
 
 /// State of a link-based delivery.
@@ -531,6 +549,8 @@ pub struct LinkDeliveryManager {
     /// can advance only after frames are accepted here or by the actor.
     pending_transport: VecDeque<TransportMessage>,
     pending_endpoint_binds: HashMap<[u8; 16], PendingEndpointBind>,
+    pending_endpoint_sends: Vec<PendingEndpointSend>,
+    pending_endpoint_cleanups: Vec<PendingEndpointCleanup>,
     endpoint_lifecycle_tx: mpsc::UnboundedSender<LinkEndpointLifecycleEvent>,
     endpoint_lifecycle_rx: mpsc::UnboundedReceiver<LinkEndpointLifecycleEvent>,
     /// Reusable upstream-style Direct links keyed by LXMF delivery destination hash.
@@ -577,6 +597,8 @@ impl LinkDeliveryManager {
             transport_tx,
             pending_transport: VecDeque::new(),
             pending_endpoint_binds: HashMap::new(),
+            pending_endpoint_sends: Vec::new(),
+            pending_endpoint_cleanups: Vec::new(),
             endpoint_lifecycle_tx,
             endpoint_lifecycle_rx,
             direct_links: HashMap::new(),
@@ -917,6 +939,7 @@ impl LinkDeliveryManager {
                     let graceful_release = send_link_teardown(
                         &self.transport_tx,
                         &mut self.pending_transport,
+                        &mut self.pending_endpoint_sends,
                         &link_id,
                         &mut delivery.link,
                     );
@@ -924,12 +947,8 @@ impl LinkDeliveryManager {
                         let _ = stage_link_endpoint_unbind(
                             &self.transport_tx,
                             &mut self.pending_transport,
+                            &mut self.pending_endpoint_cleanups,
                             link_id,
-                        );
-                        let _ = stage_transport(
-                            &self.transport_tx,
-                            &mut self.pending_transport,
-                            TransportMessage::DeregisterDestination { hash: link_id },
                         );
                     }
                 }
@@ -1170,7 +1189,84 @@ impl LinkDeliveryManager {
         Ok(link_id)
     }
 
+    fn poll_endpoint_send_results(&mut self) {
+        let mut still_pending = Vec::new();
+        let mut endpoint_sends = std::mem::take(&mut self.pending_endpoint_sends);
+        for mut pending in endpoint_sends.drain(..) {
+            match pending.result_rx.try_recv() {
+                Ok(LinkEndpointSendResult::Sent | LinkEndpointSendResult::Queued { .. }) => {
+                    if self.pending.contains_key(&pending.link_id) {
+                        match pending.success {
+                            EndpointSendSuccess::None => {}
+                            EndpointSendSuccess::PublishInboundPacket(plaintext) => {
+                                if let Some(ref tx) = self.inbound_packet_tx {
+                                    let _ = tx.send((plaintext, pending.link_id));
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(result) => {
+                    let reason = format!("Link endpoint send rejected: {result:?}");
+                    tracing::warn!(
+                        link_id = %hex_encode(&pending.link_id),
+                        ?result,
+                        final_send = pending.final_send,
+                        "Direct Link endpoint send rejected"
+                    );
+                    if let Some(delivery) = self.pending.get_mut(&pending.link_id) {
+                        delivery.state = DeliveryState::Failed;
+                        delivery.failure_reason = Some(reason);
+                    }
+                    if pending.final_send {
+                        let _ = stage_link_endpoint_unbind(
+                            &self.transport_tx,
+                            &mut self.pending_transport,
+                            &mut self.pending_endpoint_cleanups,
+                            pending.link_id,
+                        );
+                    }
+                }
+                Err(oneshot::error::TryRecvError::Closed) => {
+                    if let Some(delivery) = self.pending.get_mut(&pending.link_id) {
+                        delivery.state = DeliveryState::Failed;
+                        delivery.failure_reason =
+                            Some("Link endpoint send result channel closed".to_string());
+                    }
+                }
+                Err(oneshot::error::TryRecvError::Empty) => still_pending.push(pending),
+            }
+        }
+        self.pending_endpoint_sends = still_pending;
+
+        let mut cleanup_pending = Vec::new();
+        let mut cleanups = std::mem::take(&mut self.pending_endpoint_cleanups);
+        for mut pending in cleanups.drain(..) {
+            match pending.result_rx.try_recv() {
+                Ok(LinkEndpointUnbindResult::Unbound | LinkEndpointUnbindResult::NotBound) => {
+                    let _ = stage_transport(
+                        &self.transport_tx,
+                        &mut self.pending_transport,
+                        TransportMessage::DeregisterDestination {
+                            hash: pending.link_id,
+                        },
+                    );
+                }
+                Ok(LinkEndpointUnbindResult::RoleMismatch) => {
+                    tracing::warn!(
+                        link_id = %hex_encode(&pending.link_id),
+                        "refusing to deregister a Direct Link owned by the opposite role"
+                    );
+                }
+                Err(oneshot::error::TryRecvError::Closed) => {}
+                Err(oneshot::error::TryRecvError::Empty) => cleanup_pending.push(pending),
+            }
+        }
+        self.pending_endpoint_cleanups = cleanup_pending;
+    }
+
     fn poll_endpoint_control(&mut self) {
+        self.poll_endpoint_send_results();
         while let Ok(event) = self.endpoint_lifecycle_rx.try_recv() {
             if event.binding.role != LinkEndpointRole::Initiator {
                 continue;
@@ -1224,6 +1320,7 @@ impl LinkDeliveryManager {
                     if let Err(reason) = stage_link_endpoint(
                         &self.transport_tx,
                         &mut self.pending_transport,
+                        &mut self.pending_endpoint_sends,
                         link_id,
                         pending.rtt_request,
                     ) {
@@ -1581,28 +1678,26 @@ impl LinkDeliveryManager {
         };
         let mut proof_raw = proof_header.pack();
         proof_raw.extend_from_slice(&proof_data);
-        if let Err(reason) = stage_link_endpoint(
-            &self.transport_tx,
-            &mut self.pending_transport,
-            *link_id,
-            OutboundRequest {
-                raw: Bytes::from(proof_raw),
-                destination_hash: *link_id,
-            },
-        ) {
-            delivery.state = DeliveryState::Failed;
-            delivery.failure_reason = Some(reason.to_string());
-            return false;
-        }
-
         delivery.link.record_inbound();
         delivery.link.record_rx(encrypted_data.len());
         let Ok(plaintext) = delivery.link.decrypt(encrypted_data) else {
             return false;
         };
 
-        if let Some(ref tx) = self.inbound_packet_tx {
-            let _ = tx.send((plaintext, *link_id));
+        if let Err(reason) = stage_link_endpoint_with_success(
+            &self.transport_tx,
+            &mut self.pending_transport,
+            &mut self.pending_endpoint_sends,
+            *link_id,
+            OutboundRequest {
+                raw: Bytes::from(proof_raw),
+                destination_hash: *link_id,
+            },
+            EndpointSendSuccess::PublishInboundPacket(plaintext),
+        ) {
+            delivery.state = DeliveryState::Failed;
+            delivery.failure_reason = Some(reason.to_string());
+            return false;
         }
 
         true
@@ -1667,6 +1762,7 @@ impl LinkDeliveryManager {
                 delivery,
                 &self.transport_tx,
                 &mut self.pending_transport,
+                &mut self.pending_endpoint_sends,
                 TransferAction::SendCancel(
                     rns_protocol::resource::CancelType::Rcl,
                     adv.resource_hash,
@@ -1692,6 +1788,7 @@ impl LinkDeliveryManager {
                 delivery,
                 &self.transport_tx,
                 &mut self.pending_transport,
+                &mut self.pending_endpoint_sends,
                 action,
             )
             .is_ok();
@@ -1703,6 +1800,7 @@ impl LinkDeliveryManager {
                 delivery,
                 &self.transport_tx,
                 &mut self.pending_transport,
+                &mut self.pending_endpoint_sends,
                 TransferAction::SendCancel(
                     rns_protocol::resource::CancelType::Rcl,
                     adv.resource_hash,
@@ -1731,6 +1829,7 @@ impl LinkDeliveryManager {
                 delivery,
                 &self.transport_tx,
                 &mut self.pending_transport,
+                &mut self.pending_endpoint_sends,
                 TransferAction::SendCancel(
                     rns_protocol::resource::CancelType::Rcl,
                     adv.resource_hash,
@@ -1776,6 +1875,7 @@ impl LinkDeliveryManager {
             delivery,
             &self.transport_tx,
             &mut self.pending_transport,
+            &mut self.pending_endpoint_sends,
             action,
         ) {
             let resource_id = drop_inbound_resource(delivery, adv.resource_hash);
@@ -1834,6 +1934,7 @@ impl LinkDeliveryManager {
                     delivery,
                     &self.transport_tx,
                     &mut self.pending_transport,
+                    &mut self.pending_endpoint_sends,
                     action,
                 )
                 .is_err()
@@ -1866,6 +1967,7 @@ impl LinkDeliveryManager {
                 delivery,
                 &self.transport_tx,
                 &mut self.pending_transport,
+                &mut self.pending_endpoint_sends,
                 TransferAction::SendCancel(rns_protocol::resource::CancelType::Rcl, resource_hash),
             );
             let resource_id = drop_inbound_resource(delivery, resource_hash);
@@ -1881,6 +1983,7 @@ impl LinkDeliveryManager {
             delivery,
             &self.transport_tx,
             &mut self.pending_transport,
+            &mut self.pending_endpoint_sends,
             TransferAction::SendProof(proof),
         )
         .is_err()
@@ -1970,6 +2073,7 @@ impl LinkDeliveryManager {
             delivery,
             &self.transport_tx,
             &mut self.pending_transport,
+            &mut self.pending_endpoint_sends,
             action,
         )
         .is_ok();
@@ -2023,6 +2127,7 @@ impl LinkDeliveryManager {
                     delivery,
                     &self.transport_tx,
                     &mut self.pending_transport,
+                    &mut self.pending_endpoint_sends,
                     self.inbound_resource_concluded_handler.as_ref(),
                 );
             }
@@ -2111,6 +2216,7 @@ impl LinkDeliveryManager {
                                     if let Err(reason) = stage_link_endpoint(
                                         &self.transport_tx,
                                         &mut self.pending_transport,
+                                        &mut self.pending_endpoint_sends,
                                         *link_id,
                                         OutboundRequest {
                                             raw: Bytes::from(id_raw),
@@ -2160,6 +2266,7 @@ impl LinkDeliveryManager {
                                     delivery,
                                     &self.transport_tx,
                                     &mut self.pending_transport,
+                                    &mut self.pending_endpoint_sends,
                                     &packed,
                                 ) {
                                     Some(packet_hash) => {
@@ -2244,6 +2351,7 @@ impl LinkDeliveryManager {
                                 delivery,
                                 &self.transport_tx,
                                 &mut self.pending_transport,
+                                &mut self.pending_endpoint_sends,
                                 action,
                             ) {
                                 ActionOutcome::Continue => {
@@ -2275,6 +2383,7 @@ impl LinkDeliveryManager {
                                         finish_reusable_delivery(
                                             &self.transport_tx,
                                             &mut self.pending_transport,
+                                            &mut self.pending_endpoint_sends,
                                             &self.identity_pub,
                                             &self.identity_key,
                                             link_id,
@@ -2321,6 +2430,7 @@ impl LinkDeliveryManager {
                             finish_reusable_delivery(
                                 &self.transport_tx,
                                 &mut self.pending_transport,
+                                &mut self.pending_endpoint_sends,
                                 &self.identity_pub,
                                 &self.identity_key,
                                 link_id,
@@ -2412,6 +2522,7 @@ impl LinkDeliveryManager {
                     delivery.endpoint_release_queued = send_link_teardown(
                         &self.transport_tx,
                         &mut self.pending_transport,
+                        &mut self.pending_endpoint_sends,
                         link_id,
                         &mut delivery.link,
                     );
@@ -2419,6 +2530,7 @@ impl LinkDeliveryManager {
                 } else if drive_link_action(
                     &self.transport_tx,
                     &mut self.pending_transport,
+                    &mut self.pending_endpoint_sends,
                     link_id,
                     delivery.link.tick(),
                     &mut delivery.endpoint_release_queued,
@@ -2469,6 +2581,7 @@ impl LinkDeliveryManager {
                     || send_link_teardown(
                         &self.transport_tx,
                         &mut self.pending_transport,
+                        &mut self.pending_endpoint_sends,
                         &link_id,
                         &mut delivery.link,
                     );
@@ -2476,12 +2589,8 @@ impl LinkDeliveryManager {
                     let _ = stage_link_endpoint_unbind(
                         &self.transport_tx,
                         &mut self.pending_transport,
+                        &mut self.pending_endpoint_cleanups,
                         link_id,
-                    );
-                    let _ = stage_transport(
-                        &self.transport_tx,
-                        &mut self.pending_transport,
-                        TransportMessage::DeregisterDestination { hash: link_id },
                     );
                 }
             }
@@ -2737,6 +2846,7 @@ impl LinkDeliveryManager {
                     delivery,
                     &self.transport_tx,
                     &mut self.pending_transport,
+                    &mut self.pending_endpoint_sends,
                     action,
                 ) {
                     ActionOutcome::Continue | ActionOutcome::Break => {}
@@ -3222,6 +3332,7 @@ impl LinkDeliveryManager {
                 graceful_release = send_link_teardown(
                     &self.transport_tx,
                     &mut self.pending_transport,
+                    &mut self.pending_endpoint_sends,
                     &link_id,
                     &mut delivery.link,
                 );
@@ -3231,12 +3342,8 @@ impl LinkDeliveryManager {
                 let _ = stage_link_endpoint_unbind(
                     &self.transport_tx,
                     &mut self.pending_transport,
+                    &mut self.pending_endpoint_cleanups,
                     link_id,
-                );
-                let _ = stage_transport(
-                    &self.transport_tx,
-                    &mut self.pending_transport,
-                    TransportMessage::DeregisterDestination { hash: link_id },
                 );
             }
             if self.direct_links.get(&dest_hash) == Some(&link_id) {
@@ -3306,6 +3413,7 @@ impl LinkDeliveryManager {
                 cancel_current_delivery(
                     &self.transport_tx,
                     &mut self.pending_transport,
+                    &mut self.pending_endpoint_sends,
                     link_id,
                     delivery,
                 );
@@ -3335,6 +3443,7 @@ impl LinkDeliveryManager {
                 graceful_release = send_link_teardown(
                     &self.transport_tx,
                     &mut self.pending_transport,
+                    &mut self.pending_endpoint_sends,
                     &link_id,
                     &mut delivery.link,
                 );
@@ -3344,12 +3453,8 @@ impl LinkDeliveryManager {
                 let _ = stage_link_endpoint_unbind(
                     &self.transport_tx,
                     &mut self.pending_transport,
+                    &mut self.pending_endpoint_cleanups,
                     link_id,
-                );
-                let _ = stage_transport(
-                    &self.transport_tx,
-                    &mut self.pending_transport,
-                    TransportMessage::DeregisterDestination { hash: link_id },
                 );
             }
             if self.direct_links.get(&dest_hash) == Some(&link_id) {
@@ -3723,6 +3828,7 @@ fn maybe_push_resource_progress_event(
 fn finish_reusable_delivery(
     transport_tx: &mpsc::Sender<TransportMessage>,
     pending_transport: &mut VecDeque<TransportMessage>,
+    pending_endpoint_sends: &mut Vec<PendingEndpointSend>,
     identity_pub: &Option<[u8; 64]>,
     identity_key: &Option<Ed25519PrivateKey>,
     link_id: &[u8; 16],
@@ -3733,6 +3839,7 @@ fn finish_reusable_delivery(
             delivery.backchannel_identified = send_link_identify(
                 transport_tx,
                 pending_transport,
+                pending_endpoint_sends,
                 link_id,
                 &delivery.link,
                 pub_key,
@@ -3769,6 +3876,7 @@ fn finish_unsuccessful_reusable_delivery(delivery: &mut PendingDelivery) {
 fn cancel_current_delivery(
     transport_tx: &mpsc::Sender<TransportMessage>,
     pending_transport: &mut VecDeque<TransportMessage>,
+    pending_endpoint_sends: &mut Vec<PendingEndpointSend>,
     link_id: &[u8; 16],
     delivery: &mut PendingDelivery,
 ) {
@@ -3782,6 +3890,7 @@ fn cancel_current_delivery(
             delivery,
             transport_tx,
             pending_transport,
+            pending_endpoint_sends,
             TransferAction::SendCancel(rns_protocol::resource::CancelType::Icl, resource_hash),
         );
     }
@@ -3857,6 +3966,7 @@ fn fail_queued_deliveries(
 fn send_link_identify(
     transport_tx: &mpsc::Sender<TransportMessage>,
     pending_transport: &mut VecDeque<TransportMessage>,
+    pending_endpoint_sends: &mut Vec<PendingEndpointSend>,
     link_id: &[u8; 16],
     link: &Link,
     identity_pub: &[u8; 64],
@@ -3883,6 +3993,7 @@ fn send_link_identify(
     stage_link_endpoint(
         transport_tx,
         pending_transport,
+        pending_endpoint_sends,
         *link_id,
         OutboundRequest {
             raw: Bytes::from(id_raw),
@@ -3895,18 +4006,29 @@ fn send_link_identify(
 fn drive_link_action(
     transport_tx: &mpsc::Sender<TransportMessage>,
     pending_transport: &mut VecDeque<TransportMessage>,
+    pending_endpoint_sends: &mut Vec<PendingEndpointSend>,
     link_id: &[u8; 16],
     action: LinkAction,
     endpoint_release_queued: &mut bool,
 ) -> bool {
     match action {
         LinkAction::SendKeepalive => {
-            send_keepalive_packet(transport_tx, pending_transport, link_id);
+            send_keepalive_packet(
+                transport_tx,
+                pending_transport,
+                pending_endpoint_sends,
+                link_id,
+            );
             false
         }
         LinkAction::TransitionedToStale => {
             // Python sends one more keepalive when an initiator transitions stale.
-            send_keepalive_packet(transport_tx, pending_transport, link_id);
+            send_keepalive_packet(
+                transport_tx,
+                pending_transport,
+                pending_endpoint_sends,
+                link_id,
+            );
             false
         }
         LinkAction::SendTeardownAndClose(teardown_data) => {
@@ -3914,6 +4036,7 @@ fn drive_link_action(
                 *endpoint_release_queued = send_link_close_payload(
                     transport_tx,
                     pending_transport,
+                    pending_endpoint_sends,
                     link_id,
                     &teardown_data,
                 );
@@ -3928,6 +4051,7 @@ fn drive_link_action(
 fn send_keepalive_packet(
     transport_tx: &mpsc::Sender<TransportMessage>,
     pending_transport: &mut VecDeque<TransportMessage>,
+    pending_endpoint_sends: &mut Vec<PendingEndpointSend>,
     link_id: &[u8; 16],
 ) {
     let header = rns_wire::header::PacketHeader {
@@ -3948,6 +4072,7 @@ fn send_keepalive_packet(
     let _ = stage_link_endpoint(
         transport_tx,
         pending_transport,
+        pending_endpoint_sends,
         *link_id,
         OutboundRequest {
             raw: Bytes::from(raw),
@@ -3959,6 +4084,7 @@ fn send_keepalive_packet(
 fn send_link_close_payload(
     transport_tx: &mpsc::Sender<TransportMessage>,
     pending_transport: &mut VecDeque<TransportMessage>,
+    pending_endpoint_sends: &mut Vec<PendingEndpointSend>,
     link_id: &[u8; 16],
     teardown_data: &[u8],
 ) -> bool {
@@ -3980,6 +4106,7 @@ fn send_link_close_payload(
     stage_link_endpoint_and_unbind(
         transport_tx,
         pending_transport,
+        pending_endpoint_sends,
         *link_id,
         OutboundRequest {
             raw: Bytes::from(raw),
@@ -4097,10 +4224,29 @@ fn stage_transport(
 fn stage_link_endpoint(
     transport_tx: &mpsc::Sender<TransportMessage>,
     pending: &mut VecDeque<TransportMessage>,
+    pending_sends: &mut Vec<PendingEndpointSend>,
     link_id: [u8; 16],
     request: OutboundRequest,
 ) -> Result<(), &'static str> {
-    let (result_tx, _result_rx) = oneshot::channel();
+    stage_link_endpoint_with_success(
+        transport_tx,
+        pending,
+        pending_sends,
+        link_id,
+        request,
+        EndpointSendSuccess::None,
+    )
+}
+
+fn stage_link_endpoint_with_success(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    pending: &mut VecDeque<TransportMessage>,
+    pending_sends: &mut Vec<PendingEndpointSend>,
+    link_id: [u8; 16],
+    request: OutboundRequest,
+    success: EndpointSendSuccess,
+) -> Result<(), &'static str> {
+    let (result_tx, result_rx) = oneshot::channel();
     stage_transport(
         transport_tx,
         pending,
@@ -4110,15 +4256,23 @@ fn stage_link_endpoint(
             request,
             result_tx,
         },
-    )
+    )?;
+    pending_sends.push(PendingEndpointSend {
+        link_id,
+        final_send: false,
+        success,
+        result_rx,
+    });
+    Ok(())
 }
 
 fn stage_link_endpoint_unbind(
     transport_tx: &mpsc::Sender<TransportMessage>,
     pending: &mut VecDeque<TransportMessage>,
+    pending_cleanups: &mut Vec<PendingEndpointCleanup>,
     link_id: [u8; 16],
 ) -> Result<(), &'static str> {
-    let (result_tx, _result_rx) = oneshot::channel();
+    let (result_tx, result_rx) = oneshot::channel();
     stage_transport(
         transport_tx,
         pending,
@@ -4127,16 +4281,19 @@ fn stage_link_endpoint_unbind(
             role: LinkEndpointRole::Initiator,
             result_tx,
         },
-    )
+    )?;
+    pending_cleanups.push(PendingEndpointCleanup { link_id, result_rx });
+    Ok(())
 }
 
 fn stage_link_endpoint_and_unbind(
     transport_tx: &mpsc::Sender<TransportMessage>,
     pending: &mut VecDeque<TransportMessage>,
+    pending_sends: &mut Vec<PendingEndpointSend>,
     link_id: [u8; 16],
     request: OutboundRequest,
 ) -> Result<(), &'static str> {
-    let (result_tx, _result_rx) = oneshot::channel();
+    let (result_tx, result_rx) = oneshot::channel();
     stage_transport(
         transport_tx,
         pending,
@@ -4146,7 +4303,14 @@ fn stage_link_endpoint_and_unbind(
             request,
             result_tx,
         },
-    )
+    )?;
+    pending_sends.push(PendingEndpointSend {
+        link_id,
+        final_send: true,
+        success: EndpointSendSuccess::None,
+        result_rx,
+    });
+    Ok(())
 }
 
 fn flush_staged_transport(
@@ -4215,6 +4379,7 @@ fn dispatch_inbound_resource_action(
     delivery: &mut PendingDelivery,
     transport_tx: &mpsc::Sender<TransportMessage>,
     pending_transport: &mut VecDeque<TransportMessage>,
+    pending_endpoint_sends: &mut Vec<PendingEndpointSend>,
     action: TransferAction,
 ) -> Result<(), &'static str> {
     let (context, payload, encrypted, packet_type) = match action {
@@ -4282,6 +4447,7 @@ fn dispatch_inbound_resource_action(
     stage_link_endpoint(
         transport_tx,
         pending_transport,
+        pending_endpoint_sends,
         *link_id,
         OutboundRequest {
             raw: Bytes::from(raw),
@@ -4342,6 +4508,7 @@ fn drive_inbound_resource_watchdogs(
     delivery: &mut PendingDelivery,
     transport_tx: &mpsc::Sender<TransportMessage>,
     pending_transport: &mut VecDeque<TransportMessage>,
+    pending_endpoint_sends: &mut Vec<PendingEndpointSend>,
     concluded_handler: Option<&InboundResourceConcludedHandler>,
 ) {
     let actions: Vec<([u8; 32], TransferAction)> = delivery
@@ -4373,6 +4540,7 @@ fn drive_inbound_resource_watchdogs(
                     delivery,
                     transport_tx,
                     pending_transport,
+                    pending_endpoint_sends,
                     retry,
                 )
                 .is_err()
@@ -4423,6 +4591,7 @@ fn send_link_packet(
     delivery: &mut PendingDelivery,
     transport_tx: &mpsc::Sender<TransportMessage>,
     pending_transport: &mut VecDeque<TransportMessage>,
+    pending_endpoint_sends: &mut Vec<PendingEndpointSend>,
     packed: &[u8],
 ) -> Option<[u8; 32]> {
     let encrypted = delivery.link.encrypt(packed).ok()?;
@@ -4445,6 +4614,7 @@ fn send_link_packet(
     stage_link_endpoint(
         transport_tx,
         pending_transport,
+        pending_endpoint_sends,
         *link_id,
         OutboundRequest {
             raw: Bytes::from(raw),
@@ -4459,6 +4629,7 @@ fn send_link_packet(
 fn send_link_teardown(
     transport_tx: &mpsc::Sender<TransportMessage>,
     pending_transport: &mut VecDeque<TransportMessage>,
+    pending_endpoint_sends: &mut Vec<PendingEndpointSend>,
     link_id: &[u8; 16],
     link: &mut Link,
 ) -> bool {
@@ -4483,6 +4654,7 @@ fn send_link_teardown(
     stage_link_endpoint_and_unbind(
         transport_tx,
         pending_transport,
+        pending_endpoint_sends,
         *link_id,
         OutboundRequest {
             raw: Bytes::from(raw),
@@ -4502,6 +4674,7 @@ fn dispatch_action(
     delivery: &mut PendingDelivery,
     transport_tx: &mpsc::Sender<TransportMessage>,
     pending_transport: &mut VecDeque<TransportMessage>,
+    pending_endpoint_sends: &mut Vec<PendingEndpointSend>,
     action: TransferAction,
 ) -> ActionOutcome {
     let base_flags = rns_wire::flags::PacketFlags {
@@ -4527,6 +4700,7 @@ fn dispatch_action(
         stage_link_endpoint(
             transport_tx,
             pending_transport,
+            pending_endpoint_sends,
             *link_id,
             OutboundRequest {
                 raw: Bytes::from(raw),
@@ -4659,14 +4833,38 @@ mod tests {
     fn next_outbound(rx: &mut mpsc::Receiver<TransportMessage>) -> Vec<u8> {
         while let Ok(message) = rx.try_recv() {
             match message {
-                TransportMessage::Outbound(request)
-                | TransportMessage::SendLinkEndpoint { request, .. } => {
+                TransportMessage::Outbound(request) => return request.raw.to_vec(),
+                TransportMessage::SendLinkEndpoint {
+                    request, result_tx, ..
+                } => {
+                    let _ = result_tx.send(LinkEndpointSendResult::Sent);
                     return request.raw.to_vec();
                 }
                 _ => {}
             }
         }
         panic!("expected outbound transport message");
+    }
+
+    fn complete_direct_cleanup(
+        mgr: &mut LinkDeliveryManager,
+        rx: &mut mpsc::Receiver<TransportMessage>,
+    ) -> bool {
+        let mut saw_deregister = false;
+        while let Ok(message) = rx.try_recv() {
+            match message {
+                TransportMessage::UnbindLinkEndpoint { result_tx, .. } => {
+                    let _ = result_tx.send(LinkEndpointUnbindResult::Unbound);
+                }
+                TransportMessage::DeregisterDestination { .. } => saw_deregister = true,
+                _ => {}
+            }
+        }
+        mgr.poll_endpoint_control();
+        while let Ok(message) = rx.try_recv() {
+            saw_deregister |= matches!(message, TransportMessage::DeregisterDestination { .. });
+        }
+        saw_deregister
     }
 
     fn establish_active_delivery(
@@ -5956,11 +6154,16 @@ mod tests {
 
         mgr.drain_events(&HashMap::new());
 
+        assert!(
+            inbound_rx.try_recv().is_err(),
+            "plaintext must wait for successful proof admission"
+        );
+        let proof_raw = next_outbound(&mut rx);
+        mgr.poll_endpoint_control();
         let (delivered, delivered_link_id) = inbound_rx.try_recv().unwrap();
         assert_eq!(delivered, payload);
         assert_eq!(delivered_link_id, link_id);
 
-        let proof_raw = next_outbound(&mut rx);
         let (proof_header, proof_offset) =
             rns_wire::header::PacketHeader::unpack(&proof_raw).unwrap();
         assert_eq!(
@@ -6405,11 +6608,12 @@ mod tests {
 
         mgr.drain_events(&HashMap::new());
 
+        let proof_raw = next_outbound(&mut rx);
+        mgr.poll_endpoint_control();
         let (delivered, delivered_link_id) = inbound_rx.try_recv().unwrap();
         assert_eq!(delivered, payload);
         assert_eq!(delivered_link_id, link_id);
 
-        let proof_raw = next_outbound(&mut rx);
         let (proof_header, proof_offset) =
             rns_wire::header::PacketHeader::unpack(&proof_raw).unwrap();
         assert_eq!(
@@ -6489,7 +6693,11 @@ mod tests {
         );
         let link_id = mgr.start_delivery(msg, [0xDD; 16], 1).unwrap();
 
-        while rx.try_recv().is_ok() {}
+        while let Ok(message) = rx.try_recv() {
+            if let TransportMessage::SendLinkEndpoint { result_tx, .. } = message {
+                let _ = result_tx.send(LinkEndpointSendResult::Sent);
+            }
+        }
 
         if let Some(delivery) = mgr.pending.get_mut(&link_id) {
             delivery.establishment_timeout = Duration::ZERO;
@@ -6507,10 +6715,7 @@ mod tests {
         )));
         assert_eq!(mgr.pending_count(), 0);
 
-        let mut saw_deregister = false;
-        while let Ok(message) = rx.try_recv() {
-            saw_deregister |= matches!(message, TransportMessage::DeregisterDestination { .. });
-        }
+        let saw_deregister = complete_direct_cleanup(&mut mgr, &mut rx);
         assert!(saw_deregister, "DeregisterDestination should be queued");
     }
 
@@ -6649,6 +6854,41 @@ mod tests {
     }
 
     #[test]
+    fn rejected_endpoint_send_fails_only_the_direct_owner() {
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut mgr = LinkDeliveryManager::new(tx, None, None);
+        let signing_key = Ed25519PrivateKey::generate();
+        let mut message = LxMessage::new(
+            [0xA8; 16],
+            [0xB8; 16],
+            "endpoint result",
+            "must fail closed",
+            crate::constants::DeliveryMethod::Direct,
+        );
+        message.sign(&signing_key).unwrap();
+        let responder_key = Ed25519PrivateKey::generate();
+        let (link_id, _) =
+            establish_active_delivery(&mut mgr, &mut rx, message, &responder_key, [0xC8; 16]);
+
+        assert!(mgr.tick().is_empty());
+        let result_tx = loop {
+            let message = rx.try_recv().expect("Direct packet send command");
+            if let TransportMessage::SendLinkEndpoint { result_tx, .. } = message {
+                break result_tx;
+            }
+        };
+        result_tx
+            .send(LinkEndpointSendResult::InvalidPacket)
+            .unwrap();
+        mgr.poll_endpoint_control();
+
+        assert_eq!(
+            mgr.pending.get(&link_id).unwrap().state,
+            DeliveryState::Failed
+        );
+    }
+
+    #[test]
     fn direct_rejects_wrong_interface_before_proof_or_plaintext_publication() {
         let (tx, mut rx) = mpsc::channel(512);
         let mut mgr = LinkDeliveryManager::new(tx, None, None);
@@ -6667,7 +6907,11 @@ mod tests {
         let (link_id, responder) =
             establish_active_delivery(&mut mgr, &mut rx, message, &responder_key, [0xC1; 16]);
         let _ = mgr.tick();
-        while rx.try_recv().is_ok() {}
+        while let Ok(message) = rx.try_recv() {
+            if let TransportMessage::SendLinkEndpoint { result_tx, .. } = message {
+                let _ = result_tx.send(LinkEndpointSendResult::Sent);
+            }
+        }
 
         let encrypted = responder.encrypt(b"wrong-interface").unwrap();
         mgr.event_tx
@@ -6947,8 +7191,13 @@ mod tests {
         let mut saw_icl = false;
         while let Ok(message) = rx.try_recv() {
             let request = match message {
-                TransportMessage::Outbound(request)
-                | TransportMessage::SendLinkEndpoint { request, .. } => request,
+                TransportMessage::Outbound(request) => request,
+                TransportMessage::SendLinkEndpoint {
+                    request, result_tx, ..
+                } => {
+                    let _ = result_tx.send(LinkEndpointSendResult::Sent);
+                    request
+                }
                 _ => continue,
             };
             let (header, _) = rns_wire::header::PacketHeader::unpack(&request.raw).unwrap();
@@ -7135,13 +7384,7 @@ mod tests {
             DeliveryResult::Failed { reason, .. } if reason == "link closed"
         )));
         assert_eq!(mgr.pending_count(), 0);
-        let mut saw_deregister = false;
-        while let Ok(message) = rx.try_recv() {
-            saw_deregister |= matches!(
-                message,
-                TransportMessage::DeregisterDestination { hash } if hash == link_id
-            );
-        }
+        let saw_deregister = complete_direct_cleanup(&mut mgr, &mut rx);
         assert!(saw_deregister);
     }
 
