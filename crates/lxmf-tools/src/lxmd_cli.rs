@@ -224,7 +224,7 @@ announce_at_start = no
 
 # stamp_cost = 12
 
-delivery_transfer_max_accepted_size = 1
+delivery_transfer_max_accepted_size = 1000
 
 # on_inbound = /path/to/handler
 
