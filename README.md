@@ -289,6 +289,13 @@ and, where network-backed, through `lxmd-rs --send-method`.
 | Propagated | Store-and-forward delivery through a propagation node, including deposit, retrieve, peer sync, stamps, and tickets. |
 | Paper | Library support for `lxm://` URI generation and ingest. The CLI does not generate QR images. |
 
+Direct and propagation Links use ordinary Reticulum path discovery only for
+their initial LINKREQUEST. After a valid LRPROOF, rsLXMF pins the Link to that
+proof's ingress interface and all later packets, Resources, proofs, keepalives,
+and teardown use the same interface. A lost interface closes the Link instead
+of silently rerouting it. Reverse Direct delivery is published only after its
+role-correct proof has been admitted to that bound endpoint.
+
 An ordinary direct or opportunistic LXMF message is a signed Reticulum payload:
 
 ```text
