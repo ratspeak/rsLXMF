@@ -63,6 +63,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libudev-dev libdbus-1-dev pkg-config
       - name: Check source-release contract
         run: python3 scripts/ci/check_source_release_contract.py
+        working-directory: rsLXMF
       - run: cargo fmt --all -- --check
         working-directory: rsLXMF
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
