@@ -18,7 +18,7 @@ env:
   PACKAGE_ROOT: rsLXMF
   LXMF_BINS: lxmd-rs
   RSLXMF_RSRETICULUM_VERSION: 1.2.0
-  RSLXMF_RSRETICULUM_COMMIT: e0889f718894ead2f0deb37ad144d67c24fe6270
+  RSLXMF_RSRETICULUM_COMMIT: a1639cc065a9f1744562b95818a583e20a609b11
 
 jobs:
   verify:
@@ -98,7 +98,7 @@ jobs:
               cp "target/release/${bin}" "dist/${PACKAGE_ROOT}/bin/${bin}"
             fi
           done
-          cp README.md LICENSE CHANGELOG.md RELEASING.md "dist/${PACKAGE_ROOT}/"
+          cp README.md LICENSE CHANGELOG.md "dist/${PACKAGE_ROOT}/"
       - name: Create tar archive
         if: runner.os != 'Windows'
         shell: bash
