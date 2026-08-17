@@ -19,7 +19,7 @@
     "sourceCommit": "b8d7afce73f7f098706029361568e63f22888ea3"
   },
   "snapshotSource": {
-    "basisCommit": "a8f74d2aed815d5508f40e3732e473b126f06aa8",
+    "commit": "c934ccc5feaaddb55461404094ed6bb514aae2cc",
     "capturedOn": "2026-08-17",
     "changeRecord": "api-reviews/wave-c-message-api.json"
   },

@@ -1,5 +1,6 @@
 {
   "schemaVersion": 1,
+  "snapshotSourceCommit": "c934ccc5feaaddb55461404094ed6bb514aae2cc",
   "capabilities": ["LXMF-01"],
   "canonicalPath": "lxmf_core::message_api",
   "retainedPaths": [
