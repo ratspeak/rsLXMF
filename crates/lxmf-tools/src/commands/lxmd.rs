@@ -62,9 +62,8 @@ use rns_runtime::link_manager::{
     LinkManagerAccountingEvent, LinkManagerCommand, LinkResourceConclusion, LinkResourceDirection,
     LinkResourceEvent,
 };
-use rns_transport::messages::{
-    AnnounceHandlerEvent, TransportMessage, TransportQuery, TransportQueryResponse,
-};
+use rns_runtime::reticulum::{AnnounceSubscription, AnnounceSubscriptionError, ReticulumHandle};
+use rns_transport::messages::{TransportMessage, TransportQuery, TransportQueryResponse};
 
 use self::lxmd_pn::{
     PnInboundRuntime, PnValidationJob, PnValidationOutcome, PnValidationToken, logical_resource_id,
@@ -1225,7 +1224,7 @@ struct LxmdRunner {
     peer_sync_cursor: Option<[u8; 16]>,
     /// Non-link inbound packets; still encrypted, need destination-level decrypt.
     inbound_raw_rx: mpsc::Receiver<Vec<u8>>,
-    announce_rx: mpsc::Receiver<AnnounceHandlerEvent>,
+    announce_subscriptions: Vec<AnnounceSubscription>,
     last_peer_announce: f64,
     last_node_announce: f64,
     last_propagation_check: f64,
@@ -1239,6 +1238,47 @@ struct LxmdRunner {
 }
 
 impl LxmdRunner {
+    async fn install_announce_subscriptions(
+        &mut self,
+        rns_handle: &ReticulumHandle,
+    ) -> Result<(), AnnounceSubscriptionError> {
+        self.close_announce_subscriptions().await;
+
+        let mut subscriptions = Vec::with_capacity(2);
+        for aspect in [DELIVERY_APP_NAME, "lxmf.propagation"] {
+            match rns_handle
+                .subscribe_announces_with_capacity(Some(aspect.to_string()), true, 256)
+                .await
+            {
+                Ok(subscription) => subscriptions.push(subscription),
+                Err(error) => {
+                    for subscription in &mut subscriptions {
+                        let _ = subscription.close().await;
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        self.announce_subscriptions = subscriptions;
+        Ok(())
+    }
+
+    async fn close_announce_subscriptions(&mut self) {
+        for subscription in &mut self.announce_subscriptions {
+            let dropped_events = subscription.dropped_events();
+            if dropped_events > 0 {
+                tracing::warn!(
+                    dropped_events,
+                    "lxmd announce subscription omitted events under backpressure"
+                );
+            }
+            if let Err(error) = subscription.close().await {
+                tracing::warn!(%error, "failed to close lxmd announce subscription");
+            }
+        }
+        self.announce_subscriptions.clear();
+    }
+
     fn queue_router_message(&mut self, message: LxMessage, operation: &'static str) -> bool {
         match self.router.try_send(message) {
             Ok(()) => true,
@@ -1785,26 +1825,6 @@ impl LxmdRunner {
             None
         };
 
-        let (announce_tx, announce_rx) = mpsc::channel(256);
-        queue_required_transport(
-            &transport_tx,
-            TransportMessage::RegisterAnnounceHandler {
-                aspect_filter: Some(DELIVERY_APP_NAME.to_string()),
-                receive_path_responses: true,
-                callback_tx: announce_tx.clone(),
-            },
-            "delivery announce-handler registration",
-        )?;
-        queue_required_transport(
-            &transport_tx,
-            TransportMessage::RegisterAnnounceHandler {
-                aspect_filter: Some("lxmf.propagation".to_string()),
-                receive_path_responses: true,
-                callback_tx: announce_tx,
-            },
-            "propagation announce-handler registration",
-        )?;
-
         let messages_dir = paths.messages_dir.clone();
         std::fs::create_dir_all(&messages_dir)?;
 
@@ -1863,7 +1883,7 @@ impl LxmdRunner {
             pending_peer_syncs: HashSet::new(),
             peer_sync_cursor: None,
             inbound_raw_rx,
-            announce_rx,
+            announce_subscriptions: Vec::new(),
             last_peer_announce: 0.0,
             last_node_announce: 0.0,
             last_propagation_check: 0.0,
@@ -3002,7 +3022,13 @@ impl LxmdRunner {
         let mut seen = Vec::new();
         let delivery_name_hash = rns_identity::name_hash::name_hash(DELIVERY_APP_NAME);
         let propagation_name_hash = rns_identity::name_hash::name_hash("lxmf.propagation");
-        while let Ok(event) = self.announce_rx.try_recv() {
+        let mut events = Vec::new();
+        for subscription in &mut self.announce_subscriptions {
+            while let Ok(event) = subscription.events().try_recv() {
+                events.push(event);
+            }
+        }
+        for event in events {
             seen.push(event.destination_hash);
             let dest_hex = hex::encode(event.destination_hash);
             tracing::info!(
@@ -4693,6 +4719,10 @@ pub(crate) async fn main() {
             std::process::exit(1);
         }
     };
+    if let Err(error) = runner.install_announce_subscriptions(&rns_handle).await {
+        tracing::error!(%error, "failed to install lxmd announce subscriptions");
+        std::process::exit(1);
+    }
 
     runner.apply_config();
 
@@ -5085,6 +5115,7 @@ pub(crate) async fn main() {
     }
 
     tracing::info!("LXMF Daemon shutting down");
+    runner.close_announce_subscriptions().await;
     for task in std::mem::take(&mut runner.prop_store_write_tasks) {
         if let Err(error) = task.await {
             tracing::warn!(%error, "propagation store write task failed during shutdown");

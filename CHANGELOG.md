@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Replaced temporary aspect-wide announce handlers in remote-control lookup
+  with bounded validated destination recall, and made lxmd's delivery and
+  propagation observers exact owned subscriptions with deterministic cleanup.
 - Matched current Python LXMF 1.1.0's fresh `lxmd` direct-delivery Resource
   admission default of 1 decimal KB, while keeping the reusable router's
   separate 1000 KB library default and preserving explicit configured limits.

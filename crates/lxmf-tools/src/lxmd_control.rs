@@ -10,8 +10,11 @@ use lxmf_core::propagation_node::PropagationNode;
 use lxmf_core::router::LxmRouter;
 use rmpv::Value;
 use rns_identity::identity::Identity;
+use rns_runtime::destination_resolver::{
+    DestinationResolveError, DestinationResolveOptions, resolve_destination_on_transport,
+};
 use rns_runtime::link_client::{LinkClient, LinkClientError};
-use rns_transport::messages::{AnnounceHandlerEvent, TransportMessage};
+use rns_transport::messages::TransportMessage;
 use tokio::sync::mpsc;
 
 pub const CONTROL_APP_NAME: &str = "lxmf.propagation.control";
@@ -68,50 +71,22 @@ pub async fn resolve_remote_identity_hash(
     remote_destination_hash: [u8; 16],
     timeout_secs: f64,
 ) -> Result<[u8; 16], LinkClientError> {
-    let (ann_tx, mut ann_rx) = mpsc::channel::<AnnounceHandlerEvent>(64);
-    transport_tx
-        .send(TransportMessage::RegisterAnnounceHandler {
-            aspect_filter: Some(PROPAGATION_APP_NAME.to_string()),
-            receive_path_responses: true,
-            callback_tx: ann_tx,
-        })
-        .await
-        .map_err(|_| LinkClientError::TransportUnavailable)?;
-
-    let send_result = transport_tx
-        .send(TransportMessage::RequestPath {
-            destination_hash: remote_destination_hash,
-        })
-        .await;
-    if send_result.is_err() {
-        let _ = transport_tx.try_send(TransportMessage::DeregisterAnnounceHandler {
-            aspect_filter: Some(PROPAGATION_APP_NAME.to_string()),
-        });
-        return Err(LinkClientError::TransportUnavailable);
-    }
-
-    let wait = async {
-        while let Some(event) = ann_rx.recv().await {
-            if event.destination_hash == remote_destination_hash {
-                if let Some(identity_hash) = event.identity_hash {
-                    return Ok(identity_hash);
-                }
-            }
+    let recalled = resolve_destination_on_transport(
+        &transport_tx,
+        remote_destination_hash,
+        DestinationResolveOptions::new(Duration::from_secs_f64(timeout_secs.max(0.0))),
+    )
+    .await;
+    let recalled = recalled.map_err(|error| match error {
+        DestinationResolveError::Timeout => LinkClientError::Timeout("remote identity resolution"),
+        DestinationResolveError::TransportUnavailable => LinkClientError::TransportUnavailable,
+        DestinationResolveError::UnexpectedResponse(operation) => {
+            LinkClientError::UnexpectedResponse(operation.to_string())
         }
-        Err(LinkClientError::PubkeyNotDiscovered)
-    };
-
-    let result =
-        match tokio::time::timeout(Duration::from_secs_f64(timeout_secs.max(0.0)), wait).await {
-            Ok(result) => result,
-            Err(_) => Err(LinkClientError::Timeout("remote identity resolution")),
-        };
-
-    let _ = transport_tx.try_send(TransportMessage::DeregisterAnnounceHandler {
-        aspect_filter: Some(PROPAGATION_APP_NAME.to_string()),
-    });
-
-    result
+    })?;
+    Identity::from_public_key(&recalled.public_key)
+        .map(|identity| identity.hash)
+        .map_err(|error| LinkClientError::UnexpectedResponse(error.to_string()))
 }
 
 pub fn decode_control_response(response: &[u8]) -> ControlResponse {
@@ -868,6 +843,68 @@ fn encode_value(value: &Value) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn remote_identity_resolution_uses_recall_and_path_request_without_handlers() {
+        use rns_transport::messages::{
+            RecalledDestinationRpcEntry, TransportQuery, TransportQueryResponse,
+        };
+
+        let remote_destination_hash = [0x41; 16];
+        let remote_identity = Identity::new();
+        let public_key = remote_identity.get_public_key();
+        let expected_identity_hash = remote_identity.hash;
+        let (transport_tx, mut transport_rx) = mpsc::channel(8);
+        let responder = tokio::spawn(async move {
+            let TransportMessage::Rpc { query, response_tx } =
+                transport_rx.recv().await.expect("initial recall")
+            else {
+                panic!("expected initial recall");
+            };
+            assert!(matches!(
+                query,
+                TransportQuery::RecallDestination { dest } if dest == remote_destination_hash
+            ));
+            response_tx
+                .send(TransportQueryResponse::RecalledDestination(None))
+                .expect("return cache miss");
+
+            assert!(matches!(
+                transport_rx.recv().await,
+                Some(TransportMessage::RequestPath { destination_hash })
+                    if destination_hash == remote_destination_hash
+            ));
+
+            let TransportMessage::Rpc { query, response_tx } =
+                transport_rx.recv().await.expect("post-request recall")
+            else {
+                panic!("expected post-request recall");
+            };
+            assert!(matches!(
+                query,
+                TransportQuery::RecallDestination { dest } if dest == remote_destination_hash
+            ));
+            response_tx
+                .send(TransportQueryResponse::RecalledDestination(Some(
+                    RecalledDestinationRpcEntry {
+                        dest_hash: remote_destination_hash,
+                        public_key,
+                        app_data: None,
+                        ratchet: None,
+                        hops: 2,
+                        timestamp: 1.0,
+                    },
+                )))
+                .expect("return resolved identity");
+            assert!(transport_rx.try_recv().is_err());
+        });
+
+        let resolved = resolve_remote_identity_hash(transport_tx, remote_destination_hash, 1.0)
+            .await
+            .expect("resolve remote identity");
+        assert_eq!(resolved, expected_identity_hash);
+        responder.await.expect("transport responder");
+    }
 
     fn decode_value(data: &[u8]) -> Value {
         rmpv::decode::read_value(&mut &data[..]).unwrap()
