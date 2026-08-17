@@ -1,8 +1,10 @@
 [package]
 name = "lxmf-tools"
 description = "Rust LXMF daemon and CLI tools for Reticulum"
+publish = false
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 autobins = false
 

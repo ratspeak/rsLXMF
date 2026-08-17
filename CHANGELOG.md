@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Made source releases reproducible from an existing immutable component tag:
+  packages are non-publishable by default and expose Rust 1.85 metadata,
+  release builds use the committed lockfile and exact dependency commits,
+  actions are commit-pinned, and CI verifies the release-source contract.
 - Replaced temporary aspect-wide announce handlers in remote-control lookup
   with bounded validated destination recall, and made lxmd's delivery and
   propagation observers exact owned subscriptions with deterministic cleanup.

@@ -1,8 +1,10 @@
 [package]
 name = "lxmf-core"
 description = "LXMF messaging protocol implementation for Reticulum"
+publish = false
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [dependencies]

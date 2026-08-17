@@ -66,7 +66,7 @@ Build from the sibling checkout:
 
 ```bash
 cd rsLXMF
-cargo build --release
+cargo build --release --locked
 ```
 
 ### Linux / Raspberry Pi
@@ -96,7 +96,7 @@ sudo pacman -S --needed base-devel pkgconf systemd
 
 ```bash
 cd rsLXMF
-cargo build --release
+cargo build --release --locked
 ```
 
 ### Windows
@@ -108,7 +108,7 @@ Build from PowerShell:
 
 ```powershell
 cd rsLXMF
-cargo build --release
+cargo build --release --locked
 ```
 
 After the build, use the commands below with `./target/release/lxmd-rs` on
