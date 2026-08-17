@@ -20,7 +20,7 @@ Before creating a tag:
 
 The release workflow checks out the requested existing tag, verifies that the
 tag, manifest, changelog, dependency checkout, and release commit agree, and
-builds with `--locked` on Rust 1.85.0. Release artifacts include this policy
+builds with `--locked` on Rust 1.87.0. Release artifacts include this policy
 and the changelog alongside the README and license.
 
 All workspace packages are intentionally marked `publish = false`. Changing
