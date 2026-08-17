@@ -10,7 +10,7 @@ permissions:
   contents: read
 
 env:
-  RSLXMF_RSRETICULUM_COMMIT: dc6bc4ee82daf66b3b40386f9777dbe62b08fec2
+  RSLXMF_RSRETICULUM_COMMIT: e0889f718894ead2f0deb37ad144d67c24fe6270
 
 jobs:
   api-compat:
@@ -47,7 +47,7 @@ jobs:
         run: python3 tools/check-api-compatibility.py
         working-directory: rsLXMF
       - name: Check canonical and legacy external consumer
-        run: cargo check --manifest-path api-fixtures/Cargo.toml --locked
+        run: cargo check --manifest-path api/fixtures/Cargo.toml --locked
         working-directory: rsLXMF
 
   test:

@@ -21,7 +21,37 @@
   "snapshotSource": {
     "commit": "c934ccc5feaaddb55461404094ed6bb514aae2cc",
     "capturedOn": "2026-08-17",
-    "changeRecord": "api-reviews/wave-c-message-api.json"
+    "review": {
+      "areas": [
+        "message construction and inspection",
+        "message status and identifiers"
+      ],
+      "canonicalPath": "lxmf_core::message_api",
+      "retainedPaths": [
+        "lxmf_core::message",
+        "lxmf_core::constants",
+        "lxmf_core::types"
+      ],
+      "excludedImplementationAreas": [
+        "router and delivery ownership",
+        "propagation and handlers",
+        "persistence",
+        "raw Reticulum transport channels"
+      ],
+      "classification": "compatible additive facade",
+      "publicApiDiff": {
+        "added": 70,
+        "removed": 0
+      },
+      "semver": "compatible additive facade included in version 1.2.0",
+      "deprecations": "none",
+      "wirePersistenceRuntimeImpact": "none; exact re-exports only",
+      "platformEvidence": [
+        "compiled message example and external canonical and legacy fixtures",
+        "stable and Rust 1.87 strict Clippy",
+        "downstream desktop and mobile product gates"
+      ]
+    }
   },
   "packages": [
     {
@@ -29,7 +59,7 @@
       "manifestPath": "Cargo.toml",
       "tier": "candidate-stable",
       "compatibility": "reviewed-snapshot",
-      "snapshot": "api-baseline/lxmf-core.txt",
+      "snapshot": "api/snapshots/lxmf-core.txt",
       "itemCount": 1622,
       "sha256": "c958cfdcb53117b02d1dbe907af6afaf5017d5ba92364267e21d204fe5ef3023"
     },
@@ -38,7 +68,7 @@
       "manifestPath": "Cargo.toml",
       "tier": "tool-internal",
       "compatibility": "reviewed-snapshot",
-      "snapshot": "api-baseline/lxmf-tools.txt",
+      "snapshot": "api/snapshots/lxmf-tools.txt",
       "itemCount": 185,
       "sha256": "0427d0fab38f8061cbf7f11b701f29f438490478f133524b0a8e4e7cfe6f3924"
     }

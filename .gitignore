@@ -1,5 +1,7 @@
 /target/
-/api-fixtures/target/
+/api/fixtures/target/
 *.swp
 .DS_Store
+__pycache__/
+*.pyc
 proptest-regressions/

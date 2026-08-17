@@ -27,7 +27,7 @@ LXMF daemons on `PATH` without worry.
 ## Contents
 
 - [Build It](#build-it)
-- [Message API](MESSAGE_API.md)
+- [Rust API](api/README.md)
 - [Operating lxmd-rs](#operating-lxmd-rs)
 - [Configuration](#configuration)
 - [Delivery Model](#delivery-model)

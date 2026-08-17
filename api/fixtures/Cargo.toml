@@ -7,4 +7,4 @@ publish = false
 [workspace]
 
 [dependencies]
-lxmf-core = { path = "../crates/lxmf-core" }
+lxmf-core = { path = "../../crates/lxmf-core" }
