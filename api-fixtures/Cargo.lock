@@ -287,7 +287,7 @@ dependencies = [
 
 [[package]]
 name = "lxmf-core"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "base64",
  "bytes",
@@ -478,7 +478,7 @@ dependencies = [
 
 [[package]]
 name = "rns-crypto"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "aes",
  "cbc",
@@ -496,7 +496,7 @@ dependencies = [
 
 [[package]]
 name = "rns-identity"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "hex",
  "rand",
@@ -514,7 +514,7 @@ dependencies = [
 
 [[package]]
 name = "rns-link"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "hex",
  "rand",
@@ -529,7 +529,7 @@ dependencies = [
 
 [[package]]
 name = "rns-protocol"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "bzip2",
  "hex",
@@ -545,7 +545,7 @@ dependencies = [
 
 [[package]]
 name = "rns-transport"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "bytes",
  "hex",
@@ -564,7 +564,7 @@ dependencies = [
 
 [[package]]
 name = "rns-wire"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "rns-crypto",
  "sha2",

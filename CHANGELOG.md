@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 1.2.0 - 2026-08-17
+
 - Added the exact-reexport `lxmf_core::message_api` facade, a compiled message
   example, and canonical/legacy external-consumer coverage while retaining all
   existing module paths and leaving router, delivery, propagation, wire, and
@@ -41,6 +43,8 @@
   peer-Resource convergence coverage.
 - Made one-shot remote control commands wait for a real online Reticulum
   interface before opening their Link, avoiding stale-path startup loss.
+- This source line targets the rsReticulum 1.2 dependency line and includes
+  API evolution since the alpha-stage 1.1.0 source release.
 
 ## 1.1.0 - 2026-07-26
 
