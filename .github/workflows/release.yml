@@ -17,8 +17,8 @@ env:
   RELEASE_TAG: ${{ github.event.inputs.tag_name || github.ref_name }}
   PACKAGE_ROOT: rsLXMF
   LXMF_BINS: lxmd-rs
-  RSLXMF_RSRETICULUM_TAG: v1.1.0
-  RSLXMF_RSRETICULUM_COMMIT: 9e7dd7d9b6920ddaff09209c720c2114a567dc6e
+  RSLXMF_RSRETICULUM_VERSION: 1.1.0
+  RSLXMF_RSRETICULUM_COMMIT: ccf2f11419c3824bfcceda7abf777772de783c60
 
 jobs:
   verify:

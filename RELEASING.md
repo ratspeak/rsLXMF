@@ -10,9 +10,9 @@ Before creating a tag:
    section.
 2. Set the workspace version to that same semantic version and keep the
    declared rsReticulum compatibility version accurate.
-3. Record the exact rsReticulum commit used by the release workflow. Its
-   adjacent component tag is a human-readable audit label; the commit is the
-   source actually built.
+3. Record the exact rsReticulum commit used by the release workflow. The
+   compatibility version describes the manifest contract; the commit is the
+   source actually built and must be proven in an isolated sibling checkout.
 4. Run `python3 scripts/ci/check_source_release_contract.py` and the normal CI
    suite with the committed `Cargo.lock`.
 5. Create the tag only after the release commit is final. Published tags are

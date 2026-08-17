@@ -84,16 +84,16 @@ def check_release_workflow(reticulum_version: str) -> str:
     if "ref: ${{ env.RELEASE_TAG }}" not in workflow:
         fail("release workflow does not check out RELEASE_TAG")
 
-    tag_match = re.search(
-        r"^\s*RSLXMF_RSRETICULUM_TAG:\s*(\S+)\s*$", workflow, re.MULTILINE
+    version_match = re.search(
+        r"^\s*RSLXMF_RSRETICULUM_VERSION:\s*(\S+)\s*$", workflow, re.MULTILINE
     )
     commit_match = re.search(
         r"^\s*RSLXMF_RSRETICULUM_COMMIT:\s*([0-9a-f]+)\s*$",
         workflow,
         re.MULTILINE,
     )
-    if not tag_match or tag_match.group(1) != f"v{reticulum_version}":
-        fail("rsReticulum audit tag does not match the dependency requirement")
+    if not version_match or version_match.group(1) != reticulum_version:
+        fail("rsReticulum compatibility label does not match the dependency requirement")
     if not commit_match or not SHA_PATTERN.fullmatch(commit_match.group(1)):
         fail("rsReticulum release dependency is not pinned to a full commit")
     if "ref: ${{ env.RSLXMF_RSRETICULUM_COMMIT }}" not in workflow:
