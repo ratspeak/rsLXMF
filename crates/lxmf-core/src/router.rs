@@ -2074,16 +2074,20 @@ impl LxmRouter {
 
     fn run_periodic_jobs(&mut self) {
         // Job cadences match the Python LXMRouter jobloop.
-        if self.processing_count % JOB_TRANSIENT_INTERVAL == 0 {
+        if self.processing_count.is_multiple_of(JOB_TRANSIENT_INTERVAL) {
             self.propagation_store.clean_transient_caches(now_f64());
         }
-        if self.processing_count % JOB_STORE_INTERVAL == 0 && self.config.propagation_enabled {
+        if self.processing_count.is_multiple_of(JOB_STORE_INTERVAL)
+            && self.config.propagation_enabled
+        {
             self.cull_propagation();
         }
-        if self.processing_count % JOB_PEERSYNC_INTERVAL == 0 {
+        if self.processing_count.is_multiple_of(JOB_PEERSYNC_INTERVAL) {
             self.clean_throttled_peers();
         }
-        if self.processing_count % JOB_ROTATE_INTERVAL == 0 && self.config.propagation_enabled {
+        if self.processing_count.is_multiple_of(JOB_ROTATE_INTERVAL)
+            && self.config.propagation_enabled
+        {
             self.rotate_peers();
         }
     }
