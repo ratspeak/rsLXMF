@@ -32,7 +32,16 @@ host API snapshot.
 cargo install cargo-public-api --version 0.52.0 --locked
 rustup toolchain install nightly-2026-08-01 --profile minimal
 python3 tools/check-api-baseline.py
+python3 tools/check-api-manifest.py
+python3 tools/check-api-compatibility.py
 ```
+
+The immutable floor and current captured snapshot source are separate
+identities in `api-stability.json`. The manifest contract covers features,
+targets, MSRV, and non-development dependencies that one Apple/all-feature API
+view cannot prove. The compatibility check currently rejects every removal
+from the Wave C floor; it complements rather than replaces feature, platform,
+wire, persistence, and interoperability evidence.
 
 Run with `--update` only after reviewing and recording the compatibility
 impact; refreshing a snapshot is never a substitute for that review.

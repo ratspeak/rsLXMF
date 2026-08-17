@@ -14,6 +14,15 @@
     "commit": "b8d7afce73f7f098706029361568e63f22888ea3",
     "capturedOn": "2026-08-17"
   },
+  "compatibilityFloor": {
+    "evidenceCommit": "80bb96f799330e28a0125367d4c29826f5147cc3",
+    "sourceCommit": "b8d7afce73f7f098706029361568e63f22888ea3"
+  },
+  "snapshotSource": {
+    "commit": "b8d7afce73f7f098706029361568e63f22888ea3",
+    "capturedOn": "2026-08-17",
+    "changeRecord": null
+  },
   "packages": [
     {
       "name": "lxmf-core",

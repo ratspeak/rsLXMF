@@ -1,0 +1,432 @@
+{
+  "schemaVersion": 1,
+  "scope": "library Cargo manifests, public features, targets, and non-dev dependencies",
+  "packages": [
+    {
+      "name": "lxmf-core",
+      "version": "1.1.0",
+      "rustVersion": "1.87",
+      "edition": "2024",
+      "features": {},
+      "targets": [
+        {
+          "name": "lxmf_core",
+          "kind": [
+            "lib"
+          ],
+          "crateTypes": [
+            "lib"
+          ],
+          "requiredFeatures": []
+        }
+      ],
+      "dependencies": [
+        {
+          "name": "base64",
+          "rename": null,
+          "kind": null,
+          "target": null,
+          "requirement": "^0.22",
+          "optional": false,
+          "defaultFeatures": true,
+          "features": [],
+          "sourceKind": "registry"
+        },
+        {
+          "name": "bytes",
+          "rename": null,
+          "kind": null,
+          "target": null,
+          "requirement": "^1",
+          "optional": false,
+          "defaultFeatures": true,
+          "features": [],
+          "sourceKind": "registry"
+        },
+        {
+          "name": "hex",
+          "rename": null,
+          "kind": null,
+          "target": null,
+          "requirement": "^0.4",
+          "optional": false,
+          "defaultFeatures": true,
+          "features": [],
+          "sourceKind": "registry"
+        },
+        {
+          "name": "rand",
+          "rename": null,
+          "kind": null,
+          "target": null,
+          "requirement": "^0.8",
+          "optional": false,
+          "defaultFeatures": true,
+          "features": [],
+          "sourceKind": "registry"
+        },
+        {
+          "name": "rmp",
+          "rename": null,
+          "kind": null,
+          "target": null,
+          "requirement": "^0.8",
+          "optional": false,
+          "defaultFeatures": true,
+          "features": [],
+          "sourceKind": "registry"
+        },
+        {
+          "name": "rmp-serde",
+          "rename": null,
+          "kind": null,
+          "target": null,
+          "requirement": "^1",
+          "optional": false,
+          "defaultFeatures": true,
+          "features": [],
+          "sourceKind": "registry"
+        },
+        {
+          "name": "rmpv",
+          "rename": null,
+          "kind": null,
+          "target": null,
+          "requirement": "^1",
+          "optional": false,
+          "defaultFeatures": true,
+          "features": [],
+          "sourceKind": "registry"
+        },
+        {
+          "name": "rns-crypto",
+          "rename": null,
+          "kind": null,
+          "target": null,
+          "requirement": "^1.1.0",
+          "optional": false,
+          "defaultFeatures": true,
+          "features": [],
+          "sourceKind": "path"
+        },
+        {
+          "name": "rns-identity",
+          "rename": null,
+          "kind": null,
+          "target": null,
+          "requirement": "^1.1.0",
+          "optional": false,
+          "defaultFeatures": true,
+          "features": [],
+          "sourceKind": "path"
+        },
+        {
+          "name": "rns-link",
+          "rename": null,
+          "kind": null,
+          "target": null,
+          "requirement": "^1.1.0",
+          "optional": false,
+          "defaultFeatures": true,
+          "features": [],
+          "sourceKind": "path"
+        },
+        {
+          "name": "rns-protocol",
+          "rename": null,
+          "kind": null,
+          "target": null,
+          "requirement": "^1.1.0",
+          "optional": false,
+          "defaultFeatures": true,
+          "features": [],
+          "sourceKind": "path"
+        },
+        {
+          "name": "rns-transport",
+          "rename": null,
+          "kind": null,
+          "target": null,
+          "requirement": "^1.1.0",
+          "optional": false,
+          "defaultFeatures": true,
+          "features": [],
+          "sourceKind": "path"
+        },
+        {
+          "name": "rns-wire",
+          "rename": null,
+          "kind": null,
+          "target": null,
+          "requirement": "^1.1.0",
+          "optional": false,
+          "defaultFeatures": true,
+          "features": [],
+          "sourceKind": "path"
+        },
+        {
+          "name": "serde",
+          "rename": null,
+          "kind": null,
+          "target": null,
+          "requirement": "^1",
+          "optional": false,
+          "defaultFeatures": true,
+          "features": [
+            "derive"
+          ],
+          "sourceKind": "registry"
+        },
+        {
+          "name": "sha2",
+          "rename": null,
+          "kind": null,
+          "target": null,
+          "requirement": "^0.10",
+          "optional": false,
+          "defaultFeatures": true,
+          "features": [],
+          "sourceKind": "registry"
+        },
+        {
+          "name": "thiserror",
+          "rename": null,
+          "kind": null,
+          "target": null,
+          "requirement": "^2",
+          "optional": false,
+          "defaultFeatures": true,
+          "features": [],
+          "sourceKind": "registry"
+        },
+        {
+          "name": "tokio",
+          "rename": null,
+          "kind": null,
+          "target": null,
+          "requirement": "^1",
+          "optional": false,
+          "defaultFeatures": true,
+          "features": [
+            "full"
+          ],
+          "sourceKind": "registry"
+        },
+        {
+          "name": "tracing",
+          "rename": null,
+          "kind": null,
+          "target": null,
+          "requirement": "^0.1",
+          "optional": false,
+          "defaultFeatures": true,
+          "features": [],
+          "sourceKind": "registry"
+        },
+        {
+          "name": "unicode-normalization",
+          "rename": null,
+          "kind": null,
+          "target": null,
+          "requirement": "^0.1",
+          "optional": false,
+          "defaultFeatures": true,
+          "features": [],
+          "sourceKind": "registry"
+        }
+      ]
+    },
+    {
+      "name": "lxmf-tools",
+      "version": "1.1.0",
+      "rustVersion": "1.87",
+      "edition": "2024",
+      "features": {},
+      "targets": [
+        {
+          "name": "lxmf_tools",
+          "kind": [
+            "lib"
+          ],
+          "crateTypes": [
+            "lib"
+          ],
+          "requiredFeatures": []
+        }
+      ],
+      "dependencies": [
+        {
+          "name": "base64",
+          "rename": null,
+          "kind": null,
+          "target": null,
+          "requirement": "^0.22",
+          "optional": false,
+          "defaultFeatures": true,
+          "features": [],
+          "sourceKind": "registry"
+        },
+        {
+          "name": "bytes",
+          "rename": null,
+          "kind": null,
+          "target": null,
+          "requirement": "^1",
+          "optional": false,
+          "defaultFeatures": true,
+          "features": [],
+          "sourceKind": "registry"
+        },
+        {
+          "name": "clap",
+          "rename": null,
+          "kind": null,
+          "target": null,
+          "requirement": "^4",
+          "optional": false,
+          "defaultFeatures": true,
+          "features": [
+            "derive"
+          ],
+          "sourceKind": "registry"
+        },
+        {
+          "name": "hex",
+          "rename": null,
+          "kind": null,
+          "target": null,
+          "requirement": "^0.4",
+          "optional": false,
+          "defaultFeatures": true,
+          "features": [],
+          "sourceKind": "registry"
+        },
+        {
+          "name": "lxmf-core",
+          "rename": null,
+          "kind": null,
+          "target": null,
+          "requirement": "^1.1.0",
+          "optional": false,
+          "defaultFeatures": true,
+          "features": [],
+          "sourceKind": "path"
+        },
+        {
+          "name": "rmpv",
+          "rename": null,
+          "kind": null,
+          "target": null,
+          "requirement": "^1",
+          "optional": false,
+          "defaultFeatures": true,
+          "features": [],
+          "sourceKind": "registry"
+        },
+        {
+          "name": "rns-crypto",
+          "rename": null,
+          "kind": null,
+          "target": null,
+          "requirement": "^1.1.0",
+          "optional": false,
+          "defaultFeatures": true,
+          "features": [],
+          "sourceKind": "path"
+        },
+        {
+          "name": "rns-identity",
+          "rename": null,
+          "kind": null,
+          "target": null,
+          "requirement": "^1.1.0",
+          "optional": false,
+          "defaultFeatures": true,
+          "features": [],
+          "sourceKind": "path"
+        },
+        {
+          "name": "rns-runtime",
+          "rename": null,
+          "kind": null,
+          "target": null,
+          "requirement": "^1.1.0",
+          "optional": false,
+          "defaultFeatures": true,
+          "features": [
+            "serial"
+          ],
+          "sourceKind": "path"
+        },
+        {
+          "name": "rns-transport",
+          "rename": null,
+          "kind": null,
+          "target": null,
+          "requirement": "^1.1.0",
+          "optional": false,
+          "defaultFeatures": true,
+          "features": [],
+          "sourceKind": "path"
+        },
+        {
+          "name": "rns-wire",
+          "rename": null,
+          "kind": null,
+          "target": null,
+          "requirement": "^1.1.0",
+          "optional": false,
+          "defaultFeatures": true,
+          "features": [],
+          "sourceKind": "path"
+        },
+        {
+          "name": "serde_json",
+          "rename": null,
+          "kind": null,
+          "target": null,
+          "requirement": "^1",
+          "optional": false,
+          "defaultFeatures": true,
+          "features": [],
+          "sourceKind": "registry"
+        },
+        {
+          "name": "tokio",
+          "rename": null,
+          "kind": null,
+          "target": null,
+          "requirement": "^1",
+          "optional": false,
+          "defaultFeatures": true,
+          "features": [
+            "full"
+          ],
+          "sourceKind": "registry"
+        },
+        {
+          "name": "tracing",
+          "rename": null,
+          "kind": null,
+          "target": null,
+          "requirement": "^0.1",
+          "optional": false,
+          "defaultFeatures": true,
+          "features": [],
+          "sourceKind": "registry"
+        },
+        {
+          "name": "tracing-subscriber",
+          "rename": null,
+          "kind": null,
+          "target": null,
+          "requirement": "^0.3",
+          "optional": false,
+          "defaultFeatures": true,
+          "features": [],
+          "sourceKind": "registry"
+        }
+      ]
+    }
+  ]
+}
