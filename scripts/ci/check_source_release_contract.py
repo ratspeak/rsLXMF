@@ -180,6 +180,11 @@ def main() -> None:
     check_workflow_actions()
     dependency_commit = check_release_workflow(reticulum_version)
     check_documentation(version)
+    subprocess.run(
+        ["python3", "tools/check-api-baseline.py", "--metadata-only"],
+        cwd=ROOT,
+        check=True,
+    )
     if args.release_tag:
         check_release_tag(args.release_tag, version, dependency_commit)
     print(f"source-release contract passed for rsLXMF {version}")

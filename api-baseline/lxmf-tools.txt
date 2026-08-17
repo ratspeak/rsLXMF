@@ -1,0 +1,185 @@
+pub mod lxmf_tools
+pub mod lxmf_tools::daemon
+pub struct lxmf_tools::daemon::DaemonConfig
+pub lxmf_tools::daemon::DaemonConfig::announce_at_start: bool
+pub lxmf_tools::daemon::DaemonConfig::announce_interval: core::option::Option<u64>
+pub lxmf_tools::daemon::DaemonConfig::auth_required: bool
+pub lxmf_tools::daemon::DaemonConfig::autopeer: bool
+pub lxmf_tools::daemon::DaemonConfig::autopeer_maxdepth: usize
+pub lxmf_tools::daemon::DaemonConfig::control_allowed: alloc::vec::Vec<alloc::string::String>
+pub lxmf_tools::daemon::DaemonConfig::delivery_transfer_max_accepted_size: f64
+pub lxmf_tools::daemon::DaemonConfig::display_name: core::option::Option<alloc::string::String>
+pub lxmf_tools::daemon::DaemonConfig::enforce_stamps: bool
+pub lxmf_tools::daemon::DaemonConfig::from_static_only: bool
+pub lxmf_tools::daemon::DaemonConfig::max_inbound_syncs: usize
+pub lxmf_tools::daemon::DaemonConfig::max_peering_cost: u8
+pub lxmf_tools::daemon::DaemonConfig::max_peers: usize
+pub lxmf_tools::daemon::DaemonConfig::message_storage_limit: core::option::Option<usize>
+pub lxmf_tools::daemon::DaemonConfig::node_announce_at_start: bool
+pub lxmf_tools::daemon::DaemonConfig::node_announce_interval: core::option::Option<u64>
+pub lxmf_tools::daemon::DaemonConfig::node_name: core::option::Option<alloc::string::String>
+pub lxmf_tools::daemon::DaemonConfig::on_inbound_command: core::option::Option<alloc::string::String>
+pub lxmf_tools::daemon::DaemonConfig::outbound_propagation_node: core::option::Option<alloc::string::String>
+pub lxmf_tools::daemon::DaemonConfig::peering_cost: u8
+pub lxmf_tools::daemon::DaemonConfig::prioritise_destinations: alloc::vec::Vec<alloc::string::String>
+pub lxmf_tools::daemon::DaemonConfig::propagation_enabled: bool
+pub lxmf_tools::daemon::DaemonConfig::propagation_limit_kb: usize
+pub lxmf_tools::daemon::DaemonConfig::propagation_stamp_cost: u8
+pub lxmf_tools::daemon::DaemonConfig::propagation_stamp_flex: u8
+pub lxmf_tools::daemon::DaemonConfig::sequential_pn_stamp_validation: bool
+pub lxmf_tools::daemon::DaemonConfig::stamp_cost: core::option::Option<u8>
+pub lxmf_tools::daemon::DaemonConfig::static_peers: alloc::vec::Vec<alloc::string::String>
+pub lxmf_tools::daemon::DaemonConfig::static_peers_bypass_sequential: bool
+pub lxmf_tools::daemon::DaemonConfig::sync_limit_kb: usize
+impl lxmf_tools::daemon::DaemonConfig
+pub fn lxmf_tools::daemon::DaemonConfig::from_config(&rns_runtime::config::Config) -> Self
+pub fn lxmf_tools::daemon::DaemonConfig::to_inbound_admission_config(&self) -> lxmf_core::propagation_admission::PnInboundAdmissionConfig
+pub fn lxmf_tools::daemon::DaemonConfig::to_router_config(&self) -> lxmf_core::router::RouterConfig
+impl core::default::Default for lxmf_tools::daemon::DaemonConfig
+pub fn lxmf_tools::daemon::DaemonConfig::default() -> Self
+pub struct lxmf_tools::daemon::PythonLxmdConfig
+pub lxmf_tools::daemon::PythonLxmdConfig::auth_required: bool
+pub lxmf_tools::daemon::PythonLxmdConfig::autopeer: bool
+pub lxmf_tools::daemon::PythonLxmdConfig::autopeer_maxdepth: core::option::Option<i64>
+pub lxmf_tools::daemon::PythonLxmdConfig::control_allowed_identities: alloc::vec::Vec<alloc::string::String>
+pub lxmf_tools::daemon::PythonLxmdConfig::delivery_transfer_max_accepted_size: f64
+pub lxmf_tools::daemon::PythonLxmdConfig::display_name: alloc::string::String
+pub lxmf_tools::daemon::PythonLxmdConfig::enable_propagation_node: bool
+pub lxmf_tools::daemon::PythonLxmdConfig::from_static_only: bool
+pub lxmf_tools::daemon::PythonLxmdConfig::max_inbound_syncs: i64
+pub lxmf_tools::daemon::PythonLxmdConfig::max_peers: core::option::Option<i64>
+pub lxmf_tools::daemon::PythonLxmdConfig::message_storage_limit: f64
+pub lxmf_tools::daemon::PythonLxmdConfig::node_announce_at_start: bool
+pub lxmf_tools::daemon::PythonLxmdConfig::node_announce_interval: core::option::Option<i64>
+pub lxmf_tools::daemon::PythonLxmdConfig::node_name: core::option::Option<alloc::string::String>
+pub lxmf_tools::daemon::PythonLxmdConfig::on_inbound: core::option::Option<alloc::string::String>
+pub lxmf_tools::daemon::PythonLxmdConfig::peer_announce_at_start: bool
+pub lxmf_tools::daemon::PythonLxmdConfig::peer_announce_interval: core::option::Option<i64>
+pub lxmf_tools::daemon::PythonLxmdConfig::peer_stamp_cost: i64
+pub lxmf_tools::daemon::PythonLxmdConfig::peering_cost: i64
+pub lxmf_tools::daemon::PythonLxmdConfig::prioritised_lxmf_destinations: alloc::vec::Vec<alloc::string::String>
+pub lxmf_tools::daemon::PythonLxmdConfig::propagation_stamp_cost_flexibility: i64
+pub lxmf_tools::daemon::PythonLxmdConfig::propagation_stamp_cost_target: i64
+pub lxmf_tools::daemon::PythonLxmdConfig::propagation_sync_max_accepted_size: f64
+pub lxmf_tools::daemon::PythonLxmdConfig::propagation_transfer_max_accepted_size: f64
+pub lxmf_tools::daemon::PythonLxmdConfig::remote_peering_cost_max: i64
+pub lxmf_tools::daemon::PythonLxmdConfig::sequential_pn_stamp_validation: bool
+pub lxmf_tools::daemon::PythonLxmdConfig::static_peers: alloc::vec::Vec<alloc::string::String>
+pub lxmf_tools::daemon::PythonLxmdConfig::static_peers_bypass_sequential: bool
+pub lxmf_tools::daemon::PythonLxmdConfig::target_loglevel: core::option::Option<i64>
+impl lxmf_tools::daemon::PythonLxmdConfig
+pub fn lxmf_tools::daemon::PythonLxmdConfig::from_config(&rns_runtime::config::Config) -> Self
+pub fn lxmf_tools::daemon::create_router(&lxmf_tools::daemon::DaemonConfig) -> lxmf_core::router::LxmRouter
+pub fn lxmf_tools::daemon::create_router_with_transport(&lxmf_tools::daemon::DaemonConfig, tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>) -> lxmf_core::router::LxmRouter
+pub fn lxmf_tools::daemon::execute_on_inbound(&str, &str) -> core::io::error::Result<()>
+pub fn lxmf_tools::daemon::persist_inbound_and_execute(&std::path::Path, &[u8], core::option::Option<&str>) -> core::io::error::Result<()>
+pub mod lxmf_tools::lxmd_cli
+pub enum lxmf_tools::lxmd_cli::SendMethod
+pub lxmf_tools::lxmd_cli::SendMethod::Direct
+pub lxmf_tools::lxmd_cli::SendMethod::Opportunistic
+pub lxmf_tools::lxmd_cli::SendMethod::Propagated
+impl lxmf_tools::lxmd_cli::SendMethod
+pub fn lxmf_tools::lxmd_cli::SendMethod::delivery_method(self) -> lxmf_core::constants::DeliveryMethod
+pub struct lxmf_tools::lxmd_cli::Args
+pub lxmf_tools::lxmd_cli::Args::config: core::option::Option<alloc::string::String>
+pub lxmf_tools::lxmd_cli::Args::exampleconfig: bool
+pub lxmf_tools::lxmd_cli::Args::identity: core::option::Option<std::path::PathBuf>
+pub lxmf_tools::lxmd_cli::Args::on_inbound: core::option::Option<alloc::string::String>
+pub lxmf_tools::lxmd_cli::Args::peers: bool
+pub lxmf_tools::lxmd_cli::Args::propagation_node: bool
+pub lxmf_tools::lxmd_cli::Args::quiet: u8
+pub lxmf_tools::lxmd_cli::Args::remote: core::option::Option<alloc::string::String>
+pub lxmf_tools::lxmd_cli::Args::rnsconfig: core::option::Option<alloc::string::String>
+pub lxmf_tools::lxmd_cli::Args::send: core::option::Option<alloc::vec::Vec<alloc::string::String>>
+pub lxmf_tools::lxmd_cli::Args::send_fields_json: core::option::Option<alloc::string::String>
+pub lxmf_tools::lxmd_cli::Args::send_file: core::option::Option<std::path::PathBuf>
+pub lxmf_tools::lxmd_cli::Args::send_method: lxmf_tools::lxmd_cli::SendMethod
+pub lxmf_tools::lxmd_cli::Args::send_timeout_secs: u64
+pub lxmf_tools::lxmd_cli::Args::service: bool
+pub lxmf_tools::lxmd_cli::Args::status: bool
+pub lxmf_tools::lxmd_cli::Args::sync: core::option::Option<alloc::string::String>
+pub lxmf_tools::lxmd_cli::Args::timeout: core::option::Option<f64>
+pub lxmf_tools::lxmd_cli::Args::unpeer: core::option::Option<alloc::string::String>
+pub lxmf_tools::lxmd_cli::Args::verbose: u8
+pub fn lxmf_tools::lxmd_cli::example_config() -> &'static str
+pub fn lxmf_tools::lxmd_cli::load_hash_list(&std::path::Path) -> alloc::vec::Vec<[u8; 16]>
+pub fn lxmf_tools::lxmd_cli::normalize_hash_hex(&str) -> alloc::string::String
+pub fn lxmf_tools::lxmd_cli::parse_destination_hash(&str) -> core::result::Result<[u8; 16], alloc::string::String>
+pub fn lxmf_tools::lxmd_cli::parse_send_fields_json(&str) -> core::result::Result<alloc::collections::btree::map::BTreeMap<u8, alloc::vec::Vec<u8>>, alloc::string::String>
+pub mod lxmf_tools::lxmd_control
+pub enum lxmf_tools::lxmd_control::ControlCommandKind
+pub lxmf_tools::lxmd_control::ControlCommandKind::Status
+pub lxmf_tools::lxmd_control::ControlCommandKind::Sync
+pub lxmf_tools::lxmd_control::ControlCommandKind::Unpeer
+impl lxmf_tools::lxmd_control::ControlCommandKind
+pub fn lxmf_tools::lxmd_control::ControlCommandKind::timeout_message(self) -> &'static str
+pub enum lxmf_tools::lxmd_control::ControlResponse
+pub lxmf_tools::lxmd_control::ControlResponse::Empty
+pub lxmf_tools::lxmd_control::ControlResponse::Error(lxmf_core::constants::PeerError)
+pub lxmf_tools::lxmd_control::ControlResponse::Stats(rmpv::Value)
+pub lxmf_tools::lxmd_control::ControlResponse::Success
+pub const lxmf_tools::lxmd_control::CONTROL_APP_NAME: &str
+pub const lxmf_tools::lxmd_control::PROPAGATION_APP_NAME: &str
+pub fn lxmf_tools::lxmd_control::decode_control_response(&[u8]) -> lxmf_tools::lxmd_control::ControlResponse
+pub fn lxmf_tools::lxmd_control::encode_control_success() -> alloc::vec::Vec<u8>
+pub fn lxmf_tools::lxmd_control::encode_nil_response() -> alloc::vec::Vec<u8>
+pub fn lxmf_tools::lxmd_control::encode_peer_error(lxmf_core::constants::PeerError) -> alloc::vec::Vec<u8>
+pub fn lxmf_tools::lxmd_control::encode_router_control_stats(&lxmf_core::router::LxmRouter, [u8; 16], [u8; 16], core::option::Option<&lxmf_core::propagation_node::PropagationNode>, f64) -> alloc::vec::Vec<u8>
+pub fn lxmf_tools::lxmd_control::exit_for_control_response(lxmf_tools::lxmd_control::ControlCommandKind, &lxmf_tools::lxmd_control::ControlResponse) -> bool
+pub fn lxmf_tools::lxmd_control::format_remote_status(&rmpv::Value, bool, bool, f64) -> alloc::string::String
+pub fn lxmf_tools::lxmd_control::peer_error_from_code(u8) -> core::option::Option<lxmf_core::constants::PeerError>
+pub fn lxmf_tools::lxmd_control::print_control_link_error(lxmf_tools::lxmd_control::ControlCommandKind, &rns_runtime::link_client::LinkClientError) -> never
+pub async fn lxmf_tools::lxmd_control::query_control(tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>, rns_identity::identity::Identity, [u8; 16], &str, alloc::vec::Vec<u8>, f64) -> core::result::Result<alloc::vec::Vec<u8>, rns_runtime::link_client::LinkClientError>
+pub async fn lxmf_tools::lxmd_control::resolve_remote_identity_hash(tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>, [u8; 16], f64) -> core::result::Result<[u8; 16], rns_runtime::link_client::LinkClientError>
+pub mod lxmf_tools::lxmd_runtime
+pub struct lxmf_tools::lxmd_runtime::ControlPreflight
+pub lxmf_tools::lxmd_runtime::ControlPreflight::identity_path: std::path::PathBuf
+pub lxmf_tools::lxmd_runtime::ControlPreflight::peer_hash: core::option::Option<[u8; 16]>
+pub lxmf_tools::lxmd_runtime::ControlPreflight::remote_hash: core::option::Option<[u8; 16]>
+pub struct lxmf_tools::lxmd_runtime::ControlPreflightError
+pub lxmf_tools::lxmd_runtime::ControlPreflightError::exit_code: i32
+pub lxmf_tools::lxmd_runtime::ControlPreflightError::message: alloc::string::String
+pub struct lxmf_tools::lxmd_runtime::LocalPeerView
+pub lxmf_tools::lxmd_runtime::LocalPeerView::alive: bool
+pub lxmf_tools::lxmd_runtime::LocalPeerView::hash: [u8; 16]
+pub lxmf_tools::lxmd_runtime::LocalPeerView::last_heard: f64
+pub lxmf_tools::lxmd_runtime::LocalPeerView::state: u8
+pub lxmf_tools::lxmd_runtime::LocalPeerView::unhandled: u32
+pub struct lxmf_tools::lxmd_runtime::LocalStatusView
+pub lxmf_tools::lxmd_runtime::LocalStatusView::lxmf_dest_hash: [u8; 16]
+pub lxmf_tools::lxmd_runtime::LocalStatusView::peers: usize
+pub lxmf_tools::lxmd_runtime::LocalStatusView::pending_deferred_stamps: usize
+pub lxmf_tools::lxmd_runtime::LocalStatusView::pending_outbound: usize
+pub lxmf_tools::lxmd_runtime::LocalStatusView::propagation_enabled: bool
+pub lxmf_tools::lxmd_runtime::LocalStatusView::propagation_entries: usize
+pub lxmf_tools::lxmd_runtime::LocalStatusView::propagation_size: usize
+pub lxmf_tools::lxmd_runtime::LocalStatusView::stamp_costs_cached: usize
+impl lxmf_tools::lxmd_runtime::LocalStatusView
+pub fn lxmf_tools::lxmd_runtime::LocalStatusView::from_router_stats([u8; 16], bool, &lxmf_core::router::RouterStats) -> Self
+pub struct lxmf_tools::lxmd_runtime::LxmdPaths
+pub lxmf_tools::lxmd_runtime::LxmdPaths::config_dir: std::path::PathBuf
+pub lxmf_tools::lxmd_runtime::LxmdPaths::identity_path: std::path::PathBuf
+pub lxmf_tools::lxmd_runtime::LxmdPaths::known_identities_path: std::path::PathBuf
+pub lxmf_tools::lxmd_runtime::LxmdPaths::legacy_identity_path: std::path::PathBuf
+pub lxmf_tools::lxmd_runtime::LxmdPaths::legacy_lxmf_dir: std::path::PathBuf
+pub lxmf_tools::lxmd_runtime::LxmdPaths::legacy_messages_dir: std::path::PathBuf
+pub lxmf_tools::lxmd_runtime::LxmdPaths::legacy_propagation_store_dir: std::path::PathBuf
+pub lxmf_tools::lxmd_runtime::LxmdPaths::legacy_ratchets_dir: std::path::PathBuf
+pub lxmf_tools::lxmd_runtime::LxmdPaths::lxmf_storage_dir: std::path::PathBuf
+pub lxmf_tools::lxmd_runtime::LxmdPaths::messages_dir: std::path::PathBuf
+pub lxmf_tools::lxmd_runtime::LxmdPaths::propagation_store_dir: std::path::PathBuf
+pub lxmf_tools::lxmd_runtime::LxmdPaths::ratchet_control_path: std::path::PathBuf
+pub lxmf_tools::lxmd_runtime::LxmdPaths::ratchet_ring_path: std::path::PathBuf
+pub lxmf_tools::lxmd_runtime::LxmdPaths::ratchets_dir: std::path::PathBuf
+pub lxmf_tools::lxmd_runtime::LxmdPaths::received_ratchets_dir: std::path::PathBuf
+pub lxmf_tools::lxmd_runtime::LxmdPaths::router_state_dir: std::path::PathBuf
+pub lxmf_tools::lxmd_runtime::LxmdPaths::storage_dir: std::path::PathBuf
+impl lxmf_tools::lxmd_runtime::LxmdPaths
+pub fn lxmf_tools::lxmd_runtime::LxmdPaths::new(impl core::convert::Into<std::path::PathBuf>) -> Self
+pub fn lxmf_tools::lxmd_runtime::LxmdPaths::preferred_identity_path(&self) -> &std::path::Path
+pub fn lxmf_tools::lxmd_runtime::delivery_announce_app_data(core::option::Option<&str>, core::option::Option<u8>) -> alloc::vec::Vec<u8>
+pub fn lxmf_tools::lxmd_runtime::format_local_peers(&[lxmf_tools::lxmd_runtime::LocalPeerView]) -> alloc::string::String
+pub fn lxmf_tools::lxmd_runtime::format_local_status(&lxmf_tools::lxmd_runtime::LocalStatusView) -> alloc::string::String
+pub fn lxmf_tools::lxmd_runtime::preflight_control_command(&std::path::Path, core::option::Option<&std::path::Path>, core::option::Option<&str>, core::option::Option<&str>) -> core::result::Result<lxmf_tools::lxmd_runtime::ControlPreflight, lxmf_tools::lxmd_runtime::ControlPreflightError>
+pub fn lxmf_tools::lxmd_runtime::propagation_announce_app_data(&lxmf_core::handlers::PropagationNodeAnnounceData) -> alloc::vec::Vec<u8>
+pub fn lxmf_tools::lxmd_runtime::resolve_config_dirs(core::option::Option<&str>, core::option::Option<&str>) -> (std::path::PathBuf, std::path::PathBuf)

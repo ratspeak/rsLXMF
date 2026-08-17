@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Classified `lxmf-core` as candidate stable and `lxmf-tools` as tool internal,
+  with pinned CI-enforced public API snapshots and no visibility or signature
+  change.
 - Made source releases reproducible from an existing immutable component tag:
   packages are non-publishable by default and expose Rust 1.87 metadata,
   release builds use the committed lockfile and exact dependency commits,

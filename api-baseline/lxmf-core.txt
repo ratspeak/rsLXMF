@@ -1,0 +1,1500 @@
+pub mod lxmf_core
+pub mod lxmf_core::constants
+#[repr(u8)] pub enum lxmf_core::constants::DeliveryMethod
+pub lxmf_core::constants::DeliveryMethod::Direct = 2
+pub lxmf_core::constants::DeliveryMethod::Opportunistic = 1
+pub lxmf_core::constants::DeliveryMethod::Paper = 5
+pub lxmf_core::constants::DeliveryMethod::Propagated = 3
+impl lxmf_core::constants::DeliveryMethod
+pub fn lxmf_core::constants::DeliveryMethod::is_sendable(&self) -> bool
+#[repr(u8)] pub enum lxmf_core::constants::DeliveryRepresentation
+pub lxmf_core::constants::DeliveryRepresentation::Packet = 1
+pub lxmf_core::constants::DeliveryRepresentation::Paper = 5
+pub lxmf_core::constants::DeliveryRepresentation::Resource = 2
+pub lxmf_core::constants::DeliveryRepresentation::Unknown = 0
+#[repr(u8)] pub enum lxmf_core::constants::MessageState
+pub lxmf_core::constants::MessageState::Cancelled = 254
+pub lxmf_core::constants::MessageState::Delivered = 8
+pub lxmf_core::constants::MessageState::Failed = 255
+pub lxmf_core::constants::MessageState::Generating = 0
+pub lxmf_core::constants::MessageState::Outbound = 1
+pub lxmf_core::constants::MessageState::Rejected = 253
+pub lxmf_core::constants::MessageState::Sending = 2
+pub lxmf_core::constants::MessageState::Sent = 4
+#[repr(u8)] pub enum lxmf_core::constants::PeerError
+pub lxmf_core::constants::PeerError::InvalidData = 244
+pub lxmf_core::constants::PeerError::InvalidKey = 243
+pub lxmf_core::constants::PeerError::InvalidStamp = 245
+pub lxmf_core::constants::PeerError::NoAccess = 241
+pub lxmf_core::constants::PeerError::NoIdentity = 240
+pub lxmf_core::constants::PeerError::NotFound = 253
+pub lxmf_core::constants::PeerError::Throttled = 246
+pub lxmf_core::constants::PeerError::Timeout = 254
+#[repr(u8)] pub enum lxmf_core::constants::PeerState
+pub lxmf_core::constants::PeerState::Idle = 0
+pub lxmf_core::constants::PeerState::LinkEstablishing = 1
+pub lxmf_core::constants::PeerState::LinkReady = 2
+pub lxmf_core::constants::PeerState::RequestSent = 3
+pub lxmf_core::constants::PeerState::ResourceTransferring = 5
+pub lxmf_core::constants::PeerState::ResponseReceived = 4
+#[repr(u8)] pub enum lxmf_core::constants::SyncStrategy
+pub lxmf_core::constants::SyncStrategy::Lazy = 1
+pub lxmf_core::constants::SyncStrategy::Persistent = 2
+#[repr(u8)] pub enum lxmf_core::constants::UnverifiedReason
+pub lxmf_core::constants::UnverifiedReason::SignatureInvalid = 2
+pub lxmf_core::constants::UnverifiedReason::SourceUnknown = 1
+pub const lxmf_core::constants::AM_CODEC2_1200: u8
+pub const lxmf_core::constants::AM_CODEC2_1300: u8
+pub const lxmf_core::constants::AM_CODEC2_1400: u8
+pub const lxmf_core::constants::AM_CODEC2_1600: u8
+pub const lxmf_core::constants::AM_CODEC2_2400: u8
+pub const lxmf_core::constants::AM_CODEC2_3200: u8
+pub const lxmf_core::constants::AM_CODEC2_450: u8
+pub const lxmf_core::constants::AM_CODEC2_450PWB: u8
+pub const lxmf_core::constants::AM_CODEC2_700C: u8
+pub const lxmf_core::constants::AM_CUSTOM: u8
+pub const lxmf_core::constants::AM_OPUS_BROADCAST: u8
+pub const lxmf_core::constants::AM_OPUS_HQ: u8
+pub const lxmf_core::constants::AM_OPUS_LBW: u8
+pub const lxmf_core::constants::AM_OPUS_LOSSLESS: u8
+pub const lxmf_core::constants::AM_OPUS_MBW: u8
+pub const lxmf_core::constants::AM_OPUS_OGG: u8
+pub const lxmf_core::constants::AM_OPUS_PTT: u8
+pub const lxmf_core::constants::AM_OPUS_RT_FDX: u8
+pub const lxmf_core::constants::AM_OPUS_RT_HDX: u8
+pub const lxmf_core::constants::AM_OPUS_STANDARD: u8
+pub const lxmf_core::constants::APP_NAME: &str
+pub const lxmf_core::constants::AUTOPEER: bool
+pub const lxmf_core::constants::AUTOPEER_MAXDEPTH: usize
+pub const lxmf_core::constants::BYTES_PER_KILOBYTE: usize
+pub const lxmf_core::constants::COMMENT_FOR: u8
+pub const lxmf_core::constants::CONTINUATION_OF: u8
+pub const lxmf_core::constants::COST_TICKET: u16
+pub const lxmf_core::constants::DELIVERY_ASPECT: &str
+pub const lxmf_core::constants::DELIVERY_LIMIT: usize
+pub const lxmf_core::constants::DELIVERY_RETRY_WAIT: u64
+pub const lxmf_core::constants::DESTINATION_LENGTH: usize
+pub const lxmf_core::constants::DUPLICATE_SIGNAL: &str
+pub const lxmf_core::constants::FASTEST_N_RANDOM_POOL: usize
+pub const lxmf_core::constants::FIELD_AUDIO: u8
+pub const lxmf_core::constants::FIELD_COMMANDS: u8
+pub const lxmf_core::constants::FIELD_COMMENT: u8
+pub const lxmf_core::constants::FIELD_CONTINUATION: u8
+pub const lxmf_core::constants::FIELD_CUSTOM_DATA: u8
+pub const lxmf_core::constants::FIELD_CUSTOM_META: u8
+pub const lxmf_core::constants::FIELD_CUSTOM_TYPE: u8
+pub const lxmf_core::constants::FIELD_DEBUG: u8
+pub const lxmf_core::constants::FIELD_EMBEDDED_LXMS: u8
+pub const lxmf_core::constants::FIELD_EVENT: u8
+pub const lxmf_core::constants::FIELD_FILE_ATTACHMENTS: u8
+pub const lxmf_core::constants::FIELD_GROUP: u8
+pub const lxmf_core::constants::FIELD_ICON_APPEARANCE: u8
+pub const lxmf_core::constants::FIELD_IMAGE: u8
+pub const lxmf_core::constants::FIELD_NON_SPECIFIC: u8
+pub const lxmf_core::constants::FIELD_REACTION: u8
+pub const lxmf_core::constants::FIELD_RENDERER: u8
+pub const lxmf_core::constants::FIELD_REPLY_QUOTE: u8
+pub const lxmf_core::constants::FIELD_REPLY_TO: u8
+pub const lxmf_core::constants::FIELD_RESULTS: u8
+pub const lxmf_core::constants::FIELD_RNR_REFS: u8
+pub const lxmf_core::constants::FIELD_TELEMETRY: u8
+pub const lxmf_core::constants::FIELD_TELEMETRY_STREAM: u8
+pub const lxmf_core::constants::FIELD_THREAD: u8
+pub const lxmf_core::constants::FIELD_TICKET: u8
+pub const lxmf_core::constants::JOB_LINKS_INTERVAL: u64
+pub const lxmf_core::constants::JOB_OUTBOUND_INTERVAL: u64
+pub const lxmf_core::constants::JOB_PEERINGEST_INTERVAL: u64
+pub const lxmf_core::constants::JOB_PEERSYNC_INTERVAL: u64
+pub const lxmf_core::constants::JOB_ROTATE_INTERVAL: u64
+pub const lxmf_core::constants::JOB_STAMPS_INTERVAL: u64
+pub const lxmf_core::constants::JOB_STORE_INTERVAL: u64
+pub const lxmf_core::constants::JOB_TRANSIENT_INTERVAL: u64
+pub const lxmf_core::constants::LINK_MAX_INACTIVITY: u64
+pub const lxmf_core::constants::LXMF_OVERHEAD: usize
+pub const lxmf_core::constants::MAX_DELIVERY_ATTEMPTS: u32
+pub const lxmf_core::constants::MAX_PATHLESS_TRIES: u32
+pub const lxmf_core::constants::MAX_PEERING_COST: u8
+pub const lxmf_core::constants::MAX_PEERS: usize
+pub const lxmf_core::constants::MAX_UNREACHABLE: u64
+pub const lxmf_core::constants::MESSAGE_EXPIRY: u64
+pub const lxmf_core::constants::MESSAGE_GET_PATH: &str
+pub const lxmf_core::constants::NODE_ANNOUNCE_DELAY: u64
+pub const lxmf_core::constants::OFFER_REQUEST_PATH: &str
+pub const lxmf_core::constants::PAPER_MDU: usize
+pub const lxmf_core::constants::PATH_REQUEST_GRACE: f64
+pub const lxmf_core::constants::PATH_REQUEST_WAIT: u64
+pub const lxmf_core::constants::PEERING_COST: u8
+pub const lxmf_core::constants::PEER_STALE_TIME: u64
+pub const lxmf_core::constants::PN_META_AUTH_BAND: u8
+pub const lxmf_core::constants::PN_META_CUSTOM: u8
+pub const lxmf_core::constants::PN_META_NAME: u8
+pub const lxmf_core::constants::PN_META_SYNC_STRATUM: u8
+pub const lxmf_core::constants::PN_META_SYNC_THROTTLE: u8
+pub const lxmf_core::constants::PN_META_UTIL_PRESSURE: u8
+pub const lxmf_core::constants::PN_META_VERSION: u8
+pub const lxmf_core::constants::PN_STAMP_THROTTLE: u64
+pub const lxmf_core::constants::PN_VALIDATION_POOL_MIN_SIZE: usize
+pub const lxmf_core::constants::PROCESSING_INTERVAL: u64
+pub const lxmf_core::constants::PROPAGATION_ASPECT: &str
+pub const lxmf_core::constants::PROPAGATION_COST: u8
+pub const lxmf_core::constants::PROPAGATION_COST_FLEX: u8
+pub const lxmf_core::constants::PROPAGATION_COST_MIN: u8
+pub const lxmf_core::constants::PROPAGATION_LIMIT: usize
+pub const lxmf_core::constants::PR_ALL_MESSAGES: u32
+pub const lxmf_core::constants::P_LINK_MAX_INACTIVITY: u64
+pub const lxmf_core::constants::REACTION_CONTENT: u8
+pub const lxmf_core::constants::REACTION_TO: u8
+pub const lxmf_core::constants::RENDERER_BBCODE: u8
+pub const lxmf_core::constants::RENDERER_MARKDOWN: u8
+pub const lxmf_core::constants::RENDERER_MICRON: u8
+pub const lxmf_core::constants::RENDERER_PLAIN: u8
+pub const lxmf_core::constants::ROTATION_AR_MAX: f64
+pub const lxmf_core::constants::ROTATION_HEADROOM_PCT: usize
+pub const lxmf_core::constants::SF_COMPRESSION: u8
+pub const lxmf_core::constants::SIGNATURE_LENGTH: usize
+pub const lxmf_core::constants::STAMP_COST_EXPIRY: u64
+pub const lxmf_core::constants::STAMP_SIZE: usize
+pub const lxmf_core::constants::STAMP_WORKBLOCK_EXPAND_ROUNDS: usize
+pub const lxmf_core::constants::STAMP_WORKBLOCK_EXPAND_ROUNDS_PEERING: usize
+pub const lxmf_core::constants::STAMP_WORKBLOCK_EXPAND_ROUNDS_PN: usize
+pub const lxmf_core::constants::STATS_GET_PATH: &str
+pub const lxmf_core::constants::STRUCT_OVERHEAD: usize
+pub const lxmf_core::constants::SYNC_BACKOFF_STEP: u64
+pub const lxmf_core::constants::SYNC_LIMIT: usize
+pub const lxmf_core::constants::SYNC_REQUEST_PATH: &str
+pub const lxmf_core::constants::TICKET_EXPIRY: u64
+pub const lxmf_core::constants::TICKET_GRACE: u64
+pub const lxmf_core::constants::TICKET_INTERVAL: u64
+pub const lxmf_core::constants::TICKET_LENGTH: usize
+pub const lxmf_core::constants::TICKET_RENEW: u64
+pub const lxmf_core::constants::TIMESTAMP_SIZE: usize
+pub const lxmf_core::constants::UNPEER_REQUEST_PATH: &str
+pub mod lxmf_core::delivery_ratchet
+pub enum lxmf_core::delivery_ratchet::DeliveryAnnounceKind<'a>
+pub lxmf_core::delivery_ratchet::DeliveryAnnounceKind::Broadcast
+pub lxmf_core::delivery_ratchet::DeliveryAnnounceKind::PathResponse
+pub lxmf_core::delivery_ratchet::DeliveryAnnounceKind::PathResponse::tag: core::option::Option<&'a [u8]>
+pub enum lxmf_core::delivery_ratchet::DeliveryRatchetError
+pub lxmf_core::delivery_ratchet::DeliveryRatchetError::Coalesced
+pub lxmf_core::delivery_ratchet::DeliveryRatchetError::Destination(rns_identity::destination::DestinationError)
+pub lxmf_core::delivery_ratchet::DeliveryRatchetError::DestinationMismatch
+pub lxmf_core::delivery_ratchet::DeliveryRatchetError::Invariant(&'static str)
+pub lxmf_core::delivery_ratchet::DeliveryRatchetError::PersistControl
+pub lxmf_core::delivery_ratchet::DeliveryRatchetError::PersistControl::path: std::path::PathBuf
+pub lxmf_core::delivery_ratchet::DeliveryRatchetError::PersistControl::source: core::io::error::Error
+pub lxmf_core::delivery_ratchet::DeliveryRatchetError::Plan(core::io::error::Error)
+pub lxmf_core::delivery_ratchet::DeliveryRatchetError::UntrustedControl
+pub lxmf_core::delivery_ratchet::DeliveryRatchetError::UntrustedControl::path: std::path::PathBuf
+pub struct lxmf_core::delivery_ratchet::DeliveryRatchetState
+impl lxmf_core::delivery_ratchet::DeliveryRatchetState
+pub fn lxmf_core::delivery_ratchet::DeliveryRatchetState::control(&self) -> &rns_identity::announce_state::RatchetControlState
+pub fn lxmf_core::delivery_ratchet::DeliveryRatchetState::control_path(&self) -> &std::path::Path
+pub fn lxmf_core::delivery_ratchet::DeliveryRatchetState::create_announce(&mut self, &rns_identity::identity::Identity, &[u8], u64, f64, lxmf_core::delivery_ratchet::DeliveryAnnounceKind<'_>) -> core::result::Result<alloc::vec::Vec<u8>, lxmf_core::delivery_ratchet::DeliveryRatchetError>
+pub fn lxmf_core::delivery_ratchet::DeliveryRatchetState::destination_hash(&self) -> [u8; 16]
+pub fn lxmf_core::delivery_ratchet::DeliveryRatchetState::load_or_initialize(&rns_identity::identity::Identity, [u8; 16], std::path::PathBuf, std::path::PathBuf, u64) -> core::result::Result<Self, lxmf_core::delivery_ratchet::DeliveryRatchetError>
+pub fn lxmf_core::delivery_ratchet::DeliveryRatchetState::ring(&self) -> &rns_identity::ratchet::RatchetRing
+pub fn lxmf_core::delivery_ratchet::DeliveryRatchetState::ring_path(&self) -> &std::path::Path
+pub fn lxmf_core::delivery_ratchet::DeliveryRatchetState::save(&self, &rns_identity::identity::Identity)
+pub const lxmf_core::delivery_ratchet::DELIVERY_APP_NAME: &str
+pub mod lxmf_core::discovery_stamper
+pub struct lxmf_core::discovery_stamper::LxmfDiscoveryStamper
+impl lxmf_core::discovery_stamper::LxmfDiscoveryStamper
+pub fn lxmf_core::discovery_stamper::LxmfDiscoveryStamper::with_max_iterations(u64) -> Self
+impl rns_transport::discovery::stamper::DiscoveryStamper for lxmf_core::discovery_stamper::LxmfDiscoveryStamper
+pub fn lxmf_core::discovery_stamper::LxmfDiscoveryStamper::generate(&self, &[u8; 32], u8) -> core::option::Option<alloc::vec::Vec<u8>>
+pub fn lxmf_core::discovery_stamper::LxmfDiscoveryStamper::valid(&self, &[u8; 32], &[u8], u8) -> bool
+pub fn lxmf_core::discovery_stamper::LxmfDiscoveryStamper::value(&self, &[u8; 32], &[u8]) -> u8
+pub const lxmf_core::discovery_stamper::DISCOVERY_MAX_ITERATIONS: u64
+pub const lxmf_core::discovery_stamper::DISCOVERY_WORKBLOCK_EXPAND_ROUNDS: usize
+pub fn lxmf_core::discovery_stamper::generate_discovery_stamp(&[u8; 32], u8, u64) -> core::option::Option<[u8; 32]>
+pub mod lxmf_core::handlers
+pub enum lxmf_core::handlers::AnnounceResult
+pub lxmf_core::handlers::AnnounceResult::Accepted
+pub lxmf_core::handlers::AnnounceResult::Ignored
+pub lxmf_core::handlers::AnnounceResult::Rejected(alloc::string::String)
+pub enum lxmf_core::handlers::CompressionSupport
+pub lxmf_core::handlers::CompressionSupport::Supported
+pub lxmf_core::handlers::CompressionSupport::Unknown
+pub lxmf_core::handlers::CompressionSupport::Unsupported
+pub enum lxmf_core::handlers::ControlEndpoint
+pub lxmf_core::handlers::ControlEndpoint::PeerSync
+pub lxmf_core::handlers::ControlEndpoint::PeerUnpeer
+pub lxmf_core::handlers::ControlEndpoint::Stats
+impl lxmf_core::handlers::ControlEndpoint
+pub fn lxmf_core::handlers::ControlEndpoint::path(&self) -> &'static str
+pub enum lxmf_core::handlers::ControlResult
+pub lxmf_core::handlers::ControlResult::InvalidData
+pub lxmf_core::handlers::ControlResult::NoAccess
+pub lxmf_core::handlers::ControlResult::NoIdentity
+pub lxmf_core::handlers::ControlResult::NotFound
+pub lxmf_core::handlers::ControlResult::Success(alloc::vec::Vec<u8>)
+pub enum lxmf_core::handlers::HandlerType
+pub lxmf_core::handlers::HandlerType::Delivery
+pub lxmf_core::handlers::HandlerType::Propagation
+impl lxmf_core::handlers::HandlerType
+pub fn lxmf_core::handlers::HandlerType::aspect_filter(&self) -> &'static str
+pub fn lxmf_core::handlers::HandlerType::full_aspect(&self) -> alloc::string::String
+pub enum lxmf_core::handlers::ResourceResult
+pub lxmf_core::handlers::ResourceResult::Complete
+pub lxmf_core::handlers::ResourceResult::Failed
+pub lxmf_core::handlers::ResourceResult::Rejected
+pub struct lxmf_core::handlers::PropagationNodeAnnounceData
+pub lxmf_core::handlers::PropagationNodeAnnounceData::legacy: bool
+pub lxmf_core::handlers::PropagationNodeAnnounceData::metadata: std::collections::hash::map::HashMap<u8, alloc::vec::Vec<u8>>
+pub lxmf_core::handlers::PropagationNodeAnnounceData::node_state: bool
+pub lxmf_core::handlers::PropagationNodeAnnounceData::peering_cost: u8
+pub lxmf_core::handlers::PropagationNodeAnnounceData::stamp_cost: u8
+pub lxmf_core::handlers::PropagationNodeAnnounceData::stamp_flex: u8
+pub lxmf_core::handlers::PropagationNodeAnnounceData::sync_limit: u64
+pub lxmf_core::handlers::PropagationNodeAnnounceData::timebase: i64
+pub lxmf_core::handlers::PropagationNodeAnnounceData::transfer_limit: u64
+impl lxmf_core::handlers::PropagationNodeAnnounceData
+pub fn lxmf_core::handlers::PropagationNodeAnnounceData::new(bool, u64, u64, u8, u8, u8) -> Self
+pub fn lxmf_core::handlers::PropagationNodeAnnounceData::set_name(&mut self, &str)
+pub struct lxmf_core::handlers::PropagationRequestHandler
+pub lxmf_core::handlers::PropagationRequestHandler::control_allowed: alloc::vec::Vec<[u8; 16]>
+pub lxmf_core::handlers::PropagationRequestHandler::from_static_only: bool
+pub lxmf_core::handlers::PropagationRequestHandler::local_identity_hash: [u8; 16]
+pub lxmf_core::handlers::PropagationRequestHandler::static_peers: std::collections::hash::set::HashSet<[u8; 16]>
+pub lxmf_core::handlers::PropagationRequestHandler::throttled_peers: std::collections::hash::map::HashMap<[u8; 16], f64>
+impl lxmf_core::handlers::PropagationRequestHandler
+pub fn lxmf_core::handlers::PropagationRequestHandler::allow_control(&mut self, [u8; 16])
+pub fn lxmf_core::handlers::PropagationRequestHandler::cleanup_throttled_peers(&mut self)
+pub fn lxmf_core::handlers::PropagationRequestHandler::disallow_control(&mut self, &[u8; 16])
+pub fn lxmf_core::handlers::PropagationRequestHandler::handle_message_get_request(&self, core::option::Option<&[u8; 16]>, &[u8; 16], &[u8], &mut lxmf_core::propagation_node::PropagationNode) -> lxmf_core::propagation_node::GetRequestAction
+pub fn lxmf_core::handlers::PropagationRequestHandler::handle_offer_request(&self, core::option::Option<&[u8; 16]>, &[u8], &mut lxmf_core::propagation_node::PropagationNode) -> alloc::vec::Vec<u8>
+pub fn lxmf_core::handlers::PropagationRequestHandler::handle_peer_sync_request(&self, core::option::Option<&[u8; 16]>, &[u8], &std::collections::hash::map::HashMap<[u8; 16], lxmf_core::peer::LxmPeer>) -> lxmf_core::handlers::ControlResult
+pub fn lxmf_core::handlers::PropagationRequestHandler::handle_peer_unpeer_request(&self, core::option::Option<&[u8; 16]>, &[u8], &std::collections::hash::map::HashMap<[u8; 16], lxmf_core::peer::LxmPeer>) -> lxmf_core::handlers::ControlResult
+pub fn lxmf_core::handlers::PropagationRequestHandler::handle_stats_request(&self, core::option::Option<&[u8; 16]>, &lxmf_core::propagation_node::PropagationNode, &std::collections::hash::map::HashMap<[u8; 16], lxmf_core::peer::LxmPeer>) -> lxmf_core::handlers::ControlResult
+pub fn lxmf_core::handlers::PropagationRequestHandler::is_peer_throttled(&self, &[u8; 16]) -> bool
+pub fn lxmf_core::handlers::PropagationRequestHandler::new([u8; 16]) -> Self
+pub fn lxmf_core::handlers::PropagationRequestHandler::throttle_peer(&mut self, [u8; 16], f64)
+pub fn lxmf_core::handlers::compression_support_from_app_data(&[u8]) -> bool
+pub fn lxmf_core::handlers::compression_support_state_from_app_data(&[u8]) -> lxmf_core::handlers::CompressionSupport
+pub fn lxmf_core::handlers::display_name_from_app_data(&[u8]) -> core::option::Option<alloc::string::String>
+pub fn lxmf_core::handlers::get_announce_app_data(core::option::Option<&str>, core::option::Option<u8>) -> alloc::vec::Vec<u8>
+pub fn lxmf_core::handlers::get_propagation_node_app_data(&lxmf_core::handlers::PropagationNodeAnnounceData) -> alloc::vec::Vec<u8>
+pub fn lxmf_core::handlers::parse_announce_app_data(&[u8]) -> core::option::Option<(core::option::Option<alloc::string::String>, core::option::Option<u8>)>
+pub fn lxmf_core::handlers::parse_pn_announce_data(&[u8]) -> core::option::Option<lxmf_core::handlers::PropagationNodeAnnounceData>
+pub fn lxmf_core::handlers::pn_name_from_app_data(&[u8]) -> core::option::Option<alloc::string::String>
+pub fn lxmf_core::handlers::pn_stamp_cost_from_app_data(&[u8]) -> core::option::Option<u8>
+pub fn lxmf_core::handlers::stamp_cost_from_app_data(&[u8]) -> core::option::Option<u8>
+pub mod lxmf_core::inbound_resource
+pub enum lxmf_core::inbound_resource::InboundResourceConclusion
+pub lxmf_core::inbound_resource::InboundResourceConclusion::Cancelled
+pub lxmf_core::inbound_resource::InboundResourceConclusion::Complete
+pub lxmf_core::inbound_resource::InboundResourceConclusion::Failed
+pub lxmf_core::inbound_resource::InboundResourceConclusion::Rejected
+impl core::convert::From<lxmf_core::inbound_resource::InboundResourceConclusion> for lxmf_core::inbound_resource::InboundResourceStatus
+pub fn lxmf_core::inbound_resource::InboundResourceStatus::from(lxmf_core::inbound_resource::InboundResourceConclusion) -> Self
+pub enum lxmf_core::inbound_resource::InboundResourceEvent
+pub lxmf_core::inbound_resource::InboundResourceEvent::Concluded
+pub lxmf_core::inbound_resource::InboundResourceEvent::Concluded::conclusion: lxmf_core::inbound_resource::InboundResourceConclusion
+pub lxmf_core::inbound_resource::InboundResourceEvent::Concluded::key: lxmf_core::inbound_resource::InboundResourceKey
+pub lxmf_core::inbound_resource::InboundResourceEvent::LinkClosed
+pub lxmf_core::inbound_resource::InboundResourceEvent::LinkClosed::link_id: [u8; 16]
+pub lxmf_core::inbound_resource::InboundResourceEvent::Progress
+pub lxmf_core::inbound_resource::InboundResourceEvent::Progress::key: lxmf_core::inbound_resource::InboundResourceKey
+pub lxmf_core::inbound_resource::InboundResourceEvent::Progress::total: usize
+pub lxmf_core::inbound_resource::InboundResourceEvent::Progress::transferred: usize
+pub lxmf_core::inbound_resource::InboundResourceEvent::Started
+pub lxmf_core::inbound_resource::InboundResourceEvent::Started::data_size: usize
+pub lxmf_core::inbound_resource::InboundResourceEvent::Started::key: lxmf_core::inbound_resource::InboundResourceKey
+pub lxmf_core::inbound_resource::InboundResourceEvent::Started::total_segments: usize
+pub enum lxmf_core::inbound_resource::InboundResourceStatus
+pub lxmf_core::inbound_resource::InboundResourceStatus::Cancelled
+pub lxmf_core::inbound_resource::InboundResourceStatus::Complete
+pub lxmf_core::inbound_resource::InboundResourceStatus::Failed
+pub lxmf_core::inbound_resource::InboundResourceStatus::Receiving
+pub lxmf_core::inbound_resource::InboundResourceStatus::Rejected
+impl lxmf_core::inbound_resource::InboundResourceStatus
+pub const fn lxmf_core::inbound_resource::InboundResourceStatus::is_closed(self) -> bool
+impl core::convert::From<lxmf_core::inbound_resource::InboundResourceConclusion> for lxmf_core::inbound_resource::InboundResourceStatus
+pub fn lxmf_core::inbound_resource::InboundResourceStatus::from(lxmf_core::inbound_resource::InboundResourceConclusion) -> Self
+pub struct lxmf_core::inbound_resource::InboundResourceCancelRequest
+impl lxmf_core::inbound_resource::InboundResourceCancelRequest
+pub const fn lxmf_core::inbound_resource::InboundResourceCancelRequest::key(self) -> lxmf_core::inbound_resource::InboundResourceKey
+pub const fn lxmf_core::inbound_resource::InboundResourceCancelRequest::new(lxmf_core::inbound_resource::InboundResourceKey) -> Self
+pub struct lxmf_core::inbound_resource::InboundResourceHandle
+impl lxmf_core::inbound_resource::InboundResourceHandle
+pub fn lxmf_core::inbound_resource::InboundResourceHandle::cancel(&self) -> bool
+pub async fn lxmf_core::inbound_resource::InboundResourceHandle::changed(&mut self) -> core::option::Option<lxmf_core::inbound_resource::InboundResourceSnapshot>
+pub const fn lxmf_core::inbound_resource::InboundResourceHandle::key(&self) -> lxmf_core::inbound_resource::InboundResourceKey
+pub fn lxmf_core::inbound_resource::InboundResourceHandle::snapshot(&self) -> lxmf_core::inbound_resource::InboundResourceSnapshot
+pub struct lxmf_core::inbound_resource::InboundResourceKey
+pub lxmf_core::inbound_resource::InboundResourceKey::link_id: [u8; 16]
+pub lxmf_core::inbound_resource::InboundResourceKey::resource_id: [u8; 32]
+impl lxmf_core::inbound_resource::InboundResourceKey
+pub const fn lxmf_core::inbound_resource::InboundResourceKey::new([u8; 16], [u8; 32]) -> Self
+pub struct lxmf_core::inbound_resource::InboundResourceSnapshot
+pub lxmf_core::inbound_resource::InboundResourceSnapshot::data_size: usize
+pub lxmf_core::inbound_resource::InboundResourceSnapshot::key: lxmf_core::inbound_resource::InboundResourceKey
+pub lxmf_core::inbound_resource::InboundResourceSnapshot::status: lxmf_core::inbound_resource::InboundResourceStatus
+pub lxmf_core::inbound_resource::InboundResourceSnapshot::total_segments: usize
+pub lxmf_core::inbound_resource::InboundResourceSnapshot::transferred: usize
+impl lxmf_core::inbound_resource::InboundResourceSnapshot
+pub const fn lxmf_core::inbound_resource::InboundResourceSnapshot::is_closed(&self) -> bool
+pub struct lxmf_core::inbound_resource::InboundResourceTracker
+impl lxmf_core::inbound_resource::InboundResourceTracker
+pub fn lxmf_core::inbound_resource::InboundResourceTracker::cancel_all_inbound(&self) -> usize
+pub fn lxmf_core::inbound_resource::InboundResourceTracker::cancel_inbound(&self, &[u8; 32]) -> bool
+pub fn lxmf_core::inbound_resource::InboundResourceTracker::cancel_inbound_exact(&self, lxmf_core::inbound_resource::InboundResourceKey) -> bool
+pub fn lxmf_core::inbound_resource::InboundResourceTracker::handle_event(&mut self, lxmf_core::inbound_resource::InboundResourceEvent)
+pub fn lxmf_core::inbound_resource::InboundResourceTracker::inbound_count(&self) -> usize
+pub fn lxmf_core::inbound_resource::InboundResourceTracker::inbound_resource(&self, &[u8; 32]) -> core::option::Option<lxmf_core::inbound_resource::InboundResourceHandle>
+pub fn lxmf_core::inbound_resource::InboundResourceTracker::inbound_resource_exact(&self, lxmf_core::inbound_resource::InboundResourceKey) -> core::option::Option<lxmf_core::inbound_resource::InboundResourceHandle>
+pub fn lxmf_core::inbound_resource::InboundResourceTracker::inbound_resources(&self) -> alloc::vec::Vec<lxmf_core::inbound_resource::InboundResourceHandle>
+pub fn lxmf_core::inbound_resource::InboundResourceTracker::new(tokio::sync::mpsc::bounded::Sender<lxmf_core::inbound_resource::InboundResourceCancelRequest>) -> Self
+pub fn lxmf_core::inbound_resource::InboundResourceTracker::set_cancel_sender(&mut self, tokio::sync::mpsc::bounded::Sender<lxmf_core::inbound_resource::InboundResourceCancelRequest>)
+pub mod lxmf_core::link_delivery
+pub enum lxmf_core::link_delivery::BackchannelResourceConclusion
+pub lxmf_core::link_delivery::BackchannelResourceConclusion::Failed
+pub lxmf_core::link_delivery::BackchannelResourceConclusion::Rejected
+pub enum lxmf_core::link_delivery::BackchannelSendError
+pub lxmf_core::link_delivery::BackchannelSendError::LinkNotActive
+pub lxmf_core::link_delivery::BackchannelSendError::LinkNotFound
+pub lxmf_core::link_delivery::BackchannelSendError::NoSessionKeys
+pub lxmf_core::link_delivery::BackchannelSendError::Other(alloc::string::String)
+pub lxmf_core::link_delivery::BackchannelSendError::ResourceStartFailed
+pub lxmf_core::link_delivery::BackchannelSendError::TransportUnavailable
+impl core::error::Error for lxmf_core::link_delivery::BackchannelSendError
+impl core::fmt::Display for lxmf_core::link_delivery::BackchannelSendError
+pub fn lxmf_core::link_delivery::BackchannelSendError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub enum lxmf_core::link_delivery::BackchannelSendReceipt
+pub lxmf_core::link_delivery::BackchannelSendReceipt::Packet
+pub lxmf_core::link_delivery::BackchannelSendReceipt::Packet::link_id: [u8; 16]
+pub lxmf_core::link_delivery::BackchannelSendReceipt::Packet::packet_hash: [u8; 32]
+pub lxmf_core::link_delivery::BackchannelSendReceipt::Resource
+pub lxmf_core::link_delivery::BackchannelSendReceipt::Resource::link_id: [u8; 16]
+pub lxmf_core::link_delivery::BackchannelSendReceipt::Resource::resource_hash: [u8; 32]
+pub enum lxmf_core::link_delivery::BackchannelStartError
+pub lxmf_core::link_delivery::BackchannelStartError::CommandClosed
+pub lxmf_core::link_delivery::BackchannelStartError::CommandFull
+pub lxmf_core::link_delivery::BackchannelStartError::NoBackchannel
+pub lxmf_core::link_delivery::BackchannelStartError::PackFailed
+pub lxmf_core::link_delivery::BackchannelStartError::SenderUnavailable
+impl core::error::Error for lxmf_core::link_delivery::BackchannelStartError
+impl core::fmt::Display for lxmf_core::link_delivery::BackchannelStartError
+pub fn lxmf_core::link_delivery::BackchannelStartError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub enum lxmf_core::link_delivery::DeliveryResult
+pub lxmf_core::link_delivery::DeliveryResult::Complete
+pub lxmf_core::link_delivery::DeliveryResult::Complete::link_id: [u8; 16]
+pub lxmf_core::link_delivery::DeliveryResult::Complete::msg_hash: core::option::Option<[u8; 32]>
+pub lxmf_core::link_delivery::DeliveryResult::Failed
+pub lxmf_core::link_delivery::DeliveryResult::Failed::dest_hash: [u8; 16]
+pub lxmf_core::link_delivery::DeliveryResult::Failed::link_id: [u8; 16]
+pub lxmf_core::link_delivery::DeliveryResult::Failed::message: lxmf_core::message::LxMessage
+pub lxmf_core::link_delivery::DeliveryResult::Failed::msg_hash: core::option::Option<[u8; 32]>
+pub lxmf_core::link_delivery::DeliveryResult::Failed::reason: alloc::string::String
+pub lxmf_core::link_delivery::DeliveryResult::Rejected
+pub lxmf_core::link_delivery::DeliveryResult::Rejected::dest_hash: [u8; 16]
+pub lxmf_core::link_delivery::DeliveryResult::Rejected::link_id: [u8; 16]
+pub lxmf_core::link_delivery::DeliveryResult::Rejected::message: lxmf_core::message::LxMessage
+pub lxmf_core::link_delivery::DeliveryResult::Rejected::msg_hash: core::option::Option<[u8; 32]>
+pub lxmf_core::link_delivery::DeliveryResult::Rejected::reason: alloc::string::String
+pub enum lxmf_core::link_delivery::DeliveryState
+pub lxmf_core::link_delivery::DeliveryState::AwaitingProof
+pub lxmf_core::link_delivery::DeliveryState::Complete
+pub lxmf_core::link_delivery::DeliveryState::Establishing
+pub lxmf_core::link_delivery::DeliveryState::Failed
+pub lxmf_core::link_delivery::DeliveryState::Identifying
+pub lxmf_core::link_delivery::DeliveryState::Idle
+pub lxmf_core::link_delivery::DeliveryState::Rejected
+pub lxmf_core::link_delivery::DeliveryState::Transferring
+pub enum lxmf_core::link_delivery::DirectLinkStartKind
+pub lxmf_core::link_delivery::DirectLinkStartKind::NewDirect
+pub lxmf_core::link_delivery::DirectLinkStartKind::QueuedOnDirect
+pub lxmf_core::link_delivery::DirectLinkStartKind::ReusedActiveDirect
+pub enum lxmf_core::link_delivery::LinkDeliveryStartError
+pub lxmf_core::link_delivery::LinkDeliveryStartError::TransportClosed
+pub lxmf_core::link_delivery::LinkDeliveryStartError::TransportFull
+impl core::error::Error for lxmf_core::link_delivery::LinkDeliveryStartError
+impl core::fmt::Display for lxmf_core::link_delivery::LinkDeliveryStartError
+pub fn lxmf_core::link_delivery::LinkDeliveryStartError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub enum lxmf_core::link_delivery::LxmfDeliveryEventKind
+pub lxmf_core::link_delivery::LxmfDeliveryEventKind::AwaitingProof
+pub lxmf_core::link_delivery::LxmfDeliveryEventKind::BackchannelLinkReused
+pub lxmf_core::link_delivery::LxmfDeliveryEventKind::Delivered
+pub lxmf_core::link_delivery::LxmfDeliveryEventKind::DirectLinkPending
+pub lxmf_core::link_delivery::LxmfDeliveryEventKind::DirectLinkReused
+pub lxmf_core::link_delivery::LxmfDeliveryEventKind::Failed
+pub lxmf_core::link_delivery::LxmfDeliveryEventKind::LinkEstablished
+pub lxmf_core::link_delivery::LxmfDeliveryEventKind::LinkEstablishing
+pub lxmf_core::link_delivery::LxmfDeliveryEventKind::Rejected
+pub lxmf_core::link_delivery::LxmfDeliveryEventKind::TransferProgress
+pub lxmf_core::link_delivery::LxmfDeliveryEventKind::TransferStarted
+pub enum lxmf_core::link_delivery::LxmfDeliveryEventMethod
+pub lxmf_core::link_delivery::LxmfDeliveryEventMethod::Direct
+pub lxmf_core::link_delivery::LxmfDeliveryEventMethod::PropagationDeposit
+pub struct lxmf_core::link_delivery::BackchannelLinkSnapshot
+pub lxmf_core::link_delivery::BackchannelLinkSnapshot::dest_hash: [u8; 16]
+pub lxmf_core::link_delivery::BackchannelLinkSnapshot::in_flight_deliveries: usize
+pub lxmf_core::link_delivery::BackchannelLinkSnapshot::link_id: [u8; 16]
+pub lxmf_core::link_delivery::BackchannelLinkSnapshot::queued_deliveries: usize
+pub struct lxmf_core::link_delivery::BackchannelResourceCancelRequest
+pub lxmf_core::link_delivery::BackchannelResourceCancelRequest::link_id: [u8; 16]
+pub lxmf_core::link_delivery::BackchannelResourceCancelRequest::resource_hash: [u8; 32]
+pub struct lxmf_core::link_delivery::BackchannelSendCommand
+pub lxmf_core::link_delivery::BackchannelSendCommand::auto_compress: bool
+pub lxmf_core::link_delivery::BackchannelSendCommand::link_id: [u8; 16]
+pub lxmf_core::link_delivery::BackchannelSendCommand::payload: alloc::vec::Vec<u8>
+pub lxmf_core::link_delivery::BackchannelSendCommand::result_tx: tokio::sync::oneshot::Sender<core::result::Result<lxmf_core::link_delivery::BackchannelSendReceipt, lxmf_core::link_delivery::BackchannelSendError>>
+pub struct lxmf_core::link_delivery::BackchannelStartFailure
+pub lxmf_core::link_delivery::BackchannelStartFailure::error: lxmf_core::link_delivery::BackchannelStartError
+pub lxmf_core::link_delivery::BackchannelStartFailure::message: alloc::boxed::Box<lxmf_core::message::LxMessage>
+impl core::error::Error for lxmf_core::link_delivery::BackchannelStartFailure
+impl core::fmt::Display for lxmf_core::link_delivery::BackchannelStartFailure
+pub fn lxmf_core::link_delivery::BackchannelStartFailure::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct lxmf_core::link_delivery::BackchannelStartReport
+pub lxmf_core::link_delivery::BackchannelStartReport::dest_hash: [u8; 16]
+pub lxmf_core::link_delivery::BackchannelStartReport::in_flight_deliveries: usize
+pub lxmf_core::link_delivery::BackchannelStartReport::link_id: [u8; 16]
+pub lxmf_core::link_delivery::BackchannelStartReport::queued_deliveries: usize
+pub struct lxmf_core::link_delivery::DirectLinkSnapshot
+pub lxmf_core::link_delivery::DirectLinkSnapshot::delivery_state: lxmf_core::link_delivery::DeliveryState
+pub lxmf_core::link_delivery::DirectLinkSnapshot::dest_hash: [u8; 16]
+pub lxmf_core::link_delivery::DirectLinkSnapshot::idle_expired: bool
+pub lxmf_core::link_delivery::DirectLinkSnapshot::in_flight_deliveries: usize
+pub lxmf_core::link_delivery::DirectLinkSnapshot::link_id: [u8; 16]
+pub lxmf_core::link_delivery::DirectLinkSnapshot::link_state: rns_link::link::LinkState
+pub lxmf_core::link_delivery::DirectLinkSnapshot::queued_deliveries: usize
+pub struct lxmf_core::link_delivery::DirectLinkStartReport
+pub lxmf_core::link_delivery::DirectLinkStartReport::delivery_state: lxmf_core::link_delivery::DeliveryState
+pub lxmf_core::link_delivery::DirectLinkStartReport::dest_hash: [u8; 16]
+pub lxmf_core::link_delivery::DirectLinkStartReport::in_flight_deliveries: usize
+pub lxmf_core::link_delivery::DirectLinkStartReport::kind: lxmf_core::link_delivery::DirectLinkStartKind
+pub lxmf_core::link_delivery::DirectLinkStartReport::link_id: [u8; 16]
+pub lxmf_core::link_delivery::DirectLinkStartReport::link_state: rns_link::link::LinkState
+pub lxmf_core::link_delivery::DirectLinkStartReport::queued_deliveries: usize
+pub struct lxmf_core::link_delivery::LinkDeliveryManager
+impl lxmf_core::link_delivery::LinkDeliveryManager
+pub fn lxmf_core::link_delivery::LinkDeliveryManager::backchannel_link_snapshot(&self, [u8; 16]) -> core::option::Option<lxmf_core::link_delivery::BackchannelLinkSnapshot>
+pub fn lxmf_core::link_delivery::LinkDeliveryManager::cancel_delivery_by_message_hash(&mut self, [u8; 32]) -> bool
+pub fn lxmf_core::link_delivery::LinkDeliveryManager::delivery_link_available(&self, &[u8; 16]) -> bool
+pub fn lxmf_core::link_delivery::LinkDeliveryManager::direct_link_snapshot(&self, [u8; 16]) -> core::option::Option<lxmf_core::link_delivery::DirectLinkSnapshot>
+pub fn lxmf_core::link_delivery::LinkDeliveryManager::drain_events(&mut self, &std::collections::hash::map::HashMap<alloc::string::String, [u8; 64]>)
+pub fn lxmf_core::link_delivery::LinkDeliveryManager::fail_backchannel_link(&mut self, [u8; 16], &str) -> alloc::vec::Vec<lxmf_core::link_delivery::DeliveryResult>
+pub fn lxmf_core::link_delivery::LinkDeliveryManager::fail_delivery_by_message_hash(&mut self, [u8; 32], &str) -> alloc::vec::Vec<lxmf_core::link_delivery::DeliveryResult>
+pub fn lxmf_core::link_delivery::LinkDeliveryManager::handle_backchannel_packet_proof(&mut self, [u8; 16], [u8; 32]) -> core::option::Option<lxmf_core::link_delivery::DeliveryResult>
+pub fn lxmf_core::link_delivery::LinkDeliveryManager::handle_backchannel_resource_conclusion(&mut self, [u8; 16], [u8; 32], lxmf_core::link_delivery::BackchannelResourceConclusion, impl core::convert::Into<alloc::string::String>) -> core::option::Option<lxmf_core::link_delivery::DeliveryResult>
+pub fn lxmf_core::link_delivery::LinkDeliveryManager::handle_backchannel_resource_proof(&mut self, [u8; 16], [u8; 32]) -> core::option::Option<lxmf_core::link_delivery::DeliveryResult>
+pub fn lxmf_core::link_delivery::LinkDeliveryManager::handle_hmu(&mut self, &[u8; 16], &[u8])
+pub fn lxmf_core::link_delivery::LinkDeliveryManager::handle_link_packet_proof(&mut self, &[u8; 16], &[u8]) -> bool
+pub fn lxmf_core::link_delivery::LinkDeliveryManager::handle_link_proof(&mut self, &[u8; 16], &[u8], &rns_crypto::ed25519::Ed25519PublicKey, &[u8; 32], rns_transport::messages::InterfaceId) -> bool
+pub fn lxmf_core::link_delivery::LinkDeliveryManager::handle_request(&mut self, &[u8; 16], &[u8])
+pub fn lxmf_core::link_delivery::LinkDeliveryManager::handle_resource_proof(&mut self, &[u8; 16], &[u8]) -> bool
+pub fn lxmf_core::link_delivery::LinkDeliveryManager::handle_resource_reject(&mut self, &[u8; 16], &[u8]) -> bool
+pub fn lxmf_core::link_delivery::LinkDeliveryManager::message_delivery_snapshot(&self, [u8; 32]) -> core::option::Option<lxmf_core::link_delivery::MessageDeliverySnapshot>
+pub fn lxmf_core::link_delivery::LinkDeliveryManager::new(tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>, core::option::Option<[u8; 64]>, core::option::Option<rns_crypto::ed25519::Ed25519PrivateKey>) -> Self
+pub fn lxmf_core::link_delivery::LinkDeliveryManager::pending_count(&self) -> usize
+pub fn lxmf_core::link_delivery::LinkDeliveryManager::register_backchannel(&mut self, [u8; 16], [u8; 16])
+pub fn lxmf_core::link_delivery::LinkDeliveryManager::remove_backchannel(&mut self, &[u8; 16]) -> core::option::Option<[u8; 16]>
+pub fn lxmf_core::link_delivery::LinkDeliveryManager::session_count(&self) -> usize
+pub fn lxmf_core::link_delivery::LinkDeliveryManager::set_backchannel_sender(&mut self, tokio::sync::mpsc::bounded::Sender<lxmf_core::link_delivery::BackchannelSendCommand>)
+pub fn lxmf_core::link_delivery::LinkDeliveryManager::set_inbound_packet_sender(&mut self, tokio::sync::mpsc::unbounded::UnboundedSender<(alloc::vec::Vec<u8>, [u8; 16])>)
+pub fn lxmf_core::link_delivery::LinkDeliveryManager::set_inbound_resource_accept_handler<F>(&mut self, F) where F: core::ops::function::Fn([u8; 16], &rns_protocol::resource_adv::ResourceAdvertisement) -> bool + core::marker::Send + core::marker::Sync + 'static
+pub fn lxmf_core::link_delivery::LinkDeliveryManager::set_inbound_resource_concluded_handler<F>(&mut self, F) where F: core::ops::function::Fn([u8; 16], [u8; 32]) + core::marker::Send + core::marker::Sync + 'static
+pub fn lxmf_core::link_delivery::LinkDeliveryManager::set_inbound_resource_limit_bytes(&mut self, usize)
+pub fn lxmf_core::link_delivery::LinkDeliveryManager::start_backchannel_delivery(&mut self, lxmf_core::message::LxMessage, [u8; 16]) -> core::result::Result<lxmf_core::link_delivery::BackchannelStartReport, lxmf_core::link_delivery::BackchannelStartFailure>
+pub fn lxmf_core::link_delivery::LinkDeliveryManager::start_delivery(&mut self, lxmf_core::message::LxMessage, [u8; 16], u8) -> core::result::Result<[u8; 16], lxmf_core::link_delivery::LinkDeliveryStartFailure>
+pub fn lxmf_core::link_delivery::LinkDeliveryManager::start_delivery_with_report(&mut self, lxmf_core::message::LxMessage, [u8; 16], u8) -> core::result::Result<lxmf_core::link_delivery::DirectLinkStartReport, lxmf_core::link_delivery::LinkDeliveryStartFailure>
+pub fn lxmf_core::link_delivery::LinkDeliveryManager::start_packed_delivery(&mut self, lxmf_core::message::LxMessage, [u8; 16], u8, alloc::vec::Vec<u8>, bool) -> core::result::Result<[u8; 16], lxmf_core::link_delivery::LinkDeliveryStartFailure>
+pub fn lxmf_core::link_delivery::LinkDeliveryManager::stats(&self) -> lxmf_core::link_delivery::LinkDeliveryStats
+pub fn lxmf_core::link_delivery::LinkDeliveryManager::take_backchannel_resource_cancellations(&mut self) -> alloc::vec::Vec<lxmf_core::link_delivery::BackchannelResourceCancelRequest>
+pub fn lxmf_core::link_delivery::LinkDeliveryManager::take_delivery_events(&mut self) -> alloc::vec::Vec<lxmf_core::link_delivery::LxmfDeliveryEvent>
+pub fn lxmf_core::link_delivery::LinkDeliveryManager::tick(&mut self) -> alloc::vec::Vec<lxmf_core::link_delivery::DeliveryResult>
+pub struct lxmf_core::link_delivery::LinkDeliveryStartFailure
+pub lxmf_core::link_delivery::LinkDeliveryStartFailure::error: lxmf_core::link_delivery::LinkDeliveryStartError
+pub lxmf_core::link_delivery::LinkDeliveryStartFailure::message: alloc::boxed::Box<lxmf_core::message::LxMessage>
+impl core::error::Error for lxmf_core::link_delivery::LinkDeliveryStartFailure
+impl core::fmt::Display for lxmf_core::link_delivery::LinkDeliveryStartFailure
+pub fn lxmf_core::link_delivery::LinkDeliveryStartFailure::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct lxmf_core::link_delivery::LinkDeliveryStats
+pub lxmf_core::link_delivery::LinkDeliveryStats::active_direct_sessions: usize
+pub lxmf_core::link_delivery::LinkDeliveryStats::backchannel_sessions: usize
+pub lxmf_core::link_delivery::LinkDeliveryStats::direct_sessions: usize
+pub lxmf_core::link_delivery::LinkDeliveryStats::establishing_direct_sessions: usize
+pub lxmf_core::link_delivery::LinkDeliveryStats::idle_direct_sessions: usize
+pub lxmf_core::link_delivery::LinkDeliveryStats::in_flight_deliveries: usize
+pub lxmf_core::link_delivery::LinkDeliveryStats::one_shot_sessions: usize
+pub lxmf_core::link_delivery::LinkDeliveryStats::pending_backchannel_deliveries: usize
+pub lxmf_core::link_delivery::LinkDeliveryStats::pending_backchannel_starts: usize
+pub lxmf_core::link_delivery::LinkDeliveryStats::queued_deliveries: usize
+pub lxmf_core::link_delivery::LinkDeliveryStats::sessions: usize
+pub struct lxmf_core::link_delivery::LxmfDeliveryEvent
+pub lxmf_core::link_delivery::LxmfDeliveryEvent::attempts: u32
+pub lxmf_core::link_delivery::LxmfDeliveryEvent::delivery_state: lxmf_core::link_delivery::DeliveryState
+pub lxmf_core::link_delivery::LxmfDeliveryEvent::dest_hash: [u8; 16]
+pub lxmf_core::link_delivery::LxmfDeliveryEvent::in_flight_deliveries: usize
+pub lxmf_core::link_delivery::LxmfDeliveryEvent::kind: lxmf_core::link_delivery::LxmfDeliveryEventKind
+pub lxmf_core::link_delivery::LxmfDeliveryEvent::link_id: [u8; 16]
+pub lxmf_core::link_delivery::LxmfDeliveryEvent::link_state: rns_link::link::LinkState
+pub lxmf_core::link_delivery::LxmfDeliveryEvent::method: lxmf_core::link_delivery::LxmfDeliveryEventMethod
+pub lxmf_core::link_delivery::LxmfDeliveryEvent::msg_hash: core::option::Option<[u8; 32]>
+pub lxmf_core::link_delivery::LxmfDeliveryEvent::progress: core::option::Option<f64>
+pub lxmf_core::link_delivery::LxmfDeliveryEvent::queued_deliveries: usize
+pub lxmf_core::link_delivery::LxmfDeliveryEvent::reason: core::option::Option<alloc::string::String>
+pub lxmf_core::link_delivery::LxmfDeliveryEvent::representation: lxmf_core::constants::DeliveryRepresentation
+pub struct lxmf_core::link_delivery::MessageDeliverySnapshot
+pub lxmf_core::link_delivery::MessageDeliverySnapshot::delivery_state: lxmf_core::link_delivery::DeliveryState
+pub lxmf_core::link_delivery::MessageDeliverySnapshot::dest_hash: [u8; 16]
+pub lxmf_core::link_delivery::MessageDeliverySnapshot::in_flight_deliveries: usize
+pub lxmf_core::link_delivery::MessageDeliverySnapshot::link_id: [u8; 16]
+pub lxmf_core::link_delivery::MessageDeliverySnapshot::link_state: rns_link::link::LinkState
+pub lxmf_core::link_delivery::MessageDeliverySnapshot::progress: f64
+pub lxmf_core::link_delivery::MessageDeliverySnapshot::queued: bool
+pub lxmf_core::link_delivery::MessageDeliverySnapshot::queued_deliveries: usize
+pub lxmf_core::link_delivery::MessageDeliverySnapshot::representation: lxmf_core::constants::DeliveryRepresentation
+pub struct lxmf_core::link_delivery::PendingDelivery
+pub lxmf_core::link_delivery::PendingDelivery::auto_compress: bool
+pub lxmf_core::link_delivery::PendingDelivery::backchannel_identified: bool
+pub lxmf_core::link_delivery::PendingDelivery::dest_hash: [u8; 16]
+pub lxmf_core::link_delivery::PendingDelivery::establishment_timeout: core::time::Duration
+pub lxmf_core::link_delivery::PendingDelivery::failure_reason: core::option::Option<alloc::string::String>
+pub lxmf_core::link_delivery::PendingDelivery::link: rns_link::link::Link
+pub lxmf_core::link_delivery::PendingDelivery::message: lxmf_core::message::LxMessage
+pub lxmf_core::link_delivery::PendingDelivery::msg_hash: core::option::Option<[u8; 32]>
+pub lxmf_core::link_delivery::PendingDelivery::packed_override: core::option::Option<alloc::vec::Vec<u8>>
+pub lxmf_core::link_delivery::PendingDelivery::packet_proof_hash: core::option::Option<[u8; 32]>
+pub lxmf_core::link_delivery::PendingDelivery::remaining_segments: core::option::Option<rns_protocol::resource::LazyMultiSegmentOutbound>
+pub lxmf_core::link_delivery::PendingDelivery::reusable: bool
+pub lxmf_core::link_delivery::PendingDelivery::started_at: std::time::Instant
+pub lxmf_core::link_delivery::PendingDelivery::state: lxmf_core::link_delivery::DeliveryState
+pub lxmf_core::link_delivery::PendingDelivery::timeout: core::time::Duration
+pub lxmf_core::link_delivery::PendingDelivery::transfer: core::option::Option<rns_protocol::resource::OutboundTransfer>
+pub fn lxmf_core::link_delivery::is_retryable_link_delivery_failure(&str) -> bool
+pub mod lxmf_core::message
+pub enum lxmf_core::message::MessageError
+pub lxmf_core::message::MessageError::InvalidUri(alloc::string::String)
+pub lxmf_core::message::MessageError::NotSigned
+pub lxmf_core::message::MessageError::PackFailed(alloc::string::String)
+pub lxmf_core::message::MessageError::TooShort(usize)
+pub lxmf_core::message::MessageError::UnpackFailed(alloc::string::String)
+pub struct lxmf_core::message::AudioField<'a>
+pub lxmf_core::message::AudioField::bytes: &'a [u8]
+pub lxmf_core::message::AudioField::mode: u8
+pub struct lxmf_core::message::LxMessage
+pub lxmf_core::message::LxMessage::auto_compress: bool
+pub lxmf_core::message::LxMessage::callbacks: lxmf_core::message::MessageCallbacks
+pub lxmf_core::message::LxMessage::content: alloc::string::String
+pub lxmf_core::message::LxMessage::delivery_attempts: u32
+pub lxmf_core::message::LxMessage::destination_hash: [u8; 16]
+pub lxmf_core::message::LxMessage::fields: alloc::collections::btree::map::BTreeMap<u8, alloc::vec::Vec<u8>>
+pub lxmf_core::message::LxMessage::hash: core::option::Option<[u8; 32]>
+pub lxmf_core::message::LxMessage::include_ticket: bool
+pub lxmf_core::message::LxMessage::incoming: bool
+pub lxmf_core::message::LxMessage::last_delivery_attempt: f64
+pub lxmf_core::message::LxMessage::message_id: core::option::Option<[u8; 32]>
+pub lxmf_core::message::LxMessage::method: lxmf_core::constants::DeliveryMethod
+pub lxmf_core::message::LxMessage::msgpack_field_ids: alloc::collections::btree::set::BTreeSet<u8>
+pub lxmf_core::message::LxMessage::next_delivery_attempt: f64
+pub lxmf_core::message::LxMessage::outbound_ticket: core::option::Option<[u8; 16]>
+pub lxmf_core::message::LxMessage::progress: f64
+pub lxmf_core::message::LxMessage::propagation_stamp: core::option::Option<[u8; 32]>
+pub lxmf_core::message::LxMessage::ratchet_id: core::option::Option<[u8; 32]>
+pub lxmf_core::message::LxMessage::representation: lxmf_core::constants::DeliveryRepresentation
+pub lxmf_core::message::LxMessage::signature: core::option::Option<[u8; 64]>
+pub lxmf_core::message::LxMessage::signature_validated: bool
+pub lxmf_core::message::LxMessage::source_blackholed: bool
+pub lxmf_core::message::LxMessage::source_hash: [u8; 16]
+pub lxmf_core::message::LxMessage::stamp: core::option::Option<alloc::vec::Vec<u8>>
+pub lxmf_core::message::LxMessage::stamp_cost: core::option::Option<u8>
+pub lxmf_core::message::LxMessage::stamp_value: core::option::Option<u16>
+pub lxmf_core::message::LxMessage::state: lxmf_core::constants::MessageState
+pub lxmf_core::message::LxMessage::timestamp: f64
+pub lxmf_core::message::LxMessage::title: alloc::string::String
+pub lxmf_core::message::LxMessage::transient_id: core::option::Option<lxmf_core::types::PropagationTransientId>
+pub lxmf_core::message::LxMessage::transport_encrypted: bool
+pub lxmf_core::message::LxMessage::transport_encryption: core::option::Option<alloc::string::String>
+pub lxmf_core::message::LxMessage::unverified_reason: core::option::Option<lxmf_core::constants::UnverifiedReason>
+pub lxmf_core::message::LxMessage::wire_payload: core::option::Option<alloc::vec::Vec<u8>>
+impl lxmf_core::message::LxMessage
+pub const lxmf_core::message::LxMessage::MIN_PROPAGATION_ENTRY_SIZE: usize
+pub fn lxmf_core::message::LxMessage::as_uri<F>(&self, F) -> core::option::Option<alloc::string::String> where F: core::ops::function::FnOnce(&[u8]) -> core::result::Result<alloc::vec::Vec<u8>, lxmf_core::message::MessageError>
+pub fn lxmf_core::message::LxMessage::audio_field(&self) -> core::result::Result<core::option::Option<lxmf_core::message::AudioField<'_>>, lxmf_core::message::MessageError>
+pub fn lxmf_core::message::LxMessage::cancel(&mut self)
+pub fn lxmf_core::message::LxMessage::compute_hash(&mut self) -> core::result::Result<[u8; 32], lxmf_core::message::MessageError>
+pub fn lxmf_core::message::LxMessage::compute_propagation_transient_id(&[u8]) -> lxmf_core::types::PropagationTransientId
+pub fn lxmf_core::message::LxMessage::decode_paper_uri(&str) -> core::result::Result<([u8; 16], alloc::vec::Vec<u8>), lxmf_core::message::MessageError>
+pub fn lxmf_core::message::LxMessage::determine_compression_support(&mut self, core::option::Option<&[u8]>)
+pub fn lxmf_core::message::LxMessage::first_file_attachment(&self) -> core::result::Result<core::option::Option<(alloc::string::String, &[u8])>, lxmf_core::message::MessageError>
+pub fn lxmf_core::message::LxMessage::from_paper_uri<F>(&str, F) -> core::result::Result<Self, lxmf_core::message::MessageError> where F: core::ops::function::FnOnce(&[u8]) -> core::result::Result<alloc::vec::Vec<u8>, lxmf_core::message::MessageError>
+pub fn lxmf_core::message::LxMessage::from_uri<F>(&str, F) -> core::result::Result<Self, lxmf_core::message::MessageError> where F: core::ops::function::FnOnce(&[u8]) -> core::result::Result<alloc::vec::Vec<u8>, lxmf_core::message::MessageError>
+pub fn lxmf_core::message::LxMessage::get_field(&self, u8) -> core::option::Option<&alloc::vec::Vec<u8>>
+pub fn lxmf_core::message::LxMessage::get_stamp(&mut self) -> core::option::Option<alloc::vec::Vec<u8>>
+pub fn lxmf_core::message::LxMessage::image_attachment(&self) -> core::result::Result<core::option::Option<(alloc::string::String, &[u8])>, lxmf_core::message::MessageError>
+pub fn lxmf_core::message::LxMessage::mark_delivered(&mut self)
+pub fn lxmf_core::message::LxMessage::mark_failed(&mut self)
+pub fn lxmf_core::message::LxMessage::mark_rejected(&mut self)
+pub fn lxmf_core::message::LxMessage::mark_sending(&mut self)
+pub fn lxmf_core::message::LxMessage::mark_sent(&mut self)
+pub fn lxmf_core::message::LxMessage::new([u8; 16], [u8; 16], &str, &str, lxmf_core::constants::DeliveryMethod) -> Self
+pub fn lxmf_core::message::LxMessage::notify_delivered(&self)
+pub fn lxmf_core::message::LxMessage::notify_failed(&self)
+pub fn lxmf_core::message::LxMessage::pack(&self) -> core::result::Result<alloc::vec::Vec<u8>, lxmf_core::message::MessageError>
+pub fn lxmf_core::message::LxMessage::pack_container(&self) -> core::result::Result<alloc::vec::Vec<u8>, lxmf_core::message::MessageError>
+pub fn lxmf_core::message::LxMessage::pack_opportunistic_encrypted<F>(&self, F) -> core::result::Result<alloc::vec::Vec<u8>, lxmf_core::message::MessageError> where F: core::ops::function::FnOnce(&[u8]) -> core::result::Result<alloc::vec::Vec<u8>, lxmf_core::message::MessageError>
+pub fn lxmf_core::message::LxMessage::pack_payload(&self) -> core::result::Result<alloc::vec::Vec<u8>, lxmf_core::message::MessageError>
+pub fn lxmf_core::message::LxMessage::pack_propagated(&self) -> core::result::Result<alloc::vec::Vec<u8>, lxmf_core::message::MessageError>
+pub fn lxmf_core::message::LxMessage::pack_propagated_encrypted<F>(&mut self, F) -> core::result::Result<(alloc::vec::Vec<u8>, lxmf_core::types::PropagationTransientId), lxmf_core::message::MessageError> where F: core::ops::function::FnOnce(&[u8]) -> core::result::Result<alloc::vec::Vec<u8>, lxmf_core::message::MessageError>
+pub fn lxmf_core::message::LxMessage::pack_propagated_encrypted_with_stamp<F>(&mut self, F, u8) -> core::result::Result<(alloc::vec::Vec<u8>, lxmf_core::types::PropagationTransientId, u32), lxmf_core::message::MessageError> where F: core::ops::function::FnOnce(&[u8]) -> core::result::Result<alloc::vec::Vec<u8>, lxmf_core::message::MessageError>
+pub fn lxmf_core::message::LxMessage::packed_len(&self) -> core::result::Result<usize, lxmf_core::message::MessageError>
+pub fn lxmf_core::message::LxMessage::read_from_file(&str) -> core::result::Result<Self, lxmf_core::message::MessageError>
+pub fn lxmf_core::message::LxMessage::register_delivery_callback<F>(&mut self, F) where F: core::ops::function::Fn(&lxmf_core::message::LxMessage) + core::marker::Send + core::marker::Sync + 'static
+pub fn lxmf_core::message::LxMessage::register_failed_callback<F>(&mut self, F) where F: core::ops::function::Fn(&lxmf_core::message::LxMessage) + core::marker::Send + core::marker::Sync + 'static
+pub fn lxmf_core::message::LxMessage::set_audio_field(&mut self, u8, &[u8]) -> core::result::Result<(), lxmf_core::message::MessageError>
+pub fn lxmf_core::message::LxMessage::set_field(&mut self, u8, alloc::vec::Vec<u8>)
+pub fn lxmf_core::message::LxMessage::set_file_attachment_field(&mut self, &str, &[u8]) -> core::result::Result<(), lxmf_core::message::MessageError>
+pub fn lxmf_core::message::LxMessage::set_image_field(&mut self, &str, &[u8]) -> core::result::Result<(), lxmf_core::message::MessageError>
+pub fn lxmf_core::message::LxMessage::set_msgpack_field(&mut self, u8, alloc::vec::Vec<u8>) -> core::result::Result<(), lxmf_core::message::MessageError>
+pub fn lxmf_core::message::LxMessage::sign(&mut self, &rns_crypto::ed25519::Ed25519PrivateKey) -> core::result::Result<(), lxmf_core::message::MessageError>
+pub fn lxmf_core::message::LxMessage::sign_with<F, E>(&mut self, F) -> core::result::Result<(), lxmf_core::message::MessageError> where F: core::ops::function::FnOnce(&[u8]) -> core::result::Result<[u8; 64], E>, E: core::fmt::Display
+pub fn lxmf_core::message::LxMessage::to_paper_uri<F>(&self, F) -> core::result::Result<alloc::string::String, lxmf_core::message::MessageError> where F: core::ops::function::FnOnce(&[u8]) -> core::result::Result<alloc::vec::Vec<u8>, lxmf_core::message::MessageError>
+pub fn lxmf_core::message::LxMessage::unpack(&[u8]) -> core::result::Result<Self, lxmf_core::message::MessageError>
+pub fn lxmf_core::message::LxMessage::unpack_container(&[u8]) -> core::result::Result<Self, lxmf_core::message::MessageError>
+pub fn lxmf_core::message::LxMessage::unpack_propagated(&[u8]) -> core::result::Result<Self, lxmf_core::message::MessageError>
+pub fn lxmf_core::message::LxMessage::unpack_propagation_wrapper(&[u8]) -> core::result::Result<(f64, alloc::vec::Vec<alloc::vec::Vec<u8>>), lxmf_core::message::MessageError>
+pub fn lxmf_core::message::LxMessage::unpack_propagation_wrapper_bounded(&[u8], usize) -> core::result::Result<(f64, alloc::vec::Vec<alloc::vec::Vec<u8>>), lxmf_core::message::MessageError>
+pub fn lxmf_core::message::LxMessage::validate_stamp_with_tickets(&mut self, u8, core::option::Option<&[alloc::vec::Vec<u8>]>) -> bool
+pub fn lxmf_core::message::LxMessage::verify(&mut self, &rns_crypto::ed25519::Ed25519PublicKey) -> bool
+pub fn lxmf_core::message::LxMessage::write_to_directory(&self, &str) -> core::result::Result<alloc::string::String, lxmf_core::message::MessageError>
+pub struct lxmf_core::message::MessageCallbacks
+pub lxmf_core::message::MessageCallbacks::on_delivered: core::option::Option<lxmf_core::message::MessageCallback>
+pub lxmf_core::message::MessageCallbacks::on_failed: core::option::Option<lxmf_core::message::MessageCallback>
+impl core::fmt::Debug for lxmf_core::message::MessageCallbacks
+pub fn lxmf_core::message::MessageCallbacks::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct lxmf_core::message::MessagePayload
+pub lxmf_core::message::MessagePayload::content: alloc::string::String
+pub lxmf_core::message::MessagePayload::fields: alloc::collections::btree::map::BTreeMap<u8, alloc::vec::Vec<u8>>
+pub lxmf_core::message::MessagePayload::msgpack_field_ids: alloc::collections::btree::set::BTreeSet<u8>
+pub lxmf_core::message::MessagePayload::stamp: core::option::Option<alloc::vec::Vec<u8>>
+pub lxmf_core::message::MessagePayload::timestamp: f64
+pub lxmf_core::message::MessagePayload::title: alloc::string::String
+pub type lxmf_core::message::MessageCallback = alloc::sync::Arc<(dyn core::ops::function::Fn(&lxmf_core::message::LxMessage) + core::marker::Send + core::marker::Sync)>
+pub mod lxmf_core::peer
+pub struct lxmf_core::peer::LxmPeer
+pub lxmf_core::peer::LxmPeer::alive: bool
+pub lxmf_core::peer::LxmPeer::autopeered: bool
+pub lxmf_core::peer::LxmPeer::created_at: f64
+pub lxmf_core::peer::LxmPeer::currently_transferring_messages: core::option::Option<alloc::vec::Vec<lxmf_core::types::PropagationTransientId>>
+pub lxmf_core::peer::LxmPeer::destination_hash: [u8; 16]
+pub lxmf_core::peer::LxmPeer::handled_messages: std::collections::hash::set::HashSet<lxmf_core::types::PropagationTransientId>
+pub lxmf_core::peer::LxmPeer::incoming: u64
+pub lxmf_core::peer::LxmPeer::is_static: bool
+pub lxmf_core::peer::LxmPeer::last_heard: f64
+pub lxmf_core::peer::LxmPeer::last_offer_generation: u64
+pub lxmf_core::peer::LxmPeer::last_sync: f64
+pub lxmf_core::peer::LxmPeer::last_sync_attempt: f64
+pub lxmf_core::peer::LxmPeer::link_alive: bool
+pub lxmf_core::peer::LxmPeer::link_establishment_rate: f64
+pub lxmf_core::peer::LxmPeer::metadata: core::option::Option<std::collections::hash::map::HashMap<u8, alloc::vec::Vec<u8>>>
+pub lxmf_core::peer::LxmPeer::next_sync_attempt: f64
+pub lxmf_core::peer::LxmPeer::offered: u64
+pub lxmf_core::peer::LxmPeer::outgoing: u64
+pub lxmf_core::peer::LxmPeer::peering_cost: u8
+pub lxmf_core::peer::LxmPeer::peering_key: core::option::Option<([u8; 32], u32)>
+pub lxmf_core::peer::LxmPeer::peering_timebase: f64
+pub lxmf_core::peer::LxmPeer::propagation_sync_limit: core::option::Option<f64>
+pub lxmf_core::peer::LxmPeer::propagation_transfer_limit: core::option::Option<f64>
+pub lxmf_core::peer::LxmPeer::rx_bytes: u64
+pub lxmf_core::peer::LxmPeer::stamp_cost: core::option::Option<u8>
+pub lxmf_core::peer::LxmPeer::stamp_cost_flexibility: core::option::Option<u8>
+pub lxmf_core::peer::LxmPeer::state: lxmf_core::constants::PeerState
+pub lxmf_core::peer::LxmPeer::sync_backoff: f64
+pub lxmf_core::peer::LxmPeer::sync_strategy: lxmf_core::constants::SyncStrategy
+pub lxmf_core::peer::LxmPeer::sync_transfer_rate: f64
+pub lxmf_core::peer::LxmPeer::tx_bytes: u64
+pub lxmf_core::peer::LxmPeer::unreachable_count: u32
+impl lxmf_core::peer::LxmPeer
+pub fn lxmf_core::peer::LxmPeer::acceptance_rate(&self) -> f64
+pub fn lxmf_core::peer::LxmPeer::add_handled_message(&mut self, &lxmf_core::types::PropagationTransientId)
+pub fn lxmf_core::peer::LxmPeer::add_unhandled_message(&mut self)
+pub fn lxmf_core::peer::LxmPeer::begin_sync(&mut self)
+pub fn lxmf_core::peer::LxmPeer::from_announce([u8; 16], f64, core::option::Option<f64>, core::option::Option<f64>, core::option::Option<u8>, core::option::Option<u8>, core::option::Option<u8>) -> Self
+pub fn lxmf_core::peer::LxmPeer::from_announce_with_metadata([u8; 16], f64, core::option::Option<f64>, core::option::Option<f64>, core::option::Option<u8>, core::option::Option<u8>, core::option::Option<u8>, core::option::Option<std::collections::hash::map::HashMap<u8, alloc::vec::Vec<u8>>>) -> Self
+pub fn lxmf_core::peer::LxmPeer::from_bytes_with_handled(&[u8]) -> core::option::Option<Self>
+pub fn lxmf_core::peer::LxmPeer::generate_peering_key(&mut self, &[u8; 16], &[u8; 16]) -> bool
+pub fn lxmf_core::peer::LxmPeer::has_handled(&self, &lxmf_core::types::PropagationTransientId) -> bool
+pub fn lxmf_core::peer::LxmPeer::heard(&mut self)
+pub fn lxmf_core::peer::LxmPeer::is_stale(&self) -> bool
+pub fn lxmf_core::peer::LxmPeer::link_closed(&mut self)
+pub fn lxmf_core::peer::LxmPeer::link_established(&mut self, [u8; 16], core::option::Option<f64>)
+pub fn lxmf_core::peer::LxmPeer::mark_offer_generation_processed(&mut self, u64)
+pub fn lxmf_core::peer::LxmPeer::mark_unreachable(&mut self)
+pub fn lxmf_core::peer::LxmPeer::minimum_accepted_stamp_cost(&self) -> u8
+pub fn lxmf_core::peer::LxmPeer::needs_offer_generation(&self, u64) -> bool
+pub fn lxmf_core::peer::LxmPeer::new([u8; 16]) -> Self
+pub fn lxmf_core::peer::LxmPeer::outbound_offer_policy(&self) -> lxmf_core::peer::OutboundOfferPolicy
+pub fn lxmf_core::peer::LxmPeer::peering_key_ready(&self) -> bool
+pub fn lxmf_core::peer::LxmPeer::peering_key_value(&self) -> core::option::Option<u32>
+pub fn lxmf_core::peer::LxmPeer::refresh_from_announce(&mut self, f64, core::option::Option<f64>, core::option::Option<f64>, core::option::Option<u8>, core::option::Option<u8>, core::option::Option<u8>) -> bool
+pub fn lxmf_core::peer::LxmPeer::refresh_from_announce_with_metadata(&mut self, f64, core::option::Option<f64>, core::option::Option<f64>, core::option::Option<u8>, core::option::Option<u8>, core::option::Option<u8>, core::option::Option<std::collections::hash::map::HashMap<u8, alloc::vec::Vec<u8>>>) -> bool
+pub fn lxmf_core::peer::LxmPeer::set_unhandled_count(&mut self, u32)
+pub fn lxmf_core::peer::LxmPeer::should_sync(&self) -> bool
+pub fn lxmf_core::peer::LxmPeer::stamp_costs_known(&self) -> bool
+pub fn lxmf_core::peer::LxmPeer::sync_backoff(&self) -> f64
+pub fn lxmf_core::peer::LxmPeer::sync_complete(&mut self)
+pub fn lxmf_core::peer::LxmPeer::sync_failed(&mut self)
+pub fn lxmf_core::peer::LxmPeer::to_bytes_with_handled(&self) -> alloc::vec::Vec<u8>
+pub fn lxmf_core::peer::LxmPeer::unhandled_messages(&self) -> u32
+impl core::convert::From<&lxmf_core::peer::LxmPeer> for lxmf_core::peer::OutboundOfferPolicy
+pub fn lxmf_core::peer::OutboundOfferPolicy::from(&lxmf_core::peer::LxmPeer) -> Self
+pub struct lxmf_core::peer::OutboundOfferPolicy
+pub lxmf_core::peer::OutboundOfferPolicy::autopeered: bool
+pub lxmf_core::peer::OutboundOfferPolicy::handled_messages: std::collections::hash::set::HashSet<lxmf_core::types::PropagationTransientId>
+pub lxmf_core::peer::OutboundOfferPolicy::is_static: bool
+pub lxmf_core::peer::OutboundOfferPolicy::metadata: core::option::Option<std::collections::hash::map::HashMap<u8, alloc::vec::Vec<u8>>>
+pub lxmf_core::peer::OutboundOfferPolicy::minimum_stamp_cost: u8
+pub lxmf_core::peer::OutboundOfferPolicy::peer_hash: [u8; 16]
+pub lxmf_core::peer::OutboundOfferPolicy::peering_cost: u8
+pub lxmf_core::peer::OutboundOfferPolicy::peering_key: alloc::vec::Vec<u8>
+pub lxmf_core::peer::OutboundOfferPolicy::peering_key_value: core::option::Option<u32>
+pub lxmf_core::peer::OutboundOfferPolicy::peering_timebase: f64
+pub lxmf_core::peer::OutboundOfferPolicy::propagation_sync_limit: core::option::Option<f64>
+pub lxmf_core::peer::OutboundOfferPolicy::propagation_transfer_limit: core::option::Option<f64>
+pub lxmf_core::peer::OutboundOfferPolicy::stamp_cost: core::option::Option<u8>
+pub lxmf_core::peer::OutboundOfferPolicy::stamp_cost_flexibility: core::option::Option<u8>
+impl lxmf_core::peer::OutboundOfferPolicy
+pub fn lxmf_core::peer::OutboundOfferPolicy::unrestricted([u8; 16]) -> Self
+impl core::convert::From<&lxmf_core::peer::LxmPeer> for lxmf_core::peer::OutboundOfferPolicy
+pub fn lxmf_core::peer::OutboundOfferPolicy::from(&lxmf_core::peer::LxmPeer) -> Self
+pub fn lxmf_core::peer::select_sync_peer(&[&lxmf_core::peer::LxmPeer]) -> core::option::Option<usize>
+pub mod lxmf_core::persist
+pub struct lxmf_core::persist::PersistedNodeStats
+pub lxmf_core::persist::PersistedNodeStats::client_propagation_messages_received: u64
+pub lxmf_core::persist::PersistedNodeStats::client_propagation_messages_served: u64
+pub lxmf_core::persist::PersistedNodeStats::unpeered_propagation_incoming: u64
+pub lxmf_core::persist::PersistedNodeStats::unpeered_propagation_rx_bytes: u64
+pub const lxmf_core::persist::LOCALLY_PROCESSED_FILE: &str
+pub const lxmf_core::persist::LOCAL_DELIVERIES_FILE: &str
+pub const lxmf_core::persist::NODE_STATS_FILE: &str
+pub const lxmf_core::persist::STAMP_COSTS_FILE: &str
+pub const lxmf_core::persist::TICKETS_FILE: &str
+pub fn lxmf_core::persist::load_local_deliveries(&std::path::Path) -> core::io::error::Result<std::collections::hash::map::HashMap<lxmf_core::types::PropagationTransientId, f64>>
+pub fn lxmf_core::persist::load_locally_processed(&std::path::Path) -> core::io::error::Result<std::collections::hash::map::HashMap<lxmf_core::types::PropagationTransientId, f64>>
+pub fn lxmf_core::persist::load_node_stats(&std::path::Path) -> core::io::error::Result<lxmf_core::persist::PersistedNodeStats>
+pub fn lxmf_core::persist::load_stamp_costs(&std::path::Path) -> core::io::error::Result<std::collections::hash::map::HashMap<[u8; 16], lxmf_core::router::StampCostEntry>>
+pub fn lxmf_core::persist::load_tickets(&std::path::Path) -> core::io::error::Result<(lxmf_core::ticket::TicketStoreSnapshot, core::option::Option<alloc::vec::Vec<lxmf_core::ticket::Ticket>>)>
+pub fn lxmf_core::persist::save_local_deliveries(&std::path::Path, &std::collections::hash::map::HashMap<lxmf_core::types::PropagationTransientId, f64>) -> core::io::error::Result<()>
+pub fn lxmf_core::persist::save_locally_processed(&std::path::Path, &std::collections::hash::map::HashMap<lxmf_core::types::PropagationTransientId, f64>) -> core::io::error::Result<()>
+pub fn lxmf_core::persist::save_node_stats(&std::path::Path, &lxmf_core::persist::PersistedNodeStats) -> core::io::error::Result<()>
+pub fn lxmf_core::persist::save_stamp_costs(&std::path::Path, &std::collections::hash::map::HashMap<[u8; 16], lxmf_core::router::StampCostEntry>) -> core::io::error::Result<()>
+pub fn lxmf_core::persist::save_tickets(&std::path::Path, &lxmf_core::ticket::TicketStoreSnapshot) -> core::io::error::Result<()>
+pub fn lxmf_core::persist::write_file_atomic(&std::path::Path, &[u8]) -> core::io::error::Result<()>
+pub mod lxmf_core::presentation
+pub const lxmf_core::presentation::MAX_ADVERTISED_NAME_CHARS: usize
+pub fn lxmf_core::presentation::sanitize_name(&str, usize) -> alloc::string::String
+pub mod lxmf_core::propagation
+pub use lxmf_core::propagation::hex_encode
+pub struct lxmf_core::propagation::PropagationEntry
+pub lxmf_core::propagation::PropagationEntry::collected: bool
+pub lxmf_core::propagation::PropagationEntry::destination_hash: [u8; 16]
+pub lxmf_core::propagation::PropagationEntry::message_hash: [u8; 32]
+pub lxmf_core::propagation::PropagationEntry::size: usize
+pub lxmf_core::propagation::PropagationEntry::stamp_value: u8
+pub lxmf_core::propagation::PropagationEntry::stamped: bool
+pub lxmf_core::propagation::PropagationEntry::stored_at: f64
+pub lxmf_core::propagation::PropagationEntry::transient_id: lxmf_core::types::PropagationTransientId
+impl lxmf_core::propagation::PropagationEntry
+pub fn lxmf_core::propagation::PropagationEntry::filename(&self) -> alloc::string::String
+pub fn lxmf_core::propagation::PropagationEntry::new(lxmf_core::types::PropagationTransientId, [u8; 32], [u8; 16], usize, u8) -> Self
+pub fn lxmf_core::propagation::PropagationEntry::new_stamped(lxmf_core::types::PropagationTransientId, [u8; 32], [u8; 16], usize, u8) -> Self
+pub fn lxmf_core::propagation::PropagationEntry::parse_filename(&str) -> core::option::Option<(lxmf_core::types::PropagationTransientId, f64, u8)>
+pub struct lxmf_core::propagation::PropagationStore
+pub lxmf_core::propagation::PropagationStore::storage_limit: core::option::Option<usize>
+impl lxmf_core::propagation::PropagationStore
+pub fn lxmf_core::propagation::PropagationStore::clean_transient_caches(&mut self, f64)
+pub fn lxmf_core::propagation::PropagationStore::compute_weight(&self, &lxmf_core::propagation::PropagationEntry, f64) -> f64
+pub fn lxmf_core::propagation::PropagationStore::contains(&self, &lxmf_core::types::PropagationTransientId) -> bool
+pub fn lxmf_core::propagation::PropagationStore::cull_by_weight(&mut self, usize)
+pub fn lxmf_core::propagation::PropagationStore::cull_expired(&mut self, u64)
+pub fn lxmf_core::propagation::PropagationStore::drain_distribution_queue(&mut self) -> alloc::vec::Vec<(lxmf_core::types::PropagationTransientId, core::option::Option<[u8; 16]>)>
+pub fn lxmf_core::propagation::PropagationStore::enqueue_distribution(&mut self, lxmf_core::types::PropagationTransientId, core::option::Option<[u8; 16]>)
+pub fn lxmf_core::propagation::PropagationStore::entries(&self) -> impl core::iter::traits::iterator::Iterator<Item = &lxmf_core::propagation::PropagationEntry>
+pub fn lxmf_core::propagation::PropagationStore::entries_for_destination(&self, &[u8; 16]) -> alloc::vec::Vec<&lxmf_core::propagation::PropagationEntry>
+pub fn lxmf_core::propagation::PropagationStore::get(&self, &lxmf_core::types::PropagationTransientId) -> core::option::Option<&lxmf_core::propagation::PropagationEntry>
+pub fn lxmf_core::propagation::PropagationStore::get_stamp_value(&self, &lxmf_core::types::PropagationTransientId) -> core::option::Option<u8>
+pub fn lxmf_core::propagation::PropagationStore::has_pending_distribution(&self) -> bool
+pub fn lxmf_core::propagation::PropagationStore::ignore_destination(&mut self, [u8; 16])
+pub fn lxmf_core::propagation::PropagationStore::insert(&mut self, lxmf_core::propagation::PropagationEntry) -> bool
+pub fn lxmf_core::propagation::PropagationStore::is_destination_ignored(&self, &[u8; 16]) -> bool
+pub fn lxmf_core::propagation::PropagationStore::is_empty(&self) -> bool
+pub fn lxmf_core::propagation::PropagationStore::is_locally_delivered(&self, &lxmf_core::types::PropagationTransientId) -> bool
+pub fn lxmf_core::propagation::PropagationStore::is_locally_processed(&self, &lxmf_core::types::PropagationTransientId) -> bool
+pub fn lxmf_core::propagation::PropagationStore::iter(&self) -> impl core::iter::traits::iterator::Iterator<Item = (&lxmf_core::types::PropagationTransientId, &lxmf_core::propagation::PropagationEntry)>
+pub fn lxmf_core::propagation::PropagationStore::len(&self) -> usize
+pub fn lxmf_core::propagation::PropagationStore::locally_delivered_ids(&self) -> &std::collections::hash::map::HashMap<lxmf_core::types::PropagationTransientId, f64>
+pub fn lxmf_core::propagation::PropagationStore::locally_processed_ids(&self) -> &std::collections::hash::map::HashMap<lxmf_core::types::PropagationTransientId, f64>
+pub fn lxmf_core::propagation::PropagationStore::mark_locally_delivered(&mut self, lxmf_core::types::PropagationTransientId)
+pub fn lxmf_core::propagation::PropagationStore::mark_locally_processed(&mut self, lxmf_core::types::PropagationTransientId)
+pub fn lxmf_core::propagation::PropagationStore::new() -> Self
+pub fn lxmf_core::propagation::PropagationStore::prioritise_destination(&mut self, [u8; 16])
+pub fn lxmf_core::propagation::PropagationStore::remove(&mut self, &lxmf_core::types::PropagationTransientId) -> core::option::Option<lxmf_core::propagation::PropagationEntry>
+pub fn lxmf_core::propagation::PropagationStore::replace_locally_delivered(&mut self, std::collections::hash::map::HashMap<lxmf_core::types::PropagationTransientId, f64>)
+pub fn lxmf_core::propagation::PropagationStore::replace_locally_processed(&mut self, std::collections::hash::map::HashMap<lxmf_core::types::PropagationTransientId, f64>)
+pub fn lxmf_core::propagation::PropagationStore::total_size(&self) -> usize
+pub fn lxmf_core::propagation::PropagationStore::transient_ids(&self) -> alloc::vec::Vec<lxmf_core::types::PropagationTransientId>
+pub fn lxmf_core::propagation::PropagationStore::unignore_destination(&mut self, &[u8; 16])
+pub fn lxmf_core::propagation::PropagationStore::unprioritise_destination(&mut self, &[u8; 16])
+pub mod lxmf_core::propagation_admission
+pub enum lxmf_core::propagation_admission::PnCandidateDiscardResult
+pub lxmf_core::propagation_admission::PnCandidateDiscardResult::Discarded
+pub lxmf_core::propagation_admission::PnCandidateDiscardResult::Stale
+pub enum lxmf_core::propagation_admission::PnCleanupResult
+pub lxmf_core::propagation_admission::PnCleanupResult::CandidateRevoked
+pub lxmf_core::propagation_admission::PnCleanupResult::NotTracked
+pub lxmf_core::propagation_admission::PnCleanupResult::Removed(lxmf_core::propagation_admission::PnInboundState)
+pub enum lxmf_core::propagation_admission::PnInboundState
+pub lxmf_core::propagation_admission::PnInboundState::Accepted
+pub lxmf_core::propagation_admission::PnInboundState::Transferring
+pub lxmf_core::propagation_admission::PnInboundState::Validating
+pub enum lxmf_core::propagation_admission::PnOfferAdmission
+pub lxmf_core::propagation_admission::PnOfferAdmission::Accepted
+pub lxmf_core::propagation_admission::PnOfferAdmission::HaveAll
+pub lxmf_core::propagation_admission::PnOfferAdmission::Rejected(lxmf_core::propagation_admission::PnOfferRejection)
+pub enum lxmf_core::propagation_admission::PnOfferRejection
+pub lxmf_core::propagation_admission::PnOfferRejection::InboundSyncLimit
+pub lxmf_core::propagation_admission::PnOfferRejection::InvalidStampThrottle
+pub lxmf_core::propagation_admission::PnOfferRejection::LinkAlreadyTracked
+pub lxmf_core::propagation_admission::PnOfferRejection::LinkCandidatePending
+pub lxmf_core::propagation_admission::PnOfferRejection::NoAccess
+pub lxmf_core::propagation_admission::PnOfferRejection::NoIdentity
+pub lxmf_core::propagation_admission::PnOfferRejection::SequentialValidationActive
+pub lxmf_core::propagation_admission::PnOfferRejection::StaleCandidate
+pub enum lxmf_core::propagation_admission::PnOfferResponse
+pub lxmf_core::propagation_admission::PnOfferResponse::HaveAll
+pub lxmf_core::propagation_admission::PnOfferResponse::WantAll
+pub lxmf_core::propagation_admission::PnOfferResponse::WantSome
+pub enum lxmf_core::propagation_admission::PnThrottleInstallError
+pub lxmf_core::propagation_admission::PnThrottleInstallError::UnknownPeerDestination
+pub enum lxmf_core::propagation_admission::PnTransitionError
+pub lxmf_core::propagation_admission::PnTransitionError::IllegalState
+pub lxmf_core::propagation_admission::PnTransitionError::IllegalState::operation: lxmf_core::propagation_admission::PnTransitionOperation
+pub lxmf_core::propagation_admission::PnTransitionError::IllegalState::state: lxmf_core::propagation_admission::PnInboundState
+pub lxmf_core::propagation_admission::PnTransitionError::LinkNotTracked
+pub enum lxmf_core::propagation_admission::PnTransitionOperation
+pub lxmf_core::propagation_admission::PnTransitionOperation::ResourceConcluded
+pub lxmf_core::propagation_admission::PnTransitionOperation::ResourceStarted
+pub lxmf_core::propagation_admission::PnTransitionOperation::ValidationConcluded
+pub enum lxmf_core::propagation_admission::PnValidationResult
+pub lxmf_core::propagation_admission::PnValidationResult::Failed
+pub lxmf_core::propagation_admission::PnValidationResult::InvalidStamp
+pub lxmf_core::propagation_admission::PnValidationResult::Valid
+pub struct lxmf_core::propagation_admission::PnInboundAdmission
+impl lxmf_core::propagation_admission::PnInboundAdmission
+pub fn lxmf_core::propagation_admission::PnInboundAdmission::add_static_peer(&mut self, [u8; 16]) -> bool
+pub fn lxmf_core::propagation_admission::PnInboundAdmission::commit_validated_offer(&mut self, lxmf_core::propagation_admission::PnOfferCandidate, lxmf_core::propagation_admission::PnOfferResponse, core::time::Duration) -> lxmf_core::propagation_admission::PnOfferAdmission
+pub fn lxmf_core::propagation_admission::PnInboundAdmission::config(&self) -> lxmf_core::propagation_admission::PnInboundAdmissionConfig
+pub fn lxmf_core::propagation_admission::PnInboundAdmission::discard_candidate(&mut self, lxmf_core::propagation_admission::PnOfferCandidate) -> lxmf_core::propagation_admission::PnCandidateDiscardResult
+pub fn lxmf_core::propagation_admission::PnInboundAdmission::expire_throttles(&mut self, core::time::Duration)
+pub fn lxmf_core::propagation_admission::PnInboundAdmission::inbound_sync_count(&self) -> usize
+pub fn lxmf_core::propagation_admission::PnInboundAdmission::install_invalid_stamp_throttle(&mut self, [u8; 16], core::time::Duration) -> core::result::Result<core::time::Duration, lxmf_core::propagation_admission::PnThrottleInstallError>
+pub fn lxmf_core::propagation_admission::PnInboundAdmission::is_empty(&self) -> bool
+pub fn lxmf_core::propagation_admission::PnInboundAdmission::is_peer_throttled(&mut self, &[u8; 16], core::time::Duration) -> bool
+pub fn lxmf_core::propagation_admission::PnInboundAdmission::is_static_peer(&self, &[u8; 16]) -> bool
+pub fn lxmf_core::propagation_admission::PnInboundAdmission::len(&self) -> usize
+pub fn lxmf_core::propagation_admission::PnInboundAdmission::link_closed(&mut self, &[u8; 16]) -> lxmf_core::propagation_admission::PnCleanupResult
+pub fn lxmf_core::propagation_admission::PnInboundAdmission::new(lxmf_core::propagation_admission::PnInboundAdmissionConfig) -> Self
+pub fn lxmf_core::propagation_admission::PnInboundAdmission::peer_destination_hash(&[u8; 16]) -> [u8; 16]
+pub fn lxmf_core::propagation_admission::PnInboundAdmission::preflight_offer(&mut self, [u8; 16], core::option::Option<[u8; 16]>, core::time::Duration) -> core::result::Result<lxmf_core::propagation_admission::PnOfferCandidate, lxmf_core::propagation_admission::PnOfferRejection>
+pub fn lxmf_core::propagation_admission::PnInboundAdmission::record(&self, &[u8; 16]) -> core::option::Option<&lxmf_core::propagation_admission::PnInboundRecord>
+pub fn lxmf_core::propagation_admission::PnInboundAdmission::remove_static_peer(&mut self, &[u8; 16]) -> bool
+pub fn lxmf_core::propagation_admission::PnInboundAdmission::resource_cancelled(&mut self, &[u8; 16]) -> lxmf_core::propagation_admission::PnCleanupResult
+pub fn lxmf_core::propagation_admission::PnInboundAdmission::resource_concluded(&mut self, &[u8; 16]) -> core::result::Result<(), lxmf_core::propagation_admission::PnTransitionError>
+pub fn lxmf_core::propagation_admission::PnInboundAdmission::resource_failed(&mut self, &[u8; 16]) -> lxmf_core::propagation_admission::PnCleanupResult
+pub fn lxmf_core::propagation_admission::PnInboundAdmission::resource_rejected(&mut self, &[u8; 16]) -> lxmf_core::propagation_admission::PnCleanupResult
+pub fn lxmf_core::propagation_admission::PnInboundAdmission::resource_started(&mut self, &[u8; 16]) -> core::result::Result<(), lxmf_core::propagation_admission::PnTransitionError>
+pub fn lxmf_core::propagation_admission::PnInboundAdmission::set_static_peers<I>(&mut self, I) where I: core::iter::traits::collect::IntoIterator<Item = [u8; 16]>
+pub fn lxmf_core::propagation_admission::PnInboundAdmission::throttle_count(&self) -> usize
+pub fn lxmf_core::propagation_admission::PnInboundAdmission::throttle_deadline(&mut self, &[u8; 16], core::time::Duration) -> core::option::Option<core::time::Duration>
+pub fn lxmf_core::propagation_admission::PnInboundAdmission::validation_concluded(&mut self, &[u8; 16], lxmf_core::propagation_admission::PnValidationResult, core::time::Duration) -> core::result::Result<lxmf_core::propagation_admission::PnCleanupResult, lxmf_core::propagation_admission::PnTransitionError>
+pub fn lxmf_core::propagation_admission::PnInboundAdmission::validation_count(&self) -> usize
+impl core::default::Default for lxmf_core::propagation_admission::PnInboundAdmission
+pub fn lxmf_core::propagation_admission::PnInboundAdmission::default() -> Self
+impl core::fmt::Debug for lxmf_core::propagation_admission::PnInboundAdmission
+pub fn lxmf_core::propagation_admission::PnInboundAdmission::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct lxmf_core::propagation_admission::PnInboundAdmissionConfig
+pub lxmf_core::propagation_admission::PnInboundAdmissionConfig::from_static_only: bool
+pub lxmf_core::propagation_admission::PnInboundAdmissionConfig::max_inbound_syncs: usize
+pub lxmf_core::propagation_admission::PnInboundAdmissionConfig::sequential_validation: bool
+pub lxmf_core::propagation_admission::PnInboundAdmissionConfig::static_sequential: bool
+impl core::default::Default for lxmf_core::propagation_admission::PnInboundAdmissionConfig
+pub fn lxmf_core::propagation_admission::PnInboundAdmissionConfig::default() -> Self
+pub struct lxmf_core::propagation_admission::PnInboundRecord
+impl lxmf_core::propagation_admission::PnInboundRecord
+pub fn lxmf_core::propagation_admission::PnInboundRecord::offer_response(&self) -> lxmf_core::propagation_admission::PnOfferResponse
+pub fn lxmf_core::propagation_admission::PnInboundRecord::peer_destination_hash(&self) -> &[u8; 16]
+pub fn lxmf_core::propagation_admission::PnInboundRecord::peer_identity_hash(&self) -> &[u8; 16]
+pub fn lxmf_core::propagation_admission::PnInboundRecord::state(&self) -> lxmf_core::propagation_admission::PnInboundState
+impl core::fmt::Debug for lxmf_core::propagation_admission::PnInboundRecord
+pub fn lxmf_core::propagation_admission::PnInboundRecord::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct lxmf_core::propagation_admission::PnOfferCandidate
+impl lxmf_core::propagation_admission::PnOfferCandidate
+pub fn lxmf_core::propagation_admission::PnOfferCandidate::link_id(&self) -> [u8; 16]
+pub fn lxmf_core::propagation_admission::PnOfferCandidate::peer_destination_hash(&self) -> [u8; 16]
+pub fn lxmf_core::propagation_admission::PnOfferCandidate::peer_identity_hash(&self) -> [u8; 16]
+impl core::fmt::Debug for lxmf_core::propagation_admission::PnOfferCandidate
+pub fn lxmf_core::propagation_admission::PnOfferCandidate::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub const lxmf_core::propagation_admission::PN_DEFAULT_MAX_INBOUND_SYNCS: usize
+pub const lxmf_core::propagation_admission::PN_INVALID_STAMP_THROTTLE: core::time::Duration
+pub const lxmf_core::propagation_admission::PN_MIN_MAX_INBOUND_SYNCS: usize
+pub mod lxmf_core::propagation_client
+pub enum lxmf_core::propagation_client::PropagationClientState
+pub lxmf_core::propagation_client::PropagationClientState::Complete
+pub lxmf_core::propagation_client::PropagationClientState::Failed
+pub lxmf_core::propagation_client::PropagationClientState::GetRequested
+pub lxmf_core::propagation_client::PropagationClientState::Idle
+pub lxmf_core::propagation_client::PropagationClientState::LinkEstablished
+pub lxmf_core::propagation_client::PropagationClientState::LinkEstablishing
+pub lxmf_core::propagation_client::PropagationClientState::ListRequested
+pub lxmf_core::propagation_client::PropagationClientState::PurgeRequested
+pub lxmf_core::propagation_client::PropagationClientState::Receiving
+pub struct lxmf_core::propagation_client::PropagationClient
+impl lxmf_core::propagation_client::PropagationClient
+pub fn lxmf_core::propagation_client::PropagationClient::acknowledge_transfer(&mut self) -> bool
+pub fn lxmf_core::propagation_client::PropagationClient::add_local_message(&mut self, lxmf_core::types::PropagationTransientId)
+pub fn lxmf_core::propagation_client::PropagationClient::add_local_message_id(&mut self, alloc::vec::Vec<u8>)
+pub fn lxmf_core::propagation_client::PropagationClient::available_messages(&self) -> &[alloc::vec::Vec<u8>]
+pub fn lxmf_core::propagation_client::PropagationClient::cancel_download(&mut self)
+pub fn lxmf_core::propagation_client::PropagationClient::drain_events(&mut self, &std::collections::hash::map::HashMap<alloc::string::String, [u8; 64]>)
+pub fn lxmf_core::propagation_client::PropagationClient::new(tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>, core::option::Option<[u8; 64]>, core::option::Option<rns_crypto::ed25519::Ed25519PrivateKey>) -> Self
+pub fn lxmf_core::propagation_client::PropagationClient::received_count(&self) -> usize
+pub fn lxmf_core::propagation_client::PropagationClient::replace_local_message_ids<I>(&mut self, I) where I: core::iter::traits::collect::IntoIterator<Item = alloc::vec::Vec<u8>>
+pub fn lxmf_core::propagation_client::PropagationClient::set_delivery_limit(&mut self, f64)
+pub fn lxmf_core::propagation_client::PropagationClient::set_propagation_node(&mut self, [u8; 16])
+pub fn lxmf_core::propagation_client::PropagationClient::set_retain_synced_on_node(&mut self, bool)
+pub fn lxmf_core::propagation_client::PropagationClient::start_download(&mut self) -> bool
+pub fn lxmf_core::propagation_client::PropagationClient::start_download_with_limit(&mut self, core::option::Option<usize>) -> bool
+pub const fn lxmf_core::propagation_client::PropagationClient::state(&self) -> lxmf_core::propagation_client::PropagationClientState
+pub fn lxmf_core::propagation_client::PropagationClient::take_received_messages(&mut self) -> alloc::vec::Vec<alloc::vec::Vec<u8>>
+pub fn lxmf_core::propagation_client::PropagationClient::tick(&mut self)
+pub const fn lxmf_core::propagation_client::PropagationClient::transfer_status(&self) -> lxmf_core::propagation_client::PropagationTransferStatus
+pub struct lxmf_core::propagation_client::PropagationTransferStatus
+pub lxmf_core::propagation_client::PropagationTransferStatus::data_size: core::option::Option<usize>
+pub lxmf_core::propagation_client::PropagationTransferStatus::progress: f64
+pub lxmf_core::propagation_client::PropagationTransferStatus::result: core::option::Option<usize>
+pub lxmf_core::propagation_client::PropagationTransferStatus::state: lxmf_core::propagation_client::PropagationClientState
+impl core::default::Default for lxmf_core::propagation_client::PropagationTransferStatus
+pub fn lxmf_core::propagation_client::PropagationTransferStatus::default() -> Self
+pub mod lxmf_core::propagation_node
+pub enum lxmf_core::propagation_node::GetRequestAction
+pub lxmf_core::propagation_node::GetRequestAction::Respond(alloc::vec::Vec<u8>)
+pub lxmf_core::propagation_node::GetRequestAction::ServeFiles(lxmf_core::propagation_node::GetServePlan)
+impl lxmf_core::propagation_node::GetRequestAction
+pub fn lxmf_core::propagation_node::GetRequestAction::into_response(self) -> alloc::vec::Vec<u8>
+pub fn lxmf_core::propagation_node::GetRequestAction::into_response_with_served_count(self) -> (alloc::vec::Vec<u8>, u64)
+pub struct lxmf_core::propagation_node::GetServePlan
+impl lxmf_core::propagation_node::GetServePlan
+pub fn lxmf_core::propagation_node::GetServePlan::serve(&self) -> alloc::vec::Vec<u8>
+pub struct lxmf_core::propagation_node::OfferRequestContext<'a>
+pub lxmf_core::propagation_node::OfferRequestContext::access_allowed: bool
+pub lxmf_core::propagation_node::OfferRequestContext::identity_known: bool
+pub lxmf_core::propagation_node::OfferRequestContext::is_throttled: bool
+pub lxmf_core::propagation_node::OfferRequestContext::local_identity_hash: core::option::Option<&'a [u8; 16]>
+pub lxmf_core::propagation_node::OfferRequestContext::peer_hash: [u8; 16]
+pub lxmf_core::propagation_node::OfferRequestContext::remote_identity_hash: core::option::Option<&'a [u8; 16]>
+pub struct lxmf_core::propagation_node::PersistedPropagationStoreWrite
+pub struct lxmf_core::propagation_node::PlannedMessageRead
+pub lxmf_core::propagation_node::PlannedMessageRead::path: std::path::PathBuf
+pub lxmf_core::propagation_node::PlannedMessageRead::transient_id: lxmf_core::types::PropagationTransientId
+pub struct lxmf_core::propagation_node::PropagationNode
+pub lxmf_core::propagation_node::PropagationNode::dest_hash: [u8; 16]
+impl lxmf_core::propagation_node::PropagationNode
+pub fn lxmf_core::propagation_node::PropagationNode::abort_store_write(&mut self, &lxmf_core::types::PropagationTransientId, usize)
+pub fn lxmf_core::propagation_node::PropagationNode::accept_message(&mut self, &lxmf_core::message::LxMessage) -> bool
+pub fn lxmf_core::propagation_node::PropagationNode::accept_propagated_blob(&mut self, &[u8], u8) -> bool
+pub fn lxmf_core::propagation_node::PropagationNode::accept_stamped_propagated_blob(&mut self, &[u8], &[u8; 32], u8) -> bool
+pub fn lxmf_core::propagation_node::PropagationNode::commit_store_write(&mut self, lxmf_core::propagation_node::PersistedPropagationStoreWrite) -> bool
+pub fn lxmf_core::propagation_node::PropagationNode::complete_sync(&mut self, &[u8; 16])
+pub fn lxmf_core::propagation_node::PropagationNode::contains(&self, &lxmf_core::types::PropagationTransientId) -> bool
+pub fn lxmf_core::propagation_node::PropagationNode::create_offer(&self, [u8; 16], core::option::Option<u8>) -> alloc::vec::Vec<lxmf_core::types::PropagationTransientId>
+pub fn lxmf_core::propagation_node::PropagationNode::create_offer_filtered(&self, &std::collections::hash::set::HashSet<lxmf_core::types::PropagationTransientId>) -> alloc::vec::Vec<lxmf_core::types::PropagationTransientId>
+pub fn lxmf_core::propagation_node::PropagationNode::delete_peer(&mut self, &[u8; 16]) -> core::io::error::Result<()>
+pub fn lxmf_core::propagation_node::PropagationNode::encode_offer_response(&lxmf_core::sync::OfferResponse) -> alloc::vec::Vec<u8>
+pub fn lxmf_core::propagation_node::PropagationNode::evaluate_offer_request(&self, &[u8], &[u8; 16], &lxmf_core::propagation_admission::PnOfferCandidate) -> core::result::Result<lxmf_core::propagation_offer::PnOfferEvaluation, lxmf_core::propagation_offer::PnOfferEvaluationError>
+pub fn lxmf_core::propagation_node::PropagationNode::get_session(&self, &[u8; 16]) -> core::option::Option<&lxmf_core::sync::SyncSession>
+pub fn lxmf_core::propagation_node::PropagationNode::get_session_mut(&mut self, &[u8; 16]) -> core::option::Option<&mut lxmf_core::sync::SyncSession>
+pub fn lxmf_core::propagation_node::PropagationNode::handle_get_request(&mut self, &[u8], &[u8; 16]) -> lxmf_core::propagation_node::GetRequestAction
+pub fn lxmf_core::propagation_node::PropagationNode::handle_offer_request(&mut self, &[u8], lxmf_core::propagation_node::OfferRequestContext<'_>) -> alloc::vec::Vec<u8>
+pub fn lxmf_core::propagation_node::PropagationNode::ignore_destination(&mut self, [u8; 16])
+pub fn lxmf_core::propagation_node::PropagationNode::is_destination_ignored(&self, &[u8; 16]) -> bool
+pub fn lxmf_core::propagation_node::PropagationNode::load_peers(&self) -> alloc::vec::Vec<lxmf_core::peer::LxmPeer>
+pub fn lxmf_core::propagation_node::PropagationNode::mark_peer_handled(&mut self, &[u8; 16], &lxmf_core::types::PropagationTransientId)
+pub fn lxmf_core::propagation_node::PropagationNode::message_count(&self) -> usize
+pub fn lxmf_core::propagation_node::PropagationNode::message_get_request(&self, &[lxmf_core::types::PropagationTransientId]) -> alloc::vec::Vec<(lxmf_core::types::PropagationTransientId, alloc::vec::Vec<u8>)>
+pub fn lxmf_core::propagation_node::PropagationNode::min_stamp_cost(&self) -> u8
+pub fn lxmf_core::propagation_node::PropagationNode::new(lxmf_core::propagation_node::PropagationNodeConfig, [u8; 16]) -> Self
+pub fn lxmf_core::propagation_node::PropagationNode::offer_generation(&self) -> u64
+pub fn lxmf_core::propagation_node::PropagationNode::offer_request(&mut self, [u8; 16], &[lxmf_core::types::PropagationTransientId]) -> alloc::vec::Vec<lxmf_core::types::PropagationTransientId>
+pub fn lxmf_core::propagation_node::PropagationNode::persist_peer_handled(&self, &lxmf_core::peer::OutboundOfferPolicy, &[lxmf_core::types::PropagationTransientId]) -> core::io::error::Result<()>
+pub fn lxmf_core::propagation_node::PropagationNode::plan_accept_message(&mut self, &lxmf_core::message::LxMessage) -> core::option::Option<lxmf_core::propagation_node::PropagationStoreWritePlan>
+pub fn lxmf_core::propagation_node::PropagationNode::plan_accept_propagated_blob(&mut self, &[u8], u8) -> core::option::Option<lxmf_core::propagation_node::PropagationStoreWritePlan>
+pub fn lxmf_core::propagation_node::PropagationNode::plan_accept_stamped_propagated_blob(&mut self, &[u8], &[u8; 32], u8) -> core::option::Option<lxmf_core::propagation_node::PropagationStoreWritePlan>
+pub fn lxmf_core::propagation_node::PropagationNode::plan_message_reads(&self, &[lxmf_core::types::PropagationTransientId]) -> alloc::vec::Vec<lxmf_core::propagation_node::PlannedMessageRead>
+pub fn lxmf_core::propagation_node::PropagationNode::prepare_sync_offer(&mut self, [u8; 16]) -> lxmf_core::sync::SyncOffer
+pub fn lxmf_core::propagation_node::PropagationNode::prepare_sync_offer_with_policy(&mut self, &lxmf_core::peer::OutboundOfferPolicy) -> lxmf_core::sync::SyncOffer
+pub fn lxmf_core::propagation_node::PropagationNode::prioritise_destination(&mut self, [u8; 16])
+pub fn lxmf_core::propagation_node::PropagationNode::process_sync_get(&mut self, [u8; 16], &lxmf_core::sync::SyncGet) -> alloc::vec::Vec<alloc::vec::Vec<u8>>
+pub fn lxmf_core::propagation_node::PropagationNode::process_sync_offer(&mut self, [u8; 16], &lxmf_core::sync::SyncOffer) -> lxmf_core::sync::SyncGet
+pub fn lxmf_core::propagation_node::PropagationNode::remove_session(&mut self, &[u8; 16])
+pub fn lxmf_core::propagation_node::PropagationNode::save_peer(&self, &lxmf_core::peer::LxmPeer) -> core::io::error::Result<()>
+pub fn lxmf_core::propagation_node::PropagationNode::set_min_stamp_cost(&mut self, u8)
+pub fn lxmf_core::propagation_node::PropagationNode::start_session(&mut self, [u8; 16]) -> &mut lxmf_core::sync::SyncSession
+pub fn lxmf_core::propagation_node::PropagationNode::tick(&mut self)
+pub fn lxmf_core::propagation_node::PropagationNode::total_size(&self) -> usize
+pub fn lxmf_core::propagation_node::PropagationNode::unhandled_message_count(&self, &std::collections::hash::set::HashSet<lxmf_core::types::PropagationTransientId>) -> usize
+pub fn lxmf_core::propagation_node::PropagationNode::unignore_destination(&mut self, &[u8; 16])
+pub fn lxmf_core::propagation_node::PropagationNode::unprioritise_destination(&mut self, &[u8; 16])
+pub fn lxmf_core::propagation_node::PropagationNode::with_storage(lxmf_core::propagation_node::PropagationNodeConfig, [u8; 16], std::path::PathBuf) -> core::io::error::Result<Self>
+impl core::fmt::Debug for lxmf_core::propagation_node::PropagationNode
+pub fn lxmf_core::propagation_node::PropagationNode::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct lxmf_core::propagation_node::PropagationNodeConfig
+pub lxmf_core::propagation_node::PropagationNodeConfig::max_message_age: u64
+pub lxmf_core::propagation_node::PropagationNodeConfig::max_message_size: usize
+pub lxmf_core::propagation_node::PropagationNodeConfig::max_offer_size: usize
+pub lxmf_core::propagation_node::PropagationNodeConfig::max_storage: usize
+pub lxmf_core::propagation_node::PropagationNodeConfig::min_stamp_cost: u8
+pub lxmf_core::propagation_node::PropagationNodeConfig::peering_cost: u8
+impl core::default::Default for lxmf_core::propagation_node::PropagationNodeConfig
+pub fn lxmf_core::propagation_node::PropagationNodeConfig::default() -> Self
+pub struct lxmf_core::propagation_node::PropagationStoreWritePlan
+impl lxmf_core::propagation_node::PropagationStoreWritePlan
+pub fn lxmf_core::propagation_node::PropagationStoreWritePlan::persist(self) -> core::io::error::Result<lxmf_core::propagation_node::PersistedPropagationStoreWrite>
+pub fn lxmf_core::propagation_node::PropagationStoreWritePlan::size(&self) -> usize
+pub fn lxmf_core::propagation_node::PropagationStoreWritePlan::transient_id(&self) -> lxmf_core::types::PropagationTransientId
+pub fn lxmf_core::propagation_node::read_planned_messages(&[lxmf_core::propagation_node::PlannedMessageRead]) -> alloc::vec::Vec<(lxmf_core::types::PropagationTransientId, alloc::vec::Vec<u8>)>
+pub mod lxmf_core::propagation_offer
+pub enum lxmf_core::propagation_offer::PnOfferEvaluation
+pub lxmf_core::propagation_offer::PnOfferEvaluation::HaveAll
+pub lxmf_core::propagation_offer::PnOfferEvaluation::WantAll
+pub lxmf_core::propagation_offer::PnOfferEvaluation::WantSome(alloc::vec::Vec<lxmf_core::types::PropagationTransientId>)
+impl lxmf_core::propagation_offer::PnOfferEvaluation
+pub fn lxmf_core::propagation_offer::PnOfferEvaluation::admission_response(&self) -> lxmf_core::propagation_admission::PnOfferResponse
+pub fn lxmf_core::propagation_offer::PnOfferEvaluation::into_wire_response(self) -> lxmf_core::sync::OfferResponse
+pub enum lxmf_core::propagation_offer::PnOfferEvaluationError
+pub lxmf_core::propagation_offer::PnOfferEvaluationError::InvalidData
+pub lxmf_core::propagation_offer::PnOfferEvaluationError::InvalidKey
+impl lxmf_core::propagation_offer::PnOfferEvaluationError
+pub fn lxmf_core::propagation_offer::PnOfferEvaluationError::wire_response(self) -> lxmf_core::sync::OfferResponse
+pub mod lxmf_core::propagation_sync
+pub enum lxmf_core::propagation_sync::PeerSyncTerminalState
+pub lxmf_core::propagation_sync::PeerSyncTerminalState::Complete
+pub lxmf_core::propagation_sync::PeerSyncTerminalState::Failed
+pub enum lxmf_core::propagation_sync::SyncTaskState
+pub lxmf_core::propagation_sync::SyncTaskState::AwaitingResponse
+pub lxmf_core::propagation_sync::SyncTaskState::Complete
+pub lxmf_core::propagation_sync::SyncTaskState::Establishing
+pub lxmf_core::propagation_sync::SyncTaskState::Failed
+pub lxmf_core::propagation_sync::SyncTaskState::Idle
+pub lxmf_core::propagation_sync::SyncTaskState::Offering
+pub lxmf_core::propagation_sync::SyncTaskState::Transferring
+pub struct lxmf_core::propagation_sync::PeerSyncTerminalResult
+pub lxmf_core::propagation_sync::PeerSyncTerminalResult::generation_exhausted: bool
+pub lxmf_core::propagation_sync::PeerSyncTerminalResult::link_establishment_rate: core::option::Option<f64>
+pub lxmf_core::propagation_sync::PeerSyncTerminalResult::offer_generation: core::option::Option<u64>
+pub lxmf_core::propagation_sync::PeerSyncTerminalResult::offered: u64
+pub lxmf_core::propagation_sync::PeerSyncTerminalResult::outgoing: u64
+pub lxmf_core::propagation_sync::PeerSyncTerminalResult::peer_hash: [u8; 16]
+pub lxmf_core::propagation_sync::PeerSyncTerminalResult::state: lxmf_core::propagation_sync::PeerSyncTerminalState
+pub lxmf_core::propagation_sync::PeerSyncTerminalResult::sync_transfer_rate: core::option::Option<f64>
+pub lxmf_core::propagation_sync::PeerSyncTerminalResult::tx_bytes: u64
+pub struct lxmf_core::propagation_sync::PropagationSyncTask
+pub lxmf_core::propagation_sync::PropagationSyncTask::propagation_node: alloc::sync::Arc<std::sync::poison::mutex::Mutex<lxmf_core::propagation_node::PropagationNode>>
+pub lxmf_core::propagation_sync::PropagationSyncTask::state: lxmf_core::propagation_sync::SyncTaskState
+impl lxmf_core::propagation_sync::PropagationSyncTask
+pub fn lxmf_core::propagation_sync::PropagationSyncTask::accept_message(&mut self, &lxmf_core::message::LxMessage) -> bool
+pub fn lxmf_core::propagation_sync::PropagationSyncTask::cancel_peer_sync(&mut self, &[u8; 16]) -> bool
+pub fn lxmf_core::propagation_sync::PropagationSyncTask::drain_events(&mut self, &std::collections::hash::map::HashMap<alloc::string::String, [u8; 64]>)
+pub fn lxmf_core::propagation_sync::PropagationSyncTask::message_count(&self) -> usize
+pub fn lxmf_core::propagation_sync::PropagationSyncTask::new(tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>, [u8; 16]) -> Self
+pub fn lxmf_core::propagation_sync::PropagationSyncTask::node_dest_hash(&self) -> core::option::Option<[u8; 16]>
+pub fn lxmf_core::propagation_sync::PropagationSyncTask::peer(&self) -> core::option::Option<&lxmf_core::peer::LxmPeer>
+pub fn lxmf_core::propagation_sync::PropagationSyncTask::request_sync_now(&mut self, [u8; 16]) -> bool
+pub fn lxmf_core::propagation_sync::PropagationSyncTask::request_sync_now_with_policy(&mut self, lxmf_core::peer::OutboundOfferPolicy) -> bool
+pub fn lxmf_core::propagation_sync::PropagationSyncTask::set_identity(&mut self, [u8; 64], rns_crypto::ed25519::Ed25519PrivateKey)
+pub fn lxmf_core::propagation_sync::PropagationSyncTask::set_node(&mut self, [u8; 16])
+pub fn lxmf_core::propagation_sync::PropagationSyncTask::take_handled_updates(&mut self) -> alloc::vec::Vec<lxmf_core::types::PropagationTransientId>
+pub fn lxmf_core::propagation_sync::PropagationSyncTask::take_terminal_peer_result(&mut self) -> core::option::Option<lxmf_core::propagation_sync::PeerSyncTerminalResult>
+pub fn lxmf_core::propagation_sync::PropagationSyncTask::tick(&mut self)
+pub fn lxmf_core::propagation_sync::PropagationSyncTask::with_shared_node(tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>, alloc::sync::Arc<std::sync::poison::mutex::Mutex<lxmf_core::propagation_node::PropagationNode>>) -> Self
+pub fn lxmf_core::propagation_sync::PropagationSyncTask::with_storage(tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>, [u8; 16], std::path::PathBuf) -> core::io::error::Result<Self>
+pub mod lxmf_core::router
+pub enum lxmf_core::router::DirectDeliveryPlan
+pub lxmf_core::router::DirectDeliveryPlan::DeferTerminalFailure
+pub lxmf_core::router::DirectDeliveryPlan::Fail
+pub lxmf_core::router::DirectDeliveryPlan::RequestPath
+pub lxmf_core::router::DirectDeliveryPlan::RequestPath::drop_existing: bool
+pub lxmf_core::router::DirectDeliveryPlan::StartNewLink
+pub lxmf_core::router::DirectDeliveryPlan::StartNewLink::hops: u8
+pub lxmf_core::router::DirectDeliveryPlan::UseReusableLink
+pub lxmf_core::router::DirectDeliveryPlan::WaitForReusableLink
+pub enum lxmf_core::router::DirectReusableLinkState
+pub lxmf_core::router::DirectReusableLinkState::Active
+pub lxmf_core::router::DirectReusableLinkState::Closed
+pub lxmf_core::router::DirectReusableLinkState::Closed::activated: bool
+pub lxmf_core::router::DirectReusableLinkState::None
+pub lxmf_core::router::DirectReusableLinkState::Pending
+pub enum lxmf_core::router::OutboundAction
+pub lxmf_core::router::OutboundAction::DeliverDirect
+pub lxmf_core::router::OutboundAction::DeliverDirect::dest_hash: [u8; 16]
+pub lxmf_core::router::OutboundAction::DeliverDirect::message: lxmf_core::message::LxMessage
+pub lxmf_core::router::OutboundAction::DeliverOpportunistic
+pub lxmf_core::router::OutboundAction::DeliverOpportunistic::dest_hash: [u8; 16]
+pub lxmf_core::router::OutboundAction::DeliverOpportunistic::message: lxmf_core::message::LxMessage
+pub lxmf_core::router::OutboundAction::DeliverPropagated
+pub lxmf_core::router::OutboundAction::DeliverPropagated::message: lxmf_core::message::LxMessage
+pub lxmf_core::router::OutboundAction::DeliverPropagated::prop_hash: [u8; 16]
+pub lxmf_core::router::OutboundAction::Expired(lxmf_core::message::LxMessage)
+pub lxmf_core::router::OutboundAction::Failed(lxmf_core::message::LxMessage)
+pub lxmf_core::router::OutboundAction::PlanDirect
+pub lxmf_core::router::OutboundAction::PlanDirect::dest_hash: [u8; 16]
+pub lxmf_core::router::OutboundAction::PlanDirect::message: lxmf_core::message::LxMessage
+pub lxmf_core::router::OutboundAction::PlanDirect::plan: lxmf_core::router::DirectDeliveryPlan
+pub enum lxmf_core::router::SendError
+pub lxmf_core::router::SendError::MissingOutboundPropagationNode(alloc::boxed::Box<lxmf_core::message::LxMessage>)
+pub lxmf_core::router::SendError::TicketPreparation
+pub lxmf_core::router::SendError::TicketPreparation::message: alloc::boxed::Box<lxmf_core::message::LxMessage>
+pub lxmf_core::router::SendError::TicketPreparation::source: lxmf_core::router::TicketPreparationError
+impl lxmf_core::router::SendError
+pub fn lxmf_core::router::SendError::message(&self) -> &lxmf_core::message::LxMessage
+impl core::error::Error for lxmf_core::router::SendError
+impl core::fmt::Display for lxmf_core::router::SendError
+pub fn lxmf_core::router::SendError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub enum lxmf_core::router::TicketPreparationError
+pub lxmf_core::router::TicketPreparationError::AlreadySigned
+pub lxmf_core::router::TicketPreparationError::Encode(alloc::string::String)
+pub struct lxmf_core::router::AutopeerCandidate
+pub lxmf_core::router::AutopeerCandidate::destination_hash: [u8; 16]
+pub lxmf_core::router::AutopeerCandidate::hops: core::option::Option<u8>
+pub lxmf_core::router::AutopeerCandidate::metadata: core::option::Option<std::collections::hash::map::HashMap<u8, alloc::vec::Vec<u8>>>
+pub lxmf_core::router::AutopeerCandidate::peering_cost: core::option::Option<u8>
+pub lxmf_core::router::AutopeerCandidate::stamp_cost: core::option::Option<u8>
+pub lxmf_core::router::AutopeerCandidate::stamp_flexibility: core::option::Option<u8>
+pub lxmf_core::router::AutopeerCandidate::sync_limit: core::option::Option<f64>
+pub lxmf_core::router::AutopeerCandidate::timebase: f64
+pub lxmf_core::router::AutopeerCandidate::transfer_limit: core::option::Option<f64>
+pub struct lxmf_core::router::DeferredStampJob
+pub lxmf_core::router::DeferredStampJob::message_hash: [u8; 32]
+pub struct lxmf_core::router::DirectDeliveryPlanInput
+pub lxmf_core::router::DirectDeliveryPlanInput::identity_known: bool
+pub lxmf_core::router::DirectDeliveryPlanInput::reusable_link: lxmf_core::router::DirectReusableLinkState
+pub lxmf_core::router::DirectDeliveryPlanInput::route: core::option::Option<lxmf_core::router::DirectRouteSnapshot>
+pub struct lxmf_core::router::DirectRouteSnapshot
+pub lxmf_core::router::DirectRouteSnapshot::destination_hash: [u8; 16]
+pub lxmf_core::router::DirectRouteSnapshot::expires_at: core::option::Option<f64>
+pub lxmf_core::router::DirectRouteSnapshot::hops: u8
+pub lxmf_core::router::DirectRouteSnapshot::interface_name: core::option::Option<alloc::string::String>
+pub lxmf_core::router::DirectRouteSnapshot::learned_at: core::option::Option<f64>
+impl lxmf_core::router::DirectRouteSnapshot
+pub fn lxmf_core::router::DirectRouteSnapshot::new([u8; 16], u8) -> Self
+pub struct lxmf_core::router::LxmRouter
+pub lxmf_core::router::LxmRouter::active_deferred_stamp: core::option::Option<lxmf_core::router::DeferredStampJob>
+pub lxmf_core::router::LxmRouter::allowed: alloc::vec::Vec<[u8; 16]>
+pub lxmf_core::router::LxmRouter::allowed_control: alloc::vec::Vec<[u8; 16]>
+pub lxmf_core::router::LxmRouter::blocked: alloc::vec::Vec<[u8; 16]>
+pub lxmf_core::router::LxmRouter::client_propagation_messages_received: u64
+pub lxmf_core::router::LxmRouter::client_propagation_messages_served: u64
+pub lxmf_core::router::LxmRouter::config: lxmf_core::router::RouterConfig
+pub lxmf_core::router::LxmRouter::delivery_callback: core::option::Option<lxmf_core::router::DeliveryCallback>
+pub lxmf_core::router::LxmRouter::ignored: alloc::vec::Vec<[u8; 16]>
+pub lxmf_core::router::LxmRouter::outbound_propagation_node: core::option::Option<[u8; 16]>
+pub lxmf_core::router::LxmRouter::outbound_stamp_costs: std::collections::hash::map::HashMap<[u8; 16], lxmf_core::router::StampCostEntry>
+pub lxmf_core::router::LxmRouter::peers: std::collections::hash::map::HashMap<[u8; 16], lxmf_core::peer::LxmPeer>
+pub lxmf_core::router::LxmRouter::pending_deferred_stamps: std::collections::hash::map::HashMap<[u8; 32], lxmf_core::message::LxMessage>
+pub lxmf_core::router::LxmRouter::pending_outbound: alloc::vec::Vec<lxmf_core::message::LxMessage>
+pub lxmf_core::router::LxmRouter::prioritized: std::collections::hash::map::HashMap<[u8; 16], u8>
+pub lxmf_core::router::LxmRouter::processing_count: u64
+pub lxmf_core::router::LxmRouter::propagation_start_time: core::option::Option<f64>
+pub lxmf_core::router::LxmRouter::propagation_store: lxmf_core::propagation::PropagationStore
+pub lxmf_core::router::LxmRouter::propagation_transfer_status: lxmf_core::propagation_client::PropagationTransferStatus
+pub lxmf_core::router::LxmRouter::runtime_handle: core::option::Option<tokio::runtime::handle::Handle>
+pub lxmf_core::router::LxmRouter::static_peers: alloc::vec::Vec<[u8; 16]>
+pub lxmf_core::router::LxmRouter::throttled_peers: std::collections::hash::map::HashMap<[u8; 16], f64>
+pub lxmf_core::router::LxmRouter::ticket_store: lxmf_core::ticket::TicketStore
+pub lxmf_core::router::LxmRouter::transport_tx: core::option::Option<tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>>
+pub lxmf_core::router::LxmRouter::unpeered_propagation_incoming: u64
+pub lxmf_core::router::LxmRouter::unpeered_propagation_rx_bytes: u64
+impl lxmf_core::router::LxmRouter
+pub fn lxmf_core::router::LxmRouter::add_peer(&mut self, lxmf_core::peer::LxmPeer) -> bool
+pub fn lxmf_core::router::LxmRouter::allow(&mut self, [u8; 16])
+pub fn lxmf_core::router::LxmRouter::allow_control(&mut self, [u8; 16])
+pub fn lxmf_core::router::LxmRouter::autopeer(&mut self, lxmf_core::router::AutopeerCandidate) -> bool
+pub fn lxmf_core::router::LxmRouter::block(&mut self, [u8; 16])
+pub fn lxmf_core::router::LxmRouter::cancel_all_inbound(&self) -> usize
+pub fn lxmf_core::router::LxmRouter::cancel_inbound(&self, &[u8; 32]) -> bool
+pub fn lxmf_core::router::LxmRouter::cancel_inbound_exact(&self, lxmf_core::inbound_resource::InboundResourceKey) -> bool
+pub fn lxmf_core::router::LxmRouter::cancel_outbound(&mut self, &[u8; 32]) -> bool
+pub fn lxmf_core::router::LxmRouter::clean_throttled_peers(&mut self)
+pub fn lxmf_core::router::LxmRouter::complete_outbound_message(&mut self, lxmf_core::message::LxMessage)
+pub fn lxmf_core::router::LxmRouter::control_status(&self) -> core::option::Option<lxmf_core::router::NodeStats>
+pub fn lxmf_core::router::LxmRouter::cull_propagation(&mut self)
+pub fn lxmf_core::router::LxmRouter::cull_stamp_costs(&mut self)
+pub fn lxmf_core::router::LxmRouter::defer_outbound_for_path_request(&mut self, &[u8; 32], f64) -> bool
+pub fn lxmf_core::router::LxmRouter::defer_stamp(&mut self, lxmf_core::message::LxMessage) -> core::option::Option<lxmf_core::message::LxMessage>
+pub fn lxmf_core::router::LxmRouter::deliver_inbound(&mut self, &lxmf_core::message::LxMessage, bool) -> bool
+pub fn lxmf_core::router::LxmRouter::disallow(&mut self, &[u8; 16])
+pub fn lxmf_core::router::LxmRouter::disallow_control(&mut self, &[u8; 16])
+pub fn lxmf_core::router::LxmRouter::execute_actions(&mut self, alloc::vec::Vec<lxmf_core::router::OutboundAction>)
+pub fn lxmf_core::router::LxmRouter::execute_actions_with_encryptor<F>(&mut self, alloc::vec::Vec<lxmf_core::router::OutboundAction>, F) where F: core::ops::function::FnMut([u8; 16], &[u8]) -> core::result::Result<alloc::vec::Vec<u8>, lxmf_core::message::MessageError>
+pub fn lxmf_core::router::LxmRouter::generate_ticket(&mut self, [u8; 16], core::option::Option<u64>) -> [u8; 16]
+pub fn lxmf_core::router::LxmRouter::get_inbound_tickets(&self) -> &[lxmf_core::ticket::Ticket]
+pub fn lxmf_core::router::LxmRouter::get_outbound_lxm_propagation_stamp_cost(&self, &[u8; 32]) -> core::option::Option<u8>
+pub fn lxmf_core::router::LxmRouter::get_outbound_lxm_stamp_cost(&self, &[u8; 16]) -> core::option::Option<u8>
+pub fn lxmf_core::router::LxmRouter::get_outbound_progress(&self, &[u8; 32]) -> core::option::Option<f64>
+pub fn lxmf_core::router::LxmRouter::get_outbound_ticket(&self, &[u8; 16]) -> core::option::Option<[u8; 16]>
+pub fn lxmf_core::router::LxmRouter::get_outbound_ticket_expiry(&self, &[u8; 16]) -> core::option::Option<f64>
+pub fn lxmf_core::router::LxmRouter::get_propagation_node_app_data(&self) -> alloc::vec::Vec<u8>
+pub fn lxmf_core::router::LxmRouter::get_stamp_cost(&self, &[u8; 16]) -> core::option::Option<u8>
+pub fn lxmf_core::router::LxmRouter::handle_inbound_resource_event(&mut self, lxmf_core::inbound_resource::InboundResourceEvent)
+pub fn lxmf_core::router::LxmRouter::handle_resource_concluded(&mut self, &[u8; 16], bool)
+pub fn lxmf_core::router::LxmRouter::has_message(&self, &lxmf_core::types::PropagationTransientId) -> bool
+pub fn lxmf_core::router::LxmRouter::has_transport(&self) -> bool
+pub fn lxmf_core::router::LxmRouter::ignore_destination(&mut self, [u8; 16])
+pub fn lxmf_core::router::LxmRouter::inbound_count(&self) -> usize
+pub fn lxmf_core::router::LxmRouter::inbound_resource(&self, &[u8; 32]) -> core::option::Option<lxmf_core::inbound_resource::InboundResourceHandle>
+pub fn lxmf_core::router::LxmRouter::inbound_resource_exact(&self, lxmf_core::inbound_resource::InboundResourceKey) -> core::option::Option<lxmf_core::inbound_resource::InboundResourceHandle>
+pub fn lxmf_core::router::LxmRouter::inbound_resources(&self) -> alloc::vec::Vec<lxmf_core::inbound_resource::InboundResourceHandle>
+pub fn lxmf_core::router::LxmRouter::ingest_lxm_uri<F>(&mut self, &str, F) -> core::result::Result<lxmf_core::message::LxMessage, lxmf_core::message::MessageError> where F: core::ops::function::FnOnce(&[u8]) -> core::result::Result<alloc::vec::Vec<u8>, lxmf_core::message::MessageError>
+pub fn lxmf_core::router::LxmRouter::is_allowed(&self, &[u8; 16]) -> bool
+pub fn lxmf_core::router::LxmRouter::is_control_allowed(&self, &[u8; 16]) -> bool
+pub fn lxmf_core::router::LxmRouter::is_peer_throttled(&self, &[u8; 16]) -> bool
+pub fn lxmf_core::router::LxmRouter::learn_ticket_from_inbound(&mut self, &lxmf_core::message::LxMessage) -> bool
+pub fn lxmf_core::router::LxmRouter::load_state(&mut self, &std::path::Path) -> core::io::error::Result<()>
+pub fn lxmf_core::router::LxmRouter::mark_outbound_delivered(&mut self, &[u8; 32]) -> bool
+pub fn lxmf_core::router::LxmRouter::mark_outbound_failed(&mut self, &[u8; 32]) -> bool
+pub fn lxmf_core::router::LxmRouter::mark_outbound_rejected(&mut self, &[u8; 32]) -> bool
+pub fn lxmf_core::router::LxmRouter::message_storage_limit(&self) -> core::option::Option<usize>
+pub fn lxmf_core::router::LxmRouter::message_storage_size(&self) -> usize
+pub fn lxmf_core::router::LxmRouter::new(lxmf_core::router::RouterConfig) -> Self
+pub fn lxmf_core::router::LxmRouter::prepare_outbound(&mut self, &mut lxmf_core::message::LxMessage) -> core::result::Result<(), lxmf_core::router::TicketPreparationError>
+pub fn lxmf_core::router::LxmRouter::prioritise(&mut self, [u8; 16], u8)
+pub fn lxmf_core::router::LxmRouter::process_deferred_stamps(&mut self)
+pub fn lxmf_core::router::LxmRouter::process_outbound(&mut self) -> alloc::vec::Vec<lxmf_core::router::OutboundAction>
+pub fn lxmf_core::router::LxmRouter::process_outbound_with_direct<F>(&mut self, F) -> alloc::vec::Vec<lxmf_core::router::OutboundAction> where F: core::ops::function::FnMut(&lxmf_core::message::LxMessage, f64) -> lxmf_core::router::DirectDeliveryPlanInput
+pub fn lxmf_core::router::LxmRouter::register_delivery_callback<F>(&mut self, F) where F: core::ops::function::Fn(&lxmf_core::message::LxMessage) + core::marker::Send + 'static
+pub fn lxmf_core::router::LxmRouter::remember_ticket(&mut self, [u8; 16], [u8; 16], f64)
+pub fn lxmf_core::router::LxmRouter::remove_peer(&mut self, &[u8; 16])
+pub fn lxmf_core::router::LxmRouter::requires_authentication(&self) -> bool
+pub fn lxmf_core::router::LxmRouter::retain_node_lxms(&self) -> bool
+pub fn lxmf_core::router::LxmRouter::rotate_peers(&mut self)
+pub fn lxmf_core::router::LxmRouter::run_jobs_tick(&mut self)
+pub fn lxmf_core::router::LxmRouter::save_state(&self, &std::path::Path) -> core::io::error::Result<()>
+pub fn lxmf_core::router::LxmRouter::send(&mut self, lxmf_core::message::LxMessage)
+pub fn lxmf_core::router::LxmRouter::set_authentication(&mut self, bool)
+pub fn lxmf_core::router::LxmRouter::set_autopeer(&mut self, bool)
+pub fn lxmf_core::router::LxmRouter::set_inbound_resource_cancel_sender(&mut self, tokio::sync::mpsc::bounded::Sender<lxmf_core::inbound_resource::InboundResourceCancelRequest>)
+pub fn lxmf_core::router::LxmRouter::set_max_peers(&mut self, usize)
+pub fn lxmf_core::router::LxmRouter::set_message_storage_limit(&mut self, core::option::Option<usize>)
+pub fn lxmf_core::router::LxmRouter::set_outbound_propagation_node(&mut self, core::option::Option<[u8; 16]>)
+pub fn lxmf_core::router::LxmRouter::set_propagation_enabled(&mut self, bool)
+pub fn lxmf_core::router::LxmRouter::set_propagation_limit(&mut self, usize)
+pub fn lxmf_core::router::LxmRouter::set_retain_node_lxms(&mut self, bool)
+pub fn lxmf_core::router::LxmRouter::set_stamp_cost(&mut self, [u8; 16], u8)
+pub fn lxmf_core::router::LxmRouter::set_stamp_requirements(&mut self, u8, u8)
+pub fn lxmf_core::router::LxmRouter::set_transport(&mut self, tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>)
+pub fn lxmf_core::router::LxmRouter::stats(&self) -> lxmf_core::router::RouterStats
+pub fn lxmf_core::router::LxmRouter::sync_peer_policies_for_store(&self, u64) -> alloc::vec::Vec<lxmf_core::peer::OutboundOfferPolicy>
+pub fn lxmf_core::router::LxmRouter::sync_peers(&mut self) -> alloc::vec::Vec<[u8; 16]>
+pub fn lxmf_core::router::LxmRouter::throttle_peer(&mut self, [u8; 16])
+pub fn lxmf_core::router::LxmRouter::tick(&mut self)
+pub fn lxmf_core::router::LxmRouter::tick_with_encryptor<F>(&mut self, F) where F: core::ops::function::FnMut([u8; 16], &[u8]) -> core::result::Result<alloc::vec::Vec<u8>, lxmf_core::message::MessageError>
+pub fn lxmf_core::router::LxmRouter::trigger_outbound_for_delivery_announce(&mut self, [u8; 16]) -> usize
+pub fn lxmf_core::router::LxmRouter::trigger_outbound_for_propagation_node_announce(&mut self, [u8; 16], &[u8]) -> usize
+pub fn lxmf_core::router::LxmRouter::try_send(&mut self, lxmf_core::message::LxMessage) -> core::result::Result<(), lxmf_core::router::SendError>
+pub fn lxmf_core::router::LxmRouter::unblock(&mut self, &[u8; 16])
+pub fn lxmf_core::router::LxmRouter::unignore_destination(&mut self, &[u8; 16])
+pub fn lxmf_core::router::LxmRouter::unpeer(&mut self, &[u8; 16])
+pub fn lxmf_core::router::LxmRouter::unprioritise(&mut self, &[u8; 16])
+pub fn lxmf_core::router::LxmRouter::update_propagation_transfer_status(&mut self, lxmf_core::propagation_client::PropagationTransferStatus)
+pub fn lxmf_core::router::LxmRouter::validate_stamp(&self, &[u8; 32], &[u8; 32], u8) -> bool
+pub fn lxmf_core::router::LxmRouter::validate_stamp_with_tickets(&self, &[u8; 32], &[u8], u8, &[u8; 16]) -> bool
+pub struct lxmf_core::router::NodeStats
+pub lxmf_core::router::NodeStats::delivery_limit: f64
+pub lxmf_core::router::NodeStats::max_peers: usize
+pub lxmf_core::router::NodeStats::message_count: usize
+pub lxmf_core::router::NodeStats::message_size: usize
+pub lxmf_core::router::NodeStats::peer_stats: std::collections::hash::map::HashMap<[u8; 16], lxmf_core::router::PeerStats>
+pub lxmf_core::router::NodeStats::peering_cost: u8
+pub lxmf_core::router::NodeStats::propagation_limit: usize
+pub lxmf_core::router::NodeStats::stamp_cost: u8
+pub lxmf_core::router::NodeStats::stamp_flex: u8
+pub lxmf_core::router::NodeStats::storage_limit: core::option::Option<usize>
+pub lxmf_core::router::NodeStats::sync_limit: usize
+pub lxmf_core::router::NodeStats::total_peers: usize
+pub lxmf_core::router::NodeStats::uptime: f64
+pub struct lxmf_core::router::PeerStats
+pub lxmf_core::router::PeerStats::alive: bool
+pub lxmf_core::router::PeerStats::incoming: u64
+pub lxmf_core::router::PeerStats::last_heard: f64
+pub lxmf_core::router::PeerStats::offered: u64
+pub lxmf_core::router::PeerStats::outgoing: u64
+pub lxmf_core::router::PeerStats::peer_type: alloc::string::String
+pub lxmf_core::router::PeerStats::stamp_cost: core::option::Option<u8>
+pub lxmf_core::router::PeerStats::state: u8
+pub lxmf_core::router::PeerStats::sync_transfer_rate: f64
+pub lxmf_core::router::PeerStats::transfer_limit: core::option::Option<f64>
+pub lxmf_core::router::PeerStats::unhandled: u32
+pub struct lxmf_core::router::RouterConfig
+pub lxmf_core::router::RouterConfig::autopeer: bool
+pub lxmf_core::router::RouterConfig::delivery_limit_kb: f64
+pub lxmf_core::router::RouterConfig::ext: lxmf_core::router::RouterConfigExt
+pub lxmf_core::router::RouterConfig::max_peers: usize
+pub lxmf_core::router::RouterConfig::propagation_enabled: bool
+pub lxmf_core::router::RouterConfig::propagation_limit_kb: usize
+pub lxmf_core::router::RouterConfig::propagation_stamp_cost: u8
+pub lxmf_core::router::RouterConfig::propagation_stamp_flex: u8
+pub lxmf_core::router::RouterConfig::stamp_cost: core::option::Option<u8>
+pub lxmf_core::router::RouterConfig::sync_limit_kb: usize
+impl core::default::Default for lxmf_core::router::RouterConfig
+pub fn lxmf_core::router::RouterConfig::default() -> Self
+pub struct lxmf_core::router::RouterConfigExt
+pub lxmf_core::router::RouterConfigExt::auth_required: bool
+pub lxmf_core::router::RouterConfigExt::autopeer_maxdepth: usize
+pub lxmf_core::router::RouterConfigExt::defer_stamp_generation: bool
+pub lxmf_core::router::RouterConfigExt::from_static_only: bool
+pub lxmf_core::router::RouterConfigExt::max_peering_cost: u8
+pub lxmf_core::router::RouterConfigExt::message_storage_limit: core::option::Option<usize>
+pub lxmf_core::router::RouterConfigExt::name: core::option::Option<alloc::string::String>
+pub lxmf_core::router::RouterConfigExt::peering_cost: u8
+pub lxmf_core::router::RouterConfigExt::processing_limit: core::option::Option<usize>
+pub lxmf_core::router::RouterConfigExt::processing_outbound: bool
+pub lxmf_core::router::RouterConfigExt::propagation_cost_min: u8
+pub lxmf_core::router::RouterConfigExt::retain_synced_on_node: bool
+impl core::default::Default for lxmf_core::router::RouterConfigExt
+pub fn lxmf_core::router::RouterConfigExt::default() -> Self
+pub struct lxmf_core::router::RouterStats
+pub lxmf_core::router::RouterStats::peers: usize
+pub lxmf_core::router::RouterStats::pending_deferred_stamps: usize
+pub lxmf_core::router::RouterStats::pending_outbound: usize
+pub lxmf_core::router::RouterStats::propagation_entries: usize
+pub lxmf_core::router::RouterStats::propagation_size: usize
+pub lxmf_core::router::RouterStats::stamp_costs_cached: usize
+pub struct lxmf_core::router::StampCostEntry
+pub lxmf_core::router::StampCostEntry::cost: u8
+pub lxmf_core::router::StampCostEntry::recorded_at: f64
+pub fn lxmf_core::router::plan_direct_delivery(&mut lxmf_core::message::LxMessage, lxmf_core::router::DirectDeliveryPlanInput, f64) -> lxmf_core::router::DirectDeliveryPlan
+pub type lxmf_core::router::DeliveryCallback = alloc::boxed::Box<(dyn core::ops::function::Fn(&lxmf_core::message::LxMessage) + core::marker::Send)>
+pub mod lxmf_core::stamper
+pub enum lxmf_core::stamper::DeferredStampResult
+pub lxmf_core::stamper::DeferredStampResult::Cancelled
+pub lxmf_core::stamper::DeferredStampResult::Success
+pub lxmf_core::stamper::DeferredStampResult::Success::stamp: [u8; 32]
+pub lxmf_core::stamper::DeferredStampResult::Success::value: u32
+pub struct lxmf_core::stamper::DeferredStampHandle
+impl lxmf_core::stamper::DeferredStampHandle
+pub fn lxmf_core::stamper::DeferredStampHandle::cancel(&self)
+pub fn lxmf_core::stamper::DeferredStampHandle::is_cancelled(&self) -> bool
+pub fn lxmf_core::stamper::generate_stamp(&[u8], u8, usize) -> core::option::Option<([u8; 32], u32)>
+pub fn lxmf_core::stamper::generate_stamp_limited(&[u8], u8, usize, u64) -> core::option::Option<[u8; 32]>
+pub fn lxmf_core::stamper::spawn_deferred_stamp([u8; 32], u8, usize) -> (lxmf_core::stamper::DeferredStampHandle, tokio::sync::oneshot::Receiver<lxmf_core::stamper::DeferredStampResult>)
+pub fn lxmf_core::stamper::spawn_deferred_stamp_on(&tokio::runtime::handle::Handle, [u8; 32], u8, usize) -> (lxmf_core::stamper::DeferredStampHandle, tokio::sync::oneshot::Receiver<lxmf_core::stamper::DeferredStampResult>)
+pub fn lxmf_core::stamper::stamp_iteration_cap(u8) -> core::option::Option<u64>
+pub fn lxmf_core::stamper::stamp_valid(&[u8; 32], u8, &[u8]) -> bool
+pub fn lxmf_core::stamper::stamp_value(&[u8], &[u8; 32]) -> u32
+pub fn lxmf_core::stamper::stamp_workblock(&[u8], usize) -> alloc::vec::Vec<u8>
+pub fn lxmf_core::stamper::validate_peering_key(&[u8], &[u8; 32], u8) -> bool
+pub fn lxmf_core::stamper::validate_pn_stamp(&[u8], u8) -> core::option::Option<lxmf_core::stamper::PropagationStampParts>
+pub fn lxmf_core::stamper::validate_stamp(&[u8; 32], &[u8; 32], u8, usize) -> bool
+pub type lxmf_core::stamper::PropagationStampParts = ([u8; 32], alloc::vec::Vec<u8>, u32, [u8; 32])
+pub mod lxmf_core::sync
+pub enum lxmf_core::sync::OfferResponse
+pub lxmf_core::sync::OfferResponse::ErrorInvalidData
+pub lxmf_core::sync::OfferResponse::ErrorInvalidKey
+pub lxmf_core::sync::OfferResponse::ErrorInvalidStamp
+pub lxmf_core::sync::OfferResponse::ErrorNoAccess
+pub lxmf_core::sync::OfferResponse::ErrorNoIdentity
+pub lxmf_core::sync::OfferResponse::ErrorThrottled
+pub lxmf_core::sync::OfferResponse::HaveAll
+pub lxmf_core::sync::OfferResponse::Unknown
+pub lxmf_core::sync::OfferResponse::WantAll
+pub lxmf_core::sync::OfferResponse::WantSome(alloc::vec::Vec<alloc::vec::Vec<u8>>)
+impl lxmf_core::sync::OfferResponse
+pub fn lxmf_core::sync::OfferResponse::as_peer_error(&self) -> core::option::Option<lxmf_core::constants::PeerError>
+pub fn lxmf_core::sync::OfferResponse::from_msgpack(&[u8]) -> Self
+pub fn lxmf_core::sync::OfferResponse::from_value(&rmpv::Value) -> Self
+pub fn lxmf_core::sync::OfferResponse::is_error(&self) -> bool
+pub enum lxmf_core::sync::SyncState
+pub lxmf_core::sync::SyncState::Complete
+pub lxmf_core::sync::SyncState::Failed
+pub lxmf_core::sync::SyncState::Idle
+pub lxmf_core::sync::SyncState::OfferSent
+pub lxmf_core::sync::SyncState::Receiving
+pub lxmf_core::sync::SyncState::Sending
+pub struct lxmf_core::sync::SyncGet
+pub lxmf_core::sync::SyncGet::wanted_ids: alloc::vec::Vec<alloc::vec::Vec<u8>>
+impl lxmf_core::sync::SyncGet
+pub fn lxmf_core::sync::SyncGet::new() -> Self
+impl core::default::Default for lxmf_core::sync::SyncGet
+pub fn lxmf_core::sync::SyncGet::default() -> Self
+impl rns_protocol::channel_message::MessageBase for lxmf_core::sync::SyncGet
+pub fn lxmf_core::sync::SyncGet::msg_type(&self) -> u16
+pub fn lxmf_core::sync::SyncGet::pack(&self) -> alloc::vec::Vec<u8>
+pub fn lxmf_core::sync::SyncGet::unpack(&mut self, &[u8]) -> core::result::Result<(), rns_protocol::channel_message::ChannelMessageError>
+pub struct lxmf_core::sync::SyncOffer
+pub lxmf_core::sync::SyncOffer::peering_key: alloc::vec::Vec<u8>
+pub lxmf_core::sync::SyncOffer::transient_ids: alloc::vec::Vec<alloc::vec::Vec<u8>>
+impl lxmf_core::sync::SyncOffer
+pub fn lxmf_core::sync::SyncOffer::new() -> Self
+impl core::default::Default for lxmf_core::sync::SyncOffer
+pub fn lxmf_core::sync::SyncOffer::default() -> Self
+impl rns_protocol::channel_message::MessageBase for lxmf_core::sync::SyncOffer
+pub fn lxmf_core::sync::SyncOffer::msg_type(&self) -> u16
+pub fn lxmf_core::sync::SyncOffer::pack(&self) -> alloc::vec::Vec<u8>
+pub fn lxmf_core::sync::SyncOffer::unpack(&mut self, &[u8]) -> core::result::Result<(), rns_protocol::channel_message::ChannelMessageError>
+pub struct lxmf_core::sync::SyncSession
+pub lxmf_core::sync::SyncSession::offered_ids: alloc::vec::Vec<lxmf_core::types::PropagationTransientId>
+pub lxmf_core::sync::SyncSession::peer_hash: [u8; 16]
+pub lxmf_core::sync::SyncSession::state: lxmf_core::sync::SyncState
+pub lxmf_core::sync::SyncSession::transferred: usize
+pub lxmf_core::sync::SyncSession::wanted_ids: alloc::vec::Vec<lxmf_core::types::PropagationTransientId>
+impl lxmf_core::sync::SyncSession
+pub fn lxmf_core::sync::SyncSession::is_finished(&self) -> bool
+pub fn lxmf_core::sync::SyncSession::mark_complete(&mut self)
+pub fn lxmf_core::sync::SyncSession::mark_failed(&mut self)
+pub fn lxmf_core::sync::SyncSession::new([u8; 16]) -> Self
+pub fn lxmf_core::sync::SyncSession::prepare_offer(&mut self, alloc::vec::Vec<lxmf_core::types::PropagationTransientId>, alloc::vec::Vec<u8>) -> lxmf_core::sync::SyncOffer
+pub fn lxmf_core::sync::SyncSession::process_get(&mut self, &lxmf_core::sync::SyncGet)
+pub fn lxmf_core::sync::SyncSession::process_offer(&mut self, &lxmf_core::sync::SyncOffer, &lxmf_core::propagation::PropagationStore) -> lxmf_core::sync::SyncGet
+pub fn lxmf_core::sync::SyncSession::record_transfer(&mut self)
+pub const lxmf_core::sync::SYNC_MSG_GET: u16
+pub const lxmf_core::sync::SYNC_MSG_OFFER: u16
+pub mod lxmf_core::ticket
+pub struct lxmf_core::ticket::Ticket
+pub lxmf_core::ticket::Ticket::destination_hash: [u8; 16]
+pub lxmf_core::ticket::Ticket::expires: f64
+pub lxmf_core::ticket::Ticket::token: [u8; 16]
+impl lxmf_core::ticket::Ticket
+pub fn lxmf_core::ticket::Ticket::decode_field([u8; 16], &[u8], f64) -> core::option::Option<Self>
+pub fn lxmf_core::ticket::Ticket::encode_field(&self) -> core::result::Result<alloc::vec::Vec<u8>, rmp::encode::ValueWriteError>
+pub fn lxmf_core::ticket::Ticket::is_valid(&self, f64) -> bool
+pub fn lxmf_core::ticket::Ticket::new([u8; 16], [u8; 16], f64) -> Self
+pub fn lxmf_core::ticket::Ticket::should_renew(&self, f64) -> bool
+pub struct lxmf_core::ticket::TicketStore
+impl lxmf_core::ticket::TicketStore
+pub fn lxmf_core::ticket::TicketStore::add_inbound(&mut self, lxmf_core::ticket::Ticket)
+pub fn lxmf_core::ticket::TicketStore::count_valid(&self, f64) -> usize
+pub fn lxmf_core::ticket::TicketStore::cull(&mut self, f64)
+pub fn lxmf_core::ticket::TicketStore::find_outbound(&self, &[u8; 16], f64) -> core::option::Option<&lxmf_core::ticket::Ticket>
+pub fn lxmf_core::ticket::TicketStore::inbound(&self) -> &[lxmf_core::ticket::Ticket]
+pub fn lxmf_core::ticket::TicketStore::inbound_tokens(&self, &[u8; 16], f64) -> alloc::vec::Vec<[u8; 16]>
+pub fn lxmf_core::ticket::TicketStore::issue_for(&mut self, [u8; 16], u64, f64) -> core::option::Option<lxmf_core::ticket::Ticket>
+pub fn lxmf_core::ticket::TicketStore::mark_ticket_delivered(&mut self, [u8; 16], f64)
+pub fn lxmf_core::ticket::TicketStore::new() -> Self
+pub fn lxmf_core::ticket::TicketStore::remember_outbound(&mut self, lxmf_core::ticket::Ticket)
+pub fn lxmf_core::ticket::TicketStore::replace_legacy(&mut self, alloc::vec::Vec<lxmf_core::ticket::Ticket>)
+pub fn lxmf_core::ticket::TicketStore::replace_snapshot(&mut self, lxmf_core::ticket::TicketStoreSnapshot)
+pub fn lxmf_core::ticket::TicketStore::should_issue_for(&self, &[u8; 16], f64) -> bool
+pub fn lxmf_core::ticket::TicketStore::snapshot(&self) -> lxmf_core::ticket::TicketStoreSnapshot
+pub struct lxmf_core::ticket::TicketStoreSnapshot
+pub lxmf_core::ticket::TicketStoreSnapshot::inbound: alloc::vec::Vec<lxmf_core::ticket::Ticket>
+pub lxmf_core::ticket::TicketStoreSnapshot::last_deliveries: std::collections::hash::map::HashMap<[u8; 16], f64>
+pub lxmf_core::ticket::TicketStoreSnapshot::outbound: alloc::vec::Vec<lxmf_core::ticket::Ticket>
+pub lxmf_core::ticket::TicketStoreSnapshot::version: u8
+impl core::default::Default for lxmf_core::ticket::TicketStoreSnapshot
+pub fn lxmf_core::ticket::TicketStoreSnapshot::default() -> Self
+pub mod lxmf_core::types
+pub const lxmf_core::types::PROPAGATION_TRANSIENT_ID_LENGTH: usize
+pub type lxmf_core::types::DestinationHash = [u8; 16]
+pub type lxmf_core::types::IdentityHash = [u8; 16]
+pub type lxmf_core::types::MessageId = [u8; 32]
+pub type lxmf_core::types::PropagationTransientId = [u8; 32]
