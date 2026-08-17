@@ -18,7 +18,7 @@ env:
   PACKAGE_ROOT: rsLXMF
   LXMF_BINS: lxmd-rs
   RSLXMF_RSRETICULUM_VERSION: 1.2.0
-  RSLXMF_RSRETICULUM_COMMIT: 4a924ce2819a55fb3bf70bca0aff86c8c2174c91
+  RSLXMF_RSRETICULUM_COMMIT: dc6bc4ee82daf66b3b40386f9777dbe62b08fec2
 
 jobs:
   verify:
@@ -30,6 +30,7 @@ jobs:
         with:
           ref: ${{ env.RELEASE_TAG }}
           path: rsLXMF
+          fetch-depth: 0
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           repository: ${{ github.repository_owner }}/rsReticulum
