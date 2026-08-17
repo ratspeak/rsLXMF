@@ -46,6 +46,9 @@ jobs:
       - name: Check additions-only compatibility floor
         run: python3 tools/check-api-compatibility.py
         working-directory: rsLXMF
+      - name: Check canonical and legacy external consumer
+        run: cargo check --manifest-path api-fixtures/Cargo.toml --locked
+        working-directory: rsLXMF
 
   test:
     name: Test (${{ matrix.os }})
@@ -74,6 +77,9 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libudev-dev libdbus-1-dev pkg-config
       - run: cargo test --workspace --locked
+        working-directory: rsLXMF
+      - name: Build embedding examples
+        run: cargo build -p lxmf-core --examples --locked
         working-directory: rsLXMF
 
   lint:

@@ -1,4 +1,5 @@
 /target/
+/api-fixtures/target/
 *.swp
 .DS_Store
 proptest-regressions/

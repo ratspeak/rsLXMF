@@ -19,9 +19,9 @@
     "sourceCommit": "b8d7afce73f7f098706029361568e63f22888ea3"
   },
   "snapshotSource": {
-    "commit": "b8d7afce73f7f098706029361568e63f22888ea3",
+    "basisCommit": "a8f74d2aed815d5508f40e3732e473b126f06aa8",
     "capturedOn": "2026-08-17",
-    "changeRecord": null
+    "changeRecord": "api-reviews/wave-c-message-api.json"
   },
   "packages": [
     {
@@ -30,8 +30,8 @@
       "tier": "candidate-stable",
       "compatibility": "reviewed-snapshot",
       "snapshot": "api-baseline/lxmf-core.txt",
-      "itemCount": 1500,
-      "sha256": "e49decc09ddd37df7e60771238756e3b20218f0271aa47c8db0eb8cebc3168da"
+      "itemCount": 1622,
+      "sha256": "c958cfdcb53117b02d1dbe907af6afaf5017d5ba92364267e21d204fe5ef3023"
     },
     {
       "name": "lxmf-tools",

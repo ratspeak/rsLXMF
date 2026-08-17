@@ -18,6 +18,11 @@ other orchestration details that remain provisional until the API-boundary
 checkpoint. `lxmf-tools` is **tool internal** and exists to support `lxmd-rs`;
 it is not a library compatibility commitment.
 
+[`lxmf_core::message_api`](MESSAGE_API.md) is the canonical candidate message
+path. It re-exports existing identities without adaptation, and the original
+module paths remain supported. Router, delivery, propagation, handler, and
+persistence ownership are not promoted by this narrow facade.
+
 No visibility, signature, serialization, wire, persistence, or runtime change
 is made by establishing this baseline. Any later boundary reduction must first
 show the public API diff, migrate Ratspeak and other first-party users, preserve
@@ -34,10 +39,14 @@ rustup toolchain install nightly-2026-08-01 --profile minimal
 python3 tools/check-api-baseline.py
 python3 tools/check-api-manifest.py
 python3 tools/check-api-compatibility.py
+cargo check --manifest-path api-fixtures/Cargo.toml --locked
 ```
 
 The immutable floor and current captured snapshot source are separate
-identities in `api-stability.json`. The manifest contract covers features,
+identities in `api-stability.json`. A capture names its clean basis commit and
+reviewed change record; CI renders the current tree and requires a byte-exact
+snapshot, avoiding an impossible self-referential commit identifier. The
+manifest contract covers features,
 targets, MSRV, and non-development dependencies that one Apple/all-feature API
 view cannot prove. The compatibility check currently rejects every removal
 from the Wave C floor; it complements rather than replaces feature, platform,

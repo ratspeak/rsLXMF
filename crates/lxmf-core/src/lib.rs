@@ -65,6 +65,19 @@ pub mod sync;
 pub mod ticket;
 pub mod types;
 
+/// Canonical message construction and inspection identities for applications.
+///
+/// These are exact re-exports of the existing module-qualified types. The
+/// original paths remain supported. Router, delivery, propagation, handler,
+/// and persistence ownership intentionally remain outside this first facade.
+pub mod message_api {
+    pub use crate::constants::{
+        DeliveryMethod, DeliveryRepresentation, MessageState, UnverifiedReason,
+    };
+    pub use crate::message::{AudioField, LxMessage, MessageError};
+    pub use crate::types::{DestinationHash, IdentityHash, MessageId};
+}
+
 /// Encode an `rmpv::Value` into a byte buffer.
 ///
 /// `Write` into a `Vec<u8>` is infallible, so the inner `expect` is unreachable.

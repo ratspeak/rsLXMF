@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Added the exact-reexport `lxmf_core::message_api` facade, a compiled message
+  example, and canonical/legacy external-consumer coverage while retaining all
+  existing module paths and leaving router, delivery, propagation, wire, and
+  persistence behavior unchanged.
 - Classified `lxmf-core` as candidate stable and `lxmf-tools` as tool internal,
   with pinned CI-enforced public API snapshots and no visibility or signature
   change.

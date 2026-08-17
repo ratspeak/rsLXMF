@@ -139,21 +139,26 @@ def validate_metadata(
     snapshot_source = config.get("snapshotSource")
     if not isinstance(snapshot_source, dict):
         fail("snapshot source identity is missing")
-    snapshot_commit = snapshot_source.get("commit")
+    snapshot_commit = snapshot_source.get("basisCommit")
     if not isinstance(snapshot_commit, str) or not SHA_PATTERN.fullmatch(
         snapshot_commit
     ):
-        fail("snapshot source commit must be a full Git commit")
+        fail("snapshot source basis commit must be a full Git commit")
     snapshot_check = subprocess.run(
         ["git", "cat-file", "-e", f"{snapshot_commit}^{{commit}}"], cwd=ROOT
     )
     if snapshot_check.returncode != 0:
-        fail(f"snapshot source commit {snapshot_commit} is unavailable")
+        fail(f"snapshot source basis commit {snapshot_commit} is unavailable")
     snapshot_ancestor = subprocess.run(
         ["git", "merge-base", "--is-ancestor", snapshot_commit, "HEAD"], cwd=ROOT
     )
     if snapshot_ancestor.returncode != 0:
-        fail(f"snapshot source commit {snapshot_commit} is not an ancestor of HEAD")
+        fail(f"snapshot source basis commit {snapshot_commit} is not an ancestor of HEAD")
+    change_record = snapshot_source.get("changeRecord")
+    if not isinstance(change_record, str) or not change_record.startswith("api-reviews/"):
+        fail("snapshot source must name a reviewed change record")
+    if not (ROOT / change_record).is_file():
+        fail(f"snapshot source change record is missing: {change_record}")
 
     packages = config.get("packages")
     if not isinstance(packages, list) or not packages:

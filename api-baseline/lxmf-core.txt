@@ -671,6 +671,128 @@ pub lxmf_core::message::MessagePayload::stamp: core::option::Option<alloc::vec::
 pub lxmf_core::message::MessagePayload::timestamp: f64
 pub lxmf_core::message::MessagePayload::title: alloc::string::String
 pub type lxmf_core::message::MessageCallback = alloc::sync::Arc<(dyn core::ops::function::Fn(&lxmf_core::message::LxMessage) + core::marker::Send + core::marker::Sync)>
+pub mod lxmf_core::message_api
+#[repr(u8)] pub enum lxmf_core::message_api::DeliveryMethod
+pub lxmf_core::message_api::DeliveryMethod::Direct = 2
+pub lxmf_core::message_api::DeliveryMethod::Opportunistic = 1
+pub lxmf_core::message_api::DeliveryMethod::Paper = 5
+pub lxmf_core::message_api::DeliveryMethod::Propagated = 3
+impl lxmf_core::constants::DeliveryMethod
+pub fn lxmf_core::constants::DeliveryMethod::is_sendable(&self) -> bool
+#[repr(u8)] pub enum lxmf_core::message_api::DeliveryRepresentation
+pub lxmf_core::message_api::DeliveryRepresentation::Packet = 1
+pub lxmf_core::message_api::DeliveryRepresentation::Paper = 5
+pub lxmf_core::message_api::DeliveryRepresentation::Resource = 2
+pub lxmf_core::message_api::DeliveryRepresentation::Unknown = 0
+pub enum lxmf_core::message_api::MessageError
+pub lxmf_core::message_api::MessageError::InvalidUri(alloc::string::String)
+pub lxmf_core::message_api::MessageError::NotSigned
+pub lxmf_core::message_api::MessageError::PackFailed(alloc::string::String)
+pub lxmf_core::message_api::MessageError::TooShort(usize)
+pub lxmf_core::message_api::MessageError::UnpackFailed(alloc::string::String)
+#[repr(u8)] pub enum lxmf_core::message_api::MessageState
+pub lxmf_core::message_api::MessageState::Cancelled = 254
+pub lxmf_core::message_api::MessageState::Delivered = 8
+pub lxmf_core::message_api::MessageState::Failed = 255
+pub lxmf_core::message_api::MessageState::Generating = 0
+pub lxmf_core::message_api::MessageState::Outbound = 1
+pub lxmf_core::message_api::MessageState::Rejected = 253
+pub lxmf_core::message_api::MessageState::Sending = 2
+pub lxmf_core::message_api::MessageState::Sent = 4
+#[repr(u8)] pub enum lxmf_core::message_api::UnverifiedReason
+pub lxmf_core::message_api::UnverifiedReason::SignatureInvalid = 2
+pub lxmf_core::message_api::UnverifiedReason::SourceUnknown = 1
+pub struct lxmf_core::message_api::AudioField<'a>
+pub lxmf_core::message_api::AudioField::bytes: &'a [u8]
+pub lxmf_core::message_api::AudioField::mode: u8
+pub struct lxmf_core::message_api::LxMessage
+pub lxmf_core::message_api::LxMessage::auto_compress: bool
+pub lxmf_core::message_api::LxMessage::callbacks: lxmf_core::message::MessageCallbacks
+pub lxmf_core::message_api::LxMessage::content: alloc::string::String
+pub lxmf_core::message_api::LxMessage::delivery_attempts: u32
+pub lxmf_core::message_api::LxMessage::destination_hash: [u8; 16]
+pub lxmf_core::message_api::LxMessage::fields: alloc::collections::btree::map::BTreeMap<u8, alloc::vec::Vec<u8>>
+pub lxmf_core::message_api::LxMessage::hash: core::option::Option<[u8; 32]>
+pub lxmf_core::message_api::LxMessage::include_ticket: bool
+pub lxmf_core::message_api::LxMessage::incoming: bool
+pub lxmf_core::message_api::LxMessage::last_delivery_attempt: f64
+pub lxmf_core::message_api::LxMessage::message_id: core::option::Option<[u8; 32]>
+pub lxmf_core::message_api::LxMessage::method: lxmf_core::constants::DeliveryMethod
+pub lxmf_core::message_api::LxMessage::msgpack_field_ids: alloc::collections::btree::set::BTreeSet<u8>
+pub lxmf_core::message_api::LxMessage::next_delivery_attempt: f64
+pub lxmf_core::message_api::LxMessage::outbound_ticket: core::option::Option<[u8; 16]>
+pub lxmf_core::message_api::LxMessage::progress: f64
+pub lxmf_core::message_api::LxMessage::propagation_stamp: core::option::Option<[u8; 32]>
+pub lxmf_core::message_api::LxMessage::ratchet_id: core::option::Option<[u8; 32]>
+pub lxmf_core::message_api::LxMessage::representation: lxmf_core::constants::DeliveryRepresentation
+pub lxmf_core::message_api::LxMessage::signature: core::option::Option<[u8; 64]>
+pub lxmf_core::message_api::LxMessage::signature_validated: bool
+pub lxmf_core::message_api::LxMessage::source_blackholed: bool
+pub lxmf_core::message_api::LxMessage::source_hash: [u8; 16]
+pub lxmf_core::message_api::LxMessage::stamp: core::option::Option<alloc::vec::Vec<u8>>
+pub lxmf_core::message_api::LxMessage::stamp_cost: core::option::Option<u8>
+pub lxmf_core::message_api::LxMessage::stamp_value: core::option::Option<u16>
+pub lxmf_core::message_api::LxMessage::state: lxmf_core::constants::MessageState
+pub lxmf_core::message_api::LxMessage::timestamp: f64
+pub lxmf_core::message_api::LxMessage::title: alloc::string::String
+pub lxmf_core::message_api::LxMessage::transient_id: core::option::Option<lxmf_core::types::PropagationTransientId>
+pub lxmf_core::message_api::LxMessage::transport_encrypted: bool
+pub lxmf_core::message_api::LxMessage::transport_encryption: core::option::Option<alloc::string::String>
+pub lxmf_core::message_api::LxMessage::unverified_reason: core::option::Option<lxmf_core::constants::UnverifiedReason>
+pub lxmf_core::message_api::LxMessage::wire_payload: core::option::Option<alloc::vec::Vec<u8>>
+impl lxmf_core::message::LxMessage
+pub const lxmf_core::message::LxMessage::MIN_PROPAGATION_ENTRY_SIZE: usize
+pub fn lxmf_core::message::LxMessage::as_uri<F>(&self, F) -> core::option::Option<alloc::string::String> where F: core::ops::function::FnOnce(&[u8]) -> core::result::Result<alloc::vec::Vec<u8>, lxmf_core::message::MessageError>
+pub fn lxmf_core::message::LxMessage::audio_field(&self) -> core::result::Result<core::option::Option<lxmf_core::message::AudioField<'_>>, lxmf_core::message::MessageError>
+pub fn lxmf_core::message::LxMessage::cancel(&mut self)
+pub fn lxmf_core::message::LxMessage::compute_hash(&mut self) -> core::result::Result<[u8; 32], lxmf_core::message::MessageError>
+pub fn lxmf_core::message::LxMessage::compute_propagation_transient_id(&[u8]) -> lxmf_core::types::PropagationTransientId
+pub fn lxmf_core::message::LxMessage::decode_paper_uri(&str) -> core::result::Result<([u8; 16], alloc::vec::Vec<u8>), lxmf_core::message::MessageError>
+pub fn lxmf_core::message::LxMessage::determine_compression_support(&mut self, core::option::Option<&[u8]>)
+pub fn lxmf_core::message::LxMessage::first_file_attachment(&self) -> core::result::Result<core::option::Option<(alloc::string::String, &[u8])>, lxmf_core::message::MessageError>
+pub fn lxmf_core::message::LxMessage::from_paper_uri<F>(&str, F) -> core::result::Result<Self, lxmf_core::message::MessageError> where F: core::ops::function::FnOnce(&[u8]) -> core::result::Result<alloc::vec::Vec<u8>, lxmf_core::message::MessageError>
+pub fn lxmf_core::message::LxMessage::from_uri<F>(&str, F) -> core::result::Result<Self, lxmf_core::message::MessageError> where F: core::ops::function::FnOnce(&[u8]) -> core::result::Result<alloc::vec::Vec<u8>, lxmf_core::message::MessageError>
+pub fn lxmf_core::message::LxMessage::get_field(&self, u8) -> core::option::Option<&alloc::vec::Vec<u8>>
+pub fn lxmf_core::message::LxMessage::get_stamp(&mut self) -> core::option::Option<alloc::vec::Vec<u8>>
+pub fn lxmf_core::message::LxMessage::image_attachment(&self) -> core::result::Result<core::option::Option<(alloc::string::String, &[u8])>, lxmf_core::message::MessageError>
+pub fn lxmf_core::message::LxMessage::mark_delivered(&mut self)
+pub fn lxmf_core::message::LxMessage::mark_failed(&mut self)
+pub fn lxmf_core::message::LxMessage::mark_rejected(&mut self)
+pub fn lxmf_core::message::LxMessage::mark_sending(&mut self)
+pub fn lxmf_core::message::LxMessage::mark_sent(&mut self)
+pub fn lxmf_core::message::LxMessage::new([u8; 16], [u8; 16], &str, &str, lxmf_core::constants::DeliveryMethod) -> Self
+pub fn lxmf_core::message::LxMessage::notify_delivered(&self)
+pub fn lxmf_core::message::LxMessage::notify_failed(&self)
+pub fn lxmf_core::message::LxMessage::pack(&self) -> core::result::Result<alloc::vec::Vec<u8>, lxmf_core::message::MessageError>
+pub fn lxmf_core::message::LxMessage::pack_container(&self) -> core::result::Result<alloc::vec::Vec<u8>, lxmf_core::message::MessageError>
+pub fn lxmf_core::message::LxMessage::pack_opportunistic_encrypted<F>(&self, F) -> core::result::Result<alloc::vec::Vec<u8>, lxmf_core::message::MessageError> where F: core::ops::function::FnOnce(&[u8]) -> core::result::Result<alloc::vec::Vec<u8>, lxmf_core::message::MessageError>
+pub fn lxmf_core::message::LxMessage::pack_payload(&self) -> core::result::Result<alloc::vec::Vec<u8>, lxmf_core::message::MessageError>
+pub fn lxmf_core::message::LxMessage::pack_propagated(&self) -> core::result::Result<alloc::vec::Vec<u8>, lxmf_core::message::MessageError>
+pub fn lxmf_core::message::LxMessage::pack_propagated_encrypted<F>(&mut self, F) -> core::result::Result<(alloc::vec::Vec<u8>, lxmf_core::types::PropagationTransientId), lxmf_core::message::MessageError> where F: core::ops::function::FnOnce(&[u8]) -> core::result::Result<alloc::vec::Vec<u8>, lxmf_core::message::MessageError>
+pub fn lxmf_core::message::LxMessage::pack_propagated_encrypted_with_stamp<F>(&mut self, F, u8) -> core::result::Result<(alloc::vec::Vec<u8>, lxmf_core::types::PropagationTransientId, u32), lxmf_core::message::MessageError> where F: core::ops::function::FnOnce(&[u8]) -> core::result::Result<alloc::vec::Vec<u8>, lxmf_core::message::MessageError>
+pub fn lxmf_core::message::LxMessage::packed_len(&self) -> core::result::Result<usize, lxmf_core::message::MessageError>
+pub fn lxmf_core::message::LxMessage::read_from_file(&str) -> core::result::Result<Self, lxmf_core::message::MessageError>
+pub fn lxmf_core::message::LxMessage::register_delivery_callback<F>(&mut self, F) where F: core::ops::function::Fn(&lxmf_core::message::LxMessage) + core::marker::Send + core::marker::Sync + 'static
+pub fn lxmf_core::message::LxMessage::register_failed_callback<F>(&mut self, F) where F: core::ops::function::Fn(&lxmf_core::message::LxMessage) + core::marker::Send + core::marker::Sync + 'static
+pub fn lxmf_core::message::LxMessage::set_audio_field(&mut self, u8, &[u8]) -> core::result::Result<(), lxmf_core::message::MessageError>
+pub fn lxmf_core::message::LxMessage::set_field(&mut self, u8, alloc::vec::Vec<u8>)
+pub fn lxmf_core::message::LxMessage::set_file_attachment_field(&mut self, &str, &[u8]) -> core::result::Result<(), lxmf_core::message::MessageError>
+pub fn lxmf_core::message::LxMessage::set_image_field(&mut self, &str, &[u8]) -> core::result::Result<(), lxmf_core::message::MessageError>
+pub fn lxmf_core::message::LxMessage::set_msgpack_field(&mut self, u8, alloc::vec::Vec<u8>) -> core::result::Result<(), lxmf_core::message::MessageError>
+pub fn lxmf_core::message::LxMessage::sign(&mut self, &rns_crypto::ed25519::Ed25519PrivateKey) -> core::result::Result<(), lxmf_core::message::MessageError>
+pub fn lxmf_core::message::LxMessage::sign_with<F, E>(&mut self, F) -> core::result::Result<(), lxmf_core::message::MessageError> where F: core::ops::function::FnOnce(&[u8]) -> core::result::Result<[u8; 64], E>, E: core::fmt::Display
+pub fn lxmf_core::message::LxMessage::to_paper_uri<F>(&self, F) -> core::result::Result<alloc::string::String, lxmf_core::message::MessageError> where F: core::ops::function::FnOnce(&[u8]) -> core::result::Result<alloc::vec::Vec<u8>, lxmf_core::message::MessageError>
+pub fn lxmf_core::message::LxMessage::unpack(&[u8]) -> core::result::Result<Self, lxmf_core::message::MessageError>
+pub fn lxmf_core::message::LxMessage::unpack_container(&[u8]) -> core::result::Result<Self, lxmf_core::message::MessageError>
+pub fn lxmf_core::message::LxMessage::unpack_propagated(&[u8]) -> core::result::Result<Self, lxmf_core::message::MessageError>
+pub fn lxmf_core::message::LxMessage::unpack_propagation_wrapper(&[u8]) -> core::result::Result<(f64, alloc::vec::Vec<alloc::vec::Vec<u8>>), lxmf_core::message::MessageError>
+pub fn lxmf_core::message::LxMessage::unpack_propagation_wrapper_bounded(&[u8], usize) -> core::result::Result<(f64, alloc::vec::Vec<alloc::vec::Vec<u8>>), lxmf_core::message::MessageError>
+pub fn lxmf_core::message::LxMessage::validate_stamp_with_tickets(&mut self, u8, core::option::Option<&[alloc::vec::Vec<u8>]>) -> bool
+pub fn lxmf_core::message::LxMessage::verify(&mut self, &rns_crypto::ed25519::Ed25519PublicKey) -> bool
+pub fn lxmf_core::message::LxMessage::write_to_directory(&self, &str) -> core::result::Result<alloc::string::String, lxmf_core::message::MessageError>
+pub type lxmf_core::message_api::DestinationHash = [u8; 16]
+pub type lxmf_core::message_api::IdentityHash = [u8; 16]
+pub type lxmf_core::message_api::MessageId = [u8; 32]
 pub mod lxmf_core::peer
 pub struct lxmf_core::peer::LxmPeer
 pub lxmf_core::peer::LxmPeer::alive: bool
