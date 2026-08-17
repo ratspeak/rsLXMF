@@ -239,7 +239,7 @@ Minimal config:
 display_name = Rat
 announce_at_start = no
 # stamp_cost = 12
-delivery_transfer_max_accepted_size = 1000
+delivery_transfer_max_accepted_size = 1
 # on_inbound = /path/to/handler
 
 [propagation]
@@ -258,6 +258,11 @@ auth_required = no
 [logging]
 loglevel = 4
 ```
+
+The standalone daemon follows current Python LXMF 1.1.0 and defaults this
+setting to 1 decimal KB when it is omitted. This is intentionally distinct
+from the reusable router library's 1000 KB default. Applications that accept
+larger incoming messages should set their own explicit policy.
 
 Supported sections:
 

@@ -2,9 +2,9 @@
 
 ## Unreleased
 
-- Restored Python-compatible `lxmd` direct-delivery Resource admission to
-  1000 decimal KB when the setting is omitted, while preserving explicit
-  lower limits and the 0.38 KB minimum.
+- Matched current Python LXMF 1.1.0's fresh `lxmd` direct-delivery Resource
+  admission default of 1 decimal KB, while keeping the reusable router's
+  separate 1000 KB library default and preserving explicit configured limits.
 - Bound Direct-delivery, propagation-download, and propagation-sync Link
   initiators to the authenticated LRPROOF ingress interface before LRRTT,
   routed all established-Link traffic through ordered typed endpoints, and

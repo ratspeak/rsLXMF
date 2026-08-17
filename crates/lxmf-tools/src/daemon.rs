@@ -71,7 +71,7 @@ impl PythonLxmdConfig {
             delivery_transfer_max_accepted_size: get_float_or_floor(
                 lxmf,
                 "delivery_transfer_max_accepted_size",
-                1000.0,
+                1.0,
                 0.38,
             ),
             on_inbound: lxmf
@@ -227,9 +227,10 @@ impl Default for DaemonConfig {
             enforce_stamps: false,
             message_storage_limit: Some(500_000_000),
             from_static_only: false,
-            // Python lxmd defaults direct-delivery Resource admission to
-            // 1000 decimal KB when the setting is omitted.
-            delivery_transfer_max_accepted_size: 1000.0,
+            // Current Python LXMF 1.1.0's standalone lxmd defaults
+            // direct-delivery Resource admission to 1 decimal KB when the
+            // setting is omitted. LXMRouter's library default is separate.
+            delivery_transfer_max_accepted_size: 1.0,
         }
     }
 }
@@ -596,7 +597,7 @@ mod tests {
         assert!(!dc.node_announce_at_start);
         assert_eq!(dc.node_announce_interval, None);
         assert_eq!(dc.message_storage_limit, Some(500_000_000));
-        assert_eq!(dc.delivery_transfer_max_accepted_size, 1000.0);
+        assert_eq!(dc.delivery_transfer_max_accepted_size, 1.0);
         assert!(!dc.from_static_only);
     }
 
@@ -609,7 +610,7 @@ mod tests {
         assert!(!py.peer_announce_at_start);
         assert_eq!(py.peer_announce_interval, None);
         assert_eq!(py.peer_stamp_cost, 12);
-        assert_eq!(py.delivery_transfer_max_accepted_size, 1000.0);
+        assert_eq!(py.delivery_transfer_max_accepted_size, 1.0);
         assert_eq!(py.on_inbound, None);
         assert!(!py.enable_propagation_node);
         assert_eq!(py.node_name, None);
@@ -732,7 +733,7 @@ propagation_transfer_max_accepted_size = 12
         let rc = dc.to_router_config();
         assert!(!rc.propagation_enabled);
         assert_eq!(rc.max_peers, 20);
-        assert_eq!(rc.delivery_limit_kb, 1000.0);
+        assert_eq!(rc.delivery_limit_kb, 1.0);
         assert_eq!(RouterConfig::default().delivery_limit_kb, 1000.0);
         assert_eq!(rc.propagation_limit_kb, 256);
         assert_eq!(rc.sync_limit_kb, 10_240);

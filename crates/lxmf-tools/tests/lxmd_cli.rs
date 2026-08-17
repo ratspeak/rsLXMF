@@ -228,7 +228,7 @@ fn example_config_exits_before_runtime_initialisation() {
     assert!(text.contains("display_name = Anonymous Peer"));
     assert!(text.contains("announce_at_start = no"));
     assert!(text.contains("# stamp_cost = 12"));
-    assert!(text.contains("delivery_transfer_max_accepted_size = 1000"));
+    assert!(text.contains("delivery_transfer_max_accepted_size = 1"));
     assert!(text.contains("[propagation]"));
     assert!(text.contains("enable_node = no"));
     assert!(text.contains("announce_interval = 360"));
