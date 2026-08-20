@@ -20,7 +20,7 @@ use crate::peer::{LxmPeer, OutboundOfferPolicy};
 use crate::propagation::PropagationStore;
 use crate::propagation_client::PropagationTransferStatus;
 use crate::stamper;
-use crate::ticket::{Ticket, TicketStore};
+use crate::ticket::{Ticket, TicketStore, TicketStoreSnapshot};
 use crate::types::PropagationTransientId;
 
 /// Router configuration.
@@ -350,6 +350,37 @@ pub struct AutopeerCandidate {
 pub struct StampCostEntry {
     pub cost: u8,
     pub recorded_at: f64,
+}
+
+/// Owned, coherent snapshot of the router state written by [`LxmRouter::save_state`].
+///
+/// Creating the snapshot only clones in-memory state. The caller can therefore
+/// release any lock that protects the router before calling [`Self::save_state`],
+/// keeping filesystem I/O out of the router's critical section.
+#[derive(Debug, Clone)]
+pub struct RouterStateSnapshot {
+    outbound_stamp_costs: HashMap<[u8; 16], StampCostEntry>,
+    tickets: TicketStoreSnapshot,
+    local_deliveries: HashMap<PropagationTransientId, f64>,
+    locally_processed: HashMap<PropagationTransientId, f64>,
+    node_stats: crate::persist::PersistedNodeStats,
+}
+
+impl RouterStateSnapshot {
+    /// Persist this owned snapshot using the router's MessagePack layout.
+    ///
+    /// Each file is written atomically via rename, matching
+    /// [`LxmRouter::save_state`].
+    pub fn save_state(&self, state_dir: &std::path::Path) -> std::io::Result<()> {
+        use crate::persist;
+
+        persist::save_stamp_costs(state_dir, &self.outbound_stamp_costs)?;
+        persist::save_tickets(state_dir, &self.tickets)?;
+        persist::save_local_deliveries(state_dir, &self.local_deliveries)?;
+        persist::save_locally_processed(state_dir, &self.locally_processed)?;
+        persist::save_node_stats(state_dir, &self.node_stats)?;
+        Ok(())
+    }
 }
 
 impl LxmRouter {
@@ -1129,25 +1160,29 @@ impl LxmRouter {
         Ok(())
     }
 
-    /// Persist runtime state to `state_dir` using MessagePack. Safe to call
-    /// periodically; each file is written atomically via rename.
-    pub fn save_state(&self, state_dir: &std::path::Path) -> std::io::Result<()> {
-        use crate::persist;
-
-        persist::save_stamp_costs(state_dir, &self.outbound_stamp_costs)?;
-        persist::save_tickets(state_dir, &self.ticket_store.snapshot())?;
-        persist::save_local_deliveries(state_dir, self.propagation_store.locally_delivered_ids())?;
-        persist::save_locally_processed(state_dir, self.propagation_store.locally_processed_ids())?;
-        persist::save_node_stats(
-            state_dir,
-            &persist::PersistedNodeStats {
+    /// Clone all runtime state written by [`Self::save_state`] into one owned
+    /// value. Embedders can take this snapshot while holding the router lock,
+    /// release the lock, and perform persistence through
+    /// [`RouterStateSnapshot::save_state`].
+    pub fn state_snapshot(&self) -> RouterStateSnapshot {
+        RouterStateSnapshot {
+            outbound_stamp_costs: self.outbound_stamp_costs.clone(),
+            tickets: self.ticket_store.snapshot(),
+            local_deliveries: self.propagation_store.locally_delivered_ids().clone(),
+            locally_processed: self.propagation_store.locally_processed_ids().clone(),
+            node_stats: crate::persist::PersistedNodeStats {
                 client_propagation_messages_received: self.client_propagation_messages_received,
                 client_propagation_messages_served: self.client_propagation_messages_served,
                 unpeered_propagation_incoming: self.unpeered_propagation_incoming,
                 unpeered_propagation_rx_bytes: self.unpeered_propagation_rx_bytes,
             },
-        )?;
-        Ok(())
+        }
+    }
+
+    /// Persist runtime state to `state_dir` using MessagePack. Safe to call
+    /// periodically; each file is written atomically via rename.
+    pub fn save_state(&self, state_dir: &std::path::Path) -> std::io::Result<()> {
+        self.state_snapshot().save_state(state_dir)
     }
 
     /// Return peer destination hashes that are due for sync and mark each as
@@ -3049,6 +3084,82 @@ mod tests {
         assert_eq!(r2.client_propagation_messages_served, 11);
         assert_eq!(r2.unpeered_propagation_incoming, 12);
         assert_eq!(r2.unpeered_propagation_rx_bytes, 13);
+    }
+
+    #[test]
+    fn test_state_snapshot_is_an_owned_coherent_copy() {
+        let dest = [0xA1; 16];
+        let transient = [0xB2; 32];
+
+        let mut router = LxmRouter::new(RouterConfig::default());
+        router.set_stamp_cost(dest, 8);
+        router.remember_ticket(dest, [0xC3; 16], 4_102_444_800.0);
+        router.propagation_store.mark_locally_delivered(transient);
+        router.propagation_store.mark_locally_processed(transient);
+        router.client_propagation_messages_received = 10;
+        router.client_propagation_messages_served = 11;
+        router.unpeered_propagation_incoming = 12;
+        router.unpeered_propagation_rx_bytes = 13;
+
+        let snapshot = router.state_snapshot();
+
+        // Mutating every persisted router dataset after capture must not alter
+        // the snapshot that a background persistence task owns.
+        router.set_stamp_cost(dest, 42);
+        router.remember_ticket(dest, [0xD4; 16], 4_102_444_800.0);
+        router
+            .propagation_store
+            .replace_locally_delivered(HashMap::new());
+        router
+            .propagation_store
+            .replace_locally_processed(HashMap::new());
+        router.client_propagation_messages_received = 20;
+        router.client_propagation_messages_served = 21;
+        router.unpeered_propagation_incoming = 22;
+        router.unpeered_propagation_rx_bytes = 23;
+
+        assert_eq!(snapshot.outbound_stamp_costs[&dest].cost, 8);
+        assert_eq!(snapshot.tickets.outbound.len(), 1);
+        assert_eq!(snapshot.tickets.outbound[0].token, [0xC3; 16]);
+        assert!(snapshot.local_deliveries.contains_key(&transient));
+        assert!(snapshot.locally_processed.contains_key(&transient));
+        assert_eq!(snapshot.node_stats.client_propagation_messages_received, 10);
+        assert_eq!(snapshot.node_stats.client_propagation_messages_served, 11);
+        assert_eq!(snapshot.node_stats.unpeered_propagation_incoming, 12);
+        assert_eq!(snapshot.node_stats.unpeered_propagation_rx_bytes, 13);
+    }
+
+    #[test]
+    fn test_state_snapshot_persists_after_router_is_dropped() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dest = [0xA5; 16];
+        let transient = [0xB6; 32];
+
+        let snapshot = {
+            let mut router = LxmRouter::new(RouterConfig::default());
+            router.set_stamp_cost(dest, 9);
+            router.remember_ticket(dest, [0xC7; 16], 4_102_444_800.0);
+            router.propagation_store.mark_locally_delivered(transient);
+            router.propagation_store.mark_locally_processed(transient);
+            router.client_propagation_messages_received = 30;
+            router.client_propagation_messages_served = 31;
+            router.unpeered_propagation_incoming = 32;
+            router.unpeered_propagation_rx_bytes = 33;
+            router.state_snapshot()
+        };
+
+        snapshot.save_state(tmp.path()).unwrap();
+
+        let mut restored = LxmRouter::new(RouterConfig::default());
+        restored.load_state(tmp.path()).unwrap();
+        assert_eq!(restored.outbound_stamp_costs[&dest].cost, 9);
+        assert_eq!(restored.get_outbound_ticket(&dest), Some([0xC7; 16]));
+        assert!(restored.propagation_store.is_locally_delivered(&transient));
+        assert!(restored.propagation_store.is_locally_processed(&transient));
+        assert_eq!(restored.client_propagation_messages_received, 30);
+        assert_eq!(restored.client_propagation_messages_served, 31);
+        assert_eq!(restored.unpeered_propagation_incoming, 32);
+        assert_eq!(restored.unpeered_propagation_rx_bytes, 33);
     }
 
     /// T1-10: persisted dedup timestamps are the REAL first-seen times —
