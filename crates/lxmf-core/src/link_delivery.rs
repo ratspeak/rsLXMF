@@ -40,6 +40,72 @@ const BACKCHANNEL_DELIVERY_TIMEOUT: Duration = Duration::from_secs(360);
 const BACKCHANNEL_EARLY_PROOF_LIMIT: usize = 256;
 const LINK_PENDING_TRANSPORT_LIMIT: usize = 1024;
 
+/// Authority-derived first-hop timing for an outbound Link.
+///
+/// Python Reticulum computes an initiator's establishment deadline as the
+/// first-hop timeout plus six seconds for every hop to the destination. The
+/// first-hop timeout is one full Reticulum MTU at the next-hop interface's
+/// bitrate, plus the same six-second baseline. When no authoritative bitrate
+/// is available, Reticulum falls back to the baseline alone.
+///
+/// Keeping this input independent of interface type is intentional: BLE,
+/// serial, TCP and every future adapter use the same Link timing rule. It does
+/// not pause or reset the protocol clock when an interface goes offline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinkEstablishmentTiming {
+    first_hop_timeout: Duration,
+}
+
+impl LinkEstablishmentTiming {
+    /// Construct timing from an already-authoritative Reticulum first-hop
+    /// timeout (for example `ReticulumHandle::first_hop_timeout`).
+    pub const fn from_first_hop_timeout(first_hop_timeout: Duration) -> Self {
+        Self { first_hop_timeout }
+    }
+
+    /// Derive Python-compatible first-hop timing from the effective next-hop
+    /// interface bitrate. A zero bitrate has the standard six-second fallback.
+    pub fn from_first_hop_bitrate(bitrate: u64) -> Self {
+        Self::from_first_hop_bitrate_and_mtu(bitrate, rns_wire::constants::MTU as u32)
+    }
+
+    /// Derive first-hop timing from the effective next-hop bitrate and an
+    /// already-normalised Reticulum protocol MTU.
+    ///
+    /// Callers normally want [`Self::from_first_hop_bitrate`], which uses the
+    /// canonical 500-byte Reticulum MTU exactly like Python Reticulum and the
+    /// trusted rsReticulum runtime. `normalised_mtu` exists for callers that
+    /// already have an authoritative *protocol* MTU. It must never be a BLE
+    /// ATT MTU, an RNode serial chunk size, or a raw hardware-interface MTU.
+    pub fn from_first_hop_bitrate_and_mtu(bitrate: u64, normalised_mtu: u32) -> Self {
+        let serialization_secs = if bitrate == 0 {
+            0.0
+        } else {
+            (f64::from(normalised_mtu.min(rns_wire::constants::MTU as u32)) * 8.0) / bitrate as f64
+        };
+        Self {
+            first_hop_timeout: Duration::from_secs_f64(
+                serialization_secs + rns_wire::constants::DEFAULT_PER_HOP_TIMEOUT,
+            ),
+        }
+    }
+
+    pub const fn first_hop_timeout(self) -> Duration {
+        self.first_hop_timeout
+    }
+
+    pub fn timeout_for_hops(self, hops: u8) -> Duration {
+        self.first_hop_timeout
+            + Duration::from_secs_f64(ESTABLISHMENT_TIMEOUT_PER_HOP * f64::from(hops.max(1)))
+    }
+}
+
+impl Default for LinkEstablishmentTiming {
+    fn default() -> Self {
+        Self::from_first_hop_bitrate(0)
+    }
+}
+
 type InboundResourceAcceptHandler =
     Arc<dyn Fn([u8; 16], &ResourceAdvertisement) -> bool + Send + Sync>;
 type InboundResourceConcludedHandler = Arc<dyn Fn([u8; 16], [u8; 32]) + Send + Sync>;
@@ -777,7 +843,24 @@ impl LinkDeliveryManager {
         dest_hash: [u8; 16],
         hops: u8,
     ) -> Result<[u8; 16], LinkDeliveryStartFailure> {
-        self.start_delivery_with_report(message, dest_hash, hops)
+        self.start_delivery_with_timing(
+            message,
+            dest_hash,
+            hops,
+            LinkEstablishmentTiming::default(),
+        )
+    }
+
+    /// Start a direct delivery with authoritative first-hop timing and return
+    /// the tracking `link_id`.
+    pub fn start_delivery_with_timing(
+        &mut self,
+        message: LxMessage,
+        dest_hash: [u8; 16],
+        hops: u8,
+        timing: LinkEstablishmentTiming,
+    ) -> Result<[u8; 16], LinkDeliveryStartFailure> {
+        self.start_delivery_with_report_and_timing(message, dest_hash, hops, timing)
             .map(|report| report.link_id)
     }
 
@@ -789,7 +872,24 @@ impl LinkDeliveryManager {
         dest_hash: [u8; 16],
         hops: u8,
     ) -> Result<DirectLinkStartReport, LinkDeliveryStartFailure> {
-        self.start_direct_delivery(message, dest_hash, hops)
+        self.start_delivery_with_report_and_timing(
+            message,
+            dest_hash,
+            hops,
+            LinkEstablishmentTiming::default(),
+        )
+    }
+
+    /// Start a Direct delivery with authoritative first-hop timing and return
+    /// whether it created, reused, or queued on reusable Link state.
+    pub fn start_delivery_with_report_and_timing(
+        &mut self,
+        message: LxMessage,
+        dest_hash: [u8; 16],
+        hops: u8,
+        timing: LinkEstablishmentTiming,
+    ) -> Result<DirectLinkStartReport, LinkDeliveryStartFailure> {
+        self.start_direct_delivery(message, dest_hash, hops, timing)
     }
 
     /// Start a link delivery with an already-packed payload.
@@ -804,10 +904,31 @@ impl LinkDeliveryManager {
         packed_payload: Vec<u8>,
         auto_compress: bool,
     ) -> Result<[u8; 16], LinkDeliveryStartFailure> {
+        self.start_packed_delivery_with_timing(
+            message,
+            dest_hash,
+            hops,
+            packed_payload,
+            auto_compress,
+            LinkEstablishmentTiming::default(),
+        )
+    }
+
+    /// Start a packed Link delivery with authoritative first-hop timing.
+    pub fn start_packed_delivery_with_timing(
+        &mut self,
+        message: LxMessage,
+        dest_hash: [u8; 16],
+        hops: u8,
+        packed_payload: Vec<u8>,
+        auto_compress: bool,
+        timing: LinkEstablishmentTiming,
+    ) -> Result<[u8; 16], LinkDeliveryStartFailure> {
         self.start_delivery_inner(
             message,
             dest_hash,
             hops,
+            timing,
             Some(packed_payload),
             auto_compress,
             false,
@@ -923,6 +1044,7 @@ impl LinkDeliveryManager {
         message: LxMessage,
         dest_hash: [u8; 16],
         hops: u8,
+        timing: LinkEstablishmentTiming,
     ) -> Result<DirectLinkStartReport, LinkDeliveryStartFailure> {
         if let Some(link_id) = self.direct_links.get(&dest_hash).copied() {
             let idle_expired = self
@@ -1024,7 +1146,8 @@ impl LinkDeliveryManager {
 
         let msg_hash = message.hash;
         let attempts = message.delivery_attempts;
-        let link_id = self.start_delivery_inner(message, dest_hash, hops, None, true, true)?;
+        let link_id =
+            self.start_delivery_inner(message, dest_hash, hops, timing, None, true, true)?;
         let snapshot = self.direct_link_snapshot(dest_hash);
         let report = DirectLinkStartReport {
             link_id,
@@ -1060,12 +1183,14 @@ impl LinkDeliveryManager {
         message: LxMessage,
         dest_hash: [u8; 16],
         hops: u8,
+        timing: LinkEstablishmentTiming,
         packed_override: Option<Vec<u8>>,
         auto_compress: bool,
         reusable: bool,
     ) -> Result<[u8; 16], LinkDeliveryStartFailure> {
         let msg_hash = message.hash;
-        let (link, request_data) = Link::new_initiator(dest_hash, hops);
+        let (mut link, request_data) = Link::new_initiator(dest_hash, hops);
+        link.extend_establishment_timeout(timing.first_hop_timeout().as_secs_f64());
         let link_id = link.link_id;
         let pending_count = self.pending_count();
 
@@ -1137,7 +1262,8 @@ impl LinkDeliveryManager {
             destination_hash: dest_hash,
         }));
 
-        let establishment_timeout_secs = ESTABLISHMENT_TIMEOUT_PER_HOP * (hops.max(1) as f64);
+        let establishment_timeout = timing.timeout_for_hops(hops);
+        let establishment_timeout_secs = establishment_timeout.as_secs_f64();
         // Full transfer timeout keeps the previous keepalive allowance once
         // establishment has succeeded.
         let timeout_secs = establishment_timeout_secs + KEEPALIVE_DEFAULT;
@@ -1154,7 +1280,7 @@ impl LinkDeliveryManager {
                 transfer: None,
                 remaining_segments: None,
                 packet_proof_hash: None,
-                establishment_timeout: Duration::from_secs_f64(establishment_timeout_secs),
+                establishment_timeout,
                 timeout: Duration::from_secs_f64(timeout_secs),
                 msg_hash,
                 failure_reason: None,
@@ -4830,6 +4956,78 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    #[test]
+    fn link_establishment_timing_matches_upstream_medium_fast_one_and_multi_hop() {
+        // RNode Firmware's Medium Fast preset is SF9/BW250/CR5. The firmware's
+        // integer bitrate calculation yields 3515 bit/s, while Reticulum uses
+        // its normalised 500-byte protocol MTU for first-hop timing.
+        let timing = LinkEstablishmentTiming::from_first_hop_bitrate(3_515);
+        let expected_first_hop = 6.0 + (500.0 * 8.0 / 3_515.0);
+        let expected_one_hop = expected_first_hop + 6.0;
+        let expected_three_hops = expected_first_hop + 18.0;
+
+        assert!((timing.first_hop_timeout().as_secs_f64() - expected_first_hop).abs() < 1e-9);
+        assert!((timing.timeout_for_hops(1).as_secs_f64() - expected_one_hop).abs() < 1e-9);
+        assert!((timing.timeout_for_hops(3).as_secs_f64() - expected_three_hops).abs() < 1e-9);
+        assert!((timing.timeout_for_hops(1).as_secs_f64() - 13.137_980_085).abs() < 1e-9);
+
+        // The explicit constructor accepts a *normalised Reticulum protocol*
+        // MTU, never a raw BLE ATT or hardware-interface MTU. Values above the
+        // protocol maximum normalise back to the canonical 500-byte boundary.
+        assert_eq!(
+            timing,
+            LinkEstablishmentTiming::from_first_hop_bitrate_and_mtu(3_515, 1_024)
+        );
+
+        let unknown_interface = LinkEstablishmentTiming::default();
+        assert_eq!(
+            unknown_interface.first_hop_timeout(),
+            Duration::from_secs(6)
+        );
+        assert_eq!(
+            unknown_interface.timeout_for_hops(1),
+            Duration::from_secs(12)
+        );
+        assert_eq!(
+            unknown_interface.timeout_for_hops(3),
+            Duration::from_secs(24)
+        );
+    }
+
+    #[test]
+    fn timed_start_applies_one_clock_and_preserves_establishing_cancel() {
+        let (tx, _rx) = mpsc::channel(64);
+        let mut mgr = LinkDeliveryManager::new(tx, None, None);
+        let signing_key = Ed25519PrivateKey::generate();
+        let mut message = LxMessage::new(
+            [0xAA; 16],
+            [0xBB; 16],
+            "Timed",
+            "cancel remains local",
+            crate::constants::DeliveryMethod::Direct,
+        );
+        message.sign(&signing_key).unwrap();
+        let message_hash = message.hash.unwrap();
+        let timing = LinkEstablishmentTiming::from_first_hop_bitrate(3_515);
+        let expected = timing.timeout_for_hops(3);
+
+        let link_id = mgr
+            .start_delivery_with_timing(message, [0xCC; 16], 3, timing)
+            .unwrap();
+        let pending = mgr.pending.get(&link_id).unwrap();
+        assert_eq!(pending.establishment_timeout, expected);
+        assert_eq!(pending.link.establishment_timeout, expected);
+
+        assert!(mgr.cancel_delivery_by_message_hash(message_hash));
+        assert!(!mgr.cancel_delivery_by_message_hash(message_hash));
+        assert_eq!(mgr.pending_count(), 0);
+        assert!(
+            mgr.take_delivery_events()
+                .iter()
+                .all(|event| event.kind != LxmfDeliveryEventKind::Failed)
+        );
+    }
+
     fn next_outbound(rx: &mut mpsc::Receiver<TransportMessage>) -> Vec<u8> {
         while let Ok(message) = rx.try_recv() {
             match message {
@@ -6680,7 +6878,7 @@ mod tests {
     }
 
     #[test]
-    fn test_establishment_timeout_deregisters() {
+    fn test_establishment_timeout_deregisters_and_remains_retryable() {
         let (tx, mut rx) = mpsc::channel(64);
         let mut mgr = LinkDeliveryManager::new(tx, None, None);
 
@@ -6691,7 +6889,17 @@ mod tests {
             "timeout test",
             crate::constants::DeliveryMethod::Direct,
         );
-        let link_id = mgr.start_delivery(msg, [0xDD; 16], 1).unwrap();
+        let timing = LinkEstablishmentTiming::from_first_hop_bitrate(3_515);
+        let link_id = mgr
+            .start_delivery_with_timing(msg, [0xDD; 16], 1, timing)
+            .unwrap();
+
+        let delivery = mgr.pending.get(&link_id).unwrap();
+        assert_eq!(delivery.establishment_timeout, timing.timeout_for_hops(1));
+        assert_eq!(
+            delivery.link.establishment_timeout,
+            timing.timeout_for_hops(1)
+        );
 
         while let Ok(message) = rx.try_recv() {
             if let TransportMessage::SendLinkEndpoint { result_tx, .. } = message {
@@ -6711,7 +6919,9 @@ mod tests {
         );
         assert!(results.iter().any(|r| matches!(
             r,
-            DeliveryResult::Failed { reason, .. } if reason == "link establishment timeout"
+            DeliveryResult::Failed { reason, .. }
+                if reason == "link establishment timeout"
+                    && is_retryable_link_delivery_failure(reason)
         )));
         assert_eq!(mgr.pending_count(), 0);
 
