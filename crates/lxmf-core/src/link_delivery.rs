@@ -106,6 +106,37 @@ impl Default for LinkEstablishmentTiming {
     }
 }
 
+struct LinkDeliveryStartOptions {
+    timing: LinkEstablishmentTiming,
+    packed_override: Option<Vec<u8>>,
+    auto_compress: bool,
+    reusable: bool,
+}
+
+impl LinkDeliveryStartOptions {
+    fn direct(timing: LinkEstablishmentTiming) -> Self {
+        Self {
+            timing,
+            packed_override: None,
+            auto_compress: true,
+            reusable: true,
+        }
+    }
+
+    fn packed(
+        timing: LinkEstablishmentTiming,
+        packed_payload: Vec<u8>,
+        auto_compress: bool,
+    ) -> Self {
+        Self {
+            timing,
+            packed_override: Some(packed_payload),
+            auto_compress,
+            reusable: false,
+        }
+    }
+}
+
 type InboundResourceAcceptHandler =
     Arc<dyn Fn([u8; 16], &ResourceAdvertisement) -> bool + Send + Sync>;
 type InboundResourceConcludedHandler = Arc<dyn Fn([u8; 16], [u8; 32]) + Send + Sync>;
@@ -928,10 +959,7 @@ impl LinkDeliveryManager {
             message,
             dest_hash,
             hops,
-            timing,
-            Some(packed_payload),
-            auto_compress,
-            false,
+            LinkDeliveryStartOptions::packed(timing, packed_payload, auto_compress),
         )
     }
 
@@ -1146,8 +1174,12 @@ impl LinkDeliveryManager {
 
         let msg_hash = message.hash;
         let attempts = message.delivery_attempts;
-        let link_id =
-            self.start_delivery_inner(message, dest_hash, hops, timing, None, true, true)?;
+        let link_id = self.start_delivery_inner(
+            message,
+            dest_hash,
+            hops,
+            LinkDeliveryStartOptions::direct(timing),
+        )?;
         let snapshot = self.direct_link_snapshot(dest_hash);
         let report = DirectLinkStartReport {
             link_id,
@@ -1183,11 +1215,14 @@ impl LinkDeliveryManager {
         message: LxMessage,
         dest_hash: [u8; 16],
         hops: u8,
-        timing: LinkEstablishmentTiming,
-        packed_override: Option<Vec<u8>>,
-        auto_compress: bool,
-        reusable: bool,
+        options: LinkDeliveryStartOptions,
     ) -> Result<[u8; 16], LinkDeliveryStartFailure> {
+        let LinkDeliveryStartOptions {
+            timing,
+            packed_override,
+            auto_compress,
+            reusable,
+        } = options;
         let msg_hash = message.hash;
         let (mut link, request_data) = Link::new_initiator(dest_hash, hops);
         link.extend_establishment_timeout(timing.first_hop_timeout().as_secs_f64());

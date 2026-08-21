@@ -19,37 +19,40 @@
     "sourceCommit": "b8d7afce73f7f098706029361568e63f22888ea3"
   },
   "snapshotSource": {
-    "commit": "c934ccc5feaaddb55461404094ed6bb514aae2cc",
-    "capturedOn": "2026-08-17",
+    "commit": "2ab8fdf22b55bf18708c7181da5d4e07801e7699",
+    "capturedOn": "2026-08-21",
     "review": {
       "areas": [
         "message construction and inspection",
-        "message status and identifiers"
+        "message status and identifiers",
+        "owned router persistence snapshots",
+        "Link establishment timing and timing-aware delivery starts"
       ],
       "canonicalPath": "lxmf_core::message_api",
       "retainedPaths": [
         "lxmf_core::message",
         "lxmf_core::constants",
-        "lxmf_core::types"
+        "lxmf_core::types",
+        "lxmf_core::router",
+        "lxmf_core::link_delivery"
       ],
       "excludedImplementationAreas": [
-        "router and delivery ownership",
         "propagation and handlers",
-        "persistence",
+        "serialized persistence representations",
         "raw Reticulum transport channels"
       ],
-      "classification": "compatible additive facade",
+      "classification": "compatible additive facade and provisional integration APIs",
       "publicApiDiff": {
-        "added": 70,
+        "added": 86,
         "removed": 0
       },
-      "semver": "compatible additive facade included in version 1.2.0",
+      "semver": "compatible additive APIs included in version 1.2.0",
       "deprecations": "none",
-      "wirePersistenceRuntimeImpact": "none; exact re-exports only",
+      "wirePersistenceRuntimeImpact": "no wire-format or persisted-layout change; exact message re-exports are behavior-neutral, owned router snapshots preserve the existing MessagePack layout, and Link establishment deadlines now follow authoritative first-hop timing while existing start methods remain available with the Reticulum fallback",
       "platformEvidence": [
         "compiled message example and external canonical and legacy fixtures",
-        "stable and Rust 1.87 strict Clippy",
-        "downstream desktop and mobile product gates"
+        "lxmf-core owned router snapshot and upstream-compatible Link timing unit tests",
+        "macOS and Ubuntu workspace test jobs for source commit 2ab8fdf22b55bf18708c7181da5d4e07801e7699"
       ]
     }
   },
@@ -60,8 +63,8 @@
       "tier": "candidate-stable",
       "compatibility": "reviewed-snapshot",
       "snapshot": "api/snapshots/lxmf-core.txt",
-      "itemCount": 1622,
-      "sha256": "c958cfdcb53117b02d1dbe907af6afaf5017d5ba92364267e21d204fe5ef3023"
+      "itemCount": 1638,
+      "sha256": "5b59de793250e211cd206c06e8e70147d91e40c45ba1d28fb659a4a354e2fd96"
     },
     {
       "name": "lxmf-tools",

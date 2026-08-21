@@ -498,7 +498,10 @@ pub fn lxmf_core::link_delivery::LinkDeliveryManager::set_inbound_resource_limit
 pub fn lxmf_core::link_delivery::LinkDeliveryManager::start_backchannel_delivery(&mut self, lxmf_core::message::LxMessage, [u8; 16]) -> core::result::Result<lxmf_core::link_delivery::BackchannelStartReport, lxmf_core::link_delivery::BackchannelStartFailure>
 pub fn lxmf_core::link_delivery::LinkDeliveryManager::start_delivery(&mut self, lxmf_core::message::LxMessage, [u8; 16], u8) -> core::result::Result<[u8; 16], lxmf_core::link_delivery::LinkDeliveryStartFailure>
 pub fn lxmf_core::link_delivery::LinkDeliveryManager::start_delivery_with_report(&mut self, lxmf_core::message::LxMessage, [u8; 16], u8) -> core::result::Result<lxmf_core::link_delivery::DirectLinkStartReport, lxmf_core::link_delivery::LinkDeliveryStartFailure>
+pub fn lxmf_core::link_delivery::LinkDeliveryManager::start_delivery_with_report_and_timing(&mut self, lxmf_core::message::LxMessage, [u8; 16], u8, lxmf_core::link_delivery::LinkEstablishmentTiming) -> core::result::Result<lxmf_core::link_delivery::DirectLinkStartReport, lxmf_core::link_delivery::LinkDeliveryStartFailure>
+pub fn lxmf_core::link_delivery::LinkDeliveryManager::start_delivery_with_timing(&mut self, lxmf_core::message::LxMessage, [u8; 16], u8, lxmf_core::link_delivery::LinkEstablishmentTiming) -> core::result::Result<[u8; 16], lxmf_core::link_delivery::LinkDeliveryStartFailure>
 pub fn lxmf_core::link_delivery::LinkDeliveryManager::start_packed_delivery(&mut self, lxmf_core::message::LxMessage, [u8; 16], u8, alloc::vec::Vec<u8>, bool) -> core::result::Result<[u8; 16], lxmf_core::link_delivery::LinkDeliveryStartFailure>
+pub fn lxmf_core::link_delivery::LinkDeliveryManager::start_packed_delivery_with_timing(&mut self, lxmf_core::message::LxMessage, [u8; 16], u8, alloc::vec::Vec<u8>, bool, lxmf_core::link_delivery::LinkEstablishmentTiming) -> core::result::Result<[u8; 16], lxmf_core::link_delivery::LinkDeliveryStartFailure>
 pub fn lxmf_core::link_delivery::LinkDeliveryManager::stats(&self) -> lxmf_core::link_delivery::LinkDeliveryStats
 pub fn lxmf_core::link_delivery::LinkDeliveryManager::take_backchannel_resource_cancellations(&mut self) -> alloc::vec::Vec<lxmf_core::link_delivery::BackchannelResourceCancelRequest>
 pub fn lxmf_core::link_delivery::LinkDeliveryManager::take_delivery_events(&mut self) -> alloc::vec::Vec<lxmf_core::link_delivery::LxmfDeliveryEvent>
@@ -521,6 +524,15 @@ pub lxmf_core::link_delivery::LinkDeliveryStats::pending_backchannel_deliveries:
 pub lxmf_core::link_delivery::LinkDeliveryStats::pending_backchannel_starts: usize
 pub lxmf_core::link_delivery::LinkDeliveryStats::queued_deliveries: usize
 pub lxmf_core::link_delivery::LinkDeliveryStats::sessions: usize
+pub struct lxmf_core::link_delivery::LinkEstablishmentTiming
+impl lxmf_core::link_delivery::LinkEstablishmentTiming
+pub const fn lxmf_core::link_delivery::LinkEstablishmentTiming::first_hop_timeout(self) -> core::time::Duration
+pub fn lxmf_core::link_delivery::LinkEstablishmentTiming::from_first_hop_bitrate(u64) -> Self
+pub fn lxmf_core::link_delivery::LinkEstablishmentTiming::from_first_hop_bitrate_and_mtu(u64, u32) -> Self
+pub const fn lxmf_core::link_delivery::LinkEstablishmentTiming::from_first_hop_timeout(core::time::Duration) -> Self
+pub fn lxmf_core::link_delivery::LinkEstablishmentTiming::timeout_for_hops(self, u8) -> core::time::Duration
+impl core::default::Default for lxmf_core::link_delivery::LinkEstablishmentTiming
+pub fn lxmf_core::link_delivery::LinkEstablishmentTiming::default() -> Self
 pub struct lxmf_core::link_delivery::LxmfDeliveryEvent
 pub lxmf_core::link_delivery::LxmfDeliveryEvent::attempts: u32
 pub lxmf_core::link_delivery::LxmfDeliveryEvent::delivery_state: lxmf_core::link_delivery::DeliveryState
@@ -1414,6 +1426,7 @@ pub fn lxmf_core::router::LxmRouter::set_retain_node_lxms(&mut self, bool)
 pub fn lxmf_core::router::LxmRouter::set_stamp_cost(&mut self, [u8; 16], u8)
 pub fn lxmf_core::router::LxmRouter::set_stamp_requirements(&mut self, u8, u8)
 pub fn lxmf_core::router::LxmRouter::set_transport(&mut self, tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>)
+pub fn lxmf_core::router::LxmRouter::state_snapshot(&self) -> lxmf_core::router::RouterStateSnapshot
 pub fn lxmf_core::router::LxmRouter::stats(&self) -> lxmf_core::router::RouterStats
 pub fn lxmf_core::router::LxmRouter::sync_peer_policies_for_store(&self, u64) -> alloc::vec::Vec<lxmf_core::peer::OutboundOfferPolicy>
 pub fn lxmf_core::router::LxmRouter::sync_peers(&mut self) -> alloc::vec::Vec<[u8; 16]>
@@ -1484,6 +1497,9 @@ pub lxmf_core::router::RouterConfigExt::propagation_cost_min: u8
 pub lxmf_core::router::RouterConfigExt::retain_synced_on_node: bool
 impl core::default::Default for lxmf_core::router::RouterConfigExt
 pub fn lxmf_core::router::RouterConfigExt::default() -> Self
+pub struct lxmf_core::router::RouterStateSnapshot
+impl lxmf_core::router::RouterStateSnapshot
+pub fn lxmf_core::router::RouterStateSnapshot::save_state(&self, &std::path::Path) -> core::io::error::Result<()>
 pub struct lxmf_core::router::RouterStats
 pub lxmf_core::router::RouterStats::peers: usize
 pub lxmf_core::router::RouterStats::pending_deferred_stamps: usize
