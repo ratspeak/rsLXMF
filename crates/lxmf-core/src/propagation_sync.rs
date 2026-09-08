@@ -5,9 +5,10 @@
 //!
 //! Flow:
 //! 1. Establish a link to the node.
-//! 2. Send link.request("/offer", [peering_key, transient_ids]).
-//! 3. Receive a Response packet (context 0x0A) with OfferResponse.
-//! 4. Transfer requested messages as a Resource.
+//! 2. Identify on the link (LinkIdentify) so the PN knows our identity.
+//! 3. Send link.request("/offer", [peering_key, transient_ids]).
+//! 4. Receive a Response packet (context 0x0A) with OfferResponse.
+//! 5. Transfer requested messages as a Resource.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -28,13 +29,14 @@ use rns_transport::messages::{
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::constants::OFFER_REQUEST_PATH;
+use crate::constants::{OFFER_REQUEST_PATH, STAMP_WORKBLOCK_EXPAND_ROUNDS_PEERING};
 use crate::peer::{LxmPeer, OutboundOfferPolicy};
 use crate::propagation::hex_encode;
 use crate::propagation_node::{
     InstallPreparedSyncOffer, PreparedSyncOffer, PropagationNode, PropagationNodeConfig,
     prepare_sync_offer_snapshot, read_planned_messages,
 };
+use crate::stamper::generate_stamp;
 use crate::sync::OfferResponse;
 use crate::types::PropagationTransientId;
 
@@ -172,6 +174,20 @@ pub struct PropagationSyncTask {
     transfer_wire_size: u64,
     transfer_started: Option<Instant>,
     link_establishment_rate: Option<f64>,
+    /// Client identity hash for peering_id = pn_identity || client_identity.
+    local_identity_hash: Option<[u8; 16]>,
+    /// Propagation-node identity hash (not destination hash).
+    peer_identity_hash: Option<[u8; 16]>,
+    /// Peering stamp cost advertised by the remote PN (0 = empty key allowed).
+    peer_peering_cost: u8,
+    /// Precomputed peering key (preferred) - avoids PoW on the maintenance tick.
+    outbound_peering_key: Option<Vec<u8>>,
+    /// Last `/offer` response error label (cleared on successful sync start).
+    pub last_offer_error: Option<&'static str>,
+    /// Sticky Establishing failure (LRPROOF identity miss / invalid proof).
+    pub last_establish_error: Option<&'static str>,
+    /// Sticky outcome after Complete/Failed -> Idle (for progress emitters).
+    pub last_finished_ok: Option<bool>,
 }
 
 impl PropagationSyncTask {
@@ -225,6 +241,13 @@ impl PropagationSyncTask {
             transfer_wire_size: 0,
             transfer_started: None,
             link_establishment_rate: None,
+            local_identity_hash: None,
+            peer_identity_hash: None,
+            peer_peering_cost: 0,
+            outbound_peering_key: None,
+            last_offer_error: None,
+            last_establish_error: None,
+            last_finished_ok: None,
         }
     }
 
@@ -284,6 +307,13 @@ impl PropagationSyncTask {
             transfer_wire_size: 0,
             transfer_started: None,
             link_establishment_rate: None,
+            local_identity_hash: None,
+            peer_identity_hash: None,
+            peer_peering_cost: 0,
+            outbound_peering_key: None,
+            last_offer_error: None,
+            last_establish_error: None,
+            last_finished_ok: None,
         })
     }
 
@@ -339,6 +369,13 @@ impl PropagationSyncTask {
             transfer_wire_size: 0,
             transfer_started: None,
             link_establishment_rate: None,
+            local_identity_hash: None,
+            peer_identity_hash: None,
+            peer_peering_cost: 0,
+            outbound_peering_key: None,
+            last_offer_error: None,
+            last_establish_error: None,
+            last_finished_ok: None,
         }
     }
 
@@ -363,6 +400,9 @@ impl PropagationSyncTask {
         }
         self.node_dest_hash = Some(dest_hash);
         self.offer_policy = None;
+        self.last_offer_error = None;
+        self.last_establish_error = None;
+        self.last_finished_ok = None;
         if !self.start_sync(dest_hash) {
             return false;
         }
@@ -378,6 +418,9 @@ impl PropagationSyncTask {
         let dest_hash = policy.peer_hash;
         self.node_dest_hash = Some(dest_hash);
         self.offer_policy = Some(policy);
+        self.last_offer_error = None;
+        self.last_establish_error = None;
+        self.last_finished_ok = None;
         if !self.start_sync(dest_hash) {
             return false;
         }
@@ -391,6 +434,29 @@ impl PropagationSyncTask {
     pub fn set_identity(&mut self, identity_pub: [u8; 64], identity_key: Ed25519PrivateKey) {
         self.identity_pub = Some(identity_pub);
         self.identity_key = Some(identity_key);
+    }
+
+    /// Alias for [`Self::set_identity`] kept for callers that used the older name.
+    pub fn set_local_identity(
+        &mut self,
+        identity_pub: [u8; 64],
+        identity_key: Ed25519PrivateKey,
+    ) {
+        self.set_identity(identity_pub, identity_key);
+    }
+
+    /// Configure peering material used for `/offer` after link establish.
+    pub fn configure_peering(
+        &mut self,
+        local_identity_hash: [u8; 16],
+        peer_identity_hash: [u8; 16],
+        peering_cost: u8,
+        precomputed_key: Option<Vec<u8>>,
+    ) {
+        self.local_identity_hash = Some(local_identity_hash);
+        self.peer_identity_hash = Some(peer_identity_hash);
+        self.peer_peering_cost = peering_cost;
+        self.outbound_peering_key = precomputed_key;
     }
 
     /// Drain peer-handled updates discovered during offer negotiation or
@@ -620,6 +686,7 @@ impl PropagationSyncTask {
                     peer.link_established(link_id, establishment_rate);
                 }
                 if !self.send_identify() {
+                    self.last_offer_error = Some("ErrorNoIdentity");
                     self.state = SyncTaskState::Failed;
                     return;
                 }
@@ -731,7 +798,22 @@ impl PropagationSyncTask {
                                             &ed25519_bytes,
                                             interface_id,
                                         );
+                                    } else {
+                                        tracing::warn!(
+                                            node = %node_hex,
+                                            "propagation sync LRPROOF: invalid ed25519 key bytes"
+                                        );
+                                        self.last_establish_error = Some("LrproofInvalidKey");
+                                        self.state = SyncTaskState::Failed;
                                     }
+                                } else {
+                                    tracing::warn!(
+                                        node = %node_hex,
+                                        "propagation sync LRPROOF ignored: destination identity unknown"
+                                    );
+                                    self.last_establish_error = Some("LrproofIdentityMissing");
+                                    // Stay Establishing so a later tick with identity can still succeed;
+                                    // sticky error surfaces if we stall out.
                                 }
                             }
                         }
@@ -978,6 +1060,11 @@ impl PropagationSyncTask {
                     rtt_request,
                     result_rx,
                 });
+                self.last_establish_error = None;
+            } else {
+                tracing::warn!("propagation sync LRPROOF validate_proof failed");
+                self.last_establish_error = Some("LrproofInvalid");
+                self.state = SyncTaskState::Failed;
             }
         }
     }
@@ -1031,7 +1118,32 @@ impl PropagationSyncTask {
                 self.record_handled_updates(&already_handled);
                 self.prepare_transfer_for_ids(&wanted_ids);
             }
-            _ => {
+            OfferResponse::ErrorNoIdentity => {
+                self.last_offer_error = Some("ErrorNoIdentity");
+                self.state = SyncTaskState::Failed;
+            }
+            OfferResponse::ErrorNoAccess => {
+                self.last_offer_error = Some("ErrorNoAccess");
+                self.state = SyncTaskState::Failed;
+            }
+            OfferResponse::ErrorInvalidKey => {
+                self.last_offer_error = Some("ErrorInvalidKey");
+                self.state = SyncTaskState::Failed;
+            }
+            OfferResponse::ErrorThrottled => {
+                self.last_offer_error = Some("ErrorThrottled");
+                self.state = SyncTaskState::Failed;
+            }
+            OfferResponse::ErrorInvalidData => {
+                self.last_offer_error = Some("ErrorInvalidData");
+                self.state = SyncTaskState::Failed;
+            }
+            OfferResponse::ErrorInvalidStamp => {
+                self.last_offer_error = Some("ErrorInvalidStamp");
+                self.state = SyncTaskState::Failed;
+            }
+            OfferResponse::Unknown => {
+                self.last_offer_error = Some("Unknown");
                 self.state = SyncTaskState::Failed;
             }
         }
@@ -1146,6 +1258,7 @@ impl PropagationSyncTask {
                 self.drive_transfers();
             }
             SyncTaskState::Complete | SyncTaskState::Failed => {
+                self.last_finished_ok = Some(self.state == SyncTaskState::Complete);
                 if self.terminal_result.is_none() {
                     if let Some(peer_hash) = self.node_dest_hash {
                         let complete = self.state == SyncTaskState::Complete;
@@ -1230,7 +1343,7 @@ impl PropagationSyncTask {
         // Compatibility callers without an authoritative policy keep the
         // synchronous wrapper. Production always uses the staged snapshot ->
         // bounded blocking worker -> generation revalidation path below.
-        let offer = if self.offer_policy.is_none() {
+        let mut offer = if self.offer_policy.is_none() {
             match self.propagation_node.lock() {
                 Ok(mut node) => {
                     let generation = node.offer_generation();
@@ -1325,6 +1438,32 @@ impl PropagationSyncTask {
             return;
         }
         self.offered_count = offer.transient_ids.len() as u64;
+        // prepare_sync_offer may leave peering_key empty; PNs with peering_cost > 0
+        // reject that as ErrorInvalidKey. Prefer a precomputed key from the caller.
+        if offer.peering_key.is_empty() {
+            if let Some(key) = self.outbound_peering_key.clone() {
+                offer.peering_key = key;
+            } else if let (Some(local), Some(peer)) =
+                (self.local_identity_hash, self.peer_identity_hash)
+            {
+                // PN validates peering_id = pn_identity || client_identity.
+                let mut peering_id = Vec::with_capacity(32);
+                peering_id.extend_from_slice(&peer);
+                peering_id.extend_from_slice(&local);
+                if let Some((key, _)) = generate_stamp(
+                    &peering_id,
+                    self.peer_peering_cost,
+                    STAMP_WORKBLOCK_EXPAND_ROUNDS_PEERING,
+                ) {
+                    offer.peering_key = key.to_vec();
+                } else if self.peer_peering_cost > 0 {
+                    tracing::warn!(
+                        cost = self.peer_peering_cost,
+                        "failed to generate peering stamp; remote PN will reject /offer"
+                    );
+                }
+            }
+        }
         let offer_data = {
             use rmpv::Value;
             let ids: Vec<Value> = offer
