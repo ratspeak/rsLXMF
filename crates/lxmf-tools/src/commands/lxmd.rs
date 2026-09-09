@@ -869,6 +869,46 @@ fn direct_reusable_link_state(
     }
 }
 
+async fn forward_backchannel_receipt(
+    mut runtime_rx: tokio::sync::oneshot::Receiver<
+        Result<
+            rns_runtime::link_manager::LinkPayloadSendReceipt,
+            rns_runtime::link_manager::LinkSendError,
+        >,
+    >,
+    mut owner_tx: tokio::sync::oneshot::Sender<
+        Result<BackchannelSendReceipt, BackchannelSendError>,
+    >,
+    abandon_tx: mpsc::Sender<BackchannelSendReceipt>,
+) {
+    let result = tokio::select! {
+        biased;
+        result = &mut runtime_rx => Some(result),
+        _ = owner_tx.closed() => None,
+        _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => None,
+    };
+    let Some(result) = result else {
+        // close preserves an already-published value and rejects future sends.
+        // The runtime cancels exact admission if its receipt publication fails.
+        runtime_rx.close();
+        if let Ok(Ok(receipt)) = runtime_rx.try_recv() {
+            let _ = abandon_tx
+                .send(backchannel_receipt_from_runtime(receipt))
+                .await;
+        }
+        let _ = owner_tx.send(Err(BackchannelSendError::TransportUnavailable));
+        return;
+    };
+    let result = match result {
+        Ok(Ok(receipt)) => Ok(backchannel_receipt_from_runtime(receipt)),
+        Ok(Err(error)) => Err(backchannel_error_from_runtime(error)),
+        Err(_) => Err(BackchannelSendError::TransportUnavailable),
+    };
+    if let Err(Ok(receipt)) = owner_tx.send(result) {
+        let _ = abandon_tx.send(receipt).await;
+    }
+}
+
 fn backchannel_receipt_from_runtime(
     receipt: rns_runtime::link_manager::LinkPayloadSendReceipt,
 ) -> BackchannelSendReceipt {
@@ -1179,12 +1219,19 @@ struct LxmdRunner {
         mpsc::UnboundedReceiver<rns_runtime::link_manager::DestinationDeliveryProof>,
     opportunistic_in_flight: HashMap<[u8; 32], PendingOpportunisticDelivery>,
     backchannel_command_rx: Option<mpsc::Receiver<BackchannelSendCommand>>,
+    backchannel_abandon_tx: mpsc::Sender<BackchannelSendReceipt>,
+    backchannel_abandon_rx: mpsc::Receiver<BackchannelSendReceipt>,
+    pending_backchannel_abandon: Option<BackchannelSendReceipt>,
+    backchannel_bridge_slots: Arc<tokio::sync::Semaphore>,
+    pending_backchannel_resource_cancellations:
+        VecDeque<lxmf_core::link_delivery::BackchannelResourceCancelRequest>,
     last_delivery_failure: Option<String>,
     propagation_sync: Option<lxmf_core::propagation_sync::PropagationSyncTask>,
     propagation_client: Option<lxmf_core::propagation_client::PropagationClient>,
     propagation_node: Option<Arc<Mutex<PropagationNode>>>,
     propagation_admission: Option<Arc<Mutex<PnInboundRuntime>>>,
     prop_link_command_tx: Option<mpsc::Sender<rns_runtime::link_manager::LinkManagerCommand>>,
+    endpoint_dispatch: Option<rns_transport::link_endpoint_dispatch::LinkEndpointDispatchHandle>,
     transport_tx: mpsc::Sender<TransportMessage>,
     pending_runtime_transport: VecDeque<TransportMessage>,
     required_announces: AnnounceMailbox,
@@ -1293,6 +1340,9 @@ impl LxmdRunner {
         config: DaemonConfig,
         config_dir: &Path,
         transport_tx: mpsc::Sender<TransportMessage>,
+        endpoint_dispatch: Option<
+            rns_transport::link_endpoint_dispatch::LinkEndpointDispatchHandle,
+        >,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let paths = LxmdPaths::new(config_dir);
         std::fs::create_dir_all(&paths.config_dir)?;
@@ -1383,6 +1433,7 @@ impl LxmdRunner {
         // LinkManager handles link handshakes (ECDH), keepalive, identification,
         // and resource transfers; it forwards plaintext application data here.
         let (delivery_tx, delivery_rx) = mpsc::channel(256);
+        let (backchannel_abandon_tx, backchannel_abandon_rx) = mpsc::channel(256);
         let (link_packet_tx, link_packet_rx) = mpsc::unbounded_channel::<(Vec<u8>, [u8; 16])>();
         let (delivery_accounting_tx, delivery_accounting_rx) =
             mpsc::unbounded_channel::<LinkManagerAccountingEvent>();
@@ -1434,6 +1485,9 @@ impl LxmdRunner {
             DELIVERY_APP_NAME,
             signing_key,
         );
+        if let Some(handle) = &endpoint_dispatch {
+            link_mgr.set_link_endpoint_dispatch_handle(handle.clone());
+        }
         link_mgr.set_link_packet_channel(link_packet_tx);
         link_mgr.set_accounting_event_channel(delivery_accounting_tx);
         link_mgr.set_resource_event_channel(delivery_resource_event_tx);
@@ -1572,6 +1626,9 @@ impl LxmdRunner {
                 "lxmf.propagation",
                 Some(prop_signing_key),
             );
+            if let Some(handle) = &endpoint_dispatch {
+                prop_link_mgr.set_link_endpoint_dispatch_handle(handle.clone());
+            }
             prop_link_mgr.set_link_packet_channel(prop_link_packet_tx);
             prop_link_mgr.set_accounting_event_channel(prop_accounting_tx);
             prop_link_mgr.set_resource_strategy(rns_runtime::prelude::ResourceStrategy::AcceptApp);
@@ -1728,6 +1785,9 @@ impl LxmdRunner {
                 CONTROL_APP_NAME,
                 Some(control_signing_key),
             );
+            if let Some(handle) = &endpoint_dispatch {
+                control_link_mgr.set_link_endpoint_dispatch_handle(handle.clone());
+            }
             let control_link_identities = control_link_mgr.link_identities_handle();
             let stats_path_hash =
                 rns_crypto::sha::truncated_hash(lxmf_core::constants::STATS_GET_PATH.as_bytes());
@@ -1854,12 +1914,18 @@ impl LxmdRunner {
             destination_delivery_proof_rx,
             opportunistic_in_flight: HashMap::new(),
             backchannel_command_rx: None,
+            backchannel_abandon_tx,
+            backchannel_abandon_rx,
+            pending_backchannel_abandon: None,
+            backchannel_bridge_slots: Arc::new(tokio::sync::Semaphore::new(256)),
+            pending_backchannel_resource_cancellations: VecDeque::new(),
             last_delivery_failure: None,
             propagation_sync: None,
             propagation_client: None,
             propagation_node: None,
             propagation_admission,
             prop_link_command_tx,
+            endpoint_dispatch,
             transport_tx: transport_tx.clone(),
             pending_runtime_transport: VecDeque::new(),
             required_announces,
@@ -2395,12 +2461,77 @@ impl LxmdRunner {
     }
 
     fn drain_core_backchannel_send_commands(&mut self) {
+        while let Some(receipt) = self
+            .pending_backchannel_abandon
+            .take()
+            .or_else(|| self.backchannel_abandon_rx.try_recv().ok())
+        {
+            match receipt {
+                BackchannelSendReceipt::Packet {
+                    link_id,
+                    packet_hash,
+                } => {
+                    if let Some(ld) = &mut self.link_delivery {
+                        if !ld.abandon_backchannel_packet(link_id, packet_hash) {
+                            self.pending_backchannel_abandon =
+                                Some(BackchannelSendReceipt::Packet {
+                                    link_id,
+                                    packet_hash,
+                                });
+                            break;
+                        }
+                    }
+                }
+                BackchannelSendReceipt::Resource {
+                    link_id,
+                    resource_hash,
+                } => {
+                    self.pending_backchannel_resource_cancellations.push_back(
+                        lxmf_core::link_delivery::BackchannelResourceCancelRequest {
+                            link_id,
+                            resource_hash,
+                        },
+                    );
+                }
+            }
+        }
+        if let Some(ld) = &mut self.link_delivery {
+            self.pending_backchannel_resource_cancellations
+                .extend(ld.take_backchannel_resource_cancellations());
+        }
+        while let Some(request) = self.pending_backchannel_resource_cancellations.front() {
+            let command = LinkManagerCommand::CancelLinkResource {
+                link_id: request.link_id,
+                resource_id: request.resource_hash,
+                direction: LinkResourceDirection::Outbound,
+                result_tx: None,
+            };
+            match self.link_command_tx.try_send(command) {
+                Ok(()) => {
+                    self.pending_backchannel_resource_cancellations.pop_front();
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => break,
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    self.pending_backchannel_resource_cancellations.clear();
+                    break;
+                }
+            }
+        }
         let Some(rx) = self.backchannel_command_rx.as_mut() else {
             return;
         };
         let command_tx = self.link_command_tx.clone();
 
         while let Ok(command) = rx.try_recv() {
+            if command.result_tx.is_closed() {
+                continue;
+            }
+            let Ok(bridge_slot) = self.backchannel_bridge_slots.clone().try_acquire_owned() else {
+                let _ = command
+                    .result_tx
+                    .send(Err(BackchannelSendError::TransportUnavailable));
+                continue;
+            };
             let (result_tx, result_rx) = tokio::sync::oneshot::channel();
             let link_id = command.link_id;
             let link_command = rns_runtime::link_manager::LinkManagerCommand::SendLinkPayload {
@@ -2411,13 +2542,10 @@ impl LxmdRunner {
             };
             match command_tx.try_send(link_command) {
                 Ok(()) => {
+                    let abandon_tx = self.backchannel_abandon_tx.clone();
                     tokio::spawn(async move {
-                        let result = match result_rx.await {
-                            Ok(Ok(receipt)) => Ok(backchannel_receipt_from_runtime(receipt)),
-                            Ok(Err(err)) => Err(backchannel_error_from_runtime(err)),
-                            Err(_) => Err(BackchannelSendError::TransportUnavailable),
-                        };
-                        let _ = command.result_tx.send(result);
+                        let _bridge_slot = bridge_slot;
+                        forward_backchannel_receipt(result_rx, command.result_tx, abandon_tx).await;
                     });
                 }
                 Err(err) => {
@@ -2849,6 +2977,7 @@ impl LxmdRunner {
                 self.handle_link_delivery_result(result);
             }
         }
+        self.drain_core_backchannel_send_commands();
 
         self.drive_propagation_sync();
 
@@ -3334,6 +3463,68 @@ impl LxmdRunner {
 
     fn handle_delivery_accounting_event(&mut self, event: LinkManagerAccountingEvent) {
         match event {
+            LinkManagerAccountingEvent::OutboundPacketWait {
+                receipt,
+                started_at,
+                timeout,
+                awaiting_admission,
+                cancellation,
+            } => {
+                if let Some(ld) = &mut self.link_delivery {
+                    ld.observe_backchannel_packet_wait(
+                        receipt.link_id,
+                        receipt.packet_hash,
+                        started_at,
+                        timeout,
+                        awaiting_admission,
+                        cancellation,
+                    );
+                }
+            }
+            LinkManagerAccountingEvent::OutboundResourceWait {
+                link_id,
+                resource_id,
+                started_at,
+                timeout,
+            } => {
+                if let Some(ld) = &mut self.link_delivery {
+                    ld.observe_backchannel_resource_wait(link_id, resource_id, started_at, timeout);
+                }
+            }
+            LinkManagerAccountingEvent::ResourceEvent(LinkResourceEvent::Concluded {
+                link_id,
+                resource_id,
+                direction: LinkResourceDirection::Outbound,
+                conclusion,
+            }) => {
+                let result = self.link_delivery.as_mut().and_then(|ld| match conclusion {
+                    LinkResourceConclusion::Complete => {
+                        ld.handle_backchannel_resource_proof(link_id, resource_id)
+                    }
+                    LinkResourceConclusion::Rejected => ld.handle_backchannel_resource_conclusion(
+                        link_id,
+                        resource_id,
+                        lxmf_core::link_delivery::BackchannelResourceConclusion::Rejected,
+                        "resource rejected",
+                    ),
+                    LinkResourceConclusion::Failed(reason) => ld
+                        .handle_backchannel_resource_conclusion(
+                            link_id,
+                            resource_id,
+                            lxmf_core::link_delivery::BackchannelResourceConclusion::Failed,
+                            reason,
+                        ),
+                    LinkResourceConclusion::Cancelled => ld.handle_backchannel_resource_conclusion(
+                        link_id,
+                        resource_id,
+                        lxmf_core::link_delivery::BackchannelResourceConclusion::Failed,
+                        "resource cancelled",
+                    ),
+                });
+                if let Some(result) = result {
+                    self.handle_link_delivery_result(result);
+                }
+            }
             LinkManagerAccountingEvent::ResourceEvent(event) => {
                 if let Some(event) = delivery_resource_event_from_runtime(event) {
                     self.router.handle_inbound_resource_event(event);
@@ -4352,11 +4543,15 @@ impl LxmdRunner {
 
     fn ensure_link_delivery(&mut self) {
         if self.link_delivery.is_none() {
-            self.link_delivery = Some(lxmf_core::link_delivery::LinkDeliveryManager::new(
+            let mut delivery = lxmf_core::link_delivery::LinkDeliveryManager::new(
                 self.transport_tx.clone(),
                 Some(self.identity.get_public_key()),
                 self.identity.get_signing_key(),
-            ));
+            );
+            if let Some(handle) = &self.endpoint_dispatch {
+                delivery.set_link_endpoint_dispatch_handle(handle.clone());
+            }
+            self.link_delivery = Some(delivery);
         }
         self.ensure_backchannel_sender();
     }
@@ -4368,7 +4563,7 @@ impl LxmdRunner {
 
         let (tx, rx) = mpsc::channel(256);
         if let Some(ref mut ld) = self.link_delivery {
-            ld.set_backchannel_sender(tx);
+            ld.set_cancellation_aware_backchannel_sender(tx);
             self.backchannel_command_rx = Some(rx);
         }
     }
@@ -4712,7 +4907,12 @@ pub(crate) async fn main() {
         }
     }
 
-    let mut runner = match LxmdRunner::new(daemon_config.clone(), &config_dir, transport_tx) {
+    let mut runner = match LxmdRunner::new(
+        daemon_config.clone(),
+        &config_dir,
+        transport_tx,
+        Some(rns_handle.link_endpoint_dispatch_handle()),
+    ) {
         Ok(r) => r,
         Err(e) => {
             tracing::error!("Failed to initialize LXMF daemon: {e}");
@@ -5144,6 +5344,111 @@ pub(crate) async fn main() {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn backchannel_accounting_retains_exact_windows_and_resource_cancellation() {
+        use rns_crypto::ed25519::Ed25519PrivateKey;
+        use std::time::{Duration, Instant};
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp = std::env::temp_dir().join(format!(
+            "lxmd-backchannel-accounting-{}-{unique}",
+            std::process::id()
+        ));
+        let (tx, _rx) = mpsc::channel(64);
+        let mut runner = LxmdRunner::new(DaemonConfig::default(), &temp, tx, None).unwrap();
+        runner.ensure_link_delivery();
+        let (send_tx, mut send_rx) = mpsc::channel(8);
+        runner
+            .link_delivery
+            .as_mut()
+            .unwrap()
+            .set_backchannel_sender(send_tx);
+        let link_id = [0x61; 16];
+        let dest = [0x62; 16];
+        let resource_hash = [0x63; 32];
+        let mut message = LxMessage::new(
+            dest,
+            [0x64; 16],
+            "accounting",
+            "bounded",
+            DeliveryMethod::Direct,
+        );
+        message.sign(&Ed25519PrivateKey::generate()).unwrap();
+        let hash = message.hash.unwrap();
+        let ld = runner.link_delivery.as_mut().unwrap();
+        ld.register_backchannel(dest, link_id);
+        ld.start_backchannel_delivery(message, dest).unwrap();
+        send_rx
+            .try_recv()
+            .unwrap()
+            .result_tx
+            .send(Ok(BackchannelSendReceipt::Resource {
+                link_id,
+                resource_hash,
+            }))
+            .unwrap();
+        assert!(ld.tick().is_empty());
+        let original = Instant::now() - Duration::from_secs(400);
+        runner.handle_delivery_accounting_event(LinkManagerAccountingEvent::OutboundResourceWait {
+            link_id,
+            resource_id: resource_hash,
+            started_at: original,
+            timeout: Duration::from_secs(800),
+        });
+        let ld = runner.link_delivery.as_mut().unwrap();
+        assert_eq!(
+            ld.message_timeout_window(hash),
+            Some((original, Duration::from_secs(980)))
+        );
+        assert!(ld.tick().is_empty());
+        assert!(ld.cancel_delivery_by_message_hash(hash));
+        let (command_tx, mut command_rx) = mpsc::channel(1);
+        command_tx
+            .try_send(LinkManagerCommand::CancelLinkResource {
+                link_id: [0; 16],
+                resource_id: [0; 32],
+                direction: LinkResourceDirection::Outbound,
+                result_tx: None,
+            })
+            .unwrap();
+        runner.link_command_tx = command_tx;
+        runner.drain_core_backchannel_send_commands();
+        assert_eq!(runner.pending_backchannel_resource_cancellations.len(), 1);
+        command_rx.try_recv().unwrap();
+        runner.drain_core_backchannel_send_commands();
+        assert!(
+            matches!(command_rx.try_recv(), Ok(LinkManagerCommand::CancelLinkResource {
+            link_id: observed_link, resource_id, direction: LinkResourceDirection::Outbound, ..
+        }) if observed_link == link_id && resource_id == resource_hash)
+        );
+        runner.drain_core_backchannel_send_commands();
+        assert!(runner.pending_backchannel_resource_cancellations.is_empty());
+        assert!(command_rx.try_recv().is_err());
+        // A late terminal is reconciled as already cancelled, not retried or
+        // published a second time by the daemon's second notification path.
+        runner.handle_delivery_accounting_event(LinkManagerAccountingEvent::ResourceEvent(
+            LinkResourceEvent::Concluded {
+                link_id,
+                resource_id: resource_hash,
+                direction: LinkResourceDirection::Outbound,
+                conclusion: LinkResourceConclusion::Rejected,
+            },
+        ));
+        assert_eq!(runner.link_delivery.as_ref().unwrap().pending_count(), 0);
+        assert!(
+            runner
+                .link_delivery
+                .as_ref()
+                .unwrap()
+                .message_timeout_window(hash)
+                .is_none()
+        );
+        drop(runner);
+        let _ = std::fs::remove_dir_all(temp);
+    }
+
     #[test]
     fn propagation_download_auth_uses_live_allowed_identity_set() {
         let allowed = [0x11; 16];
@@ -5493,7 +5798,7 @@ mod tests {
                 enforce_stamps,
                 ..Default::default()
             };
-            let mut runner = LxmdRunner::new(config, &temp, tx).expect("runner");
+            let mut runner = LxmdRunner::new(config, &temp, tx, None).expect("runner");
             let raw = runner.create_announce_packet().expect("delivery announce");
             let (_, announce) = unpack_announce(&raw);
             let (_, stamp_cost) = lxmf_core::handlers::parse_announce_app_data(
@@ -5738,7 +6043,7 @@ mod tests {
             stamp_cost: Some(8),
             ..Default::default()
         };
-        let mut runner = LxmdRunner::new(config, &temp, tx).expect("runner");
+        let mut runner = LxmdRunner::new(config, &temp, tx, None).expect("runner");
 
         let dest = [0xAB; 16];
         assert_ne!(dest, runner.lxmf_dest_hash);
@@ -5788,7 +6093,7 @@ mod tests {
             std::process::id()
         ));
         let (tx, _rx) = mpsc::channel::<TransportMessage>(64);
-        let mut runner = LxmdRunner::new(DaemonConfig::default(), &temp, tx).expect("runner");
+        let mut runner = LxmdRunner::new(DaemonConfig::default(), &temp, tx, None).expect("runner");
 
         let deliveries = Arc::new(AtomicUsize::new(0));
         let observed = Arc::clone(&deliveries);
