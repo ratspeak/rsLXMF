@@ -12,13 +12,18 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use rns_crypto::ed25519::{Ed25519PrivateKey, Ed25519PublicKey};
-use rns_link::constants::{ESTABLISHMENT_TIMEOUT_PER_HOP, KEEPALIVE_DEFAULT};
+use rns_link::constants::ESTABLISHMENT_TIMEOUT_PER_HOP;
 use rns_link::link::{CloseReason, Link, LinkAction, LinkState};
 use rns_protocol::resource::{
     InboundTransfer, LazyMultiSegmentOutbound, MAX_EFFICIENT_SIZE, MAX_RESOURCE_SIZE, MAX_SEGMENTS,
     MultiSegmentInbound, OutboundResource, OutboundTransfer, ResourceError, TransferAction,
 };
 use rns_protocol::resource_adv::ResourceAdvertisement;
+use rns_transport::link_endpoint_dispatch::{
+    LINK_ENDPOINT_ADMISSION_TIMEOUT_MAX, LinkEndpointDispatchBindReceipt,
+    LinkEndpointDispatchCancellation, LinkEndpointDispatchHandle, LinkEndpointDispatchOutcome,
+    LinkEndpointDispatchToken,
+};
 use rns_transport::link_messages::DestinationEvent;
 use rns_transport::messages::{
     InterfaceId, LinkEndpointBindResult, LinkEndpointBinding, LinkEndpointLifecycleEvent,
@@ -37,8 +42,15 @@ use crate::propagation::hex_encode;
 const LINK_MAX_INACTIVITY: Duration = Duration::from_secs(600);
 const BACKCHANNEL_SEND_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const BACKCHANNEL_DELIVERY_TIMEOUT: Duration = Duration::from_secs(360);
+// External Resource clocks cross an asynchronous accounting adapter. Let a
+// queued renewal/terminal observation arrive after the original protocol
+// deadline, bounded by the app's existing 180s orphan policy. This never alters
+// the Resource engine's own retries or starts a timer at observation time.
+const BACKCHANNEL_RESOURCE_OBSERVATION_GRACE: Duration = Duration::from_secs(180);
 const BACKCHANNEL_EARLY_PROOF_LIMIT: usize = 256;
 const LINK_PENDING_TRANSPORT_LIMIT: usize = 1024;
+/// Local FIFO ownership is finite even when the interface stops draining.
+const LINK_PACKET_DISPATCH_TIMEOUT: Duration = LINK_ENDPOINT_ADMISSION_TIMEOUT_MAX;
 
 /// Authority-derived first-hop timing for an outbound Link.
 ///
@@ -140,6 +152,7 @@ impl LinkDeliveryStartOptions {
 type InboundResourceAcceptHandler =
     Arc<dyn Fn([u8; 16], &ResourceAdvertisement) -> bool + Send + Sync>;
 type InboundResourceConcludedHandler = Arc<dyn Fn([u8; 16], [u8; 32]) + Send + Sync>;
+type InboundResourceCompletionHandler = Arc<dyn Fn([u8; 16], [u8; 32], Vec<u8>) + Send + Sync>;
 
 #[derive(Debug, Clone, Copy)]
 struct InboundSegmentRoute {
@@ -158,11 +171,41 @@ struct InboundResourceLifecycle {
 struct PendingEndpointBind {
     interface_id: InterfaceId,
     rtt_request: OutboundRequest,
-    result_rx: oneshot::Receiver<LinkEndpointBindResult>,
+    result_rx: EndpointBindReceiver,
+}
+
+enum EndpointBindReceiver {
+    Legacy(oneshot::Receiver<LinkEndpointBindResult>),
+    Exact(LinkEndpointDispatchBindReceipt),
+}
+
+impl EndpointBindReceiver {
+    fn try_recv(
+        &mut self,
+    ) -> Result<
+        (LinkEndpointBindResult, Option<LinkEndpointDispatchToken>),
+        oneshot::error::TryRecvError,
+    > {
+        match self {
+            Self::Legacy(rx) => rx.try_recv().map(|result| (result, None)),
+            Self::Exact(rx) => rx.try_recv().map(|result| match result {
+                Ok(token) => (LinkEndpointBindResult::Bound, Some(token)),
+                Err(result) => (result, None),
+            }),
+        }
+    }
+}
+
+struct PendingPacketDispatch {
+    link_id: [u8; 16],
+    packet_hash: [u8; 32],
+    result_rx: oneshot::Receiver<LinkEndpointDispatchOutcome>,
 }
 
 enum EndpointSendSuccess {
     None,
+    FinishHandshake,
+    StartPacketProofClock([u8; 32]),
     PublishInboundPacket(Vec<u8>),
 }
 
@@ -212,13 +255,17 @@ pub struct PendingDelivery {
     /// an initiator that never receives LRPROOF should fail on the Link
     /// establishment clock, not on the active-link inactivity clock.
     pub establishment_timeout: Duration,
-    /// Full delivery timeout after the link has moved beyond establishment.
+    /// Ordinary Link-packet proof window, installed when the packet is
+    /// locally admitted. Resource transfers use their own progress watchdog.
     pub timeout: Duration,
     pub msg_hash: Option<[u8; 32]>,
     pub failure_reason: Option<String>,
     /// Immutable ingress/egress interface learned from the authenticated
     /// LRPROOF. No established-Link traffic is accepted before this is set.
     attached_interface: Option<InterfaceId>,
+    endpoint_dispatch_token: Option<LinkEndpointDispatchToken>,
+    packet_awaiting_dispatch: bool,
+    pretransfer_identify_staged: bool,
     endpoint_release_queued: bool,
     /// Keep successful Direct links open for additional messages. Propagation
     /// deposits currently keep the old one-shot behavior.
@@ -328,6 +375,7 @@ struct PendingBackchannelStart {
     /// send receipt identifies whether the external send was a non-recallable
     /// Packet or a cancellable Resource.
     cancelled: bool,
+    cancellation_aware: bool,
     /// A validated proof may be observed before the send receipt and then be
     /// followed by Link closure on a separate adapter channel. Keep the receipt
     /// owner for its original bounded window so the exact proof can still win.
@@ -341,6 +389,15 @@ struct PendingBackchannelDelivery {
     representation: DeliveryRepresentation,
     started_at: Instant,
     link_closed: bool,
+    wait: Option<BackchannelWaitWindow>,
+    packet_cancellation: Option<LinkEndpointDispatchCancellation>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BackchannelWaitWindow {
+    started_at: Instant,
+    timeout: Duration,
+    awaiting_admission: bool,
 }
 
 struct EarlyBackchannelResourceConclusion {
@@ -457,12 +514,37 @@ impl std::error::Error for BackchannelSendError {}
 /// closed/pending Link path, where the message remains eligible for Direct
 /// rediscovery instead of being terminally failed.
 pub fn is_retryable_link_delivery_failure(reason: &str) -> bool {
+    // Only concrete local endpoint terminal outcomes, not malformed packet,
+    // role mismatch or arbitrary peer rejection text, trigger rediscovery.
+    let endpoint_reason = reason
+        .strip_prefix("Link endpoint terminated: ")
+        .or_else(|| {
+            reason
+                .strip_prefix("Link endpoint send rejected: Terminated(")?
+                .strip_suffix(')')
+        });
+    if matches!(
+        endpoint_reason,
+        Some(
+            "Unbound"
+                | "InterfaceRemoved"
+                | "InterfaceClosed"
+                | "InterfaceOffline"
+                | "InterfaceNotOutbound"
+                | "EgressQueueExhausted"
+                | "TransportShutdown"
+        )
+    ) {
+        return true;
+    }
     matches!(
         reason,
         "link establishment timeout"
             | "link closed"
             | "transport full"
             | "transport closed"
+            | "transport channel closed"
+            | "transport staging queue full"
             // Backchannel adapters discover these only after asking the
             // embedding runtime to send over an externally-owned inbound Link.
             // They are equivalent to Python seeing direct_link.status == CLOSED.
@@ -472,6 +554,18 @@ pub fn is_retryable_link_delivery_failure(reason: &str) -> bool {
             | "transport channel is full or closed"
             | "backchannel send command timeout"
             | "backchannel send command closed"
+            | "delivery timeout"
+            | "Link endpoint admission timeout"
+            | "backchannel delivery timeout"
+            | "resource advertisement timed out"
+            | "resource part requests timed out"
+            | "resource proof timed out"
+            | "resource transfer timed out"
+            | "resource cancelled"
+            | "Link endpoint binding failed"
+            | "Link endpoint send result channel closed"
+            | "Link endpoint send rejected: NotBound"
+            | "Link endpoint send rejected: DroppedBackpressure"
     )
 }
 
@@ -641,6 +735,8 @@ fn start_error_from_reserve(err: TrySendError<()>) -> LinkDeliveryStartError {
 /// Callers invoke [`Self::start_delivery`] to begin, [`Self::drain_events`] to route inbound
 /// packets, and [`Self::tick`] periodically to advance transfers and enforce timeouts.
 pub struct LinkDeliveryManager {
+    endpoint_dispatch: Option<LinkEndpointDispatchHandle>,
+    pending_packet_dispatches: Vec<PendingPacketDispatch>,
     transport_tx: mpsc::Sender<TransportMessage>,
     /// Ordered staging for temporary transport backpressure. Resource state
     /// can advance only after frames are accepted here or by the actor.
@@ -656,6 +752,7 @@ pub struct LinkDeliveryManager {
     backchannel_links: HashMap<[u8; 16], [u8; 16]>,
     pending: HashMap<[u8; 16], PendingDelivery>,
     backchannel_tx: Option<mpsc::Sender<BackchannelSendCommand>>,
+    backchannel_cancellation_aware: bool,
     /// Unbounded: inbound link data is proved to the peer on receipt, so
     /// local delivery must not drop.
     inbound_packet_tx: Option<mpsc::UnboundedSender<(Vec<u8>, [u8; 16])>>,
@@ -665,6 +762,7 @@ pub struct LinkDeliveryManager {
     inbound_resource_limit_bytes: usize,
     inbound_resource_accept_handler: Option<InboundResourceAcceptHandler>,
     inbound_resource_concluded_handler: Option<InboundResourceConcludedHandler>,
+    inbound_resource_completion_handler: Option<InboundResourceCompletionHandler>,
     pending_backchannel_starts: Vec<PendingBackchannelStart>,
     pending_backchannel_deliveries: HashMap<BackchannelProofKey, PendingBackchannelDelivery>,
     pending_backchannel_resource_cancellations: VecDeque<BackchannelResourceCancelRequest>,
@@ -673,6 +771,10 @@ pub struct LinkDeliveryManager {
     /// keys for Links that still have a pending send receipt, then reconcile
     /// them when that receipt installs delivery ownership.
     early_backchannel_proofs: HashMap<BackchannelProofKey, Instant>,
+    early_backchannel_waits: HashMap<BackchannelProofKey, BackchannelWaitWindow>,
+    early_backchannel_packet_cancellations:
+        HashMap<BackchannelProofKey, (LinkEndpointDispatchCancellation, Instant)>,
+    cancelled_backchannel_packets: HashMap<BackchannelProofKey, Instant>,
     early_backchannel_resource_conclusions:
         HashMap<BackchannelProofKey, EarlyBackchannelResourceConclusion>,
     identity_pub: Option<[u8; 64]>,
@@ -691,6 +793,8 @@ impl LinkDeliveryManager {
         let (event_tx, event_rx) = mpsc::channel(256);
         let (endpoint_lifecycle_tx, endpoint_lifecycle_rx) = mpsc::unbounded_channel();
         Self {
+            endpoint_dispatch: None,
+            pending_packet_dispatches: Vec::new(),
             transport_tx,
             pending_transport: VecDeque::new(),
             pending_endpoint_binds: HashMap::new(),
@@ -702,14 +806,19 @@ impl LinkDeliveryManager {
             backchannel_links: HashMap::new(),
             pending: HashMap::new(),
             backchannel_tx: None,
+            backchannel_cancellation_aware: false,
             inbound_packet_tx: None,
             inbound_resource_limit_bytes: DELIVERY_LIMIT * BYTES_PER_KILOBYTE,
             inbound_resource_accept_handler: None,
             inbound_resource_concluded_handler: None,
+            inbound_resource_completion_handler: None,
             pending_backchannel_starts: Vec::new(),
             pending_backchannel_deliveries: HashMap::new(),
             pending_backchannel_resource_cancellations: VecDeque::new(),
             early_backchannel_proofs: HashMap::new(),
+            early_backchannel_waits: HashMap::new(),
+            early_backchannel_packet_cancellations: HashMap::new(),
+            cancelled_backchannel_packets: HashMap::new(),
             early_backchannel_resource_conclusions: HashMap::new(),
             identity_pub,
             identity_key,
@@ -719,10 +828,30 @@ impl LinkDeliveryManager {
         }
     }
 
+    /// Use exact generation-bound driver-admission receipts for subsequently
+    /// established Links. Existing Links retain their original binding path.
+    /// The handle must belong to the same transport as this manager.
+    pub fn set_link_endpoint_dispatch_handle(&mut self, handle: LinkEndpointDispatchHandle) {
+        self.endpoint_dispatch = Some(handle);
+    }
+
     /// Install the adapter used to send LXMF payloads over inbound
     /// authenticated backchannel Links owned by the embedding runtime.
     pub fn set_backchannel_sender(&mut self, tx: mpsc::Sender<BackchannelSendCommand>) {
         self.backchannel_tx = Some(tx);
+        self.backchannel_cancellation_aware = false;
+    }
+
+    /// Install an adapter that fences closed receipt publication and retains
+    /// exact cleanup ownership. New starts close/drain their receipt immediately
+    /// on user cancellation; existing starts retain their captured policy.
+    /// Legacy adapters must continue using `set_backchannel_sender` instead.
+    pub fn set_cancellation_aware_backchannel_sender(
+        &mut self,
+        tx: mpsc::Sender<BackchannelSendCommand>,
+    ) {
+        self.backchannel_tx = Some(tx);
+        self.backchannel_cancellation_aware = true;
     }
 
     /// Install the adapter used to deliver inbound LXMF payloads that arrive
@@ -752,6 +881,18 @@ impl LinkDeliveryManager {
         self.inbound_resource_concluded_handler = Some(Arc::new(handler));
     }
 
+    /// Hand off one completed reverse Resource while its application admission
+    /// ownership is still live. The ordinary concluded callback runs afterwards.
+    /// This replaces only Resource payload delivery through the packet sender;
+    /// ordinary packets are unchanged. A handler can move an exact Resource
+    /// admission lease and this Vec into one retained application envelope.
+    pub fn set_inbound_resource_completion_handler<F>(&mut self, handler: F)
+    where
+        F: Fn([u8; 16], [u8; 32], Vec<u8>) + Send + Sync + 'static,
+    {
+        self.inbound_resource_completion_handler = Some(Arc::new(handler));
+    }
+
     /// Register an inbound authenticated Link as a reusable backchannel for a
     /// remote LXMF delivery destination.
     pub fn register_backchannel(&mut self, dest_hash: [u8; 16], link_id: [u8; 16]) {
@@ -765,6 +906,33 @@ impl LinkDeliveryManager {
 
     pub fn remove_backchannel(&mut self, dest_hash: &[u8; 16]) -> Option<[u8; 16]> {
         self.backchannel_links.remove(dest_hash)
+    }
+
+    fn remove_backchannel_owner(&mut self, dest_hash: [u8; 16], link_id: [u8; 16]) {
+        if self.backchannel_links.get(&dest_hash) == Some(&link_id) {
+            self.backchannel_links.remove(&dest_hash);
+        }
+    }
+
+    fn retain_failed_backchannel_start(
+        &mut self,
+        mut start: PendingBackchannelStart,
+        reason: String,
+    ) -> DeliveryResult {
+        let result = fail_backchannel_start_in_place(&mut self.delivery_events, &mut start, reason);
+        if start.cancellation_aware {
+            start.receiver.close();
+            if let Ok(receipt) = start.receiver.try_recv() {
+                if let Ok(receipt) = receipt {
+                    self.cancel_backchannel_receipt(receipt);
+                }
+                return result;
+            }
+        }
+        // The bridge may still own a raced receipt. Keep only its original,
+        // finite reservation, never the failed message bytes or visible work.
+        self.pending_backchannel_starts.push(start);
+        result
     }
 
     /// Remove cached backchannel state for a closed Link and fail any
@@ -801,11 +969,7 @@ impl LinkDeliveryManager {
                     start.closed_reason = Some(reason.to_string());
                     self.pending_backchannel_starts.push(start);
                 } else {
-                    results.push(fail_backchannel_start(
-                        &mut self.delivery_events,
-                        start,
-                        reason.to_string(),
-                    ));
+                    results.push(self.retain_failed_backchannel_start(start, reason.to_string()));
                 }
             } else {
                 self.pending_backchannel_starts.push(start);
@@ -819,6 +983,7 @@ impl LinkDeliveryManager {
             .collect();
         for key in delivery_keys {
             if let Some(delivery) = self.pending_backchannel_deliveries.remove(&key) {
+                self.cancel_backchannel_packet_key(key, delivery.packet_cancellation);
                 self.delivery_events.push_back(backchannel_delivery_event(
                     BackchannelDeliveryEventInput {
                         kind: LxmfDeliveryEventKind::Failed,
@@ -969,6 +1134,20 @@ impl LinkDeliveryManager {
         message: LxMessage,
         dest_hash: [u8; 16],
     ) -> Result<BackchannelStartReport, BackchannelStartFailure> {
+        self.prune_early_backchannel_settlement();
+        // Reserve reconciliation space before a runtime command can exist.
+        // Cancelled keys are never evicted while their exact packet could
+        // still be in the driver's admission FIFO.
+        if self.pending_backchannel_starts.len()
+            + self.pending_backchannel_deliveries.len()
+            + self.cancelled_backchannel_packets.len()
+            >= BACKCHANNEL_EARLY_PROOF_LIMIT
+        {
+            return Err(BackchannelStartFailure {
+                error: BackchannelStartError::CommandFull,
+                message: Box::new(message),
+            });
+        }
         let Some(link_id) = self.backchannel_links.get(&dest_hash).copied() else {
             return Err(BackchannelStartFailure {
                 error: BackchannelStartError::NoBackchannel,
@@ -1009,7 +1188,7 @@ impl LinkDeliveryManager {
         let command_permit = match command_tx.try_reserve_owned() {
             Ok(permit) => permit,
             Err(err) => {
-                self.backchannel_links.remove(&dest_hash);
+                self.remove_backchannel_owner(dest_hash, link_id);
                 let error = match err {
                     TrySendError::Full(_) => BackchannelStartError::CommandFull,
                     TrySendError::Closed(_) => BackchannelStartError::CommandClosed,
@@ -1043,8 +1222,15 @@ impl LinkDeliveryManager {
             representation: DeliveryRepresentation::Unknown,
             link_state: LinkState::Active,
             delivery_state: DeliveryState::Transferring,
-            queued_deliveries: self.pending_backchannel_starts.len(),
-            in_flight_deliveries: self.pending_backchannel_deliveries.len() + 1,
+            queued_deliveries: self
+                .backchannel_link_snapshot(dest_hash)
+                .unwrap()
+                .queued_deliveries,
+            in_flight_deliveries: self
+                .backchannel_link_snapshot(dest_hash)
+                .unwrap()
+                .in_flight_deliveries
+                + 1,
             reason: None,
         });
         self.pending_backchannel_starts
@@ -1055,13 +1241,21 @@ impl LinkDeliveryManager {
                 link_id,
                 requested_at: Instant::now(),
                 cancelled: false,
+                cancellation_aware: self.backchannel_cancellation_aware,
                 closed_reason: None,
             });
         let report = BackchannelStartReport {
             link_id,
             dest_hash,
-            queued_deliveries: self.pending_backchannel_starts.len(),
-            in_flight_deliveries: self.pending_backchannel_deliveries.len() + 1,
+            queued_deliveries: self
+                .backchannel_link_snapshot(dest_hash)
+                .unwrap()
+                .queued_deliveries,
+            in_flight_deliveries: self
+                .backchannel_link_snapshot(dest_hash)
+                .unwrap()
+                .in_flight_deliveries
+                + 1,
         };
         command_permit.send(command);
         Ok(report)
@@ -1299,9 +1493,9 @@ impl LinkDeliveryManager {
 
         let establishment_timeout = timing.timeout_for_hops(hops);
         let establishment_timeout_secs = establishment_timeout.as_secs_f64();
-        // Full transfer timeout keeps the previous keepalive allowance once
-        // establishment has succeeded.
-        let timeout_secs = establishment_timeout_secs + KEEPALIVE_DEFAULT;
+        // Bound local pre-send preparation separately from the packet proof
+        // clock, which starts only when the packet is locally admitted.
+        let timeout_secs = BACKCHANNEL_SEND_COMMAND_TIMEOUT.as_secs_f64();
         self.pending.insert(
             link_id,
             PendingDelivery {
@@ -1320,6 +1514,9 @@ impl LinkDeliveryManager {
                 msg_hash,
                 failure_reason: None,
                 attached_interface: None,
+                endpoint_dispatch_token: None,
+                packet_awaiting_dispatch: false,
+                pretransfer_identify_staged: false,
                 endpoint_release_queued: false,
                 reusable,
                 backchannel_identified: false,
@@ -1350,15 +1547,78 @@ impl LinkDeliveryManager {
         Ok(link_id)
     }
 
+    fn poll_packet_dispatches(&mut self) {
+        self.pending_packet_dispatches.retain_mut(|pending| {
+            let Some(delivery) = self.pending.get_mut(&pending.link_id) else {
+                return false;
+            };
+            if delivery.state != DeliveryState::AwaitingProof
+                || delivery.packet_proof_hash != Some(pending.packet_hash)
+            {
+                // Dropping a not-yet-admitted receipt cancels its exact FIFO item.
+                return false;
+            }
+            match pending.result_rx.try_recv() {
+                Ok(LinkEndpointDispatchOutcome::Sent {
+                    packet_hash,
+                    dispatched_at,
+                }) if packet_hash == pending.packet_hash => {
+                    delivery.packet_awaiting_dispatch = false;
+                    delivery.started_at = dispatched_at;
+                    delivery.timeout = delivery.link.packet_proof_timeout();
+                }
+                Ok(LinkEndpointDispatchOutcome::Rejected(result)) => {
+                    delivery.state = DeliveryState::Failed;
+                    delivery.failure_reason =
+                        Some(format!("Link endpoint send rejected: {result:?}"));
+                }
+                Ok(LinkEndpointDispatchOutcome::Expired) => {
+                    delivery.state = DeliveryState::Failed;
+                    delivery.failure_reason = Some("Link endpoint admission timeout".to_string());
+                }
+                Ok(_) | Err(oneshot::error::TryRecvError::Closed) => {
+                    delivery.state = DeliveryState::Failed;
+                    delivery.failure_reason =
+                        Some("Link endpoint send result channel closed".to_string());
+                }
+                Err(oneshot::error::TryRecvError::Empty) => return true,
+            }
+            false
+        });
+    }
+
     fn poll_endpoint_send_results(&mut self) {
+        self.poll_packet_dispatches();
         let mut still_pending = Vec::new();
         let mut endpoint_sends = std::mem::take(&mut self.pending_endpoint_sends);
         for mut pending in endpoint_sends.drain(..) {
             match pending.result_rx.try_recv() {
-                Ok(LinkEndpointSendResult::Sent | LinkEndpointSendResult::Queued { .. }) => {
+                Ok(
+                    result @ (LinkEndpointSendResult::Sent | LinkEndpointSendResult::Queued { .. }),
+                ) => {
                     if self.pending.contains_key(&pending.link_id) {
                         match pending.success {
-                            EndpointSendSuccess::None => {}
+                            EndpointSendSuccess::None | EndpointSendSuccess::FinishHandshake => {}
+                            EndpointSendSuccess::StartPacketProofClock(packet_hash) => {
+                                let delivery = self.pending.get_mut(&pending.link_id).unwrap();
+                                // A proof or cancellation can beat this acknowledgement.
+                                // Never rearm a terminal owner or the next queued message.
+                                if delivery.state == DeliveryState::AwaitingProof
+                                    && delivery.packet_proof_hash == Some(packet_hash)
+                                {
+                                    delivery.started_at = Instant::now();
+                                    delivery.packet_awaiting_dispatch =
+                                        !matches!(result, LinkEndpointSendResult::Sent);
+                                    delivery.timeout = delivery
+                                        .link
+                                        .packet_proof_timeout()
+                                        .saturating_add(if delivery.packet_awaiting_dispatch {
+                                            BACKCHANNEL_SEND_COMMAND_TIMEOUT
+                                        } else {
+                                            Duration::ZERO
+                                        });
+                                }
+                            }
                             EndpointSendSuccess::PublishInboundPacket(plaintext) => {
                                 if let Some(ref tx) = self.inbound_packet_tx {
                                     let _ = tx.send((plaintext, pending.link_id));
@@ -1457,6 +1717,17 @@ impl LinkDeliveryManager {
 
         let link_ids: Vec<[u8; 16]> = self.pending_endpoint_binds.keys().copied().collect();
         for link_id in link_ids {
+            if !self
+                .pending
+                .get(&link_id)
+                .is_some_and(|delivery| delivery.state == DeliveryState::Establishing)
+            {
+                // Do not publish an exact bind token after its delivery has
+                // failed/cancelled. Dropping the unread bind receipt retires
+                // only that unpublished transport binding.
+                self.pending_endpoint_binds.remove(&link_id);
+                continue;
+            }
             let outcome = {
                 let Some(pending) = self.pending_endpoint_binds.get_mut(&link_id) else {
                     continue;
@@ -1474,16 +1745,26 @@ impl LinkDeliveryManager {
                 continue;
             };
             match outcome {
-                Ok(LinkEndpointBindResult::Bound | LinkEndpointBindResult::AlreadyBound) => {
+                Ok((
+                    LinkEndpointBindResult::Bound | LinkEndpointBindResult::AlreadyBound,
+                    token,
+                )) => {
                     if let Some(delivery) = self.pending.get_mut(&link_id) {
                         delivery.attached_interface = Some(pending.interface_id);
+                        delivery.endpoint_dispatch_token = token;
                     }
-                    if let Err(reason) = stage_link_endpoint(
+                    let success = if self.endpoint_dispatch.is_some() {
+                        EndpointSendSuccess::FinishHandshake
+                    } else {
+                        EndpointSendSuccess::None
+                    };
+                    if let Err(reason) = stage_link_endpoint_with_success(
                         &self.transport_tx,
                         &mut self.pending_transport,
                         &mut self.pending_endpoint_sends,
                         link_id,
                         pending.rtt_request,
+                        success,
                     ) {
                         if let Some(delivery) = self.pending.get_mut(&link_id) {
                             delivery.state = DeliveryState::Failed;
@@ -1491,12 +1772,14 @@ impl LinkDeliveryManager {
                         }
                     } else if let Some(delivery) = self.pending.get_mut(&link_id) {
                         delivery.state = DeliveryState::Identifying;
+                        delivery.started_at = Instant::now();
                     }
                 }
-                Ok(
+                Ok((
                     LinkEndpointBindResult::Conflict { .. }
                     | LinkEndpointBindResult::InterfaceUnavailable,
-                )
+                    _,
+                ))
                 | Err(()) => {
                     if let Some(delivery) = self.pending.get_mut(&link_id) {
                         delivery.state = DeliveryState::Failed;
@@ -1774,24 +2057,38 @@ impl LinkDeliveryManager {
                     raw: Bytes::from(rtt_raw),
                     destination_hash: *link_id,
                 };
-                let (result_tx, result_rx) = oneshot::channel();
-                if let Err(reason) = stage_transport(
-                    &self.transport_tx,
-                    &mut self.pending_transport,
-                    TransportMessage::BindLinkEndpoint {
-                        binding: LinkEndpointBinding {
-                            link_id: *link_id,
-                            interface_id,
-                            role: LinkEndpointRole::Initiator,
+                let binding = LinkEndpointBinding {
+                    link_id: *link_id,
+                    interface_id,
+                    role: LinkEndpointRole::Initiator,
+                };
+                let result_rx = if let Some(handle) = &self.endpoint_dispatch {
+                    match handle.try_bind(binding, self.endpoint_lifecycle_tx.clone()) {
+                        Ok(receipt) => EndpointBindReceiver::Exact(receipt),
+                        Err(_) => {
+                            delivery.state = DeliveryState::Failed;
+                            delivery.failure_reason =
+                                Some("Link endpoint binding failed".to_string());
+                            return false;
+                        }
+                    }
+                } else {
+                    let (result_tx, result_rx) = oneshot::channel();
+                    if let Err(reason) = stage_transport(
+                        &self.transport_tx,
+                        &mut self.pending_transport,
+                        TransportMessage::BindLinkEndpoint {
+                            binding,
+                            lifecycle_tx: self.endpoint_lifecycle_tx.clone(),
+                            result_tx,
                         },
-                        lifecycle_tx: self.endpoint_lifecycle_tx.clone(),
-                        result_tx,
-                    },
-                ) {
-                    delivery.state = DeliveryState::Failed;
-                    delivery.failure_reason = Some(reason.to_string());
-                    return false;
-                }
+                    ) {
+                        delivery.state = DeliveryState::Failed;
+                        delivery.failure_reason = Some(reason.to_string());
+                        return false;
+                    }
+                    EndpointBindReceiver::Legacy(result_rx)
+                };
                 self.pending_endpoint_binds.insert(
                     *link_id,
                     PendingEndpointBind {
@@ -2182,7 +2479,10 @@ impl LinkDeliveryManager {
             {
                 lifecycle.next_segment = lifecycle.next_segment.saturating_add(1);
                 if assembled_payload.is_none() {
-                    lifecycle.inter_segment_deadline = Some(Instant::now() + split_wait_timeout);
+                    lifecycle.inter_segment_deadline =
+                        Instant::now().checked_add(split_wait_timeout).or_else(|| {
+                            Instant::now().checked_add(Duration::from_secs(u32::MAX as u64))
+                        });
                 }
             }
             if assembled_payload.is_some() {
@@ -2192,21 +2492,40 @@ impl LinkDeliveryManager {
                 delivery
                     .inbound_split_resources
                     .remove(&route.original_hash);
+            }
+            assembled_payload.map(|payload| (route.original_hash, payload))
+        } else {
+            let resource_id = drop_inbound_resource(delivery, resource_hash);
+            Some((resource_id, assembled))
+        };
+
+        if let Some((resource_id, payload)) = payload {
+            if let Some(handler) = &self.inbound_resource_completion_handler {
+                // The owning handoff has the same isolation as admission and
+                // conclusion callbacks. Unwinding drops the moved payload (and
+                // any application lease); never publish a second legacy copy.
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    handler(*link_id, resource_id, payload);
+                }))
+                .is_err()
+                {
+                    tracing::error!("reverse Resource completion callback panicked");
+                }
                 notify_inbound_resource_concluded(
                     concluded_handler.as_ref(),
                     *link_id,
-                    route.original_hash,
+                    resource_id,
                 );
+            } else {
+                notify_inbound_resource_concluded(
+                    concluded_handler.as_ref(),
+                    *link_id,
+                    resource_id,
+                );
+                if let Some(tx) = &self.inbound_packet_tx {
+                    let _ = tx.send((payload, *link_id));
+                }
             }
-            assembled_payload
-        } else {
-            let resource_id = drop_inbound_resource(delivery, resource_hash);
-            notify_inbound_resource_concluded(concluded_handler.as_ref(), *link_id, resource_id);
-            Some(assembled)
-        };
-
-        if let (Some(payload), Some(tx)) = (payload, self.inbound_packet_tx.as_ref()) {
-            let _ = tx.send((payload, *link_id));
         }
         true
     }
@@ -2314,11 +2633,21 @@ impl LinkDeliveryManager {
                         delivery.establishment_timeout,
                         "link establishment timeout",
                     )
+                } else if delivery.state == DeliveryState::Identifying {
+                    (
+                        elapsed > BACKCHANNEL_SEND_COMMAND_TIMEOUT,
+                        BACKCHANNEL_SEND_COMMAND_TIMEOUT,
+                        "Link endpoint admission timeout",
+                    )
                 } else {
                     (
                         elapsed > delivery.timeout,
                         delivery.timeout,
-                        "delivery timeout",
+                        if delivery.packet_awaiting_dispatch {
+                            "Link endpoint admission timeout"
+                        } else {
+                            "delivery timeout"
+                        },
                     )
                 };
 
@@ -2351,7 +2680,21 @@ impl LinkDeliveryManager {
                 match delivery.state {
                     DeliveryState::Idle => {}
                     DeliveryState::Identifying if delivery.link.is_active() => {
-                        if !delivery.reusable {
+                        // The exact send lane is independent of the legacy
+                        // mailbox. LRRRTT must reach the driver/actor FIFO
+                        // before payload bytes enter that lane.
+                        if delivery.endpoint_dispatch_token.is_some()
+                            && self.pending_endpoint_sends.iter().any(|pending| {
+                                pending.link_id == *link_id
+                                    && matches!(
+                                        pending.success,
+                                        EndpointSendSuccess::FinishHandshake
+                                    )
+                            })
+                        {
+                            continue;
+                        }
+                        if !delivery.reusable && !delivery.pretransfer_identify_staged {
                             if let (Some(pub_key), Some(sign_key)) =
                                 (&self.identity_pub, &self.identity_key)
                             {
@@ -2374,7 +2717,7 @@ impl LinkDeliveryManager {
                                     };
                                     let mut id_raw = id_header.pack();
                                     id_raw.extend_from_slice(&identify_data);
-                                    if let Err(reason) = stage_link_endpoint(
+                                    if let Err(reason) = stage_link_endpoint_with_success(
                                         &self.transport_tx,
                                         &mut self.pending_transport,
                                         &mut self.pending_endpoint_sends,
@@ -2383,9 +2726,14 @@ impl LinkDeliveryManager {
                                             raw: Bytes::from(id_raw),
                                             destination_hash: *link_id,
                                         },
+                                        EndpointSendSuccess::FinishHandshake,
                                     ) {
                                         delivery.state = DeliveryState::Failed;
                                         delivery.failure_reason = Some(reason.to_string());
+                                        continue;
+                                    }
+                                    delivery.pretransfer_identify_staged = true;
+                                    if delivery.endpoint_dispatch_token.is_some() {
                                         continue;
                                     }
                                 }
@@ -2428,10 +2776,18 @@ impl LinkDeliveryManager {
                                     &self.transport_tx,
                                     &mut self.pending_transport,
                                     &mut self.pending_endpoint_sends,
+                                    &mut self.pending_packet_dispatches,
                                     &packed,
                                 ) {
-                                    Some(packet_hash) => {
+                                    Ok(packet_hash) => {
                                         delivery.packet_proof_hash = Some(packet_hash);
+                                        delivery.timeout =
+                                            if delivery.endpoint_dispatch_token.is_some() {
+                                                LINK_PACKET_DISPATCH_TIMEOUT
+                                            } else {
+                                                BACKCHANNEL_SEND_COMMAND_TIMEOUT
+                                            };
+                                        delivery.packet_awaiting_dispatch = true;
                                         delivery.state = DeliveryState::AwaitingProof;
                                         delivery.message.progress = 0.50;
                                         self.delivery_events.push_back(delivery_event(
@@ -2442,10 +2798,9 @@ impl LinkDeliveryManager {
                                             None,
                                         ));
                                     }
-                                    None => {
+                                    Err(reason) => {
                                         delivery.state = DeliveryState::Failed;
-                                        delivery.failure_reason =
-                                            Some("link packet encryption failed".to_string());
+                                        delivery.failure_reason = Some(reason.to_string());
                                     }
                                 }
                             } else {
@@ -2791,6 +3146,8 @@ impl LinkDeliveryManager {
                     };
 
                     if start.cancelled {
+                        self.cancel_backchannel_packet_key(key, None);
+                        self.early_backchannel_waits.remove(&key);
                         self.early_backchannel_proofs.remove(&key);
                         self.early_backchannel_resource_conclusions.remove(&key);
                         if let BackchannelProofKey::Resource(link_id, resource_hash) = key {
@@ -2845,6 +3202,11 @@ impl LinkDeliveryManager {
                             representation,
                             started_at: Instant::now(),
                             link_closed,
+                            wait: self.early_backchannel_waits.remove(&key),
+                            packet_cancellation: self
+                                .early_backchannel_packet_cancellations
+                                .remove(&key)
+                                .map(|(cancel, _)| cancel),
                         },
                     );
                     if let Some(early_conclusion) = early_conclusion {
@@ -2863,9 +3225,11 @@ impl LinkDeliveryManager {
                 }
                 Ok(Err(err)) => {
                     let reason = err.to_string();
-                    self.backchannel_links.remove(&start.dest_hash);
                     if start.cancelled {
                         continue;
+                    }
+                    if self.backchannel_links.get(&start.dest_hash) == Some(&start.link_id) {
+                        self.backchannel_links.remove(&start.dest_hash);
                     }
                     tracing::warn!(
                         link_id = %hex_encode(&start.link_id),
@@ -2885,35 +3249,54 @@ impl LinkDeliveryManager {
                             .closed_reason
                             .clone()
                             .unwrap_or_else(|| "backchannel send command timeout".to_string());
-                        self.backchannel_links.remove(&start.dest_hash);
-                        if start.cancelled {
-                            continue;
+                        if !start.cancelled
+                            && self.backchannel_links.get(&start.dest_hash) == Some(&start.link_id)
+                        {
+                            self.backchannel_links.remove(&start.dest_hash);
                         }
-                        tracing::warn!(
-                            link_id = %hex_encode(&start.link_id),
-                            dest = %hex_encode(&start.dest_hash),
-                            "LXMF backchannel send command timed out"
-                        );
-                        results.push(fail_backchannel_start(
-                            &mut self.delivery_events,
-                            start,
-                            reason,
-                        ));
+                        // Close BEFORE draining: a receipt published after our
+                        // earlier Empty poll is still recoverable; later bridge
+                        // sends fail and retain exact abandonment metadata.
+                        start.receiver.close();
+                        let raced_receipt = start.receiver.try_recv().ok().and_then(Result::ok);
+                        if !start.cancelled {
+                            results.push(fail_backchannel_start_in_place(
+                                &mut self.delivery_events,
+                                &mut start,
+                                reason,
+                            ));
+                        }
+                        if let Some(receipt) = raced_receipt {
+                            self.cancel_backchannel_receipt(receipt);
+                        } else if start.requested_at.elapsed()
+                            < BACKCHANNEL_SEND_COMMAND_TIMEOUT + LINK_PACKET_DISPATCH_TIMEOUT
+                        {
+                            // Small hidden reservation; release original message
+                            // bytes while a bridge still owns publication cleanup.
+                            start.cancelled = true;
+                            still_waiting.push(start);
+                        }
                     } else {
                         still_waiting.push(start);
                     }
                 }
                 Err(oneshot::error::TryRecvError::Closed) => {
                     let reason = "backchannel send command closed".to_string();
-                    self.backchannel_links.remove(&start.dest_hash);
-                    if start.cancelled {
-                        continue;
+                    if !start.cancelled {
+                        if self.backchannel_links.get(&start.dest_hash) == Some(&start.link_id) {
+                            self.backchannel_links.remove(&start.dest_hash);
+                        }
+                        results.push(fail_backchannel_start_in_place(
+                            &mut self.delivery_events,
+                            &mut start,
+                            reason,
+                        ));
                     }
-                    results.push(fail_backchannel_start(
-                        &mut self.delivery_events,
-                        start,
-                        reason,
-                    ));
+                    if start.requested_at.elapsed()
+                        < BACKCHANNEL_SEND_COMMAND_TIMEOUT + LINK_PACKET_DISPATCH_TIMEOUT
+                    {
+                        still_waiting.push(start);
+                    }
                 }
             }
         }
@@ -2924,13 +3307,37 @@ impl LinkDeliveryManager {
             .pending_backchannel_deliveries
             .iter()
             .filter_map(|(key, delivery)| {
-                (delivery.started_at.elapsed() > BACKCHANNEL_DELIVERY_TIMEOUT).then_some(*key)
+                let mut wait = delivery.wait.unwrap_or(BackchannelWaitWindow {
+                    started_at: delivery.started_at,
+                    timeout: BACKCHANNEL_DELIVERY_TIMEOUT,
+                    awaiting_admission: false,
+                });
+                if delivery.wait.is_some() && matches!(key, BackchannelProofKey::Resource(..)) {
+                    wait.timeout = wait
+                        .timeout
+                        .saturating_add(BACKCHANNEL_RESOURCE_OBSERVATION_GRACE);
+                }
+                (wait.started_at.elapsed() > wait.timeout).then_some(*key)
             })
             .collect();
         for key in expired {
             if let Some(delivery) = self.pending_backchannel_deliveries.remove(&key) {
-                self.backchannel_links.remove(&delivery.dest_hash);
-                let reason = "backchannel delivery timeout".to_string();
+                if let BackchannelProofKey::Resource(link_id, resource_hash) = key {
+                    self.pending_backchannel_resource_cancellations.push_back(
+                        BackchannelResourceCancelRequest {
+                            link_id,
+                            resource_hash,
+                        },
+                    );
+                }
+                self.remove_backchannel_owner(delivery.dest_hash, delivery.link_id);
+                self.cancel_backchannel_packet_key(key, delivery.packet_cancellation);
+                let reason = if delivery.wait.is_some_and(|wait| wait.awaiting_admission) {
+                    "Link endpoint admission timeout"
+                } else {
+                    "backchannel delivery timeout"
+                }
+                .to_string();
                 self.delivery_events.push_back(backchannel_delivery_event(
                     BackchannelDeliveryEventInput {
                         kind: LxmfDeliveryEventKind::Failed,
@@ -3196,6 +3603,122 @@ impl LinkDeliveryManager {
         self.complete_backchannel_delivery(BackchannelProofKey::Packet(link_id, packet_hash))
     }
 
+    /// Mirror the exact bounded packet wait observed by the authenticated Link
+    /// owner. `awaiting_admission` separates local staging from the RTT proof
+    /// window installed after endpoint acceptance. Call before or after its send receipt;
+    /// delayed observations retain the original start instant. Unowned,
+    /// cancelled and completed sends cannot be installed by this method.
+    pub fn observe_backchannel_packet_wait(
+        &mut self,
+        link_id: [u8; 16],
+        packet_hash: [u8; 32],
+        started_at: Instant,
+        timeout: Duration,
+        awaiting_admission: bool,
+        cancellation: Option<LinkEndpointDispatchCancellation>,
+    ) -> bool {
+        let key = BackchannelProofKey::Packet(link_id, packet_hash);
+        if let Some(cancellation) = cancellation {
+            if self.cancelled_backchannel_packets.contains_key(&key) {
+                cancellation.cancel();
+                return false;
+            }
+            if let Some(delivery) = self.pending_backchannel_deliveries.get_mut(&key) {
+                delivery.packet_cancellation = Some(cancellation);
+            } else if self
+                .pending_backchannel_starts
+                .iter()
+                .any(|start| start.link_id == link_id)
+            {
+                if self.early_backchannel_packet_cancellations.len() < BACKCHANNEL_EARLY_PROOF_LIMIT
+                    || self
+                        .early_backchannel_packet_cancellations
+                        .contains_key(&key)
+                {
+                    self.early_backchannel_packet_cancellations
+                        .entry(key)
+                        .or_insert((cancellation, Instant::now()));
+                } else {
+                    // Local accounting backpressure is not a route fault.
+                    cancellation.cancel();
+                    return false;
+                }
+            }
+        }
+        self.observe_backchannel_wait(
+            key,
+            BackchannelWaitWindow {
+                started_at,
+                timeout,
+                awaiting_admission,
+            },
+        )
+    }
+
+    /// Mirror an exact bounded Resource wait from its protocol owner. The
+    /// owner must drive advertisement/window/proof exhaustion and report
+    /// terminal results. Only real protocol progress/retry may update this
+    /// window; keepalives or generic UI progress must not extend it. This
+    /// replaces the finite legacy adapter fallback for this exact send only.
+    /// A bounded 180-second observation grace follows the original deadline to
+    /// tolerate asynchronous accounting delivery; terminal results still settle
+    /// immediately and duplicate observations do not restart that envelope.
+    pub fn observe_backchannel_resource_wait(
+        &mut self,
+        link_id: [u8; 16],
+        resource_hash: [u8; 32],
+        started_at: Instant,
+        timeout: Duration,
+    ) -> bool {
+        self.observe_backchannel_wait(
+            BackchannelProofKey::Resource(link_id, resource_hash),
+            BackchannelWaitWindow {
+                started_at,
+                timeout,
+                awaiting_admission: false,
+            },
+        )
+    }
+
+    fn observe_backchannel_wait(
+        &mut self,
+        key: BackchannelProofKey,
+        wait: BackchannelWaitWindow,
+    ) -> bool {
+        if let Some(delivery) = self.pending_backchannel_deliveries.get_mut(&key) {
+            if delivery.link_closed
+                || delivery
+                    .wait
+                    .is_some_and(|old| old.started_at > wait.started_at)
+            {
+                return false;
+            }
+            delivery.wait = Some(wait);
+            return true;
+        }
+        if !self.pending_backchannel_starts.iter().any(|start| {
+            start.link_id == key.link_id() && !start.cancelled && start.closed_reason.is_none()
+        }) {
+            return false;
+        }
+        if self
+            .early_backchannel_waits
+            .get(&key)
+            .is_some_and(|old| old.started_at > wait.started_at)
+        {
+            return false;
+        }
+        if !self.early_backchannel_waits.contains_key(&key)
+            && self.early_backchannel_waits.len() >= BACKCHANNEL_EARLY_PROOF_LIMIT
+        {
+            // A missing observation retains the finite legacy fallback; it
+            // never drops an authenticated proof or creates an unbounded wait.
+            return false;
+        }
+        self.early_backchannel_waits.insert(key, wait);
+        true
+    }
+
     pub fn handle_backchannel_resource_proof(
         &mut self,
         link_id: [u8; 16],
@@ -3415,6 +3938,29 @@ impl LinkDeliveryManager {
     }
 
     fn prune_early_backchannel_settlement(&mut self) {
+        self.cancelled_backchannel_packets
+            .retain(|_, cancelled_at| cancelled_at.elapsed() <= LINK_PACKET_DISPATCH_TIMEOUT);
+        self.early_backchannel_packet_cancellations
+            .retain(|key, (cancel, observed_at)| {
+                let retain = observed_at.elapsed() <= LINK_PACKET_DISPATCH_TIMEOUT
+                    && (self.pending_backchannel_deliveries.contains_key(key)
+                        || self
+                            .pending_backchannel_starts
+                            .iter()
+                            .any(|start| start.link_id == key.link_id()));
+                if !retain {
+                    cancel.cancel();
+                }
+                retain
+            });
+        self.early_backchannel_waits.retain(|key, _| {
+            self.pending_backchannel_starts.iter().any(|start| {
+                start.link_id == key.link_id()
+                    && !start.cancelled
+                    && start.closed_reason.is_none()
+                    && start.requested_at.elapsed() <= BACKCHANNEL_SEND_COMMAND_TIMEOUT
+            })
+        });
         let now = Instant::now();
         let pending_links = self
             .pending_backchannel_starts
@@ -3437,7 +3983,11 @@ impl LinkDeliveryManager {
             .values()
             .map(PendingDelivery::active_delivery_count)
             .sum::<usize>()
-            + self.pending_backchannel_starts.len()
+            + self
+                .pending_backchannel_starts
+                .iter()
+                .filter(|start| !start.cancelled)
+                .count()
             + self.pending_backchannel_deliveries.len()
     }
 
@@ -3513,21 +4063,18 @@ impl LinkDeliveryManager {
         }
 
         if !results.is_empty() {
+            self.poll_packet_dispatches();
             return results;
         }
 
         if let Some(pos) = self
             .pending_backchannel_starts
             .iter()
-            .position(|start| start.message.hash == Some(msg_hash))
+            .position(|start| !start.cancelled && start.message.hash == Some(msg_hash))
         {
             let start = self.pending_backchannel_starts.remove(pos);
-            self.backchannel_links.remove(&start.dest_hash);
-            results.push(fail_backchannel_start(
-                &mut self.delivery_events,
-                start,
-                reason.to_string(),
-            ));
+            self.remove_backchannel_owner(start.dest_hash, start.link_id);
+            results.push(self.retain_failed_backchannel_start(start, reason.to_string()));
             self.prune_early_backchannel_settlement();
             return results;
         }
@@ -3538,7 +4085,16 @@ impl LinkDeliveryManager {
             .find_map(|(key, delivery)| (delivery.message.hash == Some(msg_hash)).then_some(*key));
         if let Some(key) = pending_key {
             if let Some(delivery) = self.pending_backchannel_deliveries.remove(&key) {
-                self.backchannel_links.remove(&delivery.dest_hash);
+                self.remove_backchannel_owner(delivery.dest_hash, delivery.link_id);
+                self.cancel_backchannel_packet_key(key, delivery.packet_cancellation);
+                if let BackchannelProofKey::Resource(link_id, resource_hash) = key {
+                    self.pending_backchannel_resource_cancellations.push_back(
+                        BackchannelResourceCancelRequest {
+                            link_id,
+                            resource_hash,
+                        },
+                    );
+                }
                 self.delivery_events.push_back(backchannel_delivery_event(
                     BackchannelDeliveryEventInput {
                         kind: LxmfDeliveryEventKind::Failed,
@@ -3571,6 +4127,8 @@ impl LinkDeliveryManager {
 
         for (link_id, delivery) in &mut self.pending {
             if delivery.msg_hash == Some(msg_hash) {
+                let establishing = delivery.state == DeliveryState::Establishing;
+                let establishment_started = delivery.started_at;
                 cancel_current_delivery(
                     &self.transport_tx,
                     &mut self.pending_transport,
@@ -3578,7 +4136,16 @@ impl LinkDeliveryManager {
                     link_id,
                     delivery,
                 );
-                if delivery.reusable && delivery.link.is_active() {
+                if establishing && delivery.reusable && delivery.start_queued_delivery() {
+                    // The shared handshake belongs to the following queued
+                    // messages too. Cancel only this message, preserve the
+                    // original LR clock and any unpublished exact bind.
+                    delivery.state = DeliveryState::Establishing;
+                    delivery.started_at = establishment_started;
+                } else if delivery.reusable
+                    && delivery.link.is_active()
+                    && delivery.attached_interface.is_some()
+                {
                     finish_unsuccessful_reusable_delivery(delivery);
                 } else {
                     remove_direct_session = Some((*link_id, delivery.dest_hash));
@@ -3624,18 +4191,38 @@ impl LinkDeliveryManager {
         }
 
         if cancelled {
+            self.poll_packet_dispatches();
             return true;
         }
 
-        if let Some(start) = self
+        if let Some(index) = self
             .pending_backchannel_starts
-            .iter_mut()
-            .find(|start| start.message.hash == Some(msg_hash))
+            .iter()
+            .position(|start| start.message.hash == Some(msg_hash))
         {
+            let start = &mut self.pending_backchannel_starts[index];
             if start.cancelled {
                 return false;
             }
             start.cancelled = true;
+            let mut placeholder = LxMessage::new(
+                start.dest_hash,
+                start.message.source_hash,
+                "",
+                "",
+                start.message.method,
+            );
+            placeholder.hash = start.message.hash;
+            start.message = placeholder;
+            if start.cancellation_aware {
+                start.receiver.close();
+                if let Ok(receipt) = start.receiver.try_recv() {
+                    if let Ok(receipt) = receipt {
+                        self.cancel_backchannel_receipt(receipt);
+                    }
+                    self.pending_backchannel_starts.remove(index);
+                }
+            }
             return true;
         }
 
@@ -3644,7 +4231,8 @@ impl LinkDeliveryManager {
             .iter()
             .find_map(|(key, delivery)| (delivery.message.hash == Some(msg_hash)).then_some(*key));
         if let Some(key) = pending_key {
-            self.pending_backchannel_deliveries.remove(&key);
+            let delivery = self.pending_backchannel_deliveries.remove(&key).unwrap();
+            self.cancel_backchannel_packet_key(key, delivery.packet_cancellation);
             self.early_backchannel_proofs.remove(&key);
             if let BackchannelProofKey::Resource(link_id, resource_hash) = key {
                 self.pending_backchannel_resource_cancellations.push_back(
@@ -3660,6 +4248,98 @@ impl LinkDeliveryManager {
         false
     }
 
+    fn cancel_backchannel_packet_key(
+        &mut self,
+        key: BackchannelProofKey,
+        cancellation: Option<LinkEndpointDispatchCancellation>,
+    ) -> bool {
+        if !matches!(key, BackchannelProofKey::Packet(..)) {
+            return true;
+        }
+        if !self.cancelled_backchannel_packets.contains_key(&key)
+            && self.cancelled_backchannel_packets.len() >= BACKCHANNEL_EARLY_PROOF_LIMIT
+        {
+            return false;
+        }
+        if let Some(cancellation) = cancellation.or_else(|| {
+            self.early_backchannel_packet_cancellations
+                .remove(&key)
+                .map(|(cancel, _)| cancel)
+        }) {
+            cancellation.cancel();
+        }
+        self.cancelled_backchannel_packets
+            .entry(key)
+            .or_insert_with(Instant::now);
+        true
+    }
+
+    fn cancel_backchannel_receipt(&mut self, receipt: BackchannelSendReceipt) {
+        match receipt {
+            BackchannelSendReceipt::Packet {
+                link_id,
+                packet_hash,
+            } => {
+                self.cancel_backchannel_packet_key(
+                    BackchannelProofKey::Packet(link_id, packet_hash),
+                    None,
+                );
+            }
+            BackchannelSendReceipt::Resource {
+                link_id,
+                resource_hash,
+            } => {
+                self.pending_backchannel_resource_cancellations.push_back(
+                    BackchannelResourceCancelRequest {
+                        link_id,
+                        resource_hash,
+                    },
+                );
+            }
+        }
+    }
+
+    /// Abandon one exact packet whose send receipt could not be handed to its
+    /// LXMF owner. Adapters close and drain their receipt pipe first, then retain
+    /// any raced receipt here until its exact cleanup ownership is accepted.
+    /// It cancels only pre-driver admission; transmitted packets are not recalled.
+    /// Returns false on bounded reconciliation pressure; the adapter must retain
+    /// and retry this small exact receipt rather than discard its ownership.
+    pub fn abandon_backchannel_packet(&mut self, link_id: [u8; 16], packet_hash: [u8; 32]) -> bool {
+        let key = BackchannelProofKey::Packet(link_id, packet_hash);
+        let reservation = (!self.cancelled_backchannel_packets.contains_key(&key))
+            .then(|| {
+                self.pending_backchannel_starts.iter().position(|start| {
+                    start.link_id == link_id && start.cancelled && start.receiver.is_terminated()
+                })
+            })
+            .flatten();
+        if reservation.is_none()
+            && !self.cancelled_backchannel_packets.contains_key(&key)
+            && !self.pending_backchannel_deliveries.contains_key(&key)
+            && !self
+                .early_backchannel_packet_cancellations
+                .contains_key(&key)
+            && self.pending_backchannel_starts.len()
+                + self.pending_backchannel_deliveries.len()
+                + self.cancelled_backchannel_packets.len()
+                >= BACKCHANNEL_EARLY_PROOF_LIMIT
+        {
+            return false;
+        }
+        let cancellation = self
+            .pending_backchannel_deliveries
+            .get_mut(&key)
+            .and_then(|delivery| delivery.packet_cancellation.take());
+        if !self.cancel_backchannel_packet_key(key, cancellation) {
+            return false;
+        }
+        if let Some(index) = reservation {
+            self.pending_backchannel_starts.remove(index);
+        }
+        true
+    }
+
     pub fn take_delivery_events(&mut self) -> Vec<LxmfDeliveryEvent> {
         self.delivery_events.drain(..).collect()
     }
@@ -3672,6 +4352,62 @@ impl LinkDeliveryManager {
         self.pending_backchannel_resource_cancellations
             .drain(..)
             .collect()
+    }
+
+    /// Return the finite delivery-owner envelope currently owning this message.
+    ///
+    /// Queued messages have no independent clock. Packet waits start at local
+    /// admission; Resource waits belong to the progress engine, not total
+    /// message age. Observed backchannel bounds preserve the external owner's
+    /// original instant, with a 180-second accounting observation grace for
+    /// externally owned Resources only. Direct Resource and packet protocol
+    /// clocks are unchanged. Legacy adapters without observations retain the
+    /// finite fallback, never an unlimited exemption from an orphan watchdog.
+    pub fn message_timeout_window(&self, msg_hash: [u8; 32]) -> Option<(Instant, Duration)> {
+        for delivery in self.pending.values() {
+            if delivery.msg_hash != Some(msg_hash) {
+                continue;
+            }
+            return match delivery.state {
+                DeliveryState::Establishing => {
+                    Some((delivery.started_at, delivery.establishment_timeout))
+                }
+                DeliveryState::Identifying => {
+                    Some((delivery.started_at, BACKCHANNEL_SEND_COMMAND_TIMEOUT))
+                }
+                DeliveryState::AwaitingProof => Some((delivery.started_at, delivery.timeout)),
+                DeliveryState::Transferring => delivery
+                    .transfer
+                    .as_ref()
+                    .and_then(OutboundTransfer::timeout_window),
+                _ => None,
+            };
+        }
+        for start in &self.pending_backchannel_starts {
+            if !start.cancelled
+                && start.closed_reason.is_none()
+                && start.message.hash == Some(msg_hash)
+            {
+                return Some((start.requested_at, BACKCHANNEL_SEND_COMMAND_TIMEOUT));
+            }
+        }
+        self.pending_backchannel_deliveries
+            .iter()
+            .find_map(|(key, delivery)| {
+                (!delivery.link_closed && delivery.message.hash == Some(msg_hash)).then(|| {
+                    let mut wait = delivery.wait.unwrap_or(BackchannelWaitWindow {
+                        started_at: delivery.started_at,
+                        timeout: BACKCHANNEL_DELIVERY_TIMEOUT,
+                        awaiting_admission: false,
+                    });
+                    if delivery.wait.is_some() && matches!(key, BackchannelProofKey::Resource(..)) {
+                        wait.timeout = wait
+                            .timeout
+                            .saturating_add(BACKCHANNEL_RESOURCE_OBSERVATION_GRACE);
+                    }
+                    (wait.started_at, wait.timeout)
+                })
+            })
     }
 
     pub fn message_delivery_snapshot(&self, msg_hash: [u8; 32]) -> Option<MessageDeliverySnapshot> {
@@ -3711,11 +4447,15 @@ impl LinkDeliveryManager {
         }
 
         for start in &self.pending_backchannel_starts {
-            if start.message.hash == Some(msg_hash) {
+            if !start.cancelled && start.message.hash == Some(msg_hash) {
                 return Some(MessageDeliverySnapshot {
                     link_id: start.link_id,
                     dest_hash: start.dest_hash,
-                    link_state: LinkState::Active,
+                    link_state: if start.closed_reason.is_some() {
+                        LinkState::Closed
+                    } else {
+                        LinkState::Active
+                    },
                     delivery_state: DeliveryState::Transferring,
                     representation: DeliveryRepresentation::Unknown,
                     progress: start.message.progress,
@@ -3735,7 +4475,11 @@ impl LinkDeliveryManager {
                 return Some(MessageDeliverySnapshot {
                     link_id,
                     dest_hash: delivery.dest_hash,
-                    link_state: LinkState::Active,
+                    link_state: if delivery.link_closed {
+                        LinkState::Closed
+                    } else {
+                        LinkState::Active
+                    },
                     delivery_state: DeliveryState::AwaitingProof,
                     representation: delivery.representation,
                     progress: delivery.message.progress,
@@ -3783,12 +4527,21 @@ impl LinkDeliveryManager {
         let queued_deliveries = self
             .pending_backchannel_starts
             .iter()
-            .filter(|start| start.dest_hash == dest_hash)
+            .filter(|start| {
+                start.dest_hash == dest_hash
+                    && start.link_id == link_id
+                    && !start.cancelled
+                    && start.closed_reason.is_none()
+            })
             .count();
         let in_flight_deliveries = self
             .pending_backchannel_deliveries
             .values()
-            .filter(|delivery| delivery.dest_hash == dest_hash)
+            .filter(|delivery| {
+                delivery.dest_hash == dest_hash
+                    && delivery.link_id == link_id
+                    && !delivery.link_closed
+            })
             .count();
         Some(BackchannelLinkSnapshot {
             link_id,
@@ -3804,7 +4557,11 @@ impl LinkDeliveryManager {
             direct_sessions: self.pending.values().filter(|d| d.reusable).count(),
             one_shot_sessions: self.pending.values().filter(|d| !d.reusable).count(),
             backchannel_sessions: self.backchannel_links.len(),
-            pending_backchannel_starts: self.pending_backchannel_starts.len(),
+            pending_backchannel_starts: self
+                .pending_backchannel_starts
+                .iter()
+                .filter(|start| !start.cancelled)
+                .count(),
             pending_backchannel_deliveries: self.pending_backchannel_deliveries.len(),
             ..LinkDeliveryStats::default()
         };
@@ -3825,8 +4582,8 @@ impl LinkDeliveryManager {
                 }
             }
         }
-        stats.queued_deliveries += self.pending_backchannel_starts.len();
-        stats.in_flight_deliveries += self.pending_backchannel_deliveries.len();
+        stats.queued_deliveries += stats.pending_backchannel_starts;
+        stats.in_flight_deliveries += stats.pending_backchannel_deliveries;
         stats
     }
 
@@ -3922,7 +4679,15 @@ fn backchannel_delivery_event(input: BackchannelDeliveryEventInput<'_>) -> LxmfD
 
 fn fail_backchannel_start(
     events: &mut VecDeque<LxmfDeliveryEvent>,
-    start: PendingBackchannelStart,
+    mut start: PendingBackchannelStart,
+    reason: String,
+) -> DeliveryResult {
+    fail_backchannel_start_in_place(events, &mut start, reason)
+}
+
+fn fail_backchannel_start_in_place(
+    events: &mut VecDeque<LxmfDeliveryEvent>,
+    start: &mut PendingBackchannelStart,
     reason: String,
 ) -> DeliveryResult {
     events.push_back(backchannel_delivery_event(BackchannelDeliveryEventInput {
@@ -3936,11 +4701,20 @@ fn fail_backchannel_start(
         link_state: LinkState::Closed,
         delivery_state: DeliveryState::Failed,
     }));
+    let placeholder = LxMessage::new(
+        start.dest_hash,
+        start.message.source_hash,
+        "",
+        "",
+        start.message.method,
+    );
+    let message = std::mem::replace(&mut start.message, placeholder);
+    start.cancelled = true;
     DeliveryResult::Failed {
         link_id: start.link_id,
-        msg_hash: start.message.hash,
+        msg_hash: message.hash,
         dest_hash: start.dest_hash,
-        message: start.message,
+        message,
         reason,
     }
 }
@@ -4151,7 +4925,7 @@ fn send_link_identify(
     };
     let mut id_raw = id_header.pack();
     id_raw.extend_from_slice(&identify_data);
-    stage_link_endpoint(
+    stage_link_endpoint_with_success(
         transport_tx,
         pending_transport,
         pending_endpoint_sends,
@@ -4160,6 +4934,7 @@ fn send_link_identify(
             raw: Bytes::from(id_raw),
             destination_hash: *link_id,
         },
+        EndpointSendSuccess::FinishHandshake,
     )
     .is_ok()
 }
@@ -4736,13 +5511,17 @@ fn drive_inbound_resource_watchdogs(
 }
 
 fn inbound_split_wait_timeout(link: &Link) -> Duration {
-    let rtt = link.rtt.unwrap_or(Duration::from_millis(500)).as_secs_f64();
-    let advertisement_attempt = rtt * rns_link::constants::TRAFFIC_TIMEOUT_FACTOR
-        + rns_protocol::resource::PROCESSING_GRACE;
-    let retry_horizon = advertisement_attempt
-        * (rns_protocol::resource::MAX_ADV_RETRIES + 1) as f64
-        + rns_protocol::resource::SENDER_GRACE_TIME;
-    Duration::from_secs_f64(retry_horizon.max(30.0))
+    link.rtt
+        .unwrap_or(Duration::from_millis(500))
+        .saturating_mul(rns_link::constants::TRAFFIC_TIMEOUT_FACTOR as u32)
+        .saturating_add(Duration::from_secs_f64(
+            rns_protocol::resource::PROCESSING_GRACE,
+        ))
+        .saturating_mul((rns_protocol::resource::MAX_ADV_RETRIES + 1) as u32)
+        .saturating_add(Duration::from_secs_f64(
+            rns_protocol::resource::SENDER_GRACE_TIME,
+        ))
+        .max(Duration::from_secs(30))
 }
 
 /// Send a single LXMF packet over an active link and return the full packet hash that the peer
@@ -4753,9 +5532,13 @@ fn send_link_packet(
     transport_tx: &mpsc::Sender<TransportMessage>,
     pending_transport: &mut VecDeque<TransportMessage>,
     pending_endpoint_sends: &mut Vec<PendingEndpointSend>,
+    pending_packet_dispatches: &mut Vec<PendingPacketDispatch>,
     packed: &[u8],
-) -> Option<[u8; 32]> {
-    let encrypted = delivery.link.encrypt(packed).ok()?;
+) -> Result<[u8; 32], &'static str> {
+    let encrypted = delivery
+        .link
+        .encrypt(packed)
+        .map_err(|_| "link packet encryption failed")?;
     let header = rns_wire::header::PacketHeader {
         flags: rns_wire::flags::PacketFlags {
             header_type: rns_wire::flags::HeaderType::Header1,
@@ -4772,7 +5555,26 @@ fn send_link_packet(
     let mut raw = header.pack();
     raw.extend_from_slice(&encrypted);
     let packet_hash = rns_wire::hash::packet_hash(&raw, rns_wire::flags::HeaderType::Header1);
-    stage_link_endpoint(
+    delivery.started_at = Instant::now();
+    if let Some(token) = &delivery.endpoint_dispatch_token {
+        let result_rx = token
+            .try_send(
+                OutboundRequest {
+                    raw: Bytes::from(raw),
+                    destination_hash: *link_id,
+                },
+                delivery.started_at + LINK_PACKET_DISPATCH_TIMEOUT,
+            )
+            .map_err(|_| "transport channel is full or closed")?;
+        pending_packet_dispatches.push(PendingPacketDispatch {
+            link_id: *link_id,
+            packet_hash,
+            result_rx,
+        });
+        delivery.link.record_tx(encrypted.len());
+        return Ok(packet_hash);
+    }
+    stage_link_endpoint_with_success(
         transport_tx,
         pending_transport,
         pending_endpoint_sends,
@@ -4781,10 +5583,10 @@ fn send_link_packet(
             raw: Bytes::from(raw),
             destination_hash: *link_id,
         },
-    )
-    .ok()?;
+        EndpointSendSuccess::StartPacketProofClock(packet_hash),
+    )?;
     delivery.link.record_tx(encrypted.len());
-    Some(packet_hash)
+    Ok(packet_hash)
 }
 
 fn send_link_teardown(
@@ -5248,6 +6050,1131 @@ mod tests {
         assert_eq!(mgr.pending_count(), 0);
     }
 
+    fn timing_message(label: &str) -> LxMessage {
+        let mut message = LxMessage::new(
+            [0xAA; 16],
+            [0xBB; 16],
+            label,
+            "bounded delivery",
+            crate::constants::DeliveryMethod::Direct,
+        );
+        message.sign(&Ed25519PrivateKey::generate()).unwrap();
+        message
+    }
+
+    #[tokio::test]
+    async fn exact_packet_dispatch_waits_for_driver_and_preserves_original_proof_clock() {
+        exact_packet_driver_fixture(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn exact_packet_cancel_before_driver_admission_never_sends_payload() {
+        exact_packet_driver_fixture(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn exact_packed_packet_preserves_rtt_identify_and_payload_order() {
+        exact_packet_driver_fixture(false, true).await;
+    }
+
+    #[tokio::test]
+    async fn exact_cancel_before_bind_receipt_cannot_revive_delivery_or_leak_binding() {
+        use rns_transport::actor::TransportActor;
+        use rns_transport::constants::{InterfaceDirection, InterfaceMode};
+        use rns_transport::messages::InterfaceEntry;
+        let (mut actor, actor_tx) = TransportActor::new();
+        let (driver_tx, _driver_rx) = mpsc::channel(8);
+        actor.interfaces.insert(
+            7,
+            InterfaceEntry::new(
+                "bind cancellation".to_string(),
+                InterfaceMode::Full,
+                InterfaceDirection::bidirectional(),
+                3_515,
+                500,
+                driver_tx,
+            ),
+        );
+        let dispatch = actor.link_endpoint_dispatch_handle();
+        let (tx, mut rx) = mpsc::channel(32);
+        let mut mgr = LinkDeliveryManager::new(tx, None, None);
+        mgr.set_link_endpoint_dispatch_handle(dispatch.clone());
+        let message = timing_message("cancel before exact bind");
+        let hash = message.hash.unwrap();
+        let dest = [0x95; 16];
+        let link_id = mgr.start_delivery(message, dest, 1).unwrap();
+        let raw = next_outbound(&mut rx);
+        let (_, offset) = rns_wire::header::PacketHeader::unpack(&raw).unwrap();
+        let key = Ed25519PrivateKey::generate();
+        let (_, proof) = Link::new_responder(&raw[offset..], &key, dest, 1).unwrap();
+        let public = key.public_key();
+        assert!(mgr.handle_link_proof(&link_id, &proof, &public, &public.to_bytes(), 7));
+        assert!(mgr.pending[&link_id].link.is_active());
+        assert!(mgr.cancel_delivery_by_message_hash(hash));
+        assert!(mgr.pending_endpoint_binds.is_empty());
+        assert!(!mgr.pending.contains_key(&link_id));
+        let task = tokio::spawn(actor.run());
+        let (lifecycle_tx, _lifecycle_rx) = mpsc::unbounded_channel();
+        let receipt = dispatch
+            .try_bind(
+                LinkEndpointBinding {
+                    link_id,
+                    interface_id: 7,
+                    role: LinkEndpointRole::Initiator,
+                },
+                lifecycle_tx,
+            )
+            .unwrap();
+        let token = tokio::time::timeout(Duration::from_secs(2), receipt)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            token.binding().link_id,
+            link_id,
+            "unread old bind was retired"
+        );
+        mgr.poll_endpoint_control();
+        assert!(mgr.tick().is_empty());
+        assert!(mgr.message_timeout_window(hash).is_none());
+        actor_tx.send(TransportMessage::Shutdown).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn exact_establishing_cancellation_preserves_only_uncancelled_followers() {
+        use rns_transport::actor::TransportActor;
+        use rns_transport::constants::{InterfaceDirection, InterfaceMode};
+        use rns_transport::messages::InterfaceEntry;
+        use rns_transport::path_table::PathEntry;
+        // Cancel the first before LRPROOF, after LRPROOF but before exact bind
+        // publication, or cancel only the middle queued message.
+        for mode in 0..3 {
+            let (mut actor, tx) = TransportActor::new();
+            let (driver_tx, mut driver_rx) = mpsc::channel(8);
+            let dest = [0x38; 16];
+            actor.interfaces.insert(
+                7,
+                InterfaceEntry::new(
+                    "queued cancellation".into(),
+                    InterfaceMode::Full,
+                    InterfaceDirection::bidirectional(),
+                    3_515,
+                    500,
+                    driver_tx,
+                ),
+            );
+            actor
+                .path_table
+                .insert(dest, PathEntry::new(None, 1, 7, InterfaceMode::Full));
+            let dispatch = actor.link_endpoint_dispatch_handle();
+            let task = tokio::spawn(actor.run());
+            let mut mgr = LinkDeliveryManager::new(tx.clone(), None, None);
+            mgr.set_link_endpoint_dispatch_handle(dispatch);
+            let mut messages = [
+                timing_message("first"),
+                timing_message("second"),
+                timing_message("third"),
+            ];
+            let hashes = messages.each_ref().map(|message| message.hash.unwrap());
+            let payloads = messages.each_mut().map(|message| message.pack().unwrap());
+            let [first, second, third] = messages;
+            let link_id = mgr.start_delivery(first, dest, 1).unwrap();
+            assert_eq!(mgr.start_delivery(second, dest, 1).unwrap(), link_id);
+            assert_eq!(mgr.start_delivery(third, dest, 1).unwrap(), link_id);
+            let original_start = mgr.pending[&link_id].started_at;
+            let raw = tokio::time::timeout(Duration::from_secs(2), driver_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let (_, offset) = rns_wire::header::PacketHeader::unpack(&raw).unwrap();
+            let key = Ed25519PrivateKey::generate();
+            let (mut peer, proof) = Link::new_responder(&raw[offset..], &key, dest, 1).unwrap();
+            let public = key.public_key();
+            let cancelled_index = if mode == 2 { 1 } else { 0 };
+            if mode != 1 {
+                assert!(mgr.cancel_delivery_by_message_hash(hashes[cancelled_index]));
+            }
+            assert!(mgr.handle_link_proof(&link_id, &proof, &public, &public.to_bytes(), 7));
+            if mode == 1 {
+                assert!(mgr.cancel_delivery_by_message_hash(hashes[0]));
+                assert!(mgr.pending_endpoint_binds.contains_key(&link_id));
+            }
+            assert_eq!(mgr.pending[&link_id].started_at, original_start);
+            assert_eq!(mgr.pending[&link_id].state, DeliveryState::Establishing);
+            assert!(
+                mgr.message_delivery_snapshot(hashes[cancelled_index])
+                    .is_none()
+            );
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while mgr.pending[&link_id].state == DeliveryState::Establishing {
+                    mgr.poll_endpoint_control();
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            mgr.pending.get_mut(&link_id).unwrap().link.rtt = Some(Duration::from_secs(1));
+            let rtt = tokio::time::timeout(Duration::from_secs(2), driver_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let (header, offset) = rns_wire::header::PacketHeader::unpack(&rtt).unwrap();
+            assert_eq!(header.context, rns_wire::context::PacketContext::Lrrtt);
+            peer.receive_rtt_packet(&rtt[offset..]).unwrap();
+            for index in (0..3).filter(|index| *index != cancelled_index) {
+                let raw = tokio::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        assert!(mgr.tick().is_empty());
+                        if let Ok(raw) = driver_rx.try_recv() {
+                            break raw;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                let (header, offset) = rns_wire::header::PacketHeader::unpack(&raw).unwrap();
+                assert_eq!(header.context, rns_wire::context::PacketContext::None);
+                assert_eq!(peer.decrypt(&raw[offset..]).unwrap(), payloads[index]);
+                let packet_hash = rns_wire::hash::packet_hash(&raw, header.flags.header_type);
+                let proof = peer.prove_packet_with_local_signer(&packet_hash).unwrap();
+                assert!(mgr.handle_link_packet_proof(&link_id, &proof));
+                assert!(
+                    matches!(mgr.tick().as_slice(), [DeliveryResult::Complete {msg_hash: Some(hash), ..}] if *hash == hashes[index])
+                );
+            }
+            assert_eq!(mgr.pending_count(), 0);
+            assert!(mgr.tick().is_empty());
+            assert!(driver_rx.try_recv().is_err());
+            tx.send(TransportMessage::Shutdown).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    async fn exact_packet_driver_fixture(cancel: bool, packed: bool) {
+        use rns_transport::actor::TransportActor;
+        use rns_transport::constants::{InterfaceDirection, InterfaceMode};
+        use rns_transport::messages::{InterfaceEntry, TimerTick};
+        use rns_transport::path_table::PathEntry;
+
+        let (mut actor, tx) = TransportActor::new();
+        let (driver_tx, mut driver_rx) = mpsc::channel(1);
+        let dest = [0x94; 16];
+        actor.interfaces.insert(
+            7,
+            InterfaceEntry::new(
+                "bounded test driver".to_string(),
+                InterfaceMode::Full,
+                InterfaceDirection::bidirectional(),
+                3_515,
+                500,
+                driver_tx,
+            ),
+        );
+        actor
+            .path_table
+            .insert(dest, PathEntry::new(None, 1, 7, InterfaceMode::Full));
+        let handle = actor.link_endpoint_dispatch_handle();
+        let actor_task = tokio::spawn(actor.run());
+        let identity = Ed25519PrivateKey::generate();
+        let mut identity_pub = [0; 64];
+        identity_pub[32..].copy_from_slice(&identity.public_key().to_bytes());
+        let mut mgr = LinkDeliveryManager::new(
+            tx.clone(),
+            packed.then_some(identity_pub),
+            packed.then_some(identity),
+        );
+        mgr.set_link_endpoint_dispatch_handle(handle);
+        let message = timing_message("exact driver admission");
+        let message_hash = message.hash.unwrap();
+        let link_id = if packed {
+            mgr.start_packed_delivery(message, dest, 1, b"packed propagation".to_vec(), false)
+                .unwrap()
+        } else {
+            mgr.start_delivery(message, dest, 1).unwrap()
+        };
+        let raw = tokio::time::timeout(Duration::from_secs(2), driver_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let (_, offset) = rns_wire::header::PacketHeader::unpack(&raw).unwrap();
+        let key = Ed25519PrivateKey::generate();
+        let (mut responder, proof) = Link::new_responder(&raw[offset..], &key, dest, 1).unwrap();
+        let public = key.public_key();
+        assert!(mgr.handle_link_proof(&link_id, &proof, &public, &public.to_bytes(), 7));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                mgr.poll_endpoint_control();
+                if mgr.pending[&link_id].state == DeliveryState::Identifying {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(mgr.pending[&link_id].endpoint_dispatch_token.is_some());
+        mgr.pending.get_mut(&link_id).unwrap().link.rtt = Some(Duration::from_millis(1));
+        assert!(mgr.tick().is_empty());
+        // LRRRTT occupies the only driver slot. The ordinary packet is retained
+        // in the actor's actual FIFO, not a fabricated Queued acknowledgement.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(
+            mgr.tick().is_empty(),
+            "5ms proof floor must not run before driver admission"
+        );
+        if packed {
+            assert_eq!(mgr.pending[&link_id].state, DeliveryState::Identifying);
+            let rtt = driver_rx.recv().await.unwrap();
+            let (header, offset) = rns_wire::header::PacketHeader::unpack(&rtt).unwrap();
+            assert_eq!(header.context, rns_wire::context::PacketContext::Lrrtt);
+            responder.receive_rtt_packet(&rtt[offset..]).unwrap();
+            tx.send(TransportMessage::Tick(TimerTick {
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs_f64(),
+            }))
+            .await
+            .unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    assert!(mgr.tick().is_empty());
+                    if mgr.pending[&link_id].state == DeliveryState::AwaitingProof {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            assert!(mgr.tick().is_empty());
+        }
+        assert!(mgr.pending[&link_id].packet_awaiting_dispatch);
+        assert_eq!(
+            mgr.message_timeout_window(message_hash).unwrap().1,
+            Duration::from_secs(120)
+        );
+        if cancel {
+            assert!(mgr.cancel_delivery_by_message_hash(message_hash));
+            assert!(mgr.pending_packet_dispatches.is_empty());
+        }
+        let rtt = driver_rx.recv().await.unwrap();
+        let (header, offset) = rns_wire::header::PacketHeader::unpack(&rtt).unwrap();
+        if packed {
+            assert_eq!(
+                header.context,
+                rns_wire::context::PacketContext::LinkIdentify
+            );
+            assert_eq!(
+                responder.handle_identification(&rtt[offset..]).unwrap(),
+                identity_pub
+            );
+        } else {
+            assert_eq!(header.context, rns_wire::context::PacketContext::Lrrtt);
+            responder.receive_rtt_packet(&rtt[offset..]).unwrap();
+        }
+        tx.send(TransportMessage::Tick(TimerTick {
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs_f64(),
+        }))
+        .await
+        .unwrap();
+        if cancel {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), driver_rx.recv())
+                    .await
+                    .is_err()
+            );
+            assert!(mgr.tick().is_empty());
+            assert!(mgr.message_timeout_window(message_hash).is_none());
+        } else {
+            let packet = tokio::time::timeout(Duration::from_secs(2), driver_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let (header, offset) = rns_wire::header::PacketHeader::unpack(&packet).unwrap();
+            assert_eq!(header.context, rns_wire::context::PacketContext::None);
+            assert!(!responder.decrypt(&packet[offset..]).unwrap().is_empty());
+            let before_observation = Instant::now();
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            mgr.poll_endpoint_control();
+            let (dispatched, timeout) = mgr.message_timeout_window(message_hash).unwrap();
+            assert!(dispatched <= before_observation);
+            assert_eq!(timeout, Duration::from_millis(6));
+            assert!(!mgr.pending[&link_id].packet_awaiting_dispatch);
+            assert!(
+                matches!(mgr.tick().as_slice(), [DeliveryResult::Failed { reason, .. }] if reason == "delivery timeout")
+            );
+            assert!(mgr.tick().is_empty());
+        }
+        tx.send(TransportMessage::Shutdown).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), actor_task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[test]
+    fn reused_packet_waits_for_admission_then_rtt_and_releases_queue_after_fade() {
+        for rtt in [Duration::from_millis(1), Duration::from_secs(2)] {
+            let (tx, mut rx) = mpsc::channel(128);
+            let mut mgr = LinkDeliveryManager::new(tx, None, None);
+            let responder_key = Ed25519PrivateKey::generate();
+            let dest = [0x92; 16];
+            let (link_id, responder) = establish_active_delivery(
+                &mut mgr,
+                &mut rx,
+                timing_message("warmup"),
+                &responder_key,
+                dest,
+            );
+            assert!(mgr.tick().is_empty());
+            complete_next_link_packet(&mut mgr, &mut rx, link_id, &responder, &responder_key);
+            assert!(matches!(
+                mgr.tick().as_slice(),
+                [DeliveryResult::Complete { .. }]
+            ));
+            mgr.pending.get_mut(&link_id).unwrap().link.rtt = Some(rtt);
+            let fading = timing_message("fade");
+            let fading_hash = fading.hash.unwrap();
+            assert_eq!(mgr.start_delivery(fading, dest, 1).unwrap(), link_id);
+            assert!(mgr.tick().is_empty());
+            let TransportMessage::SendLinkEndpoint { result_tx, .. } = rx.try_recv().unwrap()
+            else {
+                panic!("ordinary packet must use its exact endpoint")
+            };
+            // Local transport staging can outlast a fast Link's proof window.
+            mgr.pending.get_mut(&link_id).unwrap().started_at =
+                Instant::now() - Duration::from_secs(4);
+            assert!(mgr.tick().is_empty());
+            assert_eq!(
+                mgr.message_timeout_window(fading_hash).unwrap().1,
+                Duration::from_secs(10)
+            );
+            result_tx.send(LinkEndpointSendResult::Sent).unwrap();
+            mgr.poll_endpoint_control();
+            let proof_window = mgr.message_timeout_window(fading_hash).unwrap();
+            assert_eq!(
+                proof_window.1,
+                rtt.saturating_mul(6).max(Duration::from_millis(5))
+            );
+            assert!(proof_window.0.elapsed() < Duration::from_secs(1));
+
+            let queued = timing_message("queued behind fade");
+            let queued_hash = queued.hash.unwrap();
+            assert_eq!(mgr.start_delivery(queued, dest, 1).unwrap(), link_id);
+            assert!(mgr.message_timeout_window(queued_hash).is_none());
+            // Even a still-active Link must not hide the missing packet proof.
+            mgr.pending.get_mut(&link_id).unwrap().started_at =
+                Instant::now() - proof_window.1 - Duration::from_secs(1);
+            let failures = mgr.tick();
+            assert_eq!(failures.len(), 2);
+            let mut recovered_messages = Vec::new();
+            for failure in failures {
+                let DeliveryResult::Failed {
+                    message, reason, ..
+                } = failure
+                else {
+                    panic!()
+                };
+                assert!(is_retryable_link_delivery_failure(&reason));
+                assert_eq!(reason, "delivery timeout");
+                recovered_messages.push(message);
+            }
+            assert!(mgr.direct_link_snapshot(dest).is_none());
+            assert!(mgr.message_timeout_window(fading_hash).is_none());
+            // A fresh authenticated Link can deliver the exact failed messages.
+            // Endpoint cleanup belongs to the old generation, not the retry.
+            complete_direct_cleanup(&mut mgr, &mut rx);
+            let (new_id, new_peer) = establish_active_delivery(
+                &mut mgr,
+                &mut rx,
+                recovered_messages.remove(0),
+                &responder_key,
+                dest,
+            );
+            assert_ne!(new_id, link_id);
+            mgr.start_delivery(recovered_messages.remove(0), dest, 1)
+                .unwrap();
+            for _ in 0..2 {
+                assert!(mgr.tick().is_empty());
+                complete_next_link_packet(&mut mgr, &mut rx, new_id, &new_peer, &responder_key);
+                assert!(matches!(
+                    mgr.tick().as_slice(),
+                    [DeliveryResult::Complete { .. }]
+                ));
+            }
+            assert_eq!(mgr.pending_count(), 0);
+        }
+    }
+
+    #[test]
+    fn late_packet_admission_does_not_rearm_next_message_or_cancelled_owner() {
+        let (tx, mut rx) = mpsc::channel(128);
+        let mut mgr = LinkDeliveryManager::new(tx, None, None);
+        let responder_key = Ed25519PrivateKey::generate();
+        let dest = [0x93; 16];
+        let first = timing_message("proof beats local acknowledgement");
+        let first_hash = first.hash.unwrap();
+        let (link_id, responder) =
+            establish_active_delivery(&mut mgr, &mut rx, first, &responder_key, dest);
+        mgr.tick();
+        let TransportMessage::SendLinkEndpoint {
+            request, result_tx, ..
+        } = rx.try_recv().unwrap()
+        else {
+            panic!()
+        };
+        let packet_hash =
+            rns_wire::hash::packet_hash(&request.raw, rns_wire::flags::HeaderType::Header1);
+        let proof = responder
+            .prove_packet_with_local_signer(&packet_hash)
+            .unwrap();
+        assert!(mgr.handle_link_packet_proof(&link_id, &proof));
+        assert!(matches!(
+            mgr.tick().as_slice(),
+            [DeliveryResult::Complete { .. }]
+        ));
+        assert!(mgr.message_timeout_window(first_hash).is_none());
+        let next = timing_message("next packet");
+        let next_hash = next.hash.unwrap();
+        mgr.start_delivery(next, dest, 1).unwrap();
+        mgr.tick();
+        let next_window = mgr.message_timeout_window(next_hash).unwrap();
+        result_tx.send(LinkEndpointSendResult::Sent).unwrap();
+        mgr.poll_endpoint_control();
+        assert_eq!(mgr.message_timeout_window(next_hash), Some(next_window));
+        assert!(mgr.cancel_delivery_by_message_hash(next_hash));
+        assert!(mgr.message_timeout_window(next_hash).is_none());
+        let TransportMessage::SendLinkEndpoint { result_tx, .. } = rx.try_recv().unwrap() else {
+            panic!()
+        };
+        result_tx.send(LinkEndpointSendResult::Sent).unwrap();
+        mgr.poll_endpoint_control();
+        assert!(mgr.tick().is_empty());
+        assert_eq!(mgr.pending_count(), 0);
+    }
+
+    #[test]
+    fn backchannel_observation_is_exact_bounded_and_not_restarted_by_late_receipt() {
+        let (tx, _rx) = mpsc::channel(16);
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
+        let mut mgr = LinkDeliveryManager::new(tx, None, None);
+        mgr.set_backchannel_sender(cmd_tx);
+        let dest = [0x94; 16];
+        let link_id = [0x95; 16];
+        let resource_hash = [0x96; 32];
+        mgr.register_backchannel(dest, link_id);
+        let message = timing_message("slow resource");
+        let hash = message.hash.unwrap();
+        mgr.start_backchannel_delivery(message, dest).unwrap();
+        let command = cmd_rx.try_recv().unwrap();
+        let original = Instant::now() - Duration::from_secs(400);
+        // A healthy slow transfer is older than the legacy 360s cap but has
+        // a real finite owner deadline. An unrelated Link cannot claim it.
+        assert!(!mgr.observe_backchannel_resource_wait(
+            [0x97; 16],
+            resource_hash,
+            original,
+            Duration::from_secs(800)
+        ));
+        assert!(mgr.observe_backchannel_resource_wait(
+            link_id,
+            resource_hash,
+            original,
+            Duration::from_secs(800)
+        ));
+        command
+            .result_tx
+            .send(Ok(BackchannelSendReceipt::Resource {
+                link_id,
+                resource_hash,
+            }))
+            .unwrap();
+        assert!(mgr.tick().is_empty());
+        assert_eq!(
+            mgr.message_timeout_window(hash),
+            Some((original, Duration::from_secs(980)))
+        );
+        assert!(!mgr.observe_backchannel_resource_wait(
+            link_id,
+            resource_hash,
+            original - Duration::from_secs(1),
+            Duration::MAX
+        ));
+        // A late observation gets only the remainder of the fixed envelope,
+        // never another timeout from observation time.
+        let expired = Instant::now() - Duration::from_secs(200);
+        assert!(mgr.observe_backchannel_resource_wait(
+            link_id,
+            resource_hash,
+            expired,
+            Duration::from_secs(10)
+        ));
+        let result = mgr.tick();
+        assert!(
+            matches!(result.as_slice(), [DeliveryResult::Failed { reason, .. }] if reason == "backchannel delivery timeout")
+        );
+        assert_eq!(
+            mgr.take_backchannel_resource_cancellations(),
+            vec![BackchannelResourceCancelRequest {
+                link_id,
+                resource_hash
+            }]
+        );
+        assert!(mgr.tick().is_empty());
+        assert!(mgr.take_backchannel_resource_cancellations().is_empty());
+        assert!(mgr.message_timeout_window(hash).is_none());
+        assert!(!mgr.observe_backchannel_resource_wait(
+            link_id,
+            resource_hash,
+            Instant::now(),
+            Duration::MAX
+        ));
+    }
+
+    #[test]
+    fn cancellation_aware_sender_policy_is_captured_and_closes_before_receipt() {
+        let (tx, _rx) = mpsc::channel(8);
+        let (command_tx, mut commands) = mpsc::channel(8);
+        let mut mgr = LinkDeliveryManager::new(tx, None, None);
+        let dest = [0x49; 16];
+        let link_id = [0x4A; 16];
+        mgr.register_backchannel(dest, link_id);
+        mgr.set_backchannel_sender(command_tx.clone());
+        let legacy = timing_message("legacy cancellation policy");
+        let legacy_hash = legacy.hash.unwrap();
+        mgr.start_backchannel_delivery(legacy, dest).unwrap();
+        let legacy_command = commands.try_recv().unwrap();
+        mgr.set_cancellation_aware_backchannel_sender(command_tx.clone());
+        assert!(mgr.cancel_delivery_by_message_hash(legacy_hash));
+        assert!(
+            !legacy_command.result_tx.is_closed(),
+            "replacement setter must not alter old adapter contract"
+        );
+        legacy_command
+            .result_tx
+            .send(Ok(BackchannelSendReceipt::Packet {
+                link_id,
+                packet_hash: [1; 32],
+            }))
+            .unwrap();
+        assert!(mgr.tick().is_empty());
+        let aware = timing_message("cancellation-aware command not yet issued");
+        let aware_hash = aware.hash.unwrap();
+        mgr.start_backchannel_delivery(aware, dest).unwrap();
+        let aware_command = commands.try_recv().unwrap();
+        mgr.set_backchannel_sender(command_tx.clone());
+        assert!(mgr.cancel_delivery_by_message_hash(aware_hash));
+        assert!(
+            aware_command.result_tx.is_closed(),
+            "canonical bridge must know immediately not to issue this command"
+        );
+        assert!(mgr.message_delivery_snapshot(aware_hash).is_none());
+        let already_published = timing_message("published before cancellation close");
+        let published_hash = already_published.hash.unwrap();
+        mgr.set_cancellation_aware_backchannel_sender(command_tx);
+        mgr.start_backchannel_delivery(already_published, dest)
+            .unwrap();
+        commands
+            .try_recv()
+            .unwrap()
+            .result_tx
+            .send(Ok(BackchannelSendReceipt::Packet {
+                link_id,
+                packet_hash: [2; 32],
+            }))
+            .unwrap();
+        assert!(mgr.cancel_delivery_by_message_hash(published_hash));
+        assert!(
+            mgr.cancelled_backchannel_packets
+                .contains_key(&BackchannelProofKey::Packet(link_id, [2; 32]))
+        );
+        assert!(
+            mgr.pending_backchannel_starts
+                .iter()
+                .all(|start| start.message.hash != Some(published_hash))
+        );
+        assert!(mgr.tick().is_empty());
+    }
+
+    #[test]
+    fn cancelled_bridge_reservations_are_small_bounded_idempotent_and_generation_scoped() {
+        let (tx, _rx) = mpsc::channel(16);
+        let (command_tx, _command_rx) = mpsc::channel(256);
+        let mut mgr = LinkDeliveryManager::new(tx, None, None);
+        mgr.set_backchannel_sender(command_tx);
+        let dest = [0x53; 16];
+        let old_link = [0x54; 16];
+        mgr.register_backchannel(dest, old_link);
+        for _ in 0..256 {
+            mgr.start_backchannel_delivery(timing_message("bounded receipt reservation"), dest)
+                .unwrap();
+        }
+        let cancelled_hash = mgr.pending_backchannel_starts[0].message.hash.unwrap();
+        mgr.pending_backchannel_starts[0].message.content =
+            "large cancelled payload".repeat(100_000);
+        assert!(mgr.cancel_delivery_by_message_hash(cancelled_hash));
+        assert!(mgr.pending_backchannel_starts[0].message.content.is_empty());
+        for start in &mut mgr.pending_backchannel_starts {
+            start.requested_at = Instant::now() - Duration::from_secs(11);
+        }
+        assert_eq!(mgr.tick().len(), 255);
+        assert_eq!(mgr.pending_count(), 0);
+        assert_eq!(mgr.pending_backchannel_starts.len(), 256);
+        assert!(
+            mgr.pending_backchannel_starts
+                .iter()
+                .all(|start| start.message.content.is_empty())
+        );
+        let new_link = [0x55; 16];
+        mgr.register_backchannel(dest, new_link);
+        assert!(mgr.tick().is_empty());
+        assert!(mgr.tick().is_empty());
+        assert_eq!(mgr.backchannel_links.get(&dest), Some(&new_link));
+        let snapshot = mgr.backchannel_link_snapshot(dest).unwrap();
+        assert_eq!(
+            (snapshot.queued_deliveries, snapshot.in_flight_deliveries),
+            (0, 0)
+        );
+        assert!(mgr.message_delivery_snapshot(cancelled_hash).is_none());
+        let stats = mgr.stats();
+        assert_eq!(
+            (
+                stats.pending_backchannel_starts,
+                stats.pending_backchannel_deliveries,
+                stats.queued_deliveries,
+                stats.in_flight_deliveries
+            ),
+            (0, 0, 0, 0)
+        );
+        let refused = mgr
+            .start_backchannel_delivery(timing_message("full reservation owner"), dest)
+            .unwrap_err();
+        assert_eq!(refused.error, BackchannelStartError::CommandFull);
+        for n in 0..256u16 {
+            let mut packet_hash = [0; 32];
+            packet_hash[..2].copy_from_slice(&n.to_be_bytes());
+            assert!(mgr.abandon_backchannel_packet(old_link, packet_hash));
+            let remaining = mgr.pending_backchannel_starts.len();
+            let original = mgr.cancelled_backchannel_packets
+                [&BackchannelProofKey::Packet(old_link, packet_hash)];
+            assert!(mgr.abandon_backchannel_packet(old_link, packet_hash));
+            assert_eq!(
+                mgr.pending_backchannel_starts.len(),
+                remaining,
+                "duplicate cannot consume another reservation"
+            );
+            assert_eq!(
+                mgr.cancelled_backchannel_packets
+                    [&BackchannelProofKey::Packet(old_link, packet_hash)],
+                original
+            );
+            assert_eq!(
+                mgr.pending_backchannel_starts.len() + mgr.cancelled_backchannel_packets.len(),
+                256
+            );
+        }
+        assert!(!mgr.abandon_backchannel_packet(old_link, [0xFF; 32]));
+        assert_eq!(mgr.cancelled_backchannel_packets.len(), 256);
+        for instant in mgr.cancelled_backchannel_packets.values_mut() {
+            *instant = Instant::now() - Duration::from_secs(121);
+        }
+        mgr.prune_early_backchannel_settlement();
+        assert!(mgr.cancelled_backchannel_packets.is_empty());
+        assert_eq!(mgr.backchannel_links.get(&dest), Some(&new_link));
+    }
+
+    #[test]
+    fn retired_backchannel_owners_never_evict_replacement_or_remain_visible() {
+        // Pending command, installed Packet, installed Resource; timeout,
+        // targeted failure, user cancel, or old-Link failure for each owner.
+        for representation in 0..3 {
+            for retirement in 0..4 {
+                let (tx, _rx) = mpsc::channel(16);
+                let (command_tx, mut commands) = mpsc::channel(16);
+                let mut mgr = LinkDeliveryManager::new(tx, None, None);
+                mgr.set_cancellation_aware_backchannel_sender(command_tx);
+                let dest = [0x31; 16];
+                let old_link = [0x32; 16];
+                let replacement = [0x33; 16];
+                let message = timing_message("old owner must not evict replacement");
+                let hash = message.hash.unwrap();
+                mgr.register_backchannel(dest, old_link);
+                mgr.start_backchannel_delivery(message, dest).unwrap();
+                let command = commands.try_recv().unwrap();
+                if representation != 0 {
+                    let receipt = if representation == 1 {
+                        BackchannelSendReceipt::Packet {
+                            link_id: old_link,
+                            packet_hash: [1; 32],
+                        }
+                    } else {
+                        BackchannelSendReceipt::Resource {
+                            link_id: old_link,
+                            resource_hash: [2; 32],
+                        }
+                    };
+                    command.result_tx.send(Ok(receipt)).unwrap();
+                    assert!(mgr.tick().is_empty());
+                }
+                mgr.register_backchannel(dest, replacement);
+                let snapshot = mgr.backchannel_link_snapshot(dest).unwrap();
+                assert_eq!(
+                    (snapshot.queued_deliveries, snapshot.in_flight_deliveries),
+                    (0, 0)
+                );
+                match retirement {
+                    0 => {
+                        for start in &mut mgr.pending_backchannel_starts {
+                            start.requested_at = Instant::now() - Duration::from_secs(11);
+                        }
+                        for delivery in mgr.pending_backchannel_deliveries.values_mut() {
+                            delivery.started_at = Instant::now() - Duration::from_secs(400);
+                        }
+                        assert_eq!(mgr.tick().len(), 1);
+                    }
+                    1 => assert_eq!(
+                        mgr.fail_delivery_by_message_hash(hash, "delivery timeout")
+                            .len(),
+                        1
+                    ),
+                    2 => assert!(mgr.cancel_delivery_by_message_hash(hash)),
+                    _ => assert_eq!(mgr.fail_backchannel_link(old_link, "link closed").len(), 1),
+                }
+                assert!(mgr.tick().is_empty());
+                assert!(mgr.tick().is_empty());
+                assert!(
+                    mgr.fail_delivery_by_message_hash(hash, "duplicate failure")
+                        .is_empty()
+                );
+                assert!(mgr.message_delivery_snapshot(hash).is_none());
+                assert_eq!(mgr.pending_count(), 0);
+                assert_eq!(mgr.backchannel_links.get(&dest), Some(&replacement));
+                let snapshot = mgr.backchannel_link_snapshot(dest).unwrap();
+                assert_eq!(
+                    (snapshot.queued_deliveries, snapshot.in_flight_deliveries),
+                    (0, 0)
+                );
+                // A new event/report must not count hidden cleanup owners.
+                let report = mgr
+                    .start_backchannel_delivery(timing_message("replacement work"), dest)
+                    .unwrap();
+                assert_eq!(
+                    (report.queued_deliveries, report.in_flight_deliveries),
+                    (1, 1)
+                );
+                let event = mgr.take_delivery_events().pop().unwrap();
+                assert_eq!(
+                    (event.queued_deliveries, event.in_flight_deliveries),
+                    (0, 1)
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn backchannel_packet_cancel_reconciles_before_receipt_and_after_late_observation() {
+        use rns_transport::actor::TransportActor;
+        use rns_transport::constants::{InterfaceDirection, InterfaceMode};
+        use rns_transport::messages::{InterfaceEntry, TimerTick};
+        for mode in 0..4 {
+            let (mut actor, tx) = TransportActor::new();
+            let (driver_tx, mut driver_rx) = mpsc::channel(1);
+            driver_tx.try_send(Bytes::from_static(b"occupied")).unwrap();
+            actor.interfaces.insert(
+                7,
+                InterfaceEntry::new(
+                    "cancelled backchannel driver".to_string(),
+                    InterfaceMode::Full,
+                    InterfaceDirection::bidirectional(),
+                    3_515,
+                    500,
+                    driver_tx,
+                ),
+            );
+            let dispatch = actor.link_endpoint_dispatch_handle();
+            let actor_task = tokio::spawn(actor.run());
+            let link_id = [0x59; 16];
+            let dest = [0x5A; 16];
+            let (lifecycle_tx, _lifecycle_rx) = mpsc::unbounded_channel();
+            let token = dispatch
+                .try_bind(
+                    LinkEndpointBinding {
+                        link_id,
+                        interface_id: 7,
+                        role: LinkEndpointRole::Responder,
+                    },
+                    lifecycle_tx,
+                )
+                .unwrap()
+                .await
+                .unwrap()
+                .unwrap();
+            let mut mgr = LinkDeliveryManager::new(tx.clone(), None, None);
+            let (command_tx, mut command_rx) = mpsc::channel(8);
+            if mode == 3 {
+                mgr.set_cancellation_aware_backchannel_sender(command_tx);
+            } else {
+                mgr.set_backchannel_sender(command_tx);
+            }
+            mgr.register_backchannel(dest, link_id);
+            let message = timing_message("cancel exact actor packet");
+            let hash = message.hash.unwrap();
+            mgr.start_backchannel_delivery(message, dest).unwrap();
+            let command = command_rx.try_recv().unwrap();
+            let raw = link_data_packet(
+                link_id,
+                rns_wire::context::PacketContext::None,
+                &command.payload,
+            );
+            let packet_hash =
+                rns_wire::hash::packet_hash(&raw, rns_wire::flags::HeaderType::Header1);
+            let started = Instant::now();
+            let (outcome, cancellation) = token
+                .try_send_cancellable(
+                    OutboundRequest {
+                        raw,
+                        destination_hash: link_id,
+                    },
+                    started + Duration::from_secs(120),
+                )
+                .unwrap();
+            if mode != 0 {
+                assert!(mgr.cancel_delivery_by_message_hash(hash));
+            }
+            if mode != 2 {
+                mgr.observe_backchannel_packet_wait(
+                    link_id,
+                    packet_hash,
+                    started,
+                    Duration::from_secs(120),
+                    true,
+                    Some(cancellation.clone()),
+                );
+            }
+            let published = command.result_tx.send(Ok(BackchannelSendReceipt::Packet {
+                link_id,
+                packet_hash,
+            }));
+            if mode == 3 {
+                assert!(published.is_err());
+                assert!(mgr.abandon_backchannel_packet(link_id, packet_hash));
+            } else {
+                published.unwrap();
+            }
+            assert!(mgr.tick().is_empty());
+            if mode == 0 {
+                assert!(mgr.cancel_delivery_by_message_hash(hash));
+            }
+            if mode == 2 {
+                assert!(!mgr.observe_backchannel_packet_wait(
+                    link_id,
+                    packet_hash,
+                    started,
+                    Duration::from_secs(120),
+                    true,
+                    Some(cancellation)
+                ));
+            }
+            let other_raw = link_data_packet(
+                link_id,
+                rns_wire::context::PacketContext::None,
+                b"unrelated packet survives",
+            );
+            let other = token
+                .try_send(
+                    OutboundRequest {
+                        raw: other_raw.clone(),
+                        destination_hash: link_id,
+                    },
+                    Instant::now() + Duration::from_secs(120),
+                )
+                .unwrap();
+            assert_eq!(driver_rx.recv().await.unwrap(), b"occupied"[..]);
+            tx.send(TransportMessage::Tick(TimerTick {
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs_f64(),
+            }))
+            .await
+            .unwrap();
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(2), driver_rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                other_raw
+            );
+            assert_eq!(
+                outcome.await.unwrap(),
+                LinkEndpointDispatchOutcome::Cancelled
+            );
+            assert!(matches!(
+                other.await.unwrap(),
+                LinkEndpointDispatchOutcome::Sent { .. }
+            ));
+            assert!(mgr.tick().is_empty());
+            assert_eq!(mgr.backchannel_links.get(&dest), Some(&link_id));
+            assert!(mgr.message_timeout_window(hash).is_none());
+            tx.send(TransportMessage::Shutdown).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(2), actor_task)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn legacy_queued_packet_stays_finite_local_uncertainty_not_network_proof() {
+        let (tx, mut rx) = mpsc::channel(128);
+        let mut mgr = LinkDeliveryManager::new(tx, None, None);
+        let key = Ed25519PrivateKey::generate();
+        let message = timing_message("legacy queued packet");
+        let hash = message.hash.unwrap();
+        let (link_id, _) = establish_active_delivery(&mut mgr, &mut rx, message, &key, [0x63; 16]);
+        mgr.pending.get_mut(&link_id).unwrap().link.rtt = Some(Duration::from_millis(1));
+        assert!(mgr.tick().is_empty());
+        let TransportMessage::SendLinkEndpoint { result_tx, .. } = rx.try_recv().unwrap() else {
+            panic!()
+        };
+        result_tx
+            .send(LinkEndpointSendResult::Queued { depth: 1 })
+            .unwrap();
+        mgr.poll_endpoint_control();
+        let window = mgr.message_timeout_window(hash).unwrap();
+        assert_eq!(window.1, Duration::from_secs(10) + Duration::from_millis(6));
+        assert!(mgr.pending[&link_id].packet_awaiting_dispatch);
+        mgr.pending.get_mut(&link_id).unwrap().started_at =
+            Instant::now() - window.1 - Duration::from_secs(1);
+        assert!(
+            matches!(mgr.tick().as_slice(), [DeliveryResult::Failed { reason, .. }]
+            if reason == "Link endpoint admission timeout" && is_retryable_link_delivery_failure(reason))
+        );
+        assert!(mgr.tick().is_empty());
+    }
+
+    #[test]
+    fn external_resource_observation_grace_handles_queued_renewal_without_resetting_deadline() {
+        let (tx, _rx) = mpsc::channel(16);
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
+        let mut mgr = LinkDeliveryManager::new(tx, None, None);
+        mgr.set_backchannel_sender(cmd_tx);
+        let dest = [0x64; 16];
+        let link_id = [0x65; 16];
+        let resource_hash = [0x66; 32];
+        mgr.register_backchannel(dest, link_id);
+        let message = timing_message("queued resource phase renewal");
+        let hash = message.hash.unwrap();
+        mgr.start_backchannel_delivery(message, dest).unwrap();
+        cmd_rx
+            .try_recv()
+            .unwrap()
+            .result_tx
+            .send(Ok(BackchannelSendReceipt::Resource {
+                link_id,
+                resource_hash,
+            }))
+            .unwrap();
+        assert!(mgr.tick().is_empty());
+        let old = Instant::now() - Duration::from_secs(20);
+        assert!(mgr.observe_backchannel_resource_wait(
+            link_id,
+            resource_hash,
+            old,
+            Duration::from_secs(10)
+        ));
+        let old_window = Some((old, Duration::from_secs(190)));
+        // A real renewal is still upstream in the accounting adapter. Crossing
+        // its previous protocol deadline must not orphan an active Resource.
+        assert!(mgr.tick().is_empty());
+        assert_eq!(mgr.message_timeout_window(hash), old_window);
+        assert!(mgr.observe_backchannel_resource_wait(
+            link_id,
+            resource_hash,
+            old,
+            Duration::from_secs(10)
+        ));
+        mgr.register_backchannel(dest, link_id); // Generic Link activity is not progress.
+        assert_eq!(mgr.message_timeout_window(hash), old_window);
+        let renewed = Instant::now() - Duration::from_secs(5);
+        assert!(mgr.observe_backchannel_resource_wait(
+            link_id,
+            resource_hash,
+            renewed,
+            Duration::from_secs(10)
+        ));
+        assert_eq!(
+            mgr.message_timeout_window(hash),
+            Some((renewed, Duration::from_secs(190)))
+        );
+        assert!(mgr.tick().is_empty());
+        assert!(matches!(
+            mgr.handle_backchannel_resource_proof(link_id, resource_hash),
+            Some(DeliveryResult::Complete { .. })
+        ));
+        assert!(mgr.message_timeout_window(hash).is_none());
+        assert!(
+            mgr.handle_backchannel_resource_proof(link_id, resource_hash)
+                .is_none()
+        );
+        assert!(!mgr.observe_backchannel_resource_wait(
+            link_id,
+            resource_hash,
+            Instant::now(),
+            Duration::MAX
+        ));
+        assert!(mgr.take_backchannel_resource_cancellations().is_empty());
+    }
+
+    #[test]
+    fn backchannel_packet_admission_expiry_is_not_network_proof_expiry() {
+        let (tx, _rx) = mpsc::channel(16);
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(16);
+        let mut mgr = LinkDeliveryManager::new(tx, None, None);
+        mgr.set_backchannel_sender(cmd_tx);
+        let dest = [0x98; 16];
+        let link_id = [0x99; 16];
+        let packet_hash = [0x9A; 32];
+        mgr.register_backchannel(dest, link_id);
+        mgr.start_backchannel_delivery(timing_message("admission expires"), dest)
+            .unwrap();
+        assert!(mgr.observe_backchannel_packet_wait(
+            link_id,
+            packet_hash,
+            Instant::now() - Duration::from_secs(11),
+            Duration::from_secs(10),
+            true,
+            None
+        ));
+        cmd_rx
+            .try_recv()
+            .unwrap()
+            .result_tx
+            .send(Ok(BackchannelSendReceipt::Packet {
+                link_id,
+                packet_hash,
+            }))
+            .unwrap();
+        assert!(
+            matches!(mgr.tick().as_slice(), [DeliveryResult::Failed { reason, .. }] if reason == "Link endpoint admission timeout")
+        );
+        assert!(mgr.take_backchannel_resource_cancellations().is_empty());
+    }
+
     #[test]
     fn test_backchannel_delivery_uses_registered_link_and_packet_proof() {
         let (tx, _rx) = mpsc::channel(16);
@@ -5433,6 +7360,9 @@ mod tests {
         assert!(!mgr.delivery_link_available(&dest_hash));
         assert_eq!(mgr.pending_count(), 1);
         assert_eq!(mgr.early_backchannel_proofs.len(), 1);
+        let settling = mgr.message_delivery_snapshot(msg_hash.unwrap()).unwrap();
+        assert_eq!(settling.link_state, LinkState::Closed);
+        assert_eq!(mgr.stats().pending_backchannel_starts, 1);
 
         command
             .result_tx
@@ -5815,6 +7745,9 @@ mod tests {
         assert!(mgr.fail_backchannel_link(link_id, "link closed").is_empty());
         assert_eq!(mgr.pending_count(), 1);
         assert!(!mgr.delivery_link_available(&dest_hash));
+        let settling = mgr.message_delivery_snapshot(msg_hash.unwrap()).unwrap();
+        assert_eq!(settling.link_state, LinkState::Closed);
+        assert_eq!(mgr.stats().pending_backchannel_starts, 1);
 
         command
             .result_tx
@@ -5980,6 +7913,34 @@ mod tests {
 
     #[test]
     fn test_retryable_link_delivery_failure_includes_stale_backchannels() {
+        for reason in [
+            "delivery timeout",
+            "backchannel delivery timeout",
+            "resource proof timed out",
+            "resource part requests timed out",
+            "resource advertisement timed out",
+            "resource cancelled",
+            "Link endpoint admission timeout",
+            "Link endpoint terminated: InterfaceOffline",
+            "Link endpoint send rejected: Terminated(EgressQueueExhausted)",
+            "transport channel closed",
+            "transport staging queue full",
+        ] {
+            assert!(is_retryable_link_delivery_failure(reason), "{reason}");
+        }
+        for reason in [
+            "resource rejected",
+            "cancelled by user",
+            "resource transfer cancelled",
+            "Link endpoint send rejected: InvalidPacket",
+            "Link endpoint send rejected: RoleMismatch",
+            "Link endpoint terminated: untrusted invented reason",
+        ] {
+            assert!(!is_retryable_link_delivery_failure(reason), "{reason}");
+        }
+        let (mut link, _) = Link::new_initiator([0x33; 16], 1);
+        link.rtt = Some(Duration::MAX);
+        assert_eq!(inbound_split_wait_timeout(&link), Duration::MAX);
         assert!(is_retryable_link_delivery_failure(
             "link establishment timeout"
         ));
@@ -6416,12 +8377,50 @@ mod tests {
 
     #[test]
     fn reusable_initiator_link_receives_reverse_resource_and_proves_before_delivery() {
+        reverse_resource_completion_handoff(false, false, false);
+    }
+
+    #[test]
+    fn reverse_resource_owned_handoff_precedes_admission_release() {
+        reverse_resource_completion_handoff(true, false, false);
+    }
+
+    #[test]
+    fn reverse_split_resource_owned_handoff_uses_logical_id_once() {
+        reverse_resource_completion_handoff(true, true, false);
+    }
+
+    #[test]
+    fn reverse_resource_panicking_handoff_cleans_up_once_without_legacy_delivery() {
+        reverse_resource_completion_handoff(true, false, true);
+    }
+
+    fn reverse_resource_completion_handoff(owned: bool, split: bool, panics: bool) {
         let (tx, mut rx) = mpsc::channel(512);
         let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel();
         let mut mgr = LinkDeliveryManager::new(tx, None, None);
-        mgr.set_inbound_packet_sender(inbound_tx);
+        mgr.set_inbound_packet_sender(inbound_tx.clone());
         let admissions = Arc::new(AtomicUsize::new(0));
         let conclusions = Arc::new(AtomicUsize::new(0));
+        let handoffs = Arc::new(AtomicUsize::new(0));
+        let logical_id = [0x71; 32];
+        if owned {
+            let observed_conclusions = conclusions.clone();
+            let observed_handoffs = handoffs.clone();
+            mgr.set_inbound_resource_completion_handler(move |link_id, resource_id, data| {
+                assert_eq!(
+                    observed_conclusions.load(Ordering::Relaxed),
+                    0,
+                    "application admission is still live while the payload is handed off"
+                );
+                if split {
+                    assert_eq!(resource_id, logical_id);
+                }
+                observed_handoffs.fetch_add(1, Ordering::Relaxed);
+                assert!(!panics, "intentional completion handoff failure");
+                inbound_tx.send((data, link_id)).unwrap();
+            });
+        }
         let admission_counter = Arc::clone(&admissions);
         mgr.set_inbound_resource_accept_handler(move |_, _| {
             admission_counter.fetch_add(1, Ordering::Relaxed);
@@ -6455,80 +8454,99 @@ mod tests {
         while rx.try_recv().is_ok() {}
 
         let payload = vec![0x5A; 4_096];
-        let (mut transfer, remaining) = build_resource_transfer(
-            &responder_link,
-            payload.clone(),
-            false,
-            Duration::from_millis(25),
-        )
-        .unwrap();
-        assert!(remaining.is_none());
-        let resource_hash = transfer.resource.resource_hash;
-        let TransferAction::SendAdvertisement(advertisement) = transfer.tick() else {
-            panic!("first Resource action must be an advertisement");
-        };
-        let encrypted_advertisement = responder_link.encrypt(&advertisement).unwrap();
-        mgr.event_tx
-            .try_send(DestinationEvent::InboundPacket {
-                raw: link_data_packet(
-                    link_id,
-                    rns_wire::context::PacketContext::ResourceAdv,
-                    &encrypted_advertisement,
-                ),
-                interface_id: 0,
-                metrics: Default::default(),
-            })
+        let count = if split { 2 } else { 1 };
+        for segment_index in 1..=count {
+            let segment_size = payload.len() / count;
+            let (mut transfer, remaining) = build_resource_transfer(
+                &responder_link,
+                payload[(segment_index - 1) * segment_size..segment_index * segment_size].to_vec(),
+                false,
+                Duration::from_millis(25),
+            )
             .unwrap();
-        mgr.drain_events(&HashMap::new());
+            assert!(remaining.is_none());
+            if split {
+                transfer.resource.flags.split = true;
+                transfer.resource.original_hash = Some(logical_id);
+                transfer.resource.advertisement_data_size = payload.len();
+                transfer.resource.segment_index = segment_index;
+                transfer.resource.total_segments = count;
+            }
+            let resource_hash = transfer.resource.resource_hash;
+            let TransferAction::SendAdvertisement(advertisement) = transfer.tick() else {
+                panic!("first Resource action must be an advertisement");
+            };
+            let encrypted_advertisement = responder_link.encrypt(&advertisement).unwrap();
+            mgr.event_tx
+                .try_send(DestinationEvent::InboundPacket {
+                    raw: link_data_packet(
+                        link_id,
+                        rns_wire::context::PacketContext::ResourceAdv,
+                        &encrypted_advertisement,
+                    ),
+                    interface_id: 0,
+                    metrics: Default::default(),
+                })
+                .unwrap();
+            mgr.drain_events(&HashMap::new());
 
-        assert!(
-            mgr.pending[&link_id]
-                .inbound_resources
-                .contains_key(&resource_hash)
-        );
-        assert!(inbound_rx.try_recv().is_err());
+            assert!(
+                mgr.pending[&link_id]
+                    .inbound_resources
+                    .contains_key(&resource_hash)
+            );
+            assert!(inbound_rx.try_recv().is_err());
 
-        let mut proof_seen = false;
-        for _ in 0..128 {
-            let raw = next_outbound(&mut rx);
-            let (header, offset) = rns_wire::header::PacketHeader::unpack(&raw).unwrap();
-            match header.context {
-                rns_wire::context::PacketContext::ResourceReq => {
-                    let request = responder_link.decrypt(&raw[offset..]).unwrap();
-                    for action in transfer.handle_request(&request) {
-                        if let TransferAction::SendPart(_, part) = action {
-                            mgr.event_tx
-                                .try_send(DestinationEvent::InboundPacket {
-                                    raw: link_data_packet(
-                                        link_id,
-                                        rns_wire::context::PacketContext::Resource,
-                                        &part,
-                                    ),
-                                    interface_id: 0,
-                                    metrics: Default::default(),
-                                })
-                                .unwrap();
+            let mut proof_seen = false;
+            for _ in 0..128 {
+                let raw = next_outbound(&mut rx);
+                let (header, offset) = rns_wire::header::PacketHeader::unpack(&raw).unwrap();
+                match header.context {
+                    rns_wire::context::PacketContext::ResourceReq => {
+                        let request = responder_link.decrypt(&raw[offset..]).unwrap();
+                        for action in transfer.handle_request(&request) {
+                            if let TransferAction::SendPart(_, part) = action {
+                                mgr.event_tx
+                                    .try_send(DestinationEvent::InboundPacket {
+                                        raw: link_data_packet(
+                                            link_id,
+                                            rns_wire::context::PacketContext::Resource,
+                                            &part,
+                                        ),
+                                        interface_id: 0,
+                                        metrics: Default::default(),
+                                    })
+                                    .unwrap();
+                            }
                         }
+                        mgr.drain_events(&HashMap::new());
                     }
-                    mgr.drain_events(&HashMap::new());
+                    rns_wire::context::PacketContext::ResourcePrf => {
+                        assert_eq!(header.flags.packet_type, rns_wire::flags::PacketType::Proof);
+                        assert!(transfer.handle_proof(&raw[offset..]));
+                        proof_seen = true;
+                        break;
+                    }
+                    other => panic!("unexpected reverse Resource control packet: {other:?}"),
                 }
-                rns_wire::context::PacketContext::ResourcePrf => {
-                    assert_eq!(header.flags.packet_type, rns_wire::flags::PacketType::Proof);
-                    assert!(transfer.handle_proof(&raw[offset..]));
-                    proof_seen = true;
-                    break;
-                }
-                other => panic!("unexpected reverse Resource control packet: {other:?}"),
+            }
+            assert!(proof_seen);
+            if segment_index < count {
+                assert!(inbound_rx.try_recv().is_err());
+                assert_eq!(conclusions.load(Ordering::Relaxed), 0);
+                assert_eq!(handoffs.load(Ordering::Relaxed), 0);
             }
         }
-        assert!(proof_seen);
-        let (delivered, delivered_link_id) = inbound_rx.try_recv().unwrap();
-        assert_eq!(delivered, payload);
-        assert_eq!(delivered_link_id, link_id);
+        if !panics {
+            let (delivered, delivered_link_id) = inbound_rx.try_recv().unwrap();
+            assert_eq!(delivered, payload);
+            assert_eq!(delivered_link_id, link_id);
+        }
         assert!(inbound_rx.try_recv().is_err());
         assert!(mgr.pending[&link_id].inbound_resources.is_empty());
-        assert_eq!(admissions.load(Ordering::Relaxed), 1);
+        assert_eq!(admissions.load(Ordering::Relaxed), count);
         assert_eq!(conclusions.load(Ordering::Relaxed), 1);
+        assert_eq!(handoffs.load(Ordering::Relaxed), usize::from(owned));
     }
 
     #[test]

@@ -25,6 +25,48 @@ delivery methods, proofs, persistence, or runtime behavior. Later reductions
 to the broader module tree require a reviewed API diff, downstream migration,
 and an explicit version decision.
 
+## Delivery-owner integration
+
+`LinkDeliveryManager::set_link_endpoint_dispatch_handle` opts Direct packet
+sends into the Reticulum owner's exact local-admission receipts. Supply the
+handle from the same runtime that owns the manager's transport channel.
+Local FIFO residence and the subsequent measured-RTT proof wait are different
+phases; neither is a recipient delivery confirmation.
+
+Applications using responder-owned backchannels should forward the ordered
+`LinkManagerAccountingEvent` packet and Resource wait observations through
+`observe_backchannel_packet_wait` and `observe_backchannel_resource_wait`,
+retaining the exact packet/resource identity and original timestamps.
+Forward the optional exact packet-cancellation capability with its original
+wait observation as well. A separate application owner can then cancel a
+packet still awaiting local admission without closing the shared Link. This
+cannot retract driver-admitted bytes. When a command receipt cannot be
+published to its message owner, retain its exact identity for bounded cleanup;
+close and drain a oneshot receiver before discarding it to fence concurrent
+publication.
+Adapters implementing that close-and-drain protocol can install their sender
+with `set_cancellation_aware_backchannel_sender`, allowing cancellation before
+the command receipt arrives to notify the adapter immediately. The existing
+`set_backchannel_sender` retains legacy receipt-after-cancellation behavior.
+Each pending send captures its adapter policy; replacing a sender does not
+retroactively change cancellation semantics for older sends.
+`message_timeout_window` exposes the finite current owner window for an outer
+orphan watchdog. Externally observed Resource windows include a bounded
+180-second notification allowance measured from the original protocol deadline;
+this does not alter the Resource engine's timeout or delay explicit terminal
+events. It is not renewed by receiving the same observation or by keepalives.
+Queued messages without an active protocol owner receive no
+blanket timeout exemption. Explicit rejection and cancellation are not evidence
+of a failed route.
+
+Applications that reserve inbound attachment memory can opt into
+`set_inbound_resource_completion_handler`. It receives one owned completed
+payload before the ordinary conclusion callback, so an application can move
+its exact Link/Resource reservation into a queued payload and retain it through
+processing. This synchronous callback must not block. It replaces the legacy
+inbound packet-channel delivery for that Resource, without cloning the data;
+applications that do not install it keep the existing completion behavior.
+
 ## Compatibility checks
 
 The `api/` directory contains the evidence used by CI:
