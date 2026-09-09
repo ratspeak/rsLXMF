@@ -468,6 +468,7 @@ pub lxmf_core::link_delivery::DirectLinkStartReport::link_state: rns_link::link:
 pub lxmf_core::link_delivery::DirectLinkStartReport::queued_deliveries: usize
 pub struct lxmf_core::link_delivery::LinkDeliveryManager
 impl lxmf_core::link_delivery::LinkDeliveryManager
+pub fn lxmf_core::link_delivery::LinkDeliveryManager::abandon_backchannel_packet(&mut self, [u8; 16], [u8; 32]) -> bool
 pub fn lxmf_core::link_delivery::LinkDeliveryManager::backchannel_link_snapshot(&self, [u8; 16]) -> core::option::Option<lxmf_core::link_delivery::BackchannelLinkSnapshot>
 pub fn lxmf_core::link_delivery::LinkDeliveryManager::cancel_delivery_by_message_hash(&mut self, [u8; 32]) -> bool
 pub fn lxmf_core::link_delivery::LinkDeliveryManager::delivery_link_available(&self, &[u8; 16]) -> bool
@@ -485,16 +486,22 @@ pub fn lxmf_core::link_delivery::LinkDeliveryManager::handle_request(&mut self, 
 pub fn lxmf_core::link_delivery::LinkDeliveryManager::handle_resource_proof(&mut self, &[u8; 16], &[u8]) -> bool
 pub fn lxmf_core::link_delivery::LinkDeliveryManager::handle_resource_reject(&mut self, &[u8; 16], &[u8]) -> bool
 pub fn lxmf_core::link_delivery::LinkDeliveryManager::message_delivery_snapshot(&self, [u8; 32]) -> core::option::Option<lxmf_core::link_delivery::MessageDeliverySnapshot>
+pub fn lxmf_core::link_delivery::LinkDeliveryManager::message_timeout_window(&self, [u8; 32]) -> core::option::Option<(std::time::Instant, core::time::Duration)>
 pub fn lxmf_core::link_delivery::LinkDeliveryManager::new(tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>, core::option::Option<[u8; 64]>, core::option::Option<rns_crypto::ed25519::Ed25519PrivateKey>) -> Self
+pub fn lxmf_core::link_delivery::LinkDeliveryManager::observe_backchannel_packet_wait(&mut self, [u8; 16], [u8; 32], std::time::Instant, core::time::Duration, bool, core::option::Option<rns_transport::link_endpoint_dispatch::LinkEndpointDispatchCancellation>) -> bool
+pub fn lxmf_core::link_delivery::LinkDeliveryManager::observe_backchannel_resource_wait(&mut self, [u8; 16], [u8; 32], std::time::Instant, core::time::Duration) -> bool
 pub fn lxmf_core::link_delivery::LinkDeliveryManager::pending_count(&self) -> usize
 pub fn lxmf_core::link_delivery::LinkDeliveryManager::register_backchannel(&mut self, [u8; 16], [u8; 16])
 pub fn lxmf_core::link_delivery::LinkDeliveryManager::remove_backchannel(&mut self, &[u8; 16]) -> core::option::Option<[u8; 16]>
 pub fn lxmf_core::link_delivery::LinkDeliveryManager::session_count(&self) -> usize
 pub fn lxmf_core::link_delivery::LinkDeliveryManager::set_backchannel_sender(&mut self, tokio::sync::mpsc::bounded::Sender<lxmf_core::link_delivery::BackchannelSendCommand>)
+pub fn lxmf_core::link_delivery::LinkDeliveryManager::set_cancellation_aware_backchannel_sender(&mut self, tokio::sync::mpsc::bounded::Sender<lxmf_core::link_delivery::BackchannelSendCommand>)
 pub fn lxmf_core::link_delivery::LinkDeliveryManager::set_inbound_packet_sender(&mut self, tokio::sync::mpsc::unbounded::UnboundedSender<(alloc::vec::Vec<u8>, [u8; 16])>)
 pub fn lxmf_core::link_delivery::LinkDeliveryManager::set_inbound_resource_accept_handler<F>(&mut self, F) where F: core::ops::function::Fn([u8; 16], &rns_protocol::resource_adv::ResourceAdvertisement) -> bool + core::marker::Send + core::marker::Sync + 'static
+pub fn lxmf_core::link_delivery::LinkDeliveryManager::set_inbound_resource_completion_handler<F>(&mut self, F) where F: core::ops::function::Fn([u8; 16], [u8; 32], alloc::vec::Vec<u8>) + core::marker::Send + core::marker::Sync + 'static
 pub fn lxmf_core::link_delivery::LinkDeliveryManager::set_inbound_resource_concluded_handler<F>(&mut self, F) where F: core::ops::function::Fn([u8; 16], [u8; 32]) + core::marker::Send + core::marker::Sync + 'static
 pub fn lxmf_core::link_delivery::LinkDeliveryManager::set_inbound_resource_limit_bytes(&mut self, usize)
+pub fn lxmf_core::link_delivery::LinkDeliveryManager::set_link_endpoint_dispatch_handle(&mut self, rns_transport::link_endpoint_dispatch::LinkEndpointDispatchHandle)
 pub fn lxmf_core::link_delivery::LinkDeliveryManager::start_backchannel_delivery(&mut self, lxmf_core::message::LxMessage, [u8; 16]) -> core::result::Result<lxmf_core::link_delivery::BackchannelStartReport, lxmf_core::link_delivery::BackchannelStartFailure>
 pub fn lxmf_core::link_delivery::LinkDeliveryManager::start_delivery(&mut self, lxmf_core::message::LxMessage, [u8; 16], u8) -> core::result::Result<[u8; 16], lxmf_core::link_delivery::LinkDeliveryStartFailure>
 pub fn lxmf_core::link_delivery::LinkDeliveryManager::start_delivery_with_report(&mut self, lxmf_core::message::LxMessage, [u8; 16], u8) -> core::result::Result<lxmf_core::link_delivery::DirectLinkStartReport, lxmf_core::link_delivery::LinkDeliveryStartFailure>

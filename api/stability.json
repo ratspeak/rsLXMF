@@ -19,16 +19,17 @@
     "sourceCommit": "b8d7afce73f7f098706029361568e63f22888ea3"
   },
   "snapshotSource": {
-    "commit": "2ab8fdf22b55bf18708c7181da5d4e07801e7699",
-    "capturedOn": "2026-08-21",
+    "commit": "8db95825c568ace467c99d2011cefe618e1c60fc",
+    "capturedOn": "2026-09-08",
     "review": {
       "areas": [
-        "message construction and inspection",
-        "message status and identifiers",
-        "owned router persistence snapshots",
-        "Link establishment timing and timing-aware delivery starts"
+        "Exact local packet admission and proof-clock ownership",
+        "Finite original Resource windows and bounded external observation grace",
+        "Cancellation-aware backchannel adapters with legacy compatibility",
+        "Generation-safe cleanup, settlement and queued-message preservation",
+        "Owned reverse Resource completion handoff"
       ],
-      "canonicalPath": "lxmf_core::message_api",
+      "canonicalPath": "lxmf_core::link_delivery::LinkDeliveryManager",
       "retainedPaths": [
         "lxmf_core::message",
         "lxmf_core::constants",
@@ -41,18 +42,21 @@
         "serialized persistence representations",
         "raw Reticulum transport channels"
       ],
-      "classification": "compatible additive facade and provisional integration APIs",
+      "classification": "compatible additive opt-in provisional delivery-owner integration; existing message facade and public signatures remain unchanged",
       "publicApiDiff": {
-        "added": 86,
+        "added": 93,
         "removed": 0
       },
       "semver": "compatible additive APIs included in version 1.2.0",
       "deprecations": "none",
-      "wirePersistenceRuntimeImpact": "no wire-format or persisted-layout change; exact message re-exports are behavior-neutral, owned router snapshots preserve the existing MessagePack layout, and Link establishment deadlines now follow authoritative first-hop timing while existing start methods remain available with the Reticulum fallback",
+      "wirePersistenceRuntimeImpact": "No wire-format, cryptography, message identity or persisted-layout change. Exact local Link admission precedes RTT proof timing. Resource owner windows retain original timestamps; only externally observed Resources receive a finite 180-second accounting allowance after the original protocol deadline. Cancellation-aware adapters close and drain unpublished receipts while legacy sender installation retains its previous behavior. Exact cleanup is bounded and cannot erase replacement Links or lose uncancelled queued messages; authenticated settlement remains owned after Link closure. Optional reverse Resource completion hands off the single owned payload before conclusion cleanup, without changing legacy consumers.",
       "platformEvidence": [
-        "compiled message example and external canonical and legacy fixtures",
-        "lxmf-core owned router snapshot and upstream-compatible Link timing unit tests",
-        "macOS and Ubuntu workspace test jobs for source commit 2ab8fdf22b55bf18708c7181da5d4e07801e7699"
+        "clean committed-source all-feature Apple ARM64 snapshot: seven added methods, zero removed; cumulative compatibility-floor diff is 93 additions and zero removals",
+        "564 LXMF core and 55 daemon tests passed on the final implementation checkpoint; strict all-target Clippy and core Rustdoc passed",
+        "independent actual-actor cancellation, captured legacy/aware policy, 256-owner reservation and replacement-Link/settlement review controls passed",
+        "actual encrypted Resource final-proof expiry and same-message retry produced one receiver publication; signed Link reuse/loss/recovery and completion-lease controls passed",
+        "default/all-feature external consumer fixtures and final working app runtime suite passed; no feature/MSRV/native-export changes",
+        "final clean combined host/MSRV/native/interop and artifact qualification remain separately required; focused software evidence is not physical fading-radio or mobile acceptance"
       ]
     }
   },
@@ -63,8 +67,8 @@
       "tier": "candidate-stable",
       "compatibility": "reviewed-snapshot",
       "snapshot": "api/snapshots/lxmf-core.txt",
-      "itemCount": 1638,
-      "sha256": "5b59de793250e211cd206c06e8e70147d91e40c45ba1d28fb659a4a354e2fd96"
+      "itemCount": 1645,
+      "sha256": "65aebd34c72bb2b621d515331bba1f4d85234c448d1c7039132f24c0a95bbe4a"
     },
     {
       "name": "lxmf-tools",
