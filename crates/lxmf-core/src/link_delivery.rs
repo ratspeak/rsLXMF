@@ -4126,7 +4126,7 @@ impl LinkDeliveryManager {
         let mut cancelled = false;
 
         for (link_id, delivery) in &mut self.pending {
-            if delivery.msg_hash == Some(msg_hash) {
+            if delivery.state != DeliveryState::Idle && delivery.msg_hash == Some(msg_hash) {
                 let establishing = delivery.state == DeliveryState::Establishing;
                 let establishment_started = delivery.started_at;
                 cancel_current_delivery(
@@ -6565,6 +6565,413 @@ mod tests {
         mgr.poll_endpoint_control();
         assert!(mgr.tick().is_empty());
         assert_eq!(mgr.pending_count(), 0);
+    }
+
+    #[test]
+    fn release_regression_prior_authenticated_packet_proof_cannot_settle_following_message() {
+        for cancel_first in [false, true] {
+            let (tx, mut rx) = mpsc::channel(128);
+            let mut mgr = LinkDeliveryManager::new(tx, None, None);
+            let peer_key = Ed25519PrivateKey::generate();
+            let dest = [0x25; 16];
+            let first = timing_message("old packet proof owner");
+            let first_hash = first.hash.unwrap();
+            let (link_id, peer) =
+                establish_active_delivery(&mut mgr, &mut rx, first, &peer_key, dest);
+            mgr.pending.get_mut(&link_id).unwrap().link.rtt = Some(Duration::from_secs(1));
+            assert!(mgr.tick().is_empty());
+            let first_packet = next_outbound(&mut rx);
+            let (header, _) = rns_wire::header::PacketHeader::unpack(&first_packet).unwrap();
+            let old_proof = peer
+                .prove_packet_with_local_signer(&rns_wire::hash::packet_hash(
+                    &first_packet,
+                    header.flags.header_type,
+                ))
+                .unwrap();
+            let next = timing_message("new packet proof owner");
+            let next_hash = next.hash.unwrap();
+            let next_packed = next.pack().unwrap();
+            assert_eq!(mgr.start_delivery(next, dest, 1).unwrap(), link_id);
+            if cancel_first {
+                assert!(mgr.cancel_delivery_by_message_hash(first_hash));
+            } else {
+                assert!(mgr.handle_link_packet_proof(&link_id, &old_proof));
+                assert!(matches!(mgr.tick().as_slice(), [DeliveryResult::Complete {
+                    msg_hash: Some(hash), ..
+                }] if *hash == first_hash));
+            }
+            assert!(mgr.tick().is_empty());
+            let next_packet = next_outbound(&mut rx);
+            let (header, offset) = rns_wire::header::PacketHeader::unpack(&next_packet).unwrap();
+            assert_eq!(peer.decrypt(&next_packet[offset..]).unwrap(), next_packed);
+            mgr.poll_endpoint_control();
+            let original_window = mgr.message_timeout_window(next_hash).unwrap();
+            for _ in 0..3 {
+                assert!(!mgr.handle_link_packet_proof(&link_id, &old_proof));
+                assert!(mgr.tick().is_empty());
+                assert_eq!(mgr.message_timeout_window(next_hash), Some(original_window));
+                assert_eq!(mgr.pending_count(), 1);
+            }
+            let next_proof = peer
+                .prove_packet_with_local_signer(&rns_wire::hash::packet_hash(
+                    &next_packet,
+                    header.flags.header_type,
+                ))
+                .unwrap();
+            assert!(mgr.handle_link_packet_proof(&link_id, &next_proof));
+            assert!(matches!(mgr.tick().as_slice(), [DeliveryResult::Complete {
+                msg_hash: Some(hash), ..
+            }] if *hash == next_hash));
+            assert!(!mgr.handle_link_packet_proof(&link_id, &old_proof));
+            assert!(!mgr.handle_link_packet_proof(&link_id, &next_proof));
+            assert!(mgr.tick().is_empty());
+            assert_eq!(mgr.pending_count(), 0);
+            let events = mgr.take_delivery_events();
+            let delivered: Vec<_> = events
+                .iter()
+                .filter(|event| event.kind == LxmfDeliveryEventKind::Delivered)
+                .map(|event| event.msg_hash.unwrap())
+                .collect();
+            assert_eq!(
+                delivered,
+                if cancel_first {
+                    vec![next_hash]
+                } else {
+                    vec![first_hash, next_hash]
+                }
+            );
+            assert!(
+                events
+                    .iter()
+                    .all(|event| event.kind != LxmfDeliveryEventKind::Failed)
+            );
+        }
+    }
+
+    #[test]
+    fn release_regression_cancel_active_resource_preserves_two_queued_payloads() {
+        let (tx, mut rx) = mpsc::channel(128);
+        let mut mgr = LinkDeliveryManager::new(tx, None, None);
+        let peer_key = Ed25519PrivateKey::generate();
+        let dest = [0x26; 16];
+        let mut resource = timing_message("cancel active Resource");
+        resource.content = "resource body".repeat(1_000);
+        resource.sign(&Ed25519PrivateKey::generate()).unwrap();
+        let cancelled_hash = resource.hash.unwrap();
+        let (link_id, peer) =
+            establish_active_delivery(&mut mgr, &mut rx, resource, &peer_key, dest);
+        mgr.pending.get_mut(&link_id).unwrap().link.rtt = Some(Duration::from_secs(1));
+        assert!(mgr.tick().is_empty());
+        assert_eq!(mgr.pending[&link_id].state, DeliveryState::Transferring);
+        assert!(mgr.tick().is_empty());
+        let advertisement = next_outbound(&mut rx);
+        let (header, _) = rns_wire::header::PacketHeader::unpack(&advertisement).unwrap();
+        assert_eq!(
+            header.context,
+            rns_wire::context::PacketContext::ResourceAdv
+        );
+        // Capture the old transfer's valid proof identity. This is a private
+        // coordinator seam, not a claim that this receiver has finished it.
+        let transfer = mgr.pending[&link_id].transfer.as_ref().unwrap();
+        let resource_hash = transfer.resource.resource_hash;
+        let old_proof = [
+            resource_hash.as_slice(),
+            transfer.resource.expected_proof.as_slice(),
+        ]
+        .concat();
+        let mut followers = [
+            timing_message("queued after Resource one"),
+            timing_message("queued after Resource two"),
+        ];
+        let hashes = followers.each_ref().map(|message| message.hash.unwrap());
+        let packed = followers.each_mut().map(|message| message.pack().unwrap());
+        for message in followers {
+            assert_eq!(mgr.start_delivery(message, dest, 1).unwrap(), link_id);
+        }
+        assert_eq!(mgr.pending_count(), 3);
+        assert!(mgr.cancel_delivery_by_message_hash(cancelled_hash));
+        assert_eq!(mgr.pending_count(), 2);
+        assert!(!mgr.cancel_delivery_by_message_hash(cancelled_hash));
+        assert!(!mgr.handle_resource_proof(&link_id, &old_proof));
+        let cancel_packet = next_outbound(&mut rx);
+        let (header, offset) = rns_wire::header::PacketHeader::unpack(&cancel_packet).unwrap();
+        assert_eq!(
+            header.context,
+            rns_wire::context::PacketContext::ResourceIcl
+        );
+        assert_eq!(
+            peer.decrypt(&cancel_packet[offset..]).unwrap(),
+            resource_hash
+        );
+        for (index, expected) in packed.iter().enumerate() {
+            assert!(mgr.tick().is_empty());
+            let packet = next_outbound(&mut rx);
+            let (header, offset) = rns_wire::header::PacketHeader::unpack(&packet).unwrap();
+            assert_eq!(header.context, rns_wire::context::PacketContext::None);
+            assert_eq!(&peer.decrypt(&packet[offset..]).unwrap(), expected);
+            mgr.poll_endpoint_control();
+            let window = mgr.message_timeout_window(hashes[index]).unwrap();
+            assert!(!mgr.handle_resource_proof(&link_id, &old_proof));
+            assert_eq!(mgr.message_timeout_window(hashes[index]), Some(window));
+            let proof = peer
+                .prove_packet_with_local_signer(&rns_wire::hash::packet_hash(
+                    &packet,
+                    header.flags.header_type,
+                ))
+                .unwrap();
+            assert!(mgr.handle_link_packet_proof(&link_id, &proof));
+            assert!(matches!(mgr.tick().as_slice(), [DeliveryResult::Complete {
+                msg_hash: Some(hash), ..
+            }] if *hash == hashes[index]));
+        }
+        assert!(mgr.tick().is_empty());
+        assert_eq!(mgr.pending_count(), 0);
+        assert!(mgr.delivery_link_available(&dest));
+        let events = mgr.take_delivery_events();
+        let delivered: Vec<_> = events
+            .iter()
+            .filter(|event| event.kind == LxmfDeliveryEventKind::Delivered)
+            .map(|event| event.msg_hash.unwrap())
+            .collect();
+        assert_eq!(delivered, hashes);
+        assert!(
+            events
+                .iter()
+                .all(|event| event.kind != LxmfDeliveryEventKind::Failed)
+        );
+    }
+
+    #[test]
+    fn release_regression_retired_resource_events_cannot_poison_same_link_successor() {
+        for cancel_first in [false, true] {
+            let (tx, _rx) = mpsc::channel(16);
+            let (commands, mut command_rx) = mpsc::channel(16);
+            let mut mgr = LinkDeliveryManager::new(tx, None, None);
+            mgr.set_cancellation_aware_backchannel_sender(commands);
+            let dest = [0x27; 16];
+            let link_id = [0x28; 16];
+            let old_resource = [0x29; 32];
+            let new_resource = [0x2A; 32];
+            mgr.register_backchannel(dest, link_id);
+            let first = timing_message("old same-Link Resource");
+            let first_hash = first.hash.unwrap();
+            mgr.start_backchannel_delivery(first, dest).unwrap();
+            command_rx
+                .try_recv()
+                .unwrap()
+                .result_tx
+                .send(Ok(BackchannelSendReceipt::Resource {
+                    link_id,
+                    resource_hash: old_resource,
+                }))
+                .unwrap();
+            assert!(mgr.tick().is_empty());
+            if cancel_first {
+                assert!(mgr.cancel_delivery_by_message_hash(first_hash));
+                let cancels = mgr.take_backchannel_resource_cancellations();
+                assert_eq!(cancels.len(), 1);
+                assert_eq!(
+                    (cancels[0].link_id, cancels[0].resource_hash),
+                    (link_id, old_resource)
+                );
+            } else {
+                assert!(
+                    matches!(mgr.handle_backchannel_resource_proof(link_id, old_resource),
+                    Some(DeliveryResult::Complete { msg_hash: Some(hash), .. }) if hash == first_hash)
+                );
+            }
+            let next = timing_message("new same-Link Resource");
+            let next_hash = next.hash.unwrap();
+            mgr.start_backchannel_delivery(next, dest).unwrap();
+            let next_receipt = command_rx.try_recv().unwrap();
+            let command_window = mgr.message_timeout_window(next_hash).unwrap();
+            // Receipt publication is still outstanding, so the adapter cannot
+            // yet know which Resource ID belongs to this pending command.
+            assert!(
+                mgr.handle_backchannel_resource_proof(link_id, old_resource)
+                    .is_none()
+            );
+            assert!(
+                mgr.handle_backchannel_resource_conclusion(
+                    link_id,
+                    old_resource,
+                    BackchannelResourceConclusion::Rejected,
+                    "late old rejection"
+                )
+                .is_none()
+            );
+            let _ = mgr.observe_backchannel_resource_wait(
+                link_id,
+                old_resource,
+                Instant::now(),
+                Duration::MAX,
+            );
+            assert_eq!(mgr.message_timeout_window(next_hash), Some(command_window));
+            next_receipt
+                .result_tx
+                .send(Ok(BackchannelSendReceipt::Resource {
+                    link_id,
+                    resource_hash: new_resource,
+                }))
+                .unwrap();
+            assert!(mgr.tick().is_empty());
+            let started = Instant::now();
+            assert!(mgr.observe_backchannel_resource_wait(
+                link_id,
+                new_resource,
+                started,
+                Duration::from_secs(17)
+            ));
+            let window = Some((started, Duration::from_secs(197)));
+            assert_eq!(mgr.message_timeout_window(next_hash), window);
+            for _ in 0..3 {
+                assert!(
+                    mgr.handle_backchannel_resource_proof(link_id, old_resource)
+                        .is_none()
+                );
+                assert!(
+                    mgr.handle_backchannel_resource_conclusion(
+                        link_id,
+                        old_resource,
+                        BackchannelResourceConclusion::Failed,
+                        "late old failure"
+                    )
+                    .is_none()
+                );
+                assert!(!mgr.observe_backchannel_resource_wait(
+                    link_id,
+                    old_resource,
+                    Instant::now(),
+                    Duration::MAX
+                ));
+                assert_eq!(mgr.message_timeout_window(next_hash), window);
+                assert!(mgr.tick().is_empty());
+                assert_eq!(mgr.pending_count(), 1);
+                assert_eq!(
+                    mgr.backchannel_link_snapshot(dest)
+                        .unwrap()
+                        .in_flight_deliveries,
+                    1
+                );
+            }
+            assert!(
+                matches!(mgr.handle_backchannel_resource_proof(link_id, new_resource),
+                Some(DeliveryResult::Complete { msg_hash: Some(hash), .. }) if hash == next_hash)
+            );
+            assert!(
+                mgr.handle_backchannel_resource_proof(link_id, new_resource)
+                    .is_none()
+            );
+            assert!(mgr.tick().is_empty());
+            assert!(mgr.take_backchannel_resource_cancellations().is_empty());
+            assert_eq!(mgr.pending_count(), 0);
+            assert_eq!(mgr.backchannel_links.get(&dest), Some(&link_id));
+            let events = mgr.take_delivery_events();
+            let delivered: Vec<_> = events
+                .iter()
+                .filter(|event| event.kind == LxmfDeliveryEventKind::Delivered)
+                .map(|event| event.msg_hash.unwrap())
+                .collect();
+            assert_eq!(
+                delivered,
+                if cancel_first {
+                    vec![next_hash]
+                } else {
+                    vec![first_hash, next_hash]
+                }
+            );
+            assert!(events.iter().all(|event| !matches!(
+                event.kind,
+                LxmfDeliveryEventKind::Failed | LxmfDeliveryEventKind::Rejected
+            )));
+        }
+    }
+
+    #[test]
+    fn release_regression_idle_historical_hash_is_not_a_live_cancellation_owner() {
+        for cancel_first in [false, true] {
+            let (tx, mut rx) = mpsc::channel(128);
+            let mut mgr = LinkDeliveryManager::new(tx, None, None);
+            let peer_key = Ed25519PrivateKey::generate();
+            let dest = [0x2B; 16];
+            let first = timing_message("historical idle delivery");
+            let historical_hash = first.hash.unwrap();
+            let retry_same_hash = first.clone();
+            let (link_id, peer) =
+                establish_active_delivery(&mut mgr, &mut rx, first, &peer_key, dest);
+            mgr.pending.get_mut(&link_id).unwrap().link.rtt = Some(Duration::from_secs(1));
+            assert!(mgr.tick().is_empty());
+            let first_packet = next_outbound(&mut rx);
+            mgr.poll_endpoint_control();
+            if cancel_first {
+                assert!(mgr.cancel_delivery_by_message_hash(historical_hash));
+            } else {
+                let (header, _) = rns_wire::header::PacketHeader::unpack(&first_packet).unwrap();
+                let proof = peer
+                    .prove_packet_with_local_signer(&rns_wire::hash::packet_hash(
+                        &first_packet,
+                        header.flags.header_type,
+                    ))
+                    .unwrap();
+                assert!(mgr.handle_link_packet_proof(&link_id, &proof));
+                assert!(matches!(mgr.tick().as_slice(), [DeliveryResult::Complete {
+                    msg_hash: Some(hash), ..
+                }] if *hash == historical_hash));
+            }
+            assert_eq!(mgr.pending[&link_id].state, DeliveryState::Idle);
+            assert_eq!(mgr.pending[&link_id].msg_hash, Some(historical_hash));
+            assert_eq!(mgr.pending_count(), 0);
+            mgr.take_delivery_events();
+            for _ in 0..3 {
+                assert!(!mgr.cancel_delivery_by_message_hash(historical_hash));
+                assert!(mgr.tick().is_empty());
+                assert!(mgr.take_delivery_events().is_empty());
+                assert!(
+                    rx.try_recv().is_err(),
+                    "idle cancellation emits no wire control"
+                );
+            }
+            assert!(mgr.delivery_link_available(&dest));
+
+            // The same logical hash is not globally blacklisted: a new queued
+            // attempt is a live owner and remains independently cancellable.
+            let next = timing_message("future distinct owner");
+            let next_hash = next.hash.unwrap();
+            let next_packed = next.pack().unwrap();
+            assert_eq!(mgr.start_delivery(next, dest, 1).unwrap(), link_id);
+            assert_eq!(
+                mgr.start_delivery(retry_same_hash, dest, 1).unwrap(),
+                link_id
+            );
+            assert_eq!(mgr.pending_count(), 2);
+            let next_window = mgr.message_timeout_window(next_hash).unwrap();
+            assert!(mgr.cancel_delivery_by_message_hash(historical_hash));
+            assert!(!mgr.cancel_delivery_by_message_hash(historical_hash));
+            assert_eq!(mgr.pending_count(), 1);
+            assert_eq!(mgr.message_timeout_window(next_hash), Some(next_window));
+            assert!(mgr.tick().is_empty());
+            let packet = next_outbound(&mut rx);
+            let (header, offset) = rns_wire::header::PacketHeader::unpack(&packet).unwrap();
+            assert_eq!(peer.decrypt(&packet[offset..]).unwrap(), next_packed);
+            let proof = peer
+                .prove_packet_with_local_signer(&rns_wire::hash::packet_hash(
+                    &packet,
+                    header.flags.header_type,
+                ))
+                .unwrap();
+            assert!(mgr.handle_link_packet_proof(&link_id, &proof));
+            assert!(matches!(mgr.tick().as_slice(), [DeliveryResult::Complete {
+                msg_hash: Some(hash), ..
+            }] if *hash == next_hash));
+            assert!(!mgr.cancel_delivery_by_message_hash(next_hash));
+            assert!(mgr.tick().is_empty());
+            assert_eq!(mgr.pending_count(), 0);
+            assert!(
+                mgr.take_delivery_events()
+                    .iter()
+                    .all(|event| event.kind != LxmfDeliveryEventKind::Failed)
+            );
+        }
     }
 
     #[test]
@@ -9439,6 +9846,7 @@ mod tests {
 
         assert!(mgr.cancel_delivery_by_message_hash(msg_hash));
         assert_eq!(mgr.pending_count(), 0);
+        assert!(!mgr.cancel_delivery_by_message_hash(msg_hash));
         assert_eq!(mgr.session_count(), 1);
         assert!(mgr.delivery_link_available(&dest_hash));
         assert_eq!(
