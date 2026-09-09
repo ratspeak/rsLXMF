@@ -745,6 +745,17 @@ impl PropagationNode {
                     PropagationEntry::new_stamped(tid, message_hash, destination_hash, size, sv);
                 pe.stored_at = ts;
 
+                // Older app hosts persisted opaque blobs without their PN
+                // stamp. Their filename TID hashes the entire file, whereas
+                // canonical stamped storage hashes the file before its final
+                // 32-byte stamp. Recover that exact legacy representation so
+                // client /get cannot truncate ciphertext after a restart.
+                // This distinguishes storage format, not stamp authenticity;
+                // retain the existing policy for other opaque/malformed files.
+                if data.len() > DESTINATION_LENGTH && message_hash == tid {
+                    pe.stamped = false;
+                }
+
                 if let Ok(msg) = LxMessage::unpack(&data) {
                     pe.message_hash = msg.hash.unwrap_or([0u8; 32]);
                     pe.destination_hash = msg.destination_hash;
@@ -2840,7 +2851,138 @@ mod tests {
         let value: Value = rmpv::decode::read_value(&mut &response[..]).unwrap();
         assert_eq!(value.as_array().unwrap().len(), 1);
 
+        let full_id = rns_crypto::sha::full_hash(&lxmf_data);
+        let get_request = Value::Array(vec![
+            Value::Array(vec![Value::Binary(full_id.to_vec())]),
+            Value::Array(vec![]),
+        ]);
+        let mut get_buf = Vec::new();
+        rmpv::encode::write_value(&mut get_buf, &get_request).unwrap();
+        let response = reloaded
+            .handle_get_request(&get_buf, &[0xBB; 16])
+            .into_response();
+        let value: Value = rmpv::decode::read_value(&mut &response[..]).unwrap();
+        assert_eq!(
+            value.as_array().unwrap()[0].as_slice().unwrap(),
+            lxmf_data.as_slice(),
+            "legacy opaque blobs have no stamp to strip after restart"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_opaque_blob_reload_preserves_bytes_and_accounting_at_minimum_lengths() {
+        use rmpv::Value;
+
+        // These are storage-format controls, not authenticated ciphertext or
+        // stamp-validation tests. Retain the existing public ingress minimum.
+        for stamped in [false, true] {
+            for len in [17, 31, 32, 33, 48, 49, 144] {
+                let dir = tempfile::tempdir().unwrap();
+                let mut node = PropagationNode::with_storage(
+                    PropagationNodeConfig::default(),
+                    [0xAA; 16],
+                    dir.path().to_path_buf(),
+                )
+                .unwrap();
+                assert!(!node.accept_propagated_blob(&[0xBB; 16], 0));
+                assert!(!node.accept_stamped_propagated_blob(&[0xBB; 16], &[0; 32], 0));
+                assert_eq!(node.message_count(), 0);
+                let mut blob = vec![0xBB; 16];
+                blob.resize(len, 0xCC);
+                let stamp = [0x5A; 32];
+                let full_id = rns_crypto::sha::full_hash(&blob);
+                let mut stored = blob.clone();
+                if stamped {
+                    stored.extend_from_slice(&stamp);
+                    assert!(node.accept_stamped_propagated_blob(&blob, &stamp, 0));
+                } else {
+                    assert!(node.accept_propagated_blob(&blob, 0));
+                }
+                assert_eq!(node.total_size(), stored.len());
+                let path = dir
+                    .path()
+                    .join(node.store.get(&full_id).unwrap().filename());
+                assert_eq!(std::fs::read(&path).unwrap(), stored);
+                drop(node);
+
+                let mut node = PropagationNode::with_storage(
+                    PropagationNodeConfig::default(),
+                    [0xAA; 16],
+                    dir.path().to_path_buf(),
+                )
+                .unwrap();
+                assert_eq!(node.message_count(), 1);
+                assert_eq!(node.total_size(), stored.len());
+                assert_eq!(node.store.get(&full_id).unwrap().stamped, stamped);
+                // Duplicate admission must neither replace the known format
+                // nor grow the byte/accounting reservation after reload.
+                assert!(!node.accept_propagated_blob(&blob, 0));
+                assert!(!node.accept_stamped_propagated_blob(&blob, &stamp, 0));
+                assert_eq!(node.message_count(), 1);
+                assert_eq!(node.total_size(), stored.len());
+                assert!(node.pending_write_ids.is_empty());
+                assert_eq!(node.pending_write_bytes, 0);
+                let get = Value::Array(vec![
+                    Value::Array(vec![Value::Binary(full_id.to_vec())]),
+                    Value::Array(vec![]),
+                ]);
+                let mut request = Vec::new();
+                rmpv::encode::write_value(&mut request, &get).unwrap();
+                let response = node
+                    .handle_get_request(&request, &[0xBB; 16])
+                    .into_response();
+                let value: Value = rmpv::decode::read_value(&mut &response[..]).unwrap();
+                let messages = value.as_array().unwrap();
+                assert_eq!(messages.len(), 1);
+                assert_eq!(messages[0].as_slice().unwrap(), blob);
+                assert_eq!(
+                    node.message_get_request(&[full_id]),
+                    vec![(full_id, stored.clone())]
+                );
+                assert_eq!(std::fs::read(&path).unwrap(), stored);
+            }
+        }
+    }
+
+    #[test]
+    fn test_reloaded_legacy_message_keeps_original_get_bytes() {
+        use rmpv::Value;
+
+        let dir = tempfile::tempdir().unwrap();
+        let message = make_signed_message([0xBB; 16], [0xCC; 16], "legacy", "full message");
+        let packed = message.pack().unwrap();
+        let full_id = message.transient_id.or(message.hash).unwrap();
+        assert_ne!(full_id, rns_crypto::sha::full_hash(&packed));
+        let mut node = PropagationNode::with_storage(
+            PropagationNodeConfig::default(),
+            [0xAA; 16],
+            dir.path().to_path_buf(),
+        )
+        .unwrap();
+        assert!(node.accept_message(&message));
+        drop(node);
+        let mut node = PropagationNode::with_storage(
+            PropagationNodeConfig::default(),
+            [0xAA; 16],
+            dir.path().to_path_buf(),
+        )
+        .unwrap();
+        assert_eq!(node.message_count(), 1);
+        assert_eq!(node.total_size(), packed.len());
+        assert!(!node.store.get(&full_id).unwrap().stamped);
+        let get = Value::Array(vec![
+            Value::Array(vec![Value::Binary(full_id.to_vec())]),
+            Value::Array(vec![]),
+        ]);
+        let mut request = Vec::new();
+        rmpv::encode::write_value(&mut request, &get).unwrap();
+        let response = node
+            .handle_get_request(&request, &[0xBB; 16])
+            .into_response();
+        let value: Value = rmpv::decode::read_value(&mut &response[..]).unwrap();
+        assert_eq!(value.as_array().unwrap()[0].as_slice().unwrap(), packed);
     }
 
     #[test]
