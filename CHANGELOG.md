@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Adopt rsReticulum 1.3 with a patch-line (`~1.3.0`) requirement so the next
+  breaking core minor release is not admitted implicitly.
+
 - Promote exact Python RNS 1.4.2 to the complete release baseline while
   retaining LXMF 1.0.1 for the main corpus and live matrix; the LXMF 1.1.0
   supplemental lane remains separate and RNS 1.5.0 remains deferred.

@@ -65,9 +65,11 @@ def check_packages(document: dict[str, object]) -> tuple[str, str]:
         )
 
     requirement = reticulum_requirements.pop()
-    if not requirement.startswith("^"):
+    # The project permits breaking core APIs in a minor release; caret ranges
+    # would silently admit the next incompatible minor line.
+    if not re.fullmatch(r"~\d+\.\d+\.\d+", requirement):
         fail(f"unexpected rsReticulum compatibility requirement {requirement!r}")
-    return str(versions.pop()), requirement.removeprefix("^")
+    return str(versions.pop()), requirement.removeprefix("~")
 
 
 def check_workflow_actions() -> None:

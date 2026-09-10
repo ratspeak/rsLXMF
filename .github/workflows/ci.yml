@@ -10,7 +10,7 @@ permissions:
   contents: read
 
 env:
-  RSLXMF_RSRETICULUM_COMMIT: 25c69c6f378a745d5a3ae93558ebdf8f0de901b7
+  RSLXMF_RSRETICULUM_COMMIT: 6abe1f3d4a3c53a1a838d726ac168b22c9463b27
 
 jobs:
   api-compat:
