@@ -45,6 +45,7 @@ impl ControlCommandKind {
     }
 }
 
+/// Query propagation control with a raw peer hash, or no payload for status.
 pub async fn query_control(
     transport_tx: tokio::sync::mpsc::Sender<rns_transport::messages::TransportMessage>,
     identity: Identity,
@@ -59,11 +60,23 @@ pub async fn query_control(
             target_identity_hash,
             CONTROL_APP_NAME,
             path,
-            payload,
+            encode_control_payload(payload),
             0,
             Duration::from_secs_f64(timeout_secs.max(0.0)),
         )
         .await
+}
+
+fn encode_control_payload(payload: Vec<u8>) -> Vec<u8> {
+    // LinkClient accepts an encoded MessagePack value. Raw hash bytes can
+    // themselves form a complete value (e.g. 0xaf followed by 15 bytes), so
+    // letting Link infer the type can truncate or reinterpret a peer address.
+    // Python sends a bytes object for sync/unpeer and None for status.
+    encode_value(&if payload.is_empty() {
+        Value::Nil
+    } else {
+        Value::Binary(payload)
+    })
 }
 
 pub async fn resolve_remote_identity_hash(
@@ -843,6 +856,37 @@ fn encode_value(value: &Value) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn control_payload_preserves_every_peer_hash_prefix_as_binary() {
+        for prefix in 0..=u8::MAX {
+            let mut hash = vec![0x41; 16];
+            hash[0] = prefix;
+            assert_eq!(
+                decode_value(&encode_control_payload(hash.clone())),
+                Value::Binary(hash),
+                "peer prefix {prefix:#04x} must not select a MessagePack type"
+            );
+        }
+        for hash in [
+            hex::decode("af55b3f0e0b336fdfdbe263c12a688e0").unwrap(),
+            [vec![0xc4, 14], vec![0x41; 14]].concat(),
+            [vec![0x9f], vec![0; 15]].concat(),
+        ] {
+            assert_eq!(
+                decode_value(&encode_control_payload(hash.clone())),
+                Value::Binary(hash)
+            );
+        }
+    }
+
+    #[test]
+    fn empty_control_payload_matches_python_status_nil() {
+        assert_eq!(
+            decode_value(&encode_control_payload(Vec::new())),
+            Value::Nil
+        );
+    }
 
     #[tokio::test]
     async fn remote_identity_resolution_uses_recall_and_path_request_without_handlers() {

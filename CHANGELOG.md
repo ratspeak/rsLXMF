@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Encode propagation-control peer addresses explicitly as binary data, avoiding
+  intermittent sync/unpeer failures for hashes that resemble MessagePack values.
+
 - Adopt rsReticulum 1.3 with a patch-line (`~1.3.0`) requirement so the next
   breaking core minor release is not admitted implicitly.
 
