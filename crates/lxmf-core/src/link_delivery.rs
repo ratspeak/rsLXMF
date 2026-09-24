@@ -959,6 +959,30 @@ impl LinkDeliveryManager {
         self.endpoint_dispatch = Some(handle);
     }
 
+    /// Disable compression for Direct payloads that have not constructed their
+    /// Resource yet, including payloads queued behind another delivery.
+    ///
+    /// Embedders call this when an authenticated recipient announcement reports
+    /// unsupported compression. Existing Resource bytes, advertisements and split
+    /// segments remain immutable. This never enables compression or changes the
+    /// propagation-node envelope. New submissions still carry their own policy.
+    pub fn disable_pending_direct_compression(&mut self, destination: [u8; 16]) {
+        for delivery in self
+            .pending
+            .values_mut()
+            .filter(|delivery| delivery.reusable && delivery.dest_hash == destination)
+        {
+            if delivery.transfer.is_none() && delivery.remaining_segments.is_none() {
+                delivery.message.auto_compress = false;
+                delivery.auto_compress = false;
+            }
+            for queued in &mut delivery.queued {
+                queued.message.auto_compress = false;
+                queued.auto_compress = false;
+            }
+        }
+    }
+
     /// Install the adapter used to send LXMF payloads over inbound
     /// authenticated backchannel Links owned by the embedding runtime.
     pub fn set_backchannel_sender(&mut self, tx: mpsc::Sender<BackchannelSendCommand>) {
@@ -10192,6 +10216,93 @@ mod tests {
             header.context,
             rns_wire::context::PacketContext::ResourceAdv
         );
+    }
+
+    #[test]
+    fn late_no_compression_announcement_reaches_unconstructed_and_queued_resources() {
+        let (tx, mut rx) = mpsc::channel(512);
+        let mut mgr = LinkDeliveryManager::new(tx, None, None);
+        let sign_key = Ed25519PrivateKey::generate();
+        let message = |text: &str| {
+            let mut msg = LxMessage::new(
+                [0xAA; 16],
+                [0xBB; 16],
+                text,
+                &"x".repeat(600),
+                crate::constants::DeliveryMethod::Direct,
+            );
+            msg.sign(&sign_key).unwrap();
+            msg
+        };
+        let dest = [0xCC; 16];
+        let responder_key = Ed25519PrivateKey::generate();
+        let (link, _) =
+            establish_active_delivery(&mut mgr, &mut rx, message("first"), &responder_key, dest);
+        mgr.start_delivery(message("queued"), dest, 1).unwrap();
+        mgr.disable_pending_direct_compression(dest);
+        let delivery = mgr.pending.get(&link).unwrap();
+        assert!(!delivery.auto_compress);
+        assert!(!delivery.message.auto_compress);
+        assert_eq!(delivery.queued.len(), 1);
+        assert!(!delivery.queued[0].auto_compress);
+        assert!(!delivery.queued[0].message.auto_compress);
+        mgr.tick();
+        assert!(
+            !mgr.pending[&link]
+                .transfer
+                .as_ref()
+                .unwrap()
+                .resource
+                .flags
+                .compressed
+        );
+    }
+
+    #[test]
+    fn compression_refresh_does_not_rewrite_constructed_resources_or_relay_envelopes() {
+        let (tx, mut rx) = mpsc::channel(512);
+        let mut mgr = LinkDeliveryManager::new(tx, None, None);
+        let key = Ed25519PrivateKey::generate();
+        let mut msg = LxMessage::new(
+            [0xAA; 16],
+            [0xBB; 16],
+            "first",
+            &"x".repeat(600),
+            crate::constants::DeliveryMethod::Direct,
+        );
+        msg.sign(&key).unwrap();
+        let responder_key = Ed25519PrivateKey::generate();
+        let dest = [0xCC; 16];
+        let (link, _) =
+            establish_active_delivery(&mut mgr, &mut rx, msg.clone(), &responder_key, dest);
+        mgr.tick();
+        assert!(
+            mgr.pending[&link]
+                .transfer
+                .as_ref()
+                .unwrap()
+                .resource
+                .flags
+                .compressed
+        );
+        mgr.disable_pending_direct_compression(dest);
+        assert!(mgr.pending[&link].auto_compress);
+        assert!(
+            mgr.pending[&link]
+                .transfer
+                .as_ref()
+                .unwrap()
+                .resource
+                .flags
+                .compressed
+        );
+        let relay = [0xDD; 16];
+        let relay_link = mgr
+            .start_packed_delivery(msg, relay, 1, vec![7; 600], true)
+            .unwrap();
+        mgr.disable_pending_direct_compression(relay);
+        assert!(mgr.pending[&relay_link].auto_compress);
+        assert!(mgr.pending[&relay_link].packed_override.is_some());
     }
 
     #[test]

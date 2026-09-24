@@ -68,6 +68,14 @@ Queued messages without an active protocol owner receive no
 blanket timeout exemption. Explicit rejection and cancellation are not evidence
 of a failed route.
 
+When an authenticated recipient announcement rules out compression, call
+`LinkDeliveryManager::disable_pending_direct_compression` before advancing
+ready delivery events. It updates unconstructed Direct Resources and queued
+messages, including Link setup waits. Constructed Resources and split plans
+remain immutable, and propagation envelopes keep their independent policy.
+The call only disables compression; new submissions still carry their policy.
+This additive API remains provisional delivery-owner integration.
+
 Applications that reserve inbound attachment memory can opt into
 `set_inbound_resource_completion_handler`. It receives one owned completed
 payload before the ordinary conclusion callback, so an application can move
