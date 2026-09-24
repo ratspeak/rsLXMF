@@ -19,15 +19,16 @@
     "sourceCommit": "b8d7afce73f7f098706029361568e63f22888ea3"
   },
   "snapshotSource": {
-    "commit": "8db95825c568ace467c99d2011cefe618e1c60fc",
-    "capturedOn": "2026-09-08",
+    "commit": "a48ee9c6a30d159955496ae3ff29ffdfd15d8c6f",
+    "capturedOn": "2026-09-24",
     "review": {
       "areas": [
         "Exact local packet admission and proof-clock ownership",
         "Finite original Resource windows and bounded external observation grace",
         "Cancellation-aware backchannel adapters with legacy compatibility",
         "Generation-safe cleanup, settlement and queued-message preservation",
-        "Owned reverse Resource completion handoff"
+        "Owned reverse Resource completion handoff",
+        "LXMF-02/03 and RET-05/07 event-driven delivery readiness (September 24)"
       ],
       "canonicalPath": "lxmf_core::link_delivery::LinkDeliveryManager",
       "retainedPaths": [
@@ -44,7 +45,7 @@
       ],
       "classification": "compatible additive opt-in provisional delivery-owner integration; existing message facade and public signatures remain unchanged",
       "publicApiDiff": {
-        "added": 93,
+        "added": 94,
         "removed": 0
       },
       "semver": "compatible additive APIs included in version 1.2.0",
@@ -56,7 +57,8 @@
         "independent actual-actor cancellation, captured legacy/aware policy, 256-owner reservation and replacement-Link/settlement review controls passed",
         "actual encrypted Resource final-proof expiry and same-message retry produced one receiver publication; signed Link reuse/loss/recovery and completion-lease controls passed",
         "default/all-feature external consumer fixtures and final working app runtime suite passed; no feature/MSRV/native-export changes",
-        "final clean combined host/MSRV/native/interop and artifact qualification remain separately required; focused software evidence is not physical fading-radio or mobile acceptance"
+        "final clean combined host/MSRV/native/interop and artifact qualification remain separately required; focused software evidence is not physical fading-radio or mobile acceptance",
+        "September 24: additive poll_ready method; 75 focused delivery tests, encrypted 65 KB/750 KB/2.6 MB/8 MB readiness-driven transfers, and strict stable/MSRV Clippy passed. Physical radio speed remains separately qualified."
       ]
     }
   },
@@ -67,8 +69,8 @@
       "tier": "candidate-stable",
       "compatibility": "reviewed-snapshot",
       "snapshot": "api/snapshots/lxmf-core.txt",
-      "itemCount": 1645,
-      "sha256": "65aebd34c72bb2b621d515331bba1f4d85234c448d1c7039132f24c0a95bbe4a"
+      "itemCount": 1646,
+      "sha256": "7c873767e6d720fb340fa49648c026b3c8fc8594977d72ec18f2f0ff8e055f0f"
     },
     {
       "name": "lxmf-tools",
@@ -79,5 +81,12 @@
       "itemCount": 185,
       "sha256": "0427d0fab38f8061cbf7f11b701f29f438490478f133524b0a8e4e7cfe6f3924"
     }
-  ]
+  ],
+  "deliveryReadinessReview": {
+    "reviewedOn": "2026-09-24",
+    "classification": "Compatible additive provisional integration method; no removed signatures, dependency requirement, MSRV, wire or persistence changes. No release-version bump in this implementation commit.",
+    "ownership": "Input and local receipt lookahead remain owned on cancellation; exact bind readiness does not publish the endpoint. One polling task; periodic deadline ticks remain required.",
+    "scheduling": "Bounded input drain; readiness covers packets, endpoint lifecycle/acknowledgements, backchannel receipts and staged-transport capacity. Existing lxmd-rs periodic consumers remain supported.",
+    "diagnostics": "Aggregate Resource request/part/repeated-part/byte action counts under a closed content-free target; dispatch is not driver admission or recipient delivery."
+  }
 }

@@ -491,6 +491,7 @@ pub fn lxmf_core::link_delivery::LinkDeliveryManager::new(tokio::sync::mpsc::bou
 pub fn lxmf_core::link_delivery::LinkDeliveryManager::observe_backchannel_packet_wait(&mut self, [u8; 16], [u8; 32], std::time::Instant, core::time::Duration, bool, core::option::Option<rns_transport::link_endpoint_dispatch::LinkEndpointDispatchCancellation>) -> bool
 pub fn lxmf_core::link_delivery::LinkDeliveryManager::observe_backchannel_resource_wait(&mut self, [u8; 16], [u8; 32], std::time::Instant, core::time::Duration) -> bool
 pub fn lxmf_core::link_delivery::LinkDeliveryManager::pending_count(&self) -> usize
+pub fn lxmf_core::link_delivery::LinkDeliveryManager::poll_ready(&mut self, &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<()>
 pub fn lxmf_core::link_delivery::LinkDeliveryManager::register_backchannel(&mut self, [u8; 16], [u8; 16])
 pub fn lxmf_core::link_delivery::LinkDeliveryManager::remove_backchannel(&mut self, &[u8; 16]) -> core::option::Option<[u8; 16]>
 pub fn lxmf_core::link_delivery::LinkDeliveryManager::session_count(&self) -> usize
