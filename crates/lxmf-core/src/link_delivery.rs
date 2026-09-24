@@ -7,7 +7,10 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -168,6 +171,50 @@ struct InboundResourceLifecycle {
     inter_segment_deadline: Option<Instant>,
 }
 
+/// A non-publishing lookahead for local acknowledgements. Registering a waker
+/// may receive the value, but the original owner must still consume or drain it.
+struct ReadyReceipt<T> {
+    receiver: oneshot::Receiver<T>,
+    ready: Option<Result<T, oneshot::error::RecvError>>,
+}
+impl<T> From<oneshot::Receiver<T>> for ReadyReceipt<T> {
+    fn from(receiver: oneshot::Receiver<T>) -> Self {
+        Self {
+            receiver,
+            ready: None,
+        }
+    }
+}
+impl<T> ReadyReceipt<T> {
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> bool {
+        if self.ready.is_none() {
+            if let Poll::Ready(result) = Pin::new(&mut self.receiver).poll(cx) {
+                self.ready = Some(result);
+            }
+        }
+        self.ready.is_some()
+    }
+    fn try_recv(&mut self) -> Result<T, oneshot::error::TryRecvError> {
+        match self.ready.take() {
+            Some(result) => result.map_err(|_| oneshot::error::TryRecvError::Closed),
+            None => self.receiver.try_recv(),
+        }
+    }
+    fn close(&mut self) {
+        self.receiver.close();
+    }
+    fn is_terminated(&self) -> bool {
+        self.ready.is_none() && self.receiver.is_terminated()
+    }
+}
+
+type TransportReady = Pin<
+    Box<
+        dyn Future<Output = Result<mpsc::OwnedPermit<TransportMessage>, mpsc::error::SendError<()>>>
+            + Send,
+    >,
+>;
+
 struct PendingEndpointBind {
     interface_id: InterfaceId,
     rtt_request: OutboundRequest,
@@ -175,11 +222,18 @@ struct PendingEndpointBind {
 }
 
 enum EndpointBindReceiver {
-    Legacy(oneshot::Receiver<LinkEndpointBindResult>),
+    Legacy(ReadyReceipt<LinkEndpointBindResult>),
     Exact(LinkEndpointDispatchBindReceipt),
 }
 
 impl EndpointBindReceiver {
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> bool {
+        match self {
+            Self::Legacy(rx) => rx.poll_ready(cx),
+            Self::Exact(rx) => rx.poll_ready(cx).is_ready(),
+        }
+    }
+
     fn try_recv(
         &mut self,
     ) -> Result<
@@ -199,7 +253,7 @@ impl EndpointBindReceiver {
 struct PendingPacketDispatch {
     link_id: [u8; 16],
     packet_hash: [u8; 32],
-    result_rx: oneshot::Receiver<LinkEndpointDispatchOutcome>,
+    result_rx: ReadyReceipt<LinkEndpointDispatchOutcome>,
 }
 
 enum EndpointSendSuccess {
@@ -213,12 +267,12 @@ struct PendingEndpointSend {
     link_id: [u8; 16],
     final_send: bool,
     success: EndpointSendSuccess,
-    result_rx: oneshot::Receiver<LinkEndpointSendResult>,
+    result_rx: ReadyReceipt<LinkEndpointSendResult>,
 }
 
 struct PendingEndpointCleanup {
     link_id: [u8; 16],
-    result_rx: oneshot::Receiver<LinkEndpointUnbindResult>,
+    result_rx: ReadyReceipt<LinkEndpointUnbindResult>,
 }
 
 /// State of a link-based delivery.
@@ -366,7 +420,7 @@ impl BackchannelProofKey {
 }
 
 struct PendingBackchannelStart {
-    receiver: oneshot::Receiver<Result<BackchannelSendReceipt, BackchannelSendError>>,
+    receiver: ReadyReceipt<Result<BackchannelSendReceipt, BackchannelSendError>>,
     message: LxMessage,
     dest_hash: [u8; 16],
     link_id: [u8; 16],
@@ -730,6 +784,14 @@ fn start_error_from_reserve(err: TrySendError<()>) -> LinkDeliveryStartError {
     }
 }
 
+#[derive(Default)]
+struct ResourceDispatchCounters {
+    requests: u64,
+    part_actions: u64,
+    repeated_part_actions: u64,
+    part_bytes: u64,
+}
+
 /// Driver for outbound link-based LXMF deliveries.
 ///
 /// Callers invoke [`Self::start_delivery`] to begin, [`Self::drain_events`] to route inbound
@@ -781,7 +843,11 @@ pub struct LinkDeliveryManager {
     identity_key: Option<Ed25519PrivateKey>,
     event_tx: mpsc::Sender<DestinationEvent>,
     event_rx: mpsc::Receiver<DestinationEvent>,
+    ready_event: Option<DestinationEvent>,
+    ready_lifecycle: Option<LinkEndpointLifecycleEvent>,
+    transport_ready: Option<TransportReady>,
     delivery_events: VecDeque<LxmfDeliveryEvent>,
+    resource_counters: ResourceDispatchCounters,
 }
 
 impl LinkDeliveryManager {
@@ -824,7 +890,65 @@ impl LinkDeliveryManager {
             identity_key,
             event_tx,
             event_rx,
+            ready_event: None,
+            ready_lifecycle: None,
+            transport_ready: None,
             delivery_events: VecDeque::new(),
+            resource_counters: ResourceDispatchCounters::default(),
+        }
+    }
+
+    /// Register the embedding task's waker for inbound delivery events and
+    /// local admission/lifecycle acknowledgements. `Ready` means call
+    /// [`Self::drain_events`] and [`Self::tick`]; it is not delivery success.
+    ///
+    /// Cancellation-safe: lookahead values remain with this manager and exact
+    /// bind ownership stays unpublished until normal processing consumes it.
+    /// Use one polling task per manager and retain periodic ticks for protocol
+    /// deadlines. A bounded drain may leave more input ready for the next turn.
+    pub fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        if self.ready_event.is_none() {
+            if let Poll::Ready(event) = self.event_rx.poll_recv(cx) {
+                self.ready_event = event;
+            }
+        }
+        if self.ready_lifecycle.is_none() {
+            if let Poll::Ready(event) = self.endpoint_lifecycle_rx.poll_recv(cx) {
+                self.ready_lifecycle = event;
+            }
+        }
+        let mut ready = self.ready_event.is_some() || self.ready_lifecycle.is_some();
+        for pending in self.pending_endpoint_binds.values_mut() {
+            ready |= pending.result_rx.poll_ready(cx);
+        }
+        for pending in &mut self.pending_endpoint_sends {
+            ready |= pending.result_rx.poll_ready(cx);
+        }
+        for pending in &mut self.pending_endpoint_cleanups {
+            ready |= pending.result_rx.poll_ready(cx);
+        }
+        for pending in &mut self.pending_packet_dispatches {
+            ready |= pending.result_rx.poll_ready(cx);
+        }
+        for pending in &mut self.pending_backchannel_starts {
+            ready |= pending.receiver.poll_ready(cx);
+        }
+        if self.pending_transport.is_empty() {
+            self.transport_ready = None;
+        } else {
+            let reserve = self
+                .transport_ready
+                .get_or_insert_with(|| Box::pin(self.transport_tx.clone().reserve_owned()));
+            if reserve.as_mut().poll(cx).is_ready() {
+                // Drop the temporary permit before the normal FIFO flush.
+                self.transport_ready = None;
+                ready = true;
+            }
+        }
+        if ready {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
         }
     }
 
@@ -1235,7 +1359,7 @@ impl LinkDeliveryManager {
         });
         self.pending_backchannel_starts
             .push(PendingBackchannelStart {
-                receiver: result_rx,
+                receiver: result_rx.into(),
                 message,
                 dest_hash,
                 link_id,
@@ -1688,7 +1812,11 @@ impl LinkDeliveryManager {
 
     fn poll_endpoint_control(&mut self) {
         self.poll_endpoint_send_results();
-        while let Ok(event) = self.endpoint_lifecycle_rx.try_recv() {
+        while let Some(event) = self
+            .ready_lifecycle
+            .take()
+            .or_else(|| self.endpoint_lifecycle_rx.try_recv().ok())
+        {
             if event.binding.role != LinkEndpointRole::Initiator {
                 continue;
             }
@@ -1796,8 +1924,14 @@ impl LinkDeliveryManager {
     /// and `ResourcePrf` contexts to their handlers.
     pub fn drain_events(&mut self, known_identities: &HashMap<String, [u8; 64]>) {
         self.poll_endpoint_control();
-        let mut events = Vec::new();
-        while let Ok(event) = self.event_rx.try_recv() {
+        let mut events = Vec::with_capacity(32);
+        if let Some(event) = self.ready_event.take() {
+            events.push(event);
+        }
+        while events.len() < 32 {
+            let Ok(event) = self.event_rx.try_recv() else {
+                break;
+            };
             events.push(event);
         }
 
@@ -2087,7 +2221,7 @@ impl LinkDeliveryManager {
                         delivery.failure_reason = Some(reason.to_string());
                         return false;
                     }
-                    EndpointBindReceiver::Legacy(result_rx)
+                    EndpointBindReceiver::Legacy(result_rx.into())
                 };
                 self.pending_endpoint_binds.insert(
                     *link_id,
@@ -3407,7 +3541,30 @@ impl LinkDeliveryManager {
             let Some(ref mut transfer) = delivery.transfer else {
                 return;
             };
+            let previously_sent = transfer.sent_parts;
             let actions = transfer.handle_request(request_data);
+            let counters = &mut self.resource_counters;
+            counters.requests = counters.requests.saturating_add(1);
+            let mut requested_parts = 0u64;
+            for action in &actions {
+                if let TransferAction::SendPart(_, data) = action {
+                    requested_parts += 1;
+                    counters.part_bytes = counters.part_bytes.saturating_add(data.len() as u64);
+                }
+            }
+            counters.part_actions = counters.part_actions.saturating_add(requested_parts);
+            counters.repeated_part_actions = counters.repeated_part_actions.saturating_add(
+                requested_parts
+                    .saturating_sub(transfer.sent_parts.saturating_sub(previously_sent) as u64),
+            );
+            if counters.requests == 1 || counters.requests.is_multiple_of(64) {
+                tracing::debug!(target: "lxmf_core::delivery::transfer",
+                    resource_requests = counters.requests,
+                    part_actions = counters.part_actions,
+                    repeated_part_actions = counters.repeated_part_actions,
+                    part_bytes = counters.part_bytes,
+                    "Resource dispatch counters");
+            }
             for action in actions {
                 match dispatch_action(
                     link_id,
@@ -5197,7 +5354,7 @@ fn stage_link_endpoint_with_success(
         link_id,
         final_send: false,
         success,
-        result_rx,
+        result_rx: result_rx.into(),
     });
     Ok(())
 }
@@ -5218,7 +5375,10 @@ fn stage_link_endpoint_unbind(
             result_tx,
         },
     )?;
-    pending_cleanups.push(PendingEndpointCleanup { link_id, result_rx });
+    pending_cleanups.push(PendingEndpointCleanup {
+        link_id,
+        result_rx: result_rx.into(),
+    });
     Ok(())
 }
 
@@ -5244,7 +5404,7 @@ fn stage_link_endpoint_and_unbind(
         link_id,
         final_send: true,
         success: EndpointSendSuccess::None,
-        result_rx,
+        result_rx: result_rx.into(),
     });
     Ok(())
 }
@@ -5569,7 +5729,7 @@ fn send_link_packet(
         pending_packet_dispatches.push(PendingPacketDispatch {
             link_id: *link_id,
             packet_hash,
-            result_rx,
+            result_rx: result_rx.into(),
         });
         delivery.link.record_tx(encrypted.len());
         return Ok(packet_hash);
@@ -5789,6 +5949,74 @@ fn dispatch_action(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn delivery_readiness_retains_input_and_drains_bounded_turns() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Counter(AtomicUsize);
+        impl std::task::Wake for Counter {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let (tx, _rx) = mpsc::channel(16);
+        let mut mgr = LinkDeliveryManager::new(tx, None, None);
+        let counter = Arc::new(Counter(AtomicUsize::new(0)));
+        let waker = std::task::Waker::from(counter.clone());
+        let mut cx = Context::from_waker(&waker);
+        assert!(mgr.poll_ready(&mut cx).is_pending());
+        for _ in 0..40 {
+            mgr.event_tx
+                .try_send(DestinationEvent::LinkClosed { link_id: [0; 16] })
+                .unwrap();
+        }
+        assert!(counter.0.load(Ordering::SeqCst) > 0);
+        assert!(mgr.poll_ready(&mut cx).is_ready());
+        // Dropping a caller's wait must not lose its lookahead event.
+        assert!(mgr.poll_ready(&mut cx).is_ready());
+        mgr.drain_events(&HashMap::new());
+        assert_eq!(mgr.event_rx.len(), 8);
+        assert!(mgr.poll_ready(&mut cx).is_ready());
+        mgr.drain_events(&HashMap::new());
+        assert!(mgr.poll_ready(&mut cx).is_pending());
+    }
+
+    #[test]
+    fn receipt_readiness_preserves_close_and_drain_cancellation() {
+        let (tx, rx) = oneshot::channel();
+        let mut receipt = ReadyReceipt::from(rx);
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        assert!(!receipt.poll_ready(&mut cx));
+        tx.send(42).unwrap();
+        assert!(receipt.poll_ready(&mut cx));
+        receipt.close();
+        assert!(!receipt.is_terminated());
+        assert_eq!(receipt.try_recv().unwrap(), 42);
+        assert!(receipt.is_terminated());
+    }
+
+    #[tokio::test]
+    async fn delivery_readiness_wakes_for_transport_capacity_without_idle_spin() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(TransportMessage::DeregisterDestination { hash: [1; 16] })
+            .unwrap();
+        let mut mgr = LinkDeliveryManager::new(tx, None, None);
+        mgr.pending_transport
+            .push_back(TransportMessage::DeregisterDestination { hash: [2; 16] });
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        assert!(mgr.poll_ready(&mut cx).is_pending());
+        rx.recv().await.unwrap();
+        assert!(mgr.poll_ready(&mut cx).is_ready());
+        mgr.tick();
+        assert!(
+            matches!(rx.recv().await, Some(TransportMessage::DeregisterDestination { hash }) if hash == [2;16])
+        );
+        assert!(mgr.poll_ready(&mut cx).is_pending());
+    }
+
     use super::*;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};

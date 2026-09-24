@@ -27,6 +27,15 @@ and an explicit version decision.
 
 ## Delivery-owner integration
 
+`LinkDeliveryManager::poll_ready` lets one embedding task wait for inbound
+delivery packets, local admission acknowledgements, endpoint lifecycle changes,
+and staged-transport capacity. On readiness, call `drain_events` and `tick`.
+Keep periodic ticks for protocol deadlines, but schedule application maintenance
+separately. Drains are bounded and may leave another ready turn. Cancelling the
+wait does not discard a packet or publish an unread endpoint binding; existing
+periodic consumers remain supported. The API is provisional delivery-owner
+integration (LXMF-02/03, RET-05/07), not a new wire protocol or success signal.
+
 `LinkDeliveryManager::set_link_endpoint_dispatch_handle` opts Direct packet
 sends into the Reticulum owner's exact local-admission receipts. Supply the
 handle from the same runtime that owns the manager's transport channel.
