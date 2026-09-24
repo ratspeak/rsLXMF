@@ -2084,10 +2084,7 @@ impl LinkDeliveryManager {
                             self.handle_inbound_resource_part(&link_id, data);
                         }
                         rns_wire::context::PacketContext::ResourceHmu => {
-                            let plaintext = self
-                                .pending
-                                .get(&link_id)
-                                .and_then(|d| d.link.decrypt(data).ok());
+                            let plaintext = self.decrypt_resource_control(&link_id, data);
                             if let Some(pt) = plaintext {
                                 if !self.handle_inbound_resource_hmu(&link_id, &pt) {
                                     self.handle_hmu(&link_id, &pt);
@@ -2097,10 +2094,7 @@ impl LinkDeliveryManager {
                         rns_wire::context::PacketContext::ResourceReq => {
                             // Python `Resource.request_next` may arrive before any HMU and be the
                             // only signal to advance the transfer, so drive it here directly.
-                            let plaintext = self
-                                .pending
-                                .get(&link_id)
-                                .and_then(|d| d.link.decrypt(data).ok());
+                            let plaintext = self.decrypt_resource_control(&link_id, data);
                             if let Some(pt) = plaintext {
                                 self.handle_request(&link_id, &pt);
                             }
@@ -2113,19 +2107,13 @@ impl LinkDeliveryManager {
                         rns_wire::context::PacketContext::ResourceRcl => {
                             // Receiver-cancel/reject packets are link-encrypted and carry
                             // the rejected resource_hash.
-                            let plaintext = self
-                                .pending
-                                .get(&link_id)
-                                .and_then(|d| d.link.decrypt(data).ok());
+                            let plaintext = self.decrypt_resource_control(&link_id, data);
                             if let Some(pt) = plaintext {
                                 self.handle_resource_reject(&link_id, &pt);
                             }
                         }
                         rns_wire::context::PacketContext::ResourceIcl => {
-                            let plaintext = self
-                                .pending
-                                .get(&link_id)
-                                .and_then(|d| d.link.decrypt(data).ok());
+                            let plaintext = self.decrypt_resource_control(&link_id, data);
                             if let Some(pt) = plaintext {
                                 self.handle_inbound_resource_cancel(&link_id, &pt);
                             }
@@ -2235,6 +2223,18 @@ impl LinkDeliveryManager {
             }
             Err(_) => false,
         }
+    }
+
+    /// Authenticated Resource control traffic is peer liveness even when no
+    /// ordinary Link packet or keepalive is exchanged during a long transfer.
+    /// Keep the Resource progress watchdog separate: a valid control packet
+    /// does not by itself mean new parts were delivered.
+    fn decrypt_resource_control(&mut self, link_id: &[u8; 16], data: &[u8]) -> Option<Vec<u8>> {
+        let delivery = self.pending.get_mut(link_id)?;
+        let plaintext = delivery.link.decrypt(data).ok()?;
+        delivery.link.record_inbound();
+        delivery.link.record_rx(data.len());
+        Some(plaintext)
     }
 
     fn handle_inbound_link_packet(
@@ -3615,6 +3615,8 @@ impl LinkDeliveryManager {
                 .as_mut()
                 .is_some_and(|transfer| transfer.handle_proof(proof_data))
             {
+                delivery.link.record_inbound();
+                delivery.link.record_rx(proof_data.len());
                 let progress = delivery_resource_proof_progress(delivery).unwrap_or(1.0);
                 delivery.message.progress = progress;
                 event = Some(delivery_event(
@@ -3743,6 +3745,8 @@ impl LinkDeliveryManager {
                         .link
                         .validate_packet_proof(&packet_hash, proof_data)
                     {
+                        delivery.link.record_inbound();
+                        delivery.link.record_rx(proof_data.len());
                         delivery.state = DeliveryState::Complete;
                         return true;
                     }
@@ -9974,6 +9978,96 @@ mod tests {
             mgr.pending.get(&second).unwrap().state,
             DeliveryState::Failed
         );
+    }
+
+    #[test]
+    fn authenticated_resource_requests_keep_active_and_stale_links_alive() {
+        for stale in [false, true] {
+            let (tx, mut rx) = mpsc::channel(64);
+            let mut mgr = LinkDeliveryManager::new(tx, None, None);
+            let mut message = LxMessage::new(
+                [0xA4; 16],
+                [0xB4; 16],
+                "resource liveness",
+                &"x".repeat(4_000),
+                crate::constants::DeliveryMethod::Direct,
+            );
+            message.auto_compress = false;
+            message.sign(&Ed25519PrivateKey::generate()).unwrap();
+            let (link_id, responder) = establish_active_delivery(
+                &mut mgr,
+                &mut rx,
+                message,
+                &Ed25519PrivateKey::generate(),
+                [0xC4; 16],
+            );
+            assert!(mgr.tick().is_empty());
+            assert!(mgr.tick().is_empty());
+            let _advertisement = next_outbound(&mut rx);
+            let request = {
+                let delivery = mgr.pending.get_mut(&link_id).unwrap();
+                let old = Instant::now() - Duration::from_secs(900);
+                delivery.link.keepalive.last_inbound = old;
+                delivery.link.keepalive.last_proof = Some(old);
+                delivery.link.keepalive.activated_at = Some(old);
+                delivery.link.keepalive.last_keepalive_sent = Some(Instant::now());
+                if stale {
+                    delivery.link.state = LinkState::Stale;
+                    delivery.link.stale_since = Some(old);
+                }
+                let transfer = delivery.transfer.as_ref().unwrap();
+                let mut request = vec![rns_protocol::resource::HASHMAP_IS_NOT_EXHAUSTED];
+                request.extend_from_slice(&transfer.resource.resource_hash);
+                request.extend_from_slice(&transfer.resource.map_hashes[0]);
+                request
+            };
+            let encrypted = responder.encrypt(&request).unwrap();
+            let original_inbound = mgr.pending[&link_id].link.keepalive.last_inbound;
+            let original_rx = mgr.pending[&link_id].link.rx_count;
+            // Neither corrupt ciphertext nor a different interface owns this Link.
+            for (payload, interface_id) in [(vec![0; encrypted.len()], 0), (encrypted.clone(), 9)] {
+                mgr.event_tx
+                    .try_send(DestinationEvent::InboundPacket {
+                        raw: link_data_packet(
+                            link_id,
+                            rns_wire::context::PacketContext::ResourceReq,
+                            &payload,
+                        ),
+                        interface_id,
+                        metrics: Default::default(),
+                    })
+                    .unwrap();
+                mgr.drain_events(&HashMap::new());
+                assert_eq!(
+                    mgr.pending[&link_id].link.keepalive.last_inbound,
+                    original_inbound
+                );
+                assert_eq!(mgr.pending[&link_id].link.rx_count, original_rx);
+            }
+            mgr.event_tx
+                .try_send(DestinationEvent::InboundPacket {
+                    raw: link_data_packet(
+                        link_id,
+                        rns_wire::context::PacketContext::ResourceReq,
+                        &encrypted,
+                    ),
+                    interface_id: 0,
+                    metrics: Default::default(),
+                })
+                .unwrap();
+            mgr.drain_events(&HashMap::new());
+            assert_eq!(mgr.pending[&link_id].link.rx_count, original_rx + 1);
+            assert!(mgr.pending[&link_id].transfer.as_ref().unwrap().sent_parts > 0);
+            assert!(
+                mgr.tick().is_empty(),
+                "live Resource must not lose its Link"
+            );
+            assert_eq!(
+                mgr.pending[&link_id].link.state,
+                LinkState::Active,
+                "authenticated Resource requests are inbound liveness, including recovery from stale"
+            );
+        }
     }
 
     #[test]
