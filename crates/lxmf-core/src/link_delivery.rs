@@ -4880,19 +4880,30 @@ fn fail_backchannel_start_in_place(
     }
 }
 
+fn resource_payload_progress(transfer: &OutboundTransfer, segment_progress: f64) -> f64 {
+    let resource = &transfer.resource;
+    // LXMF builds payload-only MAX_EFFICIENT_SIZE segments. The advertisement
+    // retains the full logical size even after the lazy plan is released;
+    // data holds this segment's uncompressed bytes. Equal segment weights
+    // would make a short final segment race through a full segment's percent.
+    let completed_bytes = resource
+        .segment_index
+        .saturating_sub(1)
+        .saturating_mul(MAX_EFFICIENT_SIZE);
+    ((completed_bytes as f64 + resource.data.len() as f64 * segment_progress)
+        / resource.advertisement_data_size.max(1) as f64)
+        .clamp(0.0, 1.0)
+}
+
 fn delivery_resource_progress(delivery: &PendingDelivery) -> Option<f64> {
     let transfer = delivery.transfer.as_ref()?;
-    let total_segments = transfer.resource.total_segments.max(1);
-    let completed_segments = transfer.resource.segment_index.saturating_sub(1);
-    let aggregate = (completed_segments as f64 + transfer.progress()) / total_segments as f64;
+    let aggregate = resource_payload_progress(transfer, transfer.progress());
     Some((0.10 + aggregate * 0.90).clamp(0.10, 0.99))
 }
 
 fn delivery_resource_proof_progress(delivery: &PendingDelivery) -> Option<f64> {
     let transfer = delivery.transfer.as_ref()?;
-    let total_segments = transfer.resource.total_segments.max(1);
-    let completed_segments = transfer.resource.segment_index.min(total_segments);
-    let aggregate = completed_segments as f64 / total_segments as f64;
+    let aggregate = resource_payload_progress(transfer, 1.0);
     Some((0.10 + aggregate * 0.90).clamp(0.10, 1.0))
 }
 
@@ -9978,6 +9989,82 @@ mod tests {
             mgr.pending.get(&second).unwrap().state,
             DeliveryState::Failed
         );
+    }
+
+    #[test]
+    fn resource_progress_weights_payload_bytes_including_short_final_segment() {
+        for (size, compress) in [
+            (4_000, false),
+            (MAX_EFFICIENT_SIZE + 128, false),
+            (3_500_000, false),
+            (3_500_000, true),
+        ] {
+            let (tx, mut rx) = mpsc::channel(64);
+            let mut mgr = LinkDeliveryManager::new(tx, None, None);
+            let mut message = LxMessage::new(
+                [0xA5; 16],
+                [0xB5; 16],
+                "byte progress",
+                &"x".repeat(size),
+                crate::constants::DeliveryMethod::Direct,
+            );
+            message.auto_compress = compress;
+            message.sign(&Ed25519PrivateKey::generate()).unwrap();
+            let (link_id, _) = establish_active_delivery(
+                &mut mgr,
+                &mut rx,
+                message,
+                &Ed25519PrivateKey::generate(),
+                [0xC5; 16],
+            );
+            assert!(mgr.tick().is_empty());
+            let mut completed_bytes = 0;
+            let mut last_progress = 0.10;
+            loop {
+                let (proof, segment_bytes, total_bytes, final_segment) = {
+                    let delivery = mgr.pending.get_mut(&link_id).unwrap();
+                    let transfer = delivery.transfer.as_ref().unwrap();
+                    let segment_bytes = transfer.resource.data.len();
+                    let total_bytes = transfer.resource.advertisement_data_size;
+                    let parts = transfer.resource.num_parts();
+                    for sent in [0, parts / 2, parts] {
+                        delivery.transfer.as_mut().unwrap().sent_parts = sent;
+                        let fraction = sent as f64 / parts as f64;
+                        let expected = (0.10
+                            + 0.90 * (completed_bytes as f64 + segment_bytes as f64 * fraction)
+                                / total_bytes as f64)
+                            .clamp(0.10, 0.99);
+                        let actual = delivery_resource_progress(delivery).unwrap();
+                        assert!(
+                            (actual - expected).abs() < 1e-9,
+                            "payload {size}, completed {completed_bytes}: {actual} != {expected}"
+                        );
+                    }
+                    let transfer = delivery.transfer.as_ref().unwrap();
+                    let mut proof = transfer.resource.resource_hash.to_vec();
+                    proof.extend_from_slice(&transfer.resource.expected_proof);
+                    (
+                        proof,
+                        segment_bytes,
+                        total_bytes,
+                        delivery.remaining_segments.is_none(),
+                    )
+                };
+                assert!(mgr.handle_resource_proof(&link_id, &proof));
+                completed_bytes += segment_bytes;
+                let progress = mgr.pending[&link_id].message.progress;
+                let expected = 0.10 + 0.90 * completed_bytes as f64 / total_bytes as f64;
+                assert!((progress - expected).abs() < 1e-9);
+                assert!(progress >= last_progress);
+                last_progress = progress;
+                if final_segment {
+                    assert_eq!(completed_bytes, total_bytes);
+                    assert_eq!(progress, 1.0);
+                    break;
+                }
+                assert!(progress < 1.0, "only the final proof completes delivery");
+            }
+        }
     }
 
     #[test]
