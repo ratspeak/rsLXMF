@@ -19,7 +19,7 @@
     "sourceCommit": "b8d7afce73f7f098706029361568e63f22888ea3"
   },
   "snapshotSource": {
-    "commit": "a48ee9c6a30d159955496ae3ff29ffdfd15d8c6f",
+    "commit": "98aa927e1d2da3ebcc42ebe25f635dcbb503faf7",
     "capturedOn": "2026-09-24",
     "review": {
       "areas": [
@@ -28,7 +28,8 @@
         "Cancellation-aware backchannel adapters with legacy compatibility",
         "Generation-safe cleanup, settlement and queued-message preservation",
         "Owned reverse Resource completion handoff",
-        "LXMF-02/03 and RET-05/07 event-driven delivery readiness (September 24)"
+        "LXMF-02/03 and RET-05/07 event-driven delivery readiness (September 24)",
+        "LXMF-02/03: late authenticated compression capability on pending Direct delivery"
       ],
       "canonicalPath": "lxmf_core::link_delivery::LinkDeliveryManager",
       "retainedPaths": [
@@ -45,12 +46,12 @@
       ],
       "classification": "compatible additive opt-in provisional delivery-owner integration; existing message facade and public signatures remain unchanged",
       "publicApiDiff": {
-        "added": 94,
+        "added": 95,
         "removed": 0
       },
       "semver": "compatible additive APIs included in version 1.2.0",
       "deprecations": "none",
-      "wirePersistenceRuntimeImpact": "No wire-format, cryptography, message identity or persisted-layout change. Exact local Link admission precedes RTT proof timing. Resource owner windows retain original timestamps; only externally observed Resources receive a finite 180-second accounting allowance after the original protocol deadline. Cancellation-aware adapters close and drain unpublished receipts while legacy sender installation retains its previous behavior. Exact cleanup is bounded and cannot erase replacement Links or lose uncancelled queued messages; authenticated settlement remains owned after Link closure. Optional reverse Resource completion hands off the single owned payload before conclusion cleanup, without changing legacy consumers.",
+      "wirePersistenceRuntimeImpact": "No wire-format, cryptography, message identity or persisted-layout change. Exact local Link admission precedes RTT proof timing. Resource owner windows retain original timestamps; only externally observed Resources receive a finite 180-second accounting allowance after the original protocol deadline. Cancellation-aware adapters close and drain unpublished receipts while legacy sender installation retains its previous behavior. Exact cleanup is bounded and cannot erase replacement Links or lose uncancelled queued messages; authenticated settlement remains owned after Link closure. Optional reverse Resource completion hands off the single owned payload before conclusion cleanup, without changing legacy consumers. Authenticated no-compression announcements can now disable compression for unconstructed Direct Resources and queued payloads. Constructed Resources, split plans and propagation envelopes stay immutable; no wire fields or signatures change.",
       "platformEvidence": [
         "clean committed-source all-feature Apple ARM64 snapshot: seven added methods, zero removed; cumulative compatibility-floor diff is 93 additions and zero removals",
         "564 LXMF core and 55 daemon tests passed on the final implementation checkpoint; strict all-target Clippy and core Rustdoc passed",
@@ -58,7 +59,8 @@
         "actual encrypted Resource final-proof expiry and same-message retry produced one receiver publication; signed Link reuse/loss/recovery and completion-lease controls passed",
         "default/all-feature external consumer fixtures and final working app runtime suite passed; no feature/MSRV/native-export changes",
         "final clean combined host/MSRV/native/interop and artifact qualification remain separately required; focused software evidence is not physical fading-radio or mobile acceptance",
-        "September 24: additive poll_ready method; 75 focused delivery tests, encrypted 65 KB/750 KB/2.6 MB/8 MB readiness-driven transfers, and strict stable/MSRV Clippy passed. Physical radio speed remains separately qualified."
+        "September 24: additive poll_ready method; 75 focused delivery tests, encrypted 65 KB/750 KB/2.6 MB/8 MB readiness-driven transfers, and strict stable/MSRV Clippy passed. Physical radio speed remains separately qualified.",
+        "September 24 first-contact correction: 577 lxmf-core tests and strict all-target Clippy passed; the new API is additive provisional owner integration. Small/Micro native first-contact and full app runtime qualification are retained by the cross-repo maintainer harness."
       ]
     }
   },
@@ -69,8 +71,8 @@
       "tier": "candidate-stable",
       "compatibility": "reviewed-snapshot",
       "snapshot": "api/snapshots/lxmf-core.txt",
-      "itemCount": 1646,
-      "sha256": "7c873767e6d720fb340fa49648c026b3c8fc8594977d72ec18f2f0ff8e055f0f"
+      "itemCount": 1647,
+      "sha256": "b7b1d52406e2c97a204a5fb567abc6a216733594a7abd63797ff55a70d8d3b73"
     },
     {
       "name": "lxmf-tools",

@@ -473,6 +473,7 @@ pub fn lxmf_core::link_delivery::LinkDeliveryManager::backchannel_link_snapshot(
 pub fn lxmf_core::link_delivery::LinkDeliveryManager::cancel_delivery_by_message_hash(&mut self, [u8; 32]) -> bool
 pub fn lxmf_core::link_delivery::LinkDeliveryManager::delivery_link_available(&self, &[u8; 16]) -> bool
 pub fn lxmf_core::link_delivery::LinkDeliveryManager::direct_link_snapshot(&self, [u8; 16]) -> core::option::Option<lxmf_core::link_delivery::DirectLinkSnapshot>
+pub fn lxmf_core::link_delivery::LinkDeliveryManager::disable_pending_direct_compression(&mut self, [u8; 16])
 pub fn lxmf_core::link_delivery::LinkDeliveryManager::drain_events(&mut self, &std::collections::hash::map::HashMap<alloc::string::String, [u8; 64]>)
 pub fn lxmf_core::link_delivery::LinkDeliveryManager::fail_backchannel_link(&mut self, [u8; 16], &str) -> alloc::vec::Vec<lxmf_core::link_delivery::DeliveryResult>
 pub fn lxmf_core::link_delivery::LinkDeliveryManager::fail_delivery_by_message_hash(&mut self, [u8; 32], &str) -> alloc::vec::Vec<lxmf_core::link_delivery::DeliveryResult>
