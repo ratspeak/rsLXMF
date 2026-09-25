@@ -2,15 +2,22 @@
 
 ## Unreleased
 
-- Encode propagation-control peer addresses explicitly as binary data, avoiding
-  intermittent sync/unpeer failures for hashes that resemble MessagePack values.
+### Added
 
-- Adopt rsReticulum 1.3 with a patch-line (`~1.3.0`) requirement so the next
-  breaking core minor release is not admitted implicitly.
+- Added delivery readiness hooks so applications can react promptly to incoming Link traffic and local send completion.
+- Added support for updating pending Direct-message compression as peer capabilities become known.
 
-- Promote exact Python RNS 1.4.2 to the complete release baseline while
-  retaining LXMF 1.0.1 for the main corpus and live matrix; the LXMF 1.1.0
-  supplemental lane remains separate and RNS 1.5.0 remains deferred.
+### Fixed and improved
+
+- Kept active attachment transfers alive while data is moving and reduced delays between delivery steps.
+- Corrected progress reporting for transfers split across multiple Resources by weighting each part by its payload size.
+- Fixed intermittent propagation-node sync and unpeer failures caused by incorrectly encoded peer addresses.
+
+### Build and compatibility
+
+- Restricted rsReticulum compatibility to the 1.3 patch line so a later breaking minor release requires an explicit update.
+- Updated the Python interoperability baseline to Reticulum 1.4.2 and LXMF 1.0.1, with separate LXMF 1.1.0 checks.
+
 
 ## 1.2.0 - 2026-08-17
 
