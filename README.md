@@ -312,9 +312,17 @@ signature         64 bytes
 payload           MessagePack([timestamp, title, content, fields, optional_stamp])
 ```
 
-`title` and `content` are bytes on the wire. `fields` is a `map<u8, bytes>` for
+`title` and `content` are bytes on the wire. `fields` is a `map<u8, value>` for
 application-defined data such as tickets, attachments, location data, or
 application envelopes.
+
+Native media fields (use typed setters — do not `set_field` raw bins for these):
+
+| Field | Wire shape | API |
+| --- | --- | --- |
+| `FIELD_IMAGE` (`0x06`) | `[format, bytes]` | `set_image_field` / `image_attachment` |
+| `FIELD_FILE_ATTACHMENTS` (`0x05`) | `[[name, bytes], …]` | `set_file_attachments_field` / `file_attachments` (single-file helper: `set_file_attachment_field`) |
+| `FIELD_AUDIO` (`0x07`) | `[mode, bytes]` | `set_audio_field` / `audio_field` |
 
 Library callers requesting a reply ticket set `include_ticket`, call
 `LxmRouter::prepare_outbound`, and then sign the message. The router rejects a
