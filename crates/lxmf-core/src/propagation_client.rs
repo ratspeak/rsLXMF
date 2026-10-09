@@ -620,30 +620,28 @@ impl PropagationClient {
                                 continue;
                             }
                             let node_hex = self.outbound_propagation_node.map(|h| hex_encode(&h));
-                            if let Some(node_hex) = node_hex {
-                                if let Some(pub_key) = known_identities.get(&node_hex) {
-                                    let ed25519_bytes: [u8; 32] = pub_key[32..64]
+                            if let Some(node_hex) = node_hex
+                                && let Some(pub_key) = known_identities.get(&node_hex)
+                            {
+                                let ed25519_bytes: [u8; 32] = pub_key[32..64]
                                         .try_into()
                                         .expect("known_identities values are [u8; 64]; slice [32..64] is always 32 bytes");
-                                    if let Ok(verify_key) =
-                                        Ed25519PublicKey::from_bytes(&ed25519_bytes)
-                                    {
-                                        self.handle_link_proof(
-                                            data,
-                                            &verify_key,
-                                            &ed25519_bytes,
-                                            interface_id,
-                                        );
-                                    }
+                                if let Ok(verify_key) = Ed25519PublicKey::from_bytes(&ed25519_bytes)
+                                {
+                                    self.handle_link_proof(
+                                        data,
+                                        &verify_key,
+                                        &ed25519_bytes,
+                                        interface_id,
+                                    );
                                 }
                             }
                         }
                         rns_wire::context::PacketContext::Response => {
-                            if let Some(ref mut link) = self.link {
-                                if let Ok((_request_id, response_data)) = link.handle_response(data)
-                                {
-                                    self.handle_response_data(&response_data);
-                                }
+                            if let Some(ref mut link) = self.link
+                                && let Ok((_request_id, response_data)) = link.handle_response(data)
+                            {
+                                self.handle_response_data(&response_data);
                             }
                         }
                         rns_wire::context::PacketContext::ResourceAdv => {
@@ -709,47 +707,47 @@ impl PropagationClient {
             None => return,
         };
 
-        if let Ok(rtt_data) = link.validate_proof(proof_data, verify_key, ed25519_pub) {
-            if let Some(link_id) = self.link_id {
-                let rtt_header = rns_wire::header::PacketHeader {
-                    flags: rns_wire::flags::PacketFlags {
-                        header_type: rns_wire::flags::HeaderType::Header1,
-                        context_flag: false,
-                        transport_type: rns_wire::flags::TransportType::Broadcast,
-                        destination_type: rns_wire::flags::DestinationType::Link,
-                        packet_type: rns_wire::flags::PacketType::Data,
-                    },
-                    hops: 0,
-                    transport_id: None,
-                    destination_hash: link_id,
-                    context: rns_wire::context::PacketContext::Lrrtt,
-                };
-                let mut rtt_raw = rtt_header.pack();
-                rtt_raw.extend_from_slice(&rtt_data);
+        if let Ok(rtt_data) = link.validate_proof(proof_data, verify_key, ed25519_pub)
+            && let Some(link_id) = self.link_id
+        {
+            let rtt_header = rns_wire::header::PacketHeader {
+                flags: rns_wire::flags::PacketFlags {
+                    header_type: rns_wire::flags::HeaderType::Header1,
+                    context_flag: false,
+                    transport_type: rns_wire::flags::TransportType::Broadcast,
+                    destination_type: rns_wire::flags::DestinationType::Link,
+                    packet_type: rns_wire::flags::PacketType::Data,
+                },
+                hops: 0,
+                transport_id: None,
+                destination_hash: link_id,
+                context: rns_wire::context::PacketContext::Lrrtt,
+            };
+            let mut rtt_raw = rtt_header.pack();
+            rtt_raw.extend_from_slice(&rtt_data);
 
-                let rtt_request = OutboundRequest {
-                    raw: Bytes::from(rtt_raw),
-                    destination_hash: link_id,
-                };
-                let (result_tx, result_rx) = oneshot::channel();
-                if !self.queue_transport(TransportMessage::BindLinkEndpoint {
-                    binding: LinkEndpointBinding {
-                        link_id,
-                        interface_id,
-                        role: LinkEndpointRole::Initiator,
-                    },
-                    lifecycle_tx: self.endpoint_lifecycle_tx.clone(),
-                    result_tx,
-                }) {
-                    self.status.state = PropagationClientState::Failed;
-                    return;
-                }
-                self.pending_endpoint_bind = Some(PendingEndpointBind {
+            let rtt_request = OutboundRequest {
+                raw: Bytes::from(rtt_raw),
+                destination_hash: link_id,
+            };
+            let (result_tx, result_rx) = oneshot::channel();
+            if !self.queue_transport(TransportMessage::BindLinkEndpoint {
+                binding: LinkEndpointBinding {
+                    link_id,
                     interface_id,
-                    rtt_request,
-                    result_rx,
-                });
+                    role: LinkEndpointRole::Initiator,
+                },
+                lifecycle_tx: self.endpoint_lifecycle_tx.clone(),
+                result_tx,
+            }) {
+                self.status.state = PropagationClientState::Failed;
+                return;
             }
+            self.pending_endpoint_bind = Some(PendingEndpointBind {
+                interface_id,
+                rtt_request,
+                result_rx,
+            });
         }
     }
 
@@ -1206,10 +1204,10 @@ impl PropagationClient {
         if let Some(arr) = value.as_array() {
             self.available_messages.clear();
             for item in arr {
-                if let Some(id_bytes) = item.as_slice() {
-                    if id_bytes.len() == 32 {
-                        self.available_messages.push(id_bytes.to_vec());
-                    }
+                if let Some(id_bytes) = item.as_slice()
+                    && id_bytes.len() == 32
+                {
+                    self.available_messages.push(id_bytes.to_vec());
                 }
             }
 
@@ -1272,20 +1270,19 @@ impl PropagationClient {
             return;
         }
 
-        if let Some(started) = self.started_at {
-            if started.elapsed() > self.timeout
-                && matches!(
-                    self.status.state,
-                    PropagationClientState::LinkEstablishing
-                        | PropagationClientState::ListRequested
-                        | PropagationClientState::GetRequested
-                        | PropagationClientState::PurgeRequested
-                )
-            {
-                self.cleanup();
-                self.status.state = PropagationClientState::Failed;
-                return;
-            }
+        if let Some(started) = self.started_at
+            && started.elapsed() > self.timeout
+            && matches!(
+                self.status.state,
+                PropagationClientState::LinkEstablishing
+                    | PropagationClientState::ListRequested
+                    | PropagationClientState::GetRequested
+                    | PropagationClientState::PurgeRequested
+            )
+        {
+            self.cleanup();
+            self.status.state = PropagationClientState::Failed;
+            return;
         }
 
         let link_action = self.link.as_mut().map(Link::tick);
@@ -1384,10 +1381,10 @@ impl PropagationClient {
         } else {
             None
         };
-        if let Some(outbound) = outbound {
-            if !self.queue_link_endpoint(outbound) {
-                self.status.state = PropagationClientState::Failed;
-            }
+        if let Some(outbound) = outbound
+            && !self.queue_link_endpoint(outbound)
+        {
+            self.status.state = PropagationClientState::Failed;
         }
     }
 
@@ -1539,10 +1536,10 @@ impl PropagationClient {
 
     fn cleanup(&mut self) {
         let graceful_release = self.endpoint_release_queued || self.send_teardown();
-        if let Some(link_id) = self.link_id.take() {
-            if !graceful_release {
-                self.queue_endpoint_cleanup(link_id);
-            }
+        if let Some(link_id) = self.link_id.take()
+            && !graceful_release
+        {
+            self.queue_endpoint_cleanup(link_id);
         }
         self.attached_interface = None;
         self.endpoint_release_queued = false;

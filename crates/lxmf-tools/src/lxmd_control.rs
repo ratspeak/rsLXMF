@@ -111,10 +111,10 @@ pub fn decode_control_response(response: &[u8]) -> ControlResponse {
         return ControlResponse::Success;
     };
 
-    if let Some(code) = value.as_u64() {
-        if let Some(error) = peer_error_from_code(code as u8) {
-            return ControlResponse::Error(error);
-        }
+    if let Some(code) = value.as_u64()
+        && let Some(error) = peer_error_from_code(code as u8)
+    {
+        return ControlResponse::Error(error);
     }
 
     if value.is_nil() {

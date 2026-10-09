@@ -254,12 +254,11 @@ pub(crate) fn prepare_sync_offer_snapshot(
         .propagation_sync_limit
         .map(kilobytes_to_bytes_fail_closed);
     let mut handled_messages = snapshot.policy.handled_messages.clone();
-    if let Some(path) = snapshot.peer_path.as_ref() {
-        if let Ok(data) = std::fs::read(path) {
-            if let Some(peer) = LxmPeer::from_bytes_with_handled(&data) {
-                handled_messages.extend(peer.handled_messages);
-            }
-        }
+    if let Some(path) = snapshot.peer_path.as_ref()
+        && let Ok(data) = std::fs::read(path)
+        && let Some(peer) = LxmPeer::from_bytes_with_handled(&data)
+    {
+        handled_messages.extend(peer.handled_messages);
     }
 
     let mut candidates = snapshot.candidates;
@@ -792,10 +791,10 @@ impl PropagationNode {
             self.advance_offer_generation();
         }
 
-        if before > after {
-            if let Some(ref dir) = self.storage_path {
-                self.cleanup_orphaned_files(dir);
-            }
+        if before > after
+            && let Some(ref dir) = self.storage_path
+        {
+            self.cleanup_orphaned_files(dir);
         }
     }
 
@@ -813,10 +812,10 @@ impl PropagationNode {
                 if filename.ends_with(".peer") || filename.ends_with(".msgpack") {
                     continue;
                 }
-                if let Some((tid, _, _)) = PropagationEntry::parse_filename(&filename) {
-                    if !self.store.contains(&tid) {
-                        let _ = std::fs::remove_file(&path);
-                    }
+                if let Some((tid, _, _)) = PropagationEntry::parse_filename(&filename)
+                    && !self.store.contains(&tid)
+                {
+                    let _ = std::fs::remove_file(&path);
                 }
             }
         }
@@ -1116,16 +1115,15 @@ impl PropagationNode {
                 for want_val in wants_arr {
                     if let (Some(tid), Some(dir)) =
                         (parse_store_id(want_val), self.storage_path.as_ref())
+                        && let Some(entry) = self.store.get(&tid)
                     {
-                        if let Some(entry) = self.store.get(&tid) {
-                            // Ownership gate (Python LXMRouter.py:1479): a client
-                            // may only download messages addressed to itself.
-                            if entry.destination_hash == *client_dest_hash {
-                                reads.push(PlannedRead {
-                                    path: dir.join(entry.filename()),
-                                    stamped: entry.stamped,
-                                });
-                            }
+                        // Ownership gate (Python LXMRouter.py:1479): a client
+                        // may only download messages addressed to itself.
+                        if entry.destination_hash == *client_dest_hash {
+                            reads.push(PlannedRead {
+                                path: dir.join(entry.filename()),
+                                stamped: entry.stamped,
+                            });
                         }
                     }
                 }
@@ -1288,11 +1286,10 @@ impl PropagationNode {
                     // Compatibility wrapper: production uses the staged task
                     // path and exposes this delta to the daemon for off-loop
                     // persistence.
-                    if !terminal_handled_ids.is_empty() {
-                        if let Err(error) = self.persist_peer_handled(policy, &terminal_handled_ids)
-                        {
-                            tracing::warn!(%error, "failed to persist terminal offer dispositions");
-                        }
+                    if !terminal_handled_ids.is_empty()
+                        && let Err(error) = self.persist_peer_handled(policy, &terminal_handled_ids)
+                    {
+                        tracing::warn!(%error, "failed to persist terminal offer dispositions");
                     }
                     return offer;
                 }
@@ -1406,13 +1403,12 @@ impl PropagationNode {
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.extension().map(|e| e == "peer").unwrap_or(false) {
-                    if let Ok(data) = std::fs::read(&path) {
-                        if let Some(mut peer) = LxmPeer::from_bytes_with_handled(&data) {
-                            self.prune_handled_against_store(&mut peer);
-                            peers.push(peer);
-                        }
-                    }
+                if path.extension().map(|e| e == "peer").unwrap_or(false)
+                    && let Ok(data) = std::fs::read(&path)
+                    && let Some(mut peer) = LxmPeer::from_bytes_with_handled(&data)
+                {
+                    self.prune_handled_against_store(&mut peer);
+                    peers.push(peer);
                 }
             }
         }

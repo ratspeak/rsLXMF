@@ -187,10 +187,10 @@ impl<T> From<oneshot::Receiver<T>> for ReadyReceipt<T> {
 }
 impl<T> ReadyReceipt<T> {
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> bool {
-        if self.ready.is_none() {
-            if let Poll::Ready(result) = Pin::new(&mut self.receiver).poll(cx) {
-                self.ready = Some(result);
-            }
+        if self.ready.is_none()
+            && let Poll::Ready(result) = Pin::new(&mut self.receiver).poll(cx)
+        {
+            self.ready = Some(result);
         }
         self.ready.is_some()
     }
@@ -907,15 +907,15 @@ impl LinkDeliveryManager {
     /// Use one polling task per manager and retain periodic ticks for protocol
     /// deadlines. A bounded drain may leave more input ready for the next turn.
     pub fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<()> {
-        if self.ready_event.is_none() {
-            if let Poll::Ready(event) = self.event_rx.poll_recv(cx) {
-                self.ready_event = event;
-            }
+        if self.ready_event.is_none()
+            && let Poll::Ready(event) = self.event_rx.poll_recv(cx)
+        {
+            self.ready_event = event;
         }
-        if self.ready_lifecycle.is_none() {
-            if let Poll::Ready(event) = self.endpoint_lifecycle_rx.poll_recv(cx) {
-                self.ready_lifecycle = event;
-            }
+        if self.ready_lifecycle.is_none()
+            && let Poll::Ready(event) = self.endpoint_lifecycle_rx.poll_recv(cx)
+        {
+            self.ready_lifecycle = event;
         }
         let mut ready = self.ready_event.is_some() || self.ready_lifecycle.is_some();
         for pending in self.pending_endpoint_binds.values_mut() {
@@ -1844,26 +1844,25 @@ impl LinkDeliveryManager {
             if event.binding.role != LinkEndpointRole::Initiator {
                 continue;
             }
-            if let Some(delivery) = self.pending.get_mut(&event.binding.link_id) {
-                if delivery.attached_interface == Some(event.binding.interface_id)
+            if let Some(delivery) = self.pending.get_mut(&event.binding.link_id)
+                && (delivery.attached_interface == Some(event.binding.interface_id)
                     || self
                         .pending_endpoint_binds
                         .get(&event.binding.link_id)
-                        .is_some_and(|pending| pending.interface_id == event.binding.interface_id)
-                {
-                    tracing::warn!(
-                        link_id = %hex_encode(&event.binding.link_id),
-                        interface_id = event.binding.interface_id,
-                        reason = ?event.reason,
-                        dropped_packets = event.dropped_packets,
-                        "Direct Link endpoint terminated"
-                    );
-                    delivery.attached_interface = None;
-                    delivery.state = DeliveryState::Failed;
-                    delivery.failure_reason =
-                        Some(format!("Link endpoint terminated: {:?}", event.reason));
-                    self.pending_endpoint_binds.remove(&event.binding.link_id);
-                }
+                        .is_some_and(|pending| pending.interface_id == event.binding.interface_id))
+            {
+                tracing::warn!(
+                    link_id = %hex_encode(&event.binding.link_id),
+                    interface_id = event.binding.interface_id,
+                    reason = ?event.reason,
+                    dropped_packets = event.dropped_packets,
+                    "Direct Link endpoint terminated"
+                );
+                delivery.attached_interface = None;
+                delivery.state = DeliveryState::Failed;
+                delivery.failure_reason =
+                    Some(format!("Link endpoint terminated: {:?}", event.reason));
+                self.pending_endpoint_binds.remove(&event.binding.link_id);
             }
         }
 
@@ -2109,10 +2108,10 @@ impl LinkDeliveryManager {
                         }
                         rns_wire::context::PacketContext::ResourceHmu => {
                             let plaintext = self.decrypt_resource_control(&link_id, data);
-                            if let Some(pt) = plaintext {
-                                if !self.handle_inbound_resource_hmu(&link_id, &pt) {
-                                    self.handle_hmu(&link_id, &pt);
-                                }
+                            if let Some(pt) = plaintext
+                                && !self.handle_inbound_resource_hmu(&link_id, &pt)
+                            {
+                                self.handle_hmu(&link_id, &pt);
                             }
                         }
                         rns_wire::context::PacketContext::ResourceReq => {
@@ -2852,49 +2851,45 @@ impl LinkDeliveryManager {
                         {
                             continue;
                         }
-                        if !delivery.reusable && !delivery.pretransfer_identify_staged {
-                            if let (Some(pub_key), Some(sign_key)) =
+                        if !delivery.reusable
+                            && !delivery.pretransfer_identify_staged
+                            && let (Some(pub_key), Some(sign_key)) =
                                 (&self.identity_pub, &self.identity_key)
-                            {
-                                if let Ok(identify_data) = delivery.link.identify(pub_key, sign_key)
-                                {
-                                    let id_header = rns_wire::header::PacketHeader {
-                                        flags: rns_wire::flags::PacketFlags {
-                                            header_type: rns_wire::flags::HeaderType::Header1,
-                                            context_flag: false,
-                                            transport_type:
-                                                rns_wire::flags::TransportType::Broadcast,
-                                            destination_type:
-                                                rns_wire::flags::DestinationType::Link,
-                                            packet_type: rns_wire::flags::PacketType::Data,
-                                        },
-                                        hops: 0,
-                                        transport_id: None,
-                                        destination_hash: *link_id,
-                                        context: rns_wire::context::PacketContext::LinkIdentify,
-                                    };
-                                    let mut id_raw = id_header.pack();
-                                    id_raw.extend_from_slice(&identify_data);
-                                    if let Err(reason) = stage_link_endpoint_with_success(
-                                        &self.transport_tx,
-                                        &mut self.pending_transport,
-                                        &mut self.pending_endpoint_sends,
-                                        *link_id,
-                                        OutboundRequest {
-                                            raw: Bytes::from(id_raw),
-                                            destination_hash: *link_id,
-                                        },
-                                        EndpointSendSuccess::FinishHandshake,
-                                    ) {
-                                        delivery.state = DeliveryState::Failed;
-                                        delivery.failure_reason = Some(reason.to_string());
-                                        continue;
-                                    }
-                                    delivery.pretransfer_identify_staged = true;
-                                    if delivery.endpoint_dispatch_token.is_some() {
-                                        continue;
-                                    }
-                                }
+                            && let Ok(identify_data) = delivery.link.identify(pub_key, sign_key)
+                        {
+                            let id_header = rns_wire::header::PacketHeader {
+                                flags: rns_wire::flags::PacketFlags {
+                                    header_type: rns_wire::flags::HeaderType::Header1,
+                                    context_flag: false,
+                                    transport_type: rns_wire::flags::TransportType::Broadcast,
+                                    destination_type: rns_wire::flags::DestinationType::Link,
+                                    packet_type: rns_wire::flags::PacketType::Data,
+                                },
+                                hops: 0,
+                                transport_id: None,
+                                destination_hash: *link_id,
+                                context: rns_wire::context::PacketContext::LinkIdentify,
+                            };
+                            let mut id_raw = id_header.pack();
+                            id_raw.extend_from_slice(&identify_data);
+                            if let Err(reason) = stage_link_endpoint_with_success(
+                                &self.transport_tx,
+                                &mut self.pending_transport,
+                                &mut self.pending_endpoint_sends,
+                                *link_id,
+                                OutboundRequest {
+                                    raw: Bytes::from(id_raw),
+                                    destination_hash: *link_id,
+                                },
+                                EndpointSendSuccess::FinishHandshake,
+                            ) {
+                                delivery.state = DeliveryState::Failed;
+                                delivery.failure_reason = Some(reason.to_string());
+                                continue;
+                            }
+                            delivery.pretransfer_identify_staged = true;
+                            if delivery.endpoint_dispatch_token.is_some() {
+                                continue;
                             }
                         }
                         // Reusable Direct links follow upstream LXMF and identify
@@ -3375,10 +3370,10 @@ impl LinkDeliveryManager {
                         ) {
                             results.push(result);
                         }
-                    } else if proof_observed {
-                        if let Some(result) = self.complete_backchannel_delivery(key) {
-                            results.push(result);
-                        }
+                    } else if proof_observed
+                        && let Some(result) = self.complete_backchannel_delivery(key)
+                    {
+                        results.push(result);
                     }
                 }
                 Ok(Err(err)) => {
@@ -3527,10 +3522,10 @@ impl LinkDeliveryManager {
             if let Some(ref mut transfer) = delivery.transfer {
                 transfer.handle_hmu(hmu_data);
                 let progress = delivery_resource_progress(delivery);
-                if let Some(progress) = progress {
-                    if should_update_resource_progress(delivery.message.progress, progress) {
-                        delivery.message.progress = progress;
-                    }
+                if let Some(progress) = progress
+                    && should_update_resource_progress(delivery.message.progress, progress)
+                {
+                    delivery.message.progress = progress;
                 }
                 progress.map(|_| {
                     delivery_event(
@@ -3610,10 +3605,10 @@ impl LinkDeliveryManager {
                 }
             }
             let progress = delivery_resource_progress(delivery);
-            if let Some(progress) = progress {
-                if should_update_resource_progress(delivery.message.progress, progress) {
-                    delivery.message.progress = progress;
-                }
+            if let Some(progress) = progress
+                && should_update_resource_progress(delivery.message.progress, progress)
+            {
+                delivery.message.progress = progress;
             }
             progress.map(|_| {
                 delivery_event(
@@ -3701,17 +3696,16 @@ impl LinkDeliveryManager {
         let mut rejected_hash = [0u8; 32];
         rejected_hash.copy_from_slice(&reject_data[..32]);
 
-        if let Some(delivery) = self.pending.get_mut(link_id) {
-            if let Some(ref mut transfer) = delivery.transfer {
-                if transfer.resource.resource_hash == rejected_hash {
-                    transfer.handle_cancel();
-                    delivery.remaining_segments = None;
-                    delivery.message.mark_rejected();
-                    delivery.state = DeliveryState::Rejected;
-                    delivery.failure_reason = Some("resource rejected".to_string());
-                    return true;
-                }
-            }
+        if let Some(delivery) = self.pending.get_mut(link_id)
+            && let Some(ref mut transfer) = delivery.transfer
+            && transfer.resource.resource_hash == rejected_hash
+        {
+            transfer.handle_cancel();
+            delivery.remaining_segments = None;
+            delivery.message.mark_rejected();
+            delivery.state = DeliveryState::Rejected;
+            delivery.failure_reason = Some("resource rejected".to_string());
+            return true;
         }
 
         false
@@ -3762,20 +3756,17 @@ impl LinkDeliveryManager {
 
     /// Apply an inbound link-packet proof; returns `true` when the packet delivery is complete.
     pub fn handle_link_packet_proof(&mut self, link_id: &[u8; 16], proof_data: &[u8]) -> bool {
-        if let Some(delivery) = self.pending.get_mut(link_id) {
-            if delivery.state == DeliveryState::AwaitingProof {
-                if let Some(packet_hash) = delivery.packet_proof_hash {
-                    if delivery
-                        .link
-                        .validate_packet_proof(&packet_hash, proof_data)
-                    {
-                        delivery.link.record_inbound();
-                        delivery.link.record_rx(proof_data.len());
-                        delivery.state = DeliveryState::Complete;
-                        return true;
-                    }
-                }
-            }
+        if let Some(delivery) = self.pending.get_mut(link_id)
+            && delivery.state == DeliveryState::AwaitingProof
+            && let Some(packet_hash) = delivery.packet_proof_hash
+            && delivery
+                .link
+                .validate_packet_proof(&packet_hash, proof_data)
+        {
+            delivery.link.record_inbound();
+            delivery.link.record_rx(proof_data.len());
+            delivery.state = DeliveryState::Complete;
+            return true;
         }
         false
     }
@@ -4268,39 +4259,39 @@ impl LinkDeliveryManager {
             .pending_backchannel_deliveries
             .iter()
             .find_map(|(key, delivery)| (delivery.message.hash == Some(msg_hash)).then_some(*key));
-        if let Some(key) = pending_key {
-            if let Some(delivery) = self.pending_backchannel_deliveries.remove(&key) {
-                self.remove_backchannel_owner(delivery.dest_hash, delivery.link_id);
-                self.cancel_backchannel_packet_key(key, delivery.packet_cancellation);
-                if let BackchannelProofKey::Resource(link_id, resource_hash) = key {
-                    self.pending_backchannel_resource_cancellations.push_back(
-                        BackchannelResourceCancelRequest {
-                            link_id,
-                            resource_hash,
-                        },
-                    );
-                }
-                self.delivery_events.push_back(backchannel_delivery_event(
-                    BackchannelDeliveryEventInput {
-                        kind: LxmfDeliveryEventKind::Failed,
-                        message: &delivery.message,
-                        dest_hash: delivery.dest_hash,
-                        link_id: delivery.link_id,
-                        representation: delivery.representation,
-                        progress: Some(delivery.message.progress),
-                        reason: Some(reason.to_string()),
-                        link_state: LinkState::Closed,
-                        delivery_state: DeliveryState::Failed,
+        if let Some(key) = pending_key
+            && let Some(delivery) = self.pending_backchannel_deliveries.remove(&key)
+        {
+            self.remove_backchannel_owner(delivery.dest_hash, delivery.link_id);
+            self.cancel_backchannel_packet_key(key, delivery.packet_cancellation);
+            if let BackchannelProofKey::Resource(link_id, resource_hash) = key {
+                self.pending_backchannel_resource_cancellations.push_back(
+                    BackchannelResourceCancelRequest {
+                        link_id,
+                        resource_hash,
                     },
-                ));
-                results.push(DeliveryResult::Failed {
-                    link_id: delivery.link_id,
-                    msg_hash: delivery.message.hash,
-                    dest_hash: delivery.dest_hash,
-                    message: delivery.message,
-                    reason: reason.to_string(),
-                });
+                );
             }
+            self.delivery_events.push_back(backchannel_delivery_event(
+                BackchannelDeliveryEventInput {
+                    kind: LxmfDeliveryEventKind::Failed,
+                    message: &delivery.message,
+                    dest_hash: delivery.dest_hash,
+                    link_id: delivery.link_id,
+                    representation: delivery.representation,
+                    progress: Some(delivery.message.progress),
+                    reason: Some(reason.to_string()),
+                    link_state: LinkState::Closed,
+                    delivery_state: DeliveryState::Failed,
+                },
+            ));
+            results.push(DeliveryResult::Failed {
+                link_id: delivery.link_id,
+                msg_hash: delivery.message.hash,
+                dest_hash: delivery.dest_hash,
+                message: delivery.message,
+                reason: reason.to_string(),
+            });
         }
 
         results
@@ -4965,18 +4956,18 @@ fn finish_reusable_delivery(
     link_id: &[u8; 16],
     delivery: &mut PendingDelivery,
 ) {
-    if !delivery.backchannel_identified {
-        if let (Some(pub_key), Some(sign_key)) = (identity_pub, identity_key) {
-            delivery.backchannel_identified = send_link_identify(
-                transport_tx,
-                pending_transport,
-                pending_endpoint_sends,
-                link_id,
-                &delivery.link,
-                pub_key,
-                sign_key,
-            );
-        }
+    if !delivery.backchannel_identified
+        && let (Some(pub_key), Some(sign_key)) = (identity_pub, identity_key)
+    {
+        delivery.backchannel_identified = send_link_identify(
+            transport_tx,
+            pending_transport,
+            pending_endpoint_sends,
+            link_id,
+            &delivery.link,
+            pub_key,
+            sign_key,
+        );
     }
 
     delivery.transfer = None;

@@ -5,7 +5,7 @@
     {
       "name": "lxmf-core",
       "version": "1.2.0",
-      "rustVersion": "1.87",
+      "rustVersion": "1.89",
       "edition": "2024",
       "features": {},
       "targets": [
@@ -239,7 +239,7 @@
     {
       "name": "lxmf-tools",
       "version": "1.2.0",
-      "rustVersion": "1.87",
+      "rustVersion": "1.89",
       "edition": "2024",
       "features": {},
       "targets": [

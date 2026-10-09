@@ -718,30 +718,27 @@ impl PropagationSyncTask {
                                 continue;
                             }
                             let node_hex = self.node_dest_hash.map(|h| hex_encode(&h));
-                            if let Some(node_hex) = node_hex {
-                                if let Some(pub_key) = known_identities.get(&node_hex) {
-                                    let ed25519_bytes: [u8; 32] =
-                                        pub_key[32..64].try_into().unwrap();
-                                    if let Ok(verify_key) =
-                                        Ed25519PublicKey::from_bytes(&ed25519_bytes)
-                                    {
-                                        self.handle_link_proof(
-                                            data,
-                                            &verify_key,
-                                            &ed25519_bytes,
-                                            interface_id,
-                                        );
-                                    }
+                            if let Some(node_hex) = node_hex
+                                && let Some(pub_key) = known_identities.get(&node_hex)
+                            {
+                                let ed25519_bytes: [u8; 32] = pub_key[32..64].try_into().unwrap();
+                                if let Ok(verify_key) = Ed25519PublicKey::from_bytes(&ed25519_bytes)
+                                {
+                                    self.handle_link_proof(
+                                        data,
+                                        &verify_key,
+                                        &ed25519_bytes,
+                                        interface_id,
+                                    );
                                 }
                             }
                         }
                         rns_wire::context::PacketContext::ResourceHmu => {
-                            if let Some(ref link) = self.link {
-                                if let Ok(plaintext) = link.decrypt(data) {
-                                    if let Some(ref mut transfer) = self.active_transfer {
-                                        transfer.handle_hmu(&plaintext);
-                                    }
-                                }
+                            if let Some(ref link) = self.link
+                                && let Ok(plaintext) = link.decrypt(data)
+                                && let Some(ref mut transfer) = self.active_transfer
+                            {
+                                transfer.handle_hmu(&plaintext);
                             }
                         }
                         rns_wire::context::PacketContext::ResourceReq => {
@@ -760,16 +757,12 @@ impl PropagationSyncTask {
                             }
                         }
                         rns_wire::context::PacketContext::Response => {
-                            if self.state == SyncTaskState::AwaitingResponse {
-                                if let Some(ref mut link) = self.link {
-                                    if let Ok((_request_id, response_data)) =
-                                        link.handle_response(data)
-                                    {
-                                        let offer_response =
-                                            OfferResponse::from_msgpack(&response_data);
-                                        self.handle_offer_response(offer_response);
-                                    }
-                                }
+                            if self.state == SyncTaskState::AwaitingResponse
+                                && let Some(ref mut link) = self.link
+                                && let Ok((_request_id, response_data)) = link.handle_response(data)
+                            {
+                                let offer_response = OfferResponse::from_msgpack(&response_data);
+                                self.handle_offer_response(offer_response);
                             }
                         }
                         rns_wire::context::PacketContext::ResourceRcl
@@ -1039,10 +1032,10 @@ impl PropagationSyncTask {
 
     fn prepare_transfer_for_ids(&mut self, ids: &[PropagationTransientId]) {
         if ids.is_empty() {
-            if let Some(node_hash) = self.node_dest_hash {
-                if let Ok(mut node) = self.propagation_node.lock() {
-                    node.complete_sync(&node_hash);
-                }
+            if let Some(node_hash) = self.node_dest_hash
+                && let Ok(mut node) = self.propagation_node.lock()
+            {
+                node.complete_sync(&node_hash);
             }
             self.state = SyncTaskState::Complete;
             return;
@@ -1128,13 +1121,12 @@ impl PropagationSyncTask {
                 if self.terminal_result.is_none()
                     && self.offer_policy.is_none()
                     && self.last_sync.elapsed() >= self.sync_interval
+                    && let Some(node_hash) = self.node_dest_hash
                 {
-                    if let Some(node_hash) = self.node_dest_hash {
-                        if self.message_count() > 0 {
-                            let _ = self.start_sync(node_hash);
-                        } else {
-                            self.last_sync = Instant::now();
-                        }
+                    if self.message_count() > 0 {
+                        let _ = self.start_sync(node_hash);
+                    } else {
+                        self.last_sync = Instant::now();
                     }
                 }
             }
@@ -1146,38 +1138,38 @@ impl PropagationSyncTask {
                 self.drive_transfers();
             }
             SyncTaskState::Complete | SyncTaskState::Failed => {
-                if self.terminal_result.is_none() {
-                    if let Some(peer_hash) = self.node_dest_hash {
-                        let complete = self.state == SyncTaskState::Complete;
-                        self.terminal_result = Some(PeerSyncTerminalResult {
-                            peer_hash,
-                            state: if complete {
-                                PeerSyncTerminalState::Complete
-                            } else {
-                                PeerSyncTerminalState::Failed
-                            },
-                            offer_generation: complete
-                                .then_some(self.active_offer_generation)
-                                .flatten(),
-                            generation_exhausted: complete && self.generation_exhausted,
-                            offered: if complete { self.offered_count } else { 0 },
-                            outgoing: if complete { self.outgoing_count } else { 0 },
-                            tx_bytes: if complete { self.transfer_data_size } else { 0 },
-                            link_establishment_rate: self.link_establishment_rate,
-                            sync_transfer_rate: (complete && self.outgoing_count > 0)
-                                .then(|| {
-                                    self.transfer_started.map(|started| {
-                                        let elapsed = started.elapsed().as_secs_f64();
-                                        if elapsed > 0.0 {
-                                            self.transfer_wire_size as f64 * 8.0 / elapsed
-                                        } else {
-                                            0.0
-                                        }
-                                    })
+                if self.terminal_result.is_none()
+                    && let Some(peer_hash) = self.node_dest_hash
+                {
+                    let complete = self.state == SyncTaskState::Complete;
+                    self.terminal_result = Some(PeerSyncTerminalResult {
+                        peer_hash,
+                        state: if complete {
+                            PeerSyncTerminalState::Complete
+                        } else {
+                            PeerSyncTerminalState::Failed
+                        },
+                        offer_generation: complete
+                            .then_some(self.active_offer_generation)
+                            .flatten(),
+                        generation_exhausted: complete && self.generation_exhausted,
+                        offered: if complete { self.offered_count } else { 0 },
+                        outgoing: if complete { self.outgoing_count } else { 0 },
+                        tx_bytes: if complete { self.transfer_data_size } else { 0 },
+                        link_establishment_rate: self.link_establishment_rate,
+                        sync_transfer_rate: (complete && self.outgoing_count > 0)
+                            .then(|| {
+                                self.transfer_started.map(|started| {
+                                    let elapsed = started.elapsed().as_secs_f64();
+                                    if elapsed > 0.0 {
+                                        self.transfer_wire_size as f64 * 8.0 / elapsed
+                                    } else {
+                                        0.0
+                                    }
                                 })
-                                .flatten(),
-                        });
-                    }
+                            })
+                            .flatten(),
+                    });
                 }
                 self.cleanup_sync();
                 self.last_sync = Instant::now();
@@ -1311,10 +1303,10 @@ impl PropagationSyncTask {
                     self.active_offer_generation = Some(generation);
                     self.generation_exhausted = generation_exhausted;
                     self.record_handled_updates(&terminal_handled_ids);
-                    if offer.transient_ids.is_empty() {
-                        if let Ok(mut node) = self.propagation_node.lock() {
-                            node.complete_sync(&node_hash);
-                        }
+                    if offer.transient_ids.is_empty()
+                        && let Ok(mut node) = self.propagation_node.lock()
+                    {
+                        node.complete_sync(&node_hash);
                     }
                     offer
                 }
@@ -1589,10 +1581,10 @@ impl PropagationSyncTask {
 
         let completed_ids = std::mem::take(&mut self.active_transfer_ids);
         self.record_handled_updates(&completed_ids);
-        if let Some(node_hash) = self.node_dest_hash {
-            if let Ok(mut node) = self.propagation_node.lock() {
-                node.complete_sync(&node_hash);
-            }
+        if let Some(node_hash) = self.node_dest_hash
+            && let Ok(mut node) = self.propagation_node.lock()
+        {
+            node.complete_sync(&node_hash);
         }
         self.state = SyncTaskState::Complete;
     }
@@ -1741,10 +1733,10 @@ impl PropagationSyncTask {
             peer.link_closed();
         }
 
-        if let Some(link_id) = self.link_id.take() {
-            if !graceful_release {
-                self.queue_endpoint_cleanup(link_id);
-            }
+        if let Some(link_id) = self.link_id.take()
+            && !graceful_release
+        {
+            self.queue_endpoint_cleanup(link_id);
         }
         self.attached_interface = None;
         self.pending_endpoint_bind = None;

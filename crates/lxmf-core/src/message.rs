@@ -606,19 +606,19 @@ impl LxMessage {
         self.transient_id = Some(tid);
 
         let mut stamp_value = 0;
-        if let Some(target_cost) = propagation_stamp_cost {
-            if self.propagation_stamp.is_none() {
-                let (stamp, value) = crate::stamper::generate_stamp(
-                    &tid,
-                    target_cost,
-                    crate::constants::STAMP_WORKBLOCK_EXPAND_ROUNDS_PN,
-                )
-                .ok_or_else(|| {
-                    MessageError::PackFailed("failed to generate propagation stamp".to_string())
-                })?;
-                self.propagation_stamp = Some(stamp);
-                stamp_value = value;
-            }
+        if let Some(target_cost) = propagation_stamp_cost
+            && self.propagation_stamp.is_none()
+        {
+            let (stamp, value) = crate::stamper::generate_stamp(
+                &tid,
+                target_cost,
+                crate::constants::STAMP_WORKBLOCK_EXPAND_ROUNDS_PN,
+            )
+            .ok_or_else(|| {
+                MessageError::PackFailed("failed to generate propagation stamp".to_string())
+            })?;
+            self.propagation_stamp = Some(stamp);
+            stamp_value = value;
         }
 
         if let Some(ref prop_stamp) = self.propagation_stamp {
@@ -1008,14 +1008,13 @@ impl LxMessage {
 
         // 4. Generate PoW stamp
         let cost = self.stamp_cost.unwrap();
-        if let Some(message_id) = self.message_id {
-            if let Some((stamp, value)) =
+        if let Some(message_id) = self.message_id
+            && let Some((stamp, value)) =
                 crate::stamper::generate_stamp(&message_id, cost, STAMP_WORKBLOCK_EXPAND_ROUNDS)
-            {
-                self.stamp_value = Some(value as u16);
-                self.stamp = Some(stamp.to_vec());
-                return Some(stamp.to_vec());
-            }
+        {
+            self.stamp_value = Some(value as u16);
+            self.stamp = Some(stamp.to_vec());
+            return Some(stamp.to_vec());
         }
 
         None

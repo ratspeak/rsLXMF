@@ -561,16 +561,16 @@ impl LxmRouter {
             }
         }
 
-        if message.method == DeliveryMethod::Opportunistic {
-            if let Ok(packed) = message.pack_payload() {
-                let content_size = packed
-                    .len()
-                    .saturating_sub(TIMESTAMP_SIZE + STRUCT_OVERHEAD);
-                // Approximates ENCRYPTED_PACKET_MAX_CONTENT for default RNS parameters.
-                let max_content = 295;
-                if content_size > max_content {
-                    message.method = DeliveryMethod::Direct;
-                }
+        if message.method == DeliveryMethod::Opportunistic
+            && let Ok(packed) = message.pack_payload()
+        {
+            let content_size = packed
+                .len()
+                .saturating_sub(TIMESTAMP_SIZE + STRUCT_OVERHEAD);
+            // Approximates ENCRYPTED_PACKET_MAX_CONTENT for default RNS parameters.
+            let max_content = 295;
+            if content_size > max_content {
+                message.method = DeliveryMethod::Direct;
             }
         }
 
@@ -591,13 +591,12 @@ impl LxmRouter {
         message: &mut LxMessage,
     ) -> Result<(), TicketPreparationError> {
         let now = now_f64();
-        if message.outbound_ticket.is_none() {
-            if let Some(ticket) = self
+        if message.outbound_ticket.is_none()
+            && let Some(ticket) = self
                 .ticket_store
                 .find_outbound(&message.destination_hash, now)
-            {
-                message.outbound_ticket = Some(ticket.token);
-            }
+        {
+            message.outbound_ticket = Some(ticket.token);
         }
 
         if message.include_ticket && !message.fields.contains_key(&FIELD_TICKET) {
@@ -915,10 +914,8 @@ impl LxmRouter {
                 .active_deferred_stamp
                 .as_ref()
                 .is_some_and(|job| job.message_hash == *message_hash);
-            if active_matches {
-                if let Some(job) = self.active_deferred_stamp.take() {
-                    job.handle.cancel();
-                }
+            if active_matches && let Some(job) = self.active_deferred_stamp.take() {
+                job.handle.cancel();
             }
             return true;
         }

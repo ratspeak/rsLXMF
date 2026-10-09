@@ -15,6 +15,8 @@
 
 ### Build and compatibility
 
+- Raised the host source-build minimum to Rust 1.89 and qualified the corresponding protocol dependency update.
+
 - Restricted rsReticulum compatibility to the 1.3 patch line so a later breaking minor release requires an explicit update.
 - Updated the Python interoperability baseline to Reticulum 1.4.2 and LXMF 1.0.1, with separate LXMF 1.1.0 checks.
 
