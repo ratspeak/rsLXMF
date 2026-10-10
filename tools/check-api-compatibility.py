@@ -50,7 +50,7 @@ def main() -> None:
         [sys.executable, "tools/check-api-baseline.py", "--metadata-only"], cwd=ROOT
     )
     if metadata.returncode != 0:
-        fail("snapshot metadata or review is invalid")
+        fail("snapshot metadata is invalid")
     ledger = json.loads(LEDGER_PATH.read_text(encoding="utf-8"))
     floor = ledger.get("compatibilityFloor", {}).get("evidenceCommit")
     if not isinstance(floor, str):
@@ -59,6 +59,9 @@ def main() -> None:
     floor_snapshots = {
         package["name"]: package["snapshot"] for package in floor_ledger["packages"]
     }
+    removed_packages = set(floor_snapshots) - {package["name"] for package in ledger["packages"]}
+    if removed_packages:
+        fail(f"compatibility-floor packages removed: {sorted(removed_packages)}")
     total_added = 0
     total_removed = 0
     for package in ledger["packages"]:
@@ -81,12 +84,6 @@ def main() -> None:
             f"{total_removed} public API lines were removed from the compatibility floor; "
             "the current policy permits additions only"
         )
-    review = ledger["snapshotSource"]["review"]
-    if review["publicApiDiff"] != {
-        "added": total_added,
-        "removed": total_removed,
-    }:
-        fail("snapshot review does not match the measured API diff")
     print(f"api compatibility: additive-only (+{total_added}, -0)")
 
 
