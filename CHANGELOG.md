@@ -9,6 +9,11 @@
 
 ### Fixed and improved
 
+- Send oversized propagation `/get` and purge requests as request Resources,
+  with sequential bounded chunks for larger inboxes. Match responses and
+  Resource completion to the owning request, preserve partial downloads on
+  failure, and keep healthy transfers alive beyond the former whole-phase
+  timeout. Resource receipt alone is not successful purge completion.
 - Kept active attachment transfers alive while data is moving and reduced delays between delivery steps.
 - Corrected progress reporting for transfers split across multiple Resources by weighting each part by its payload size.
 - Fixed intermittent propagation-node sync and unpeer failures caused by incorrectly encoded peer addresses.
@@ -17,7 +22,8 @@
 
 - Raised the host source-build minimum to Rust 1.89 and qualified the corresponding protocol dependency update.
 
-- Restricted rsReticulum compatibility to the 1.3 patch line so a later breaking minor release requires an explicit update.
+- Migrated rsReticulum compatibility to the explicit `~1.4.0` line, including
+  nullable interface discovery and bounded RNode announce admission.
 - Updated the Python interoperability baseline to Reticulum 1.4.2 and LXMF 1.0.1, with separate LXMF 1.1.0 checks.
 
 
