@@ -25,7 +25,7 @@ env:
   PACKAGE_ROOT: rsLXMF
   LXMF_BINS: lxmd-rs
   RSLXMF_RSRETICULUM_VERSION: 1.3.0
-  RSLXMF_RSRETICULUM_COMMIT: 6a425e8d5afb961316a5935d9a157a4b01776983
+  RSLXMF_RSRETICULUM_COMMIT: 799e946ac997f388395fec4e8c49ea55a03e5bc8
 
 jobs:
   verify:
@@ -123,7 +123,10 @@ jobs:
               cp "target/release/${bin}" "dist/${PACKAGE_ROOT}/bin/${bin}"
             fi
           done
-          cp README.md LICENSE CHANGELOG.md "dist/${PACKAGE_ROOT}/"
+          # Read blobs directly so Windows checkout line endings cannot alter the package.
+          for doc in README.md LICENSE CHANGELOG.md; do
+            git show "HEAD:${doc}" > "dist/${PACKAGE_ROOT}/${doc}"
+          done
       - name: Create tar archive
         if: runner.os != 'Windows'
         shell: bash
