@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 1.3.0 - 2026-10-12
+
 ### Added
 
 - Added delivery readiness hooks so applications can react promptly to incoming Link traffic and local send completion.

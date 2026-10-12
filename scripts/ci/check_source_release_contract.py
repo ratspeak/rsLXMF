@@ -96,8 +96,12 @@ def check_release_workflow(reticulum_version: str) -> str:
 
     if not re.search(r"^\s*toolchain:\s*1\.89\.0\s*$", workflow, re.MULTILINE):
         fail("release workflow does not select Rust 1.89.0")
-    if "ref: ${{ env.RELEASE_TAG }}" not in workflow:
-        fail("release workflow does not check out RELEASE_TAG")
+    if "ref: ${{ env.SOURCE_REF }}" not in workflow or "SOURCE_REF: ${{ github.sha }}" not in workflow:
+        fail("release workflow must check out the immutable event commit")
+    if "    if: github.event_name == 'push' || !inputs.qualify_only\n    needs: package" not in workflow:
+        fail("publication must exclude qualification and require verified archives")
+    if "--candidate-tag" not in workflow or "actions/workflows/ci.yml/runs?head_sha=" not in workflow:
+        fail("release workflow must qualify untagged sources and require exact-source CI")
 
     version_match = re.search(
         r"^\s*RSLXMF_RSRETICULUM_VERSION:\s*(\S+)\s*$", workflow, re.MULTILINE
@@ -162,7 +166,7 @@ def check_documentation(version: str) -> None:
         fail("README.md contains an unlocked release build command")
 
 
-def check_release_tag(release_tag: str, version: str, dependency_commit: str) -> None:
+def check_release_tag(release_tag: str, version: str) -> None:
     if not re.fullmatch(r"v\d+\.\d+\.\d+", release_tag):
         fail("release tags must have the form vX.Y.Z")
     expected_tag = f"v{version}"
@@ -184,6 +188,8 @@ def check_release_tag(release_tag: str, version: str, dependency_commit: str) ->
     if head != tagged_commit:
         fail(f"HEAD {head} is not the commit named by {release_tag} ({tagged_commit})")
 
+
+def check_dependency(dependency_commit: str) -> None:
     dependency_root = ROOT.parent / "rsReticulum"
     if not dependency_root.is_dir():
         fail(f"rsReticulum checkout is missing at {dependency_root}")
@@ -194,9 +200,21 @@ def check_release_tag(release_tag: str, version: str, dependency_commit: str) ->
         )
 
 
+def check_candidate_tag(tag: str, version: str) -> None:
+    if not re.fullmatch(r"v\d+\.\d+\.\d+", tag) or tag != f"v{version}":
+        fail("candidate tag must match the workspace version as vX.Y.Z")
+    result = subprocess.run(
+        ["git", "show-ref", "--verify", "--quiet", f"refs/tags/{tag}"], cwd=ROOT
+    )
+    if result.returncode != 1:
+        fail("candidate qualification requires an untagged version")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--release-tag")
+    tags = parser.add_mutually_exclusive_group()
+    tags.add_argument("--release-tag")
+    tags.add_argument("--candidate-tag")
     args = parser.parse_args()
 
     version, reticulum_version = check_packages(metadata())
@@ -208,8 +226,12 @@ def main() -> None:
         cwd=ROOT,
         check=True,
     )
+    if args.candidate_tag or args.release_tag:
+        check_dependency(dependency_commit)
+    if args.candidate_tag:
+        check_candidate_tag(args.candidate_tag, version)
     if args.release_tag:
-        check_release_tag(args.release_tag, version, dependency_commit)
+        check_release_tag(args.release_tag, version)
     print(f"source-release contract passed for rsLXMF {version}")
 
 
