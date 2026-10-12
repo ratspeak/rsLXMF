@@ -114,6 +114,25 @@ def check_release_workflow(reticulum_version: str) -> str:
     if "ref: ${{ env.RSLXMF_RSRETICULUM_COMMIT }}" not in workflow:
         fail("release workflow does not check out the pinned rsReticulum commit")
 
+    publishers = re.findall(
+        r"^      - uses: softprops/action-gh-release@[0-9a-f]{40}[^\n]*\n"
+        r"        with:\n((?:          [^\n]*\n)+)",
+        workflow,
+        re.MULTILINE,
+    )
+    if len(publishers) != 1:
+        fail("release workflow must have one explicit GitHub publisher")
+    inputs = dict(re.findall(r"^          ([a-z_]+): (.*)$", publishers[0], re.MULTILINE))
+    expected = {
+        "tag_name": "${{ env.RELEASE_TAG }}",
+        "name": "${{ env.RELEASE_TAG }}",
+        "body": '""',
+        "generate_release_notes": "false",
+        "append_body": "false",
+    }
+    if any(inputs.get(key) != value for key, value in expected.items()) or "body_path" in inputs:
+        fail("GitHub releases must use the exact version tag as title and an empty body")
+
     release_builds = [
         line.strip()
         for line in workflow.splitlines()
@@ -144,6 +163,8 @@ def check_documentation(version: str) -> None:
 
 
 def check_release_tag(release_tag: str, version: str, dependency_commit: str) -> None:
+    if not re.fullmatch(r"v\d+\.\d+\.\d+", release_tag):
+        fail("release tags must have the form vX.Y.Z")
     expected_tag = f"v{version}"
     if release_tag != expected_tag:
         fail(f"release tag {release_tag!r} does not match {expected_tag!r}")

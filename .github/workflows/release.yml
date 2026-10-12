@@ -17,8 +17,8 @@ env:
   RELEASE_TAG: ${{ github.event.inputs.tag_name || github.ref_name }}
   PACKAGE_ROOT: rsLXMF
   LXMF_BINS: lxmd-rs
-  RSLXMF_RSRETICULUM_VERSION: 1.4.0
-  RSLXMF_RSRETICULUM_COMMIT: 1ff0134979292fa8fc04c2e3db2bf483f31d7656
+  RSLXMF_RSRETICULUM_VERSION: 1.3.0
+  RSLXMF_RSRETICULUM_COMMIT: 032c3fd6d359bd5b3068a67b2a5a4c149610ea04
 
 jobs:
   verify:
@@ -134,5 +134,9 @@ jobs:
       - uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
         with:
           tag_name: ${{ env.RELEASE_TAG }}
+          name: ${{ env.RELEASE_TAG }}
+          body: ""
+          generate_release_notes: false
+          append_body: false
           prerelease: ${{ contains(env.RELEASE_TAG, '-') }}
           files: release-assets/*
