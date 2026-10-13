@@ -937,7 +937,9 @@ fn read_msgpack_array_len(input: &mut &[u8]) -> Result<u32, MessageError> {
     }
 }
 
-fn read_msgpack_string_or_binary<'a>(input: &mut &'a [u8]) -> Result<&'a [u8], MessageError> {
+pub(crate) fn read_msgpack_string_or_binary<'a>(
+    input: &mut &'a [u8],
+) -> Result<&'a [u8], MessageError> {
     let marker = take_msgpack(input, 1)?[0];
     let length = match marker {
         0xa0..=0xbf => usize::from(marker & 0x1f),
@@ -1074,7 +1076,7 @@ fn read_msgpack_integer(input: &mut &[u8]) -> Result<i128, MessageError> {
 fn read_msgpack_integer_u8_strict(input: &mut &[u8]) -> Result<u8, MessageError> {
     u8::try_from(read_msgpack_integer(input)?).map_err(|_| MessageError::InvalidByte)
 }
-fn skip_msgpack_value(input: &mut &[u8], depth: usize) -> Result<(), MessageError> {
+pub(crate) fn skip_msgpack_value(input: &mut &[u8], depth: usize) -> Result<(), MessageError> {
     if depth >= 64 {
         return Err(MessageError::UnpackFailed(
             "MessagePack nesting exceeds limit".to_string(),

@@ -63,6 +63,9 @@ use lxmf_tools::lxmd_runtime::{
 use rns_identity::announce::AnnounceData;
 use rns_identity::destination::Destination;
 use rns_identity::identity::Identity;
+use rns_identity::persistence::{
+    durable_create_dir_all, durable_reconcile, durable_write, validate_durable_storage_directory,
+};
 use rns_identity::ratchet::{
     ReceivedRatchet, clean_received_ratchets_dir, purge_expired_ratchets_in_memory,
 };
@@ -1550,6 +1553,7 @@ struct DaemonCheckpoint {
 impl DaemonCheckpoint {
     fn persist(self) -> std::io::Result<()> {
         let received = self.ratchets.join("received");
+        require_ratchet_directory(&received)?;
         for (hash, ratchet) in self.received {
             if !hex::decode(&hash).is_ok_and(|bytes| bytes.len() == 16) {
                 return Err(std::io::Error::other("invalid ratchet destination"));
@@ -1757,7 +1761,7 @@ impl LxmdRunner {
         >,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let paths = LxmdPaths::new(config_dir);
-        std::fs::create_dir_all(&paths.config_dir)?;
+        require_storage_namespace(&paths)?;
 
         let identity_path = paths.preferred_identity_path().to_path_buf();
         let identity = if identity_path.exists() {
@@ -1785,8 +1789,6 @@ impl LxmdRunner {
             &hex::encode(lxmf_dest_hash)[..16],
         );
 
-        let ratchet_dir = paths.ratchets_dir.clone();
-        std::fs::create_dir_all(&ratchet_dir)?;
         let wall_now = now_f64() as u64;
         let delivery_ratchets = DeliveryRatchetState::load_or_initialize(
             &identity,
@@ -1799,7 +1801,6 @@ impl LxmdRunner {
         // Mirrors Python `Identity._clean_ratchets()`: sweep the directory at
         // startup so stale entries don't survive a restart.
         let received_dir = paths.received_ratchets_dir.clone();
-        std::fs::create_dir_all(&received_dir)?;
         let removed = clean_received_ratchets_dir(&received_dir);
         if removed > 0 {
             tracing::info!(removed, "swept expired received-ratchet files at startup");
@@ -3866,10 +3867,8 @@ impl LxmdRunner {
                 let path = self
                     .received_ratchets_dir
                     .join(format!("{dest_hex}.ratchet"));
-                let dir = self.received_ratchets_dir.clone();
                 tokio::task::spawn_blocking(move || {
-                    std::fs::create_dir_all(&dir).ok();
-                    if let Err(e) = rr.save(&path) {
+                    if let Err(e) = rr.save_durable(&path) {
                         tracing::warn!("Failed to persist received ratchet: {e}");
                     }
                 });
@@ -5492,12 +5491,12 @@ impl LxmdRunner {
 
     fn save_crypto_state(&self) -> std::io::Result<()> {
         let ratchet_dir = self.ratchets_dir.clone();
-        std::fs::create_dir_all(&ratchet_dir)?;
+        require_ratchet_directory(&ratchet_dir)?;
+        let received_dir = ratchet_dir.join("received");
+        require_ratchet_directory(&received_dir)?;
 
         self.delivery_ratchets.save_durable(&self.identity)?;
 
-        let received_dir = ratchet_dir.join("received");
-        std::fs::create_dir_all(&received_dir)?;
         for (hash_hex, rr) in &self.received_ratchets {
             let path = received_dir.join(format!("{hash_hex}.ratchet"));
             if !hex::decode(hash_hex).is_ok_and(|hash| hash.len() == 16) {
@@ -5522,6 +5521,85 @@ impl LxmdRunner {
         }
         lxmf_core::persist::write_file_atomic(&ki_path, &data)
     }
+}
+
+const STORAGE_NAMESPACE_BYTES: &[u8] = b"lxmd-private-namespace-v1\n";
+
+fn require_ratchet_directory(path: &Path) -> std::io::Result<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "daemon namespace must contain real directories",
+        ));
+    }
+    validate_durable_storage_directory(path).map_err(std::io::Error::other)
+}
+
+fn require_storage_namespace(paths: &LxmdPaths) -> std::io::Result<()> {
+    durable_reconcile(
+        &paths.config_dir.join(".lxmd-namespace-ready"),
+        STORAGE_NAMESPACE_BYTES,
+    )
+    .map_err(std::io::Error::other)?;
+    for path in [
+        &paths.config_dir,
+        &paths.storage_dir,
+        &paths.lxmf_storage_dir,
+        &paths.ratchets_dir,
+        &paths.received_ratchets_dir,
+    ] {
+        require_ratchet_directory(path)?;
+    }
+    Ok(())
+}
+
+/// Establish/reconcile the entire private ratchet namespace before config,
+/// RNS or daemon storage users open handles. A live runner only validates this
+/// completed marker and never republishes an existing root on Windows.
+fn initialize_storage_namespace(config_dir: &Path) -> std::io::Result<()> {
+    let target = std::path::absolute(config_dir)?;
+    if target.join(".lxmd-namespace-ready").try_exists()? {
+        require_storage_namespace(&LxmdPaths::new(&target))?;
+    }
+    let mut anchor = target.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "daemon config directory needs an outside namespace anchor",
+        )
+    })?;
+    while !anchor.try_exists()? {
+        anchor = anchor.parent().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "daemon namespace has no existing anchor",
+            )
+        })?;
+    }
+    let digest = hex::encode(rns_crypto::sha::sha256(
+        target.as_os_str().as_encoded_bytes(),
+    ));
+    let witness = durable_write(
+        &anchor.join(format!(".lxmd-root-{digest}.witness")),
+        STORAGE_NAMESPACE_BYTES,
+    )
+    .map_err(std::io::Error::other)?;
+    let paths = LxmdPaths::new(&target);
+    for path in [
+        &paths.config_dir,
+        &paths.storage_dir,
+        &paths.lxmf_storage_dir,
+        &paths.ratchets_dir,
+        &paths.received_ratchets_dir,
+    ] {
+        durable_create_dir_all(path, &witness).map_err(std::io::Error::other)?;
+    }
+    durable_write(
+        &target.join(".lxmd-namespace-ready"),
+        STORAGE_NAMESPACE_BYTES,
+    )
+    .map_err(std::io::Error::other)?;
+    Ok(())
 }
 
 #[tokio::main]
@@ -5618,6 +5696,10 @@ pub(crate) async fn main() {
         None
     };
 
+    if !is_control_command && let Err(error) = initialize_storage_namespace(&config_dir) {
+        tracing::error!(%error, "Failed to establish private daemon storage namespace");
+        std::process::exit(1);
+    }
     let config_path = config_dir.join("config");
     let config = match rns_runtime::config::Config::from_file(&config_path) {
         Ok(c) => c,
@@ -6358,6 +6440,49 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn storage_namespace_fresh_restart_and_missing_parent_are_checked() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("fresh/nested/config");
+        initialize_storage_namespace(&root).unwrap();
+        let (tx, _rx) = mpsc::channel(64);
+        let first = LxmdRunner::new(DaemonConfig::default(), &root, tx, None).unwrap();
+        let public = first.delivery_ratchets.ring().current_public_key();
+        assert!(public.is_some());
+        first.save_crypto_state().unwrap();
+        drop(first);
+        initialize_storage_namespace(&root).unwrap();
+        let (tx, _rx) = mpsc::channel(64);
+        let restarted = LxmdRunner::new(DaemonConfig::default(), &root, tx, None).unwrap();
+        assert_eq!(
+            restarted.delivery_ratchets.ring().current_public_key(),
+            public
+        );
+        std::fs::remove_dir(&restarted.received_ratchets_dir).unwrap();
+        assert!(restarted.save_crypto_state().is_err());
+        assert!(!restarted.received_ratchets_dir.exists());
+        drop(restarted);
+        assert!(initialize_storage_namespace(&root).is_err());
+    }
+
+    #[tokio::test]
+    async fn storage_namespace_barrier_failure_prevents_daemon_ratchet_creation() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("config");
+        let paths = LxmdPaths::new(&root);
+        std::fs::create_dir_all(&paths.lxmf_storage_dir).unwrap();
+        std::fs::write(&paths.ratchets_dir, b"preserve namespace blocker").unwrap();
+        assert!(initialize_storage_namespace(&root).is_err());
+        let (tx, _rx) = mpsc::channel(64);
+        assert!(LxmdRunner::new(DaemonConfig::default(), &root, tx, None).is_err());
+        assert_eq!(
+            std::fs::read(&paths.ratchets_dir).unwrap(),
+            b"preserve namespace blocker"
+        );
+        assert!(!paths.ratchet_ring_path.exists());
+        assert!(!root.join("identity").exists());
+    }
+
+    #[tokio::test]
     async fn direct_ticket_requires_source_verification_and_survives_restart() {
         use lxmf_core::constants::FIELD_TICKET;
         use lxmf_core::message::{LxMessageDraft, RecipientStamp};
@@ -6365,6 +6490,7 @@ mod tests {
 
         let temp = tempfile::tempdir().unwrap();
         let (tx, _rx) = mpsc::channel(64);
+        initialize_storage_namespace(temp.path()).unwrap();
         let mut runner = LxmdRunner::new(DaemonConfig::default(), temp.path(), tx, None).unwrap();
         let deliveries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let observed = deliveries.clone();
@@ -6526,6 +6652,7 @@ mod tests {
         assert!(config.propagation_enabled);
         let shutdown = ShutdownSignal::new();
         let rns_config = config_dir.join("rns");
+        initialize_storage_namespace(&config_dir).unwrap();
         eprintln!("PN_RECEIPT_START initializing Reticulum");
         let handle = rns_runtime::reticulum::init(
             Some(rns_config.to_str().unwrap()),
@@ -6595,6 +6722,7 @@ mod tests {
             std::process::id()
         ));
         let (tx, _rx) = mpsc::channel(64);
+        initialize_storage_namespace(&temp).unwrap();
         let mut runner = LxmdRunner::new(DaemonConfig::default(), &temp, tx, None).unwrap();
         runner.ensure_link_delivery();
         let (send_tx, mut send_rx) = mpsc::channel(8);
@@ -7035,6 +7163,7 @@ mod tests {
                 enforce_stamps,
                 ..Default::default()
             };
+            initialize_storage_namespace(&temp).unwrap();
             let mut runner = LxmdRunner::new(config, &temp, tx, None).expect("runner");
             let raw = runner.create_announce_packet().expect("delivery announce");
             let (_, announce) = unpack_announce(&raw);
@@ -7413,6 +7542,7 @@ mod tests {
             std::process::id()
         ));
         let (tx, _rx) = mpsc::channel::<TransportMessage>(64);
+        initialize_storage_namespace(&temp).unwrap();
         let mut runner = LxmdRunner::new(DaemonConfig::default(), &temp, tx, None).expect("runner");
 
         let deliveries = Arc::new(AtomicUsize::new(0));

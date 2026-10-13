@@ -765,7 +765,10 @@ impl PropagationNode {
     ) -> Option<PropagationStoreWritePlan> {
         self.reap_retired();
         let transient_id = entry.transient_id;
-        if self.store.contains(&transient_id) || self.pending_write_ids.contains(&transient_id) {
+        if self.store.is_destination_ignored(&entry.destination_hash)
+            || self.store.contains(&transient_id)
+            || self.pending_write_ids.contains(&transient_id)
+        {
             return None;
         }
         // Python checks the current store size before inserting and permits
@@ -837,7 +840,11 @@ impl PropagationNode {
             return false;
         }
         self.pending_write_bytes = self.pending_write_bytes.saturating_sub(size);
-        let inserted = !self.store.contains(&transient_id) && self.store.insert(persisted.entry);
+        // The exact live reservation already admitted this destination before
+        // publication. A later ignore change must not abandon the committed
+        // object outside the in-memory quota and maintenance accounting.
+        let inserted =
+            !self.store.contains(&transient_id) && self.store.insert_admitted(persisted.entry);
         if inserted {
             if let Some(path) = persisted.path {
                 self.object_paths.insert(transient_id, path);
@@ -1930,7 +1937,14 @@ pub(crate) mod tests {
     #[test]
     fn hosted_node_applies_ignored_destination_policy() {
         let destination = [0x44; 16];
-        let mut node = durable_test_node(PropagationNodeConfig::default(), [0xAA; 16]);
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("store");
+        let mut node = PropagationNode::with_storage(
+            PropagationNodeConfig::default(),
+            [0xAA; 16],
+            legacy.clone(),
+        )
+        .unwrap();
         node.ignore_destination(destination);
         assert!(node.is_destination_ignored(&destination));
 
@@ -1938,9 +1952,68 @@ pub(crate) mod tests {
         blob.extend_from_slice(b"encrypted-lxmf");
         assert!(!node.accept_blob_fixture(&blob, 0));
         assert_eq!(node.message_count(), 0);
+        assert!(node.pending_write_ids.is_empty());
+        assert_eq!(node.pending_write_bytes, 0);
+        assert_eq!(
+            std::fs::read_dir(node.storage_path.as_ref().unwrap().join("objects"))
+                .unwrap()
+                .count(),
+            0,
+            "ignored admissions must publish neither objects nor active indexes"
+        );
+
+        drop(node);
+        let mut node =
+            PropagationNode::with_storage(PropagationNodeConfig::default(), [0xAA; 16], legacy)
+                .unwrap();
+        assert_eq!(node.message_count(), 0, "rejected deposits cannot reappear");
+        node.ignore_destination(destination);
 
         node.unignore_destination(&destination);
         assert!(node.accept_blob_fixture(&blob, 0));
+    }
+
+    #[test]
+    fn pending_store_write_retains_its_admitted_destination_policy() {
+        let destination = [0x44; 16];
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("store");
+        let mut node = PropagationNode::with_storage(
+            PropagationNodeConfig::default(),
+            [0xAA; 16],
+            legacy.clone(),
+        )
+        .unwrap();
+        let message = make_signed_message(destination, [0xCC; 16], "", "admitted");
+        let id = message.transient_id.unwrap();
+        let plan = node.plan_fixture(&message).unwrap();
+
+        node.ignore_destination(destination);
+        let persisted = plan.persist().unwrap();
+        assert!(node.commit_store_write(persisted));
+        assert_eq!(node.message_count(), 1);
+        assert_eq!(node.total_size(), message.data.len() + 32);
+        assert_eq!(node.message_get_request(&[id]).len(), 1);
+
+        let mut duplicate = message.data.clone();
+        duplicate.extend_from_slice(&message.stamp);
+        let blob = ValidatedOpaquePropagationBlob::validate(duplicate.into(), 0).unwrap();
+        let PropagationAdmission::CommittedDuplicate(check) = node.plan_opaque_admission(blob)
+        else {
+            panic!("previous admission retains duplicate acknowledgement authority");
+        };
+        check.verify().unwrap();
+        let later = make_signed_message(destination, [0xCC; 16], "", "ignored");
+        assert!(node.plan_fixture(&later).is_none());
+
+        drop(node);
+        let mut node =
+            PropagationNode::with_storage(PropagationNodeConfig::default(), [0xAA; 16], legacy)
+                .unwrap();
+        node.ignore_destination(destination);
+        assert_eq!(node.message_count(), 1);
+        assert_eq!(node.total_size(), message.data.len() + 32);
+        assert_eq!(node.message_get_request(&[id]).len(), 1);
     }
 
     #[test]

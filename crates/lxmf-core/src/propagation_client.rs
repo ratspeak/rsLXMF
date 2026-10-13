@@ -1705,35 +1705,69 @@ impl PropagationClient {
 
     /// Phase 1: parse available transient IDs from the server.
     fn handle_list_response(&mut self, response_data: &[u8]) {
-        let value: rmpv::Value = match Self::decode_response_value(response_data) {
-            Ok(v) => v,
+        let ids = match Self::parse_available_message_ids(response_data) {
+            Ok(ids) => ids,
             Err(_) => {
                 self.fail();
                 return;
             }
         };
 
-        if let Some(arr) = value.as_array() {
-            self.finish_request(response_data);
-            self.available_messages.clear();
-            for item in arr {
-                if let Some(id_bytes) = item.as_slice()
-                    && id_bytes.len() == 32
-                {
-                    self.available_messages.push(id_bytes.to_vec());
-                }
-            }
-
-            if self.available_messages.is_empty() {
-                self.status.state = PropagationClientState::Complete;
-                self.status.progress = 1.0;
-                self.status.result = Some(0);
-            } else {
-                self.send_get_request();
-            }
+        self.finish_request(response_data);
+        self.available_messages = ids;
+        if self.available_messages.is_empty() {
+            self.status.state = PropagationClientState::Complete;
+            self.status.progress = 1.0;
+            self.status.result = Some(0);
         } else {
-            self.fail();
+            self.send_get_request();
         }
+    }
+
+    /// Validate the complete borrowed list before reserving only the valid ID
+    /// output. Unknown items are skipped without materializing their containers;
+    /// the advertised array count cannot amplify allocation for nil-heavy lists.
+    fn parse_available_message_ids(response_data: &[u8]) -> Result<Vec<Vec<u8>>, ()> {
+        fn next_id<'a>(input: &mut &'a [u8]) -> Result<Option<&'a [u8]>, ()> {
+            let value = *input;
+            crate::message::skip_msgpack_value(input, 0).map_err(|_| ())?;
+            if !matches!(value.first(), Some(0xa0..=0xbf | 0xc4..=0xc6 | 0xd9..=0xdb)) {
+                return Ok(None);
+            }
+            // Match the previous Value::as_slice behavior for binary and string
+            // bytes, including invalid UTF-8 in a legacy string-encoded ID.
+            let id =
+                crate::message::read_msgpack_string_or_binary(&mut &value[..]).map_err(|_| ())?;
+            Ok((id.len() == 32).then_some(id))
+        }
+
+        if response_data.len() > MAX_RESOURCE_SIZE {
+            return Err(());
+        }
+        let mut input = response_data;
+        let count = rmp::decode::read_array_len(&mut input).map_err(|_| ())? as usize;
+        // Every item needs at least one marker. Check before iteration or any
+        // reservation, including hostile array32 declarations in tiny payloads.
+        if count > input.len() {
+            return Err(());
+        }
+        let items = input;
+        let mut valid_count = 0;
+        for _ in 0..count {
+            valid_count += usize::from(next_id(&mut input)?.is_some());
+        }
+        if !input.is_empty() {
+            return Err(());
+        }
+        let mut ids = Vec::new();
+        ids.try_reserve_exact(valid_count).map_err(|_| ())?;
+        input = items;
+        for _ in 0..count {
+            if let Some(id) = next_id(&mut input)? {
+                ids.push(id.to_vec());
+            }
+        }
+        Ok(ids)
     }
 
     /// Validate type/count, exact requested TID membership, duplicates and full
@@ -1912,6 +1946,7 @@ impl PropagationClient {
         }
     }
 
+    #[cfg(test)]
     fn decode_response_value(data: &[u8]) -> Result<rmpv::Value, ()> {
         let mut remaining = data;
         let value = rmpv::decode::read_value(&mut remaining).map_err(|_| ())?;
@@ -1924,8 +1959,8 @@ impl PropagationClient {
     /// A successful purge is the empty array returned by Rust and Python
     /// nodes. In particular a peer error code or nil must not advance a cursor.
     fn handle_purge_response(&mut self, response_data: &[u8]) {
-        if !matches!(Self::decode_response_value(response_data), Ok(rmpv::Value::Array(items)) if items.is_empty())
-        {
+        let mut input = response_data;
+        if rmp::decode::read_array_len(&mut input).ok() != Some(0) || !input.is_empty() {
             self.fail();
             return;
         }
@@ -2956,6 +2991,115 @@ mod tests {
         client.handle_list_response(&buf);
         assert!(client.available_messages.is_empty());
         assert_eq!(client.status.state, PropagationClientState::Complete);
+    }
+
+    #[test]
+    fn list_reply_skips_non_ids_and_preserves_legacy_string_bytes() {
+        let mut reply = Vec::new();
+        rmp::encode::write_array_len(&mut reply, 5).unwrap();
+        rmp::encode::write_bin_len(&mut reply, 32).unwrap();
+        reply.extend_from_slice(&[0xab; 32]);
+        rmp::encode::write_str(&mut reply, &"x".repeat(32)).unwrap();
+        rmp::encode::write_str_len(&mut reply, 32).unwrap();
+        reply.extend_from_slice(&[0xff; 32]);
+        rmp::encode::write_bin_len(&mut reply, 16).unwrap();
+        reply.extend_from_slice(&[0xab; 16]);
+        rmp::encode::write_array_len(&mut reply, 100_000).unwrap();
+        reply.extend(std::iter::repeat_n(0xc0, 100_000));
+
+        let previous = PropagationClient::decode_response_value(&reply).unwrap();
+        let expected = previous
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| {
+                item.as_slice()
+                    .filter(|id| id.len() == 32)
+                    .map(<[u8]>::to_vec)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            expected,
+            vec![vec![0xab; 32], vec![b'x'; 32], vec![0xff; 32]]
+        );
+        assert_eq!(
+            PropagationClient::parse_available_message_ids(&reply).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn list_reply_rejects_invalid_framing_before_publishing_ids() {
+        let mut prefix = vec![0x92, 0xc4, 32];
+        prefix.extend_from_slice(&[0xab; 32]);
+        let mut truncated_item = prefix.clone();
+        truncated_item.extend_from_slice(&[0xc6, 0xff, 0xff, 0xff, 0xff]);
+        let mut deep_item = prefix;
+        deep_item.extend(std::iter::repeat_n(0x91, 64));
+        deep_item.push(0xc0);
+        for reply in [
+            vec![0xdd, 0xff, 0xff, 0xff, 0xff],
+            vec![0x91, 0xdb, 0xff, 0xff, 0xff, 0xff],
+            vec![0x91, 0xdf, 0xff, 0xff, 0xff, 0xff],
+            vec![0x90, 0xc0],
+            truncated_item,
+            deep_item,
+        ] {
+            let (tx, _rx) = mpsc::channel(16);
+            let mut client = PropagationClient::new(tx, None, None);
+            client.status.state = PropagationClientState::ListRequested;
+            client.available_messages = vec![vec![0xcc; 32]];
+            client.handle_list_response(&reply);
+            assert_eq!(client.state(), PropagationClientState::Failed);
+            assert_eq!(client.available_messages, vec![vec![0xcc; 32]]);
+        }
+    }
+
+    #[test]
+    fn list_reply_accepts_mailboxes_larger_than_a_request_chunk() {
+        let count = MAX_DOWNLOAD_ITEMS * 2 + 3;
+        let mut reply = Vec::new();
+        rmp::encode::write_array_len(&mut reply, count as u32).unwrap();
+        for number in 0..count {
+            let mut id = [0; 32];
+            id[..8].copy_from_slice(&(number as u64).to_be_bytes());
+            rmp::encode::write_bin_len(&mut reply, 32).unwrap();
+            reply.extend_from_slice(&id);
+        }
+        let ids = PropagationClient::parse_available_message_ids(&reply).unwrap();
+        assert_eq!(ids.len(), count);
+        for (number, id) in ids.iter().enumerate() {
+            assert_eq!(&id[..8], &(number as u64).to_be_bytes());
+        }
+    }
+
+    #[test]
+    fn purge_reply_requires_a_complete_empty_array_before_cursor_changes() {
+        let mut nil_heavy = Vec::new();
+        rmp::encode::write_array_len(&mut nil_heavy, 100_000).unwrap();
+        nil_heavy.extend(std::iter::repeat_n(0xc0, 100_000));
+        for reply in [
+            vec![0xdd, 0xff, 0xff, 0xff, 0xff],
+            vec![0x90, 0xc0],
+            vec![0xdc, 0, 0, 0xc0],
+            vec![0xc0],
+            nil_heavy,
+        ] {
+            let (tx, _rx) = mpsc::channel(16);
+            let mut client = PropagationClient::new(tx, None, None);
+            client.status.state = PropagationClientState::PurgeRequested;
+            client.received_ids = vec![vec![0xab; 32]];
+            client.handle_purge_response(&reply);
+            assert_eq!(client.state(), PropagationClientState::Failed);
+            assert_eq!(client.received_ids, vec![vec![0xab; 32]]);
+        }
+        for reply in [vec![0x90], vec![0xdc, 0, 0], vec![0xdd, 0, 0, 0, 0]] {
+            let (tx, _rx) = mpsc::channel(16);
+            let mut client = PropagationClient::new(tx, None, None);
+            client.status.state = PropagationClientState::PurgeRequested;
+            client.handle_purge_response(&reply);
+            assert_eq!(client.state(), PropagationClientState::Complete);
+        }
     }
 
     #[test]

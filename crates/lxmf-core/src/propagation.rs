@@ -120,6 +120,13 @@ impl PropagationStore {
         if self.ignored_destinations.contains(&entry.destination_hash) {
             return false;
         }
+        self.insert_admitted(entry)
+    }
+
+    /// Account for an entry whose admission policy was checked before its
+    /// durable publication. Later ignore-list changes affect future admissions,
+    /// not a write already accepted under the node's reservation authority.
+    pub(crate) fn insert_admitted(&mut self, entry: PropagationEntry) -> bool {
         self.total_size += entry.size;
         self.entries.insert(entry.transient_id, entry);
         true
