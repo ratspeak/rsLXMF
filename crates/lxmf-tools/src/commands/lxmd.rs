@@ -1896,6 +1896,11 @@ impl LxmdRunner {
         if let Some(handle) = &endpoint_dispatch {
             link_mgr.set_link_endpoint_dispatch_handle(handle.clone());
         }
+        // Direct LXMF keeps ordinary Link transport receipts. Only the separate
+        // propagation destination defers its proofs until durable admission.
+        link_mgr.set_ordinary_packet_proof_strategy(
+            rns_identity::destination::ProofStrategy::ProveAll,
+        )?;
         link_mgr.set_link_packet_channel(link_packet_tx)?;
         link_mgr.set_accounting_event_channel(delivery_accounting_tx);
         link_mgr.set_resource_event_channel(delivery_resource_event_tx);
@@ -4819,6 +4824,15 @@ impl LxmdRunner {
 
     /// Write a received LXMF message to disk and invoke `on_inbound`.
     fn handle_inbound_message(&mut self, msg: LxMessage) {
+        // Direct/opportunistic admission has already checked the recipient's
+        // policy. Ticket learning separately requires the source-bound proof;
+        // deliver_inbound deliberately has no authentication authority. Learn
+        // before deduplication so a retry after identity recall can teach its ticket.
+        if let Some(public_key) = self.known_identities.get(&hex::encode(msg.source_hash()))
+            && let Ok(verified) = msg.verify(public_key)
+        {
+            self.router.learn_ticket_from_inbound(&verified);
+        }
         if !self.router.deliver_inbound(&msg, false) {
             tracing::debug!(
                 message = %hex::encode(msg.message_id()),
@@ -6342,6 +6356,105 @@ pub(crate) async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn direct_ticket_requires_source_verification_and_survives_restart() {
+        use lxmf_core::constants::FIELD_TICKET;
+        use lxmf_core::message::{LxMessageDraft, RecipientStamp};
+        use lxmf_core::ticket::Ticket;
+
+        let temp = tempfile::tempdir().unwrap();
+        let (tx, _rx) = mpsc::channel(64);
+        let mut runner = LxmdRunner::new(DaemonConfig::default(), temp.path(), tx, None).unwrap();
+        let deliveries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = deliveries.clone();
+        runner.router.register_delivery_callback(move |_| {
+            observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+        let sender = Identity::new();
+        let source =
+            Destination::hash_from_name_and_identity(DELIVERY_APP_NAME, Some(&sender.hash));
+        let token = [0xA7; 16];
+        let mut draft = LxMessageDraft::new(
+            runner.lxmf_dest_hash,
+            source,
+            "ticket",
+            "reply after restart",
+            DeliveryMethod::Direct,
+        )
+        .unwrap();
+        draft
+            .set_msgpack_field(
+                FIELD_TICKET,
+                Ticket::new(token, runner.lxmf_dest_hash, now_f64() + 3600.)
+                    .encode_field()
+                    .unwrap(),
+            )
+            .unwrap();
+        let message = draft
+            .sign(&sender.get_signing_key().unwrap())
+            .unwrap()
+            .finalize(None)
+            .unwrap();
+
+        // Unknown senders may be delivered, but cannot teach a ticket. An
+        // invalid signature under a recalled full identity cannot do so either.
+        runner.handle_link_delivered_data(message.wire_bytes());
+        assert!(runner.router.get_outbound_ticket(&source).is_none());
+        runner
+            .known_identities
+            .insert(hex::encode(source), sender.get_public_key());
+        let mut invalid = message.wire_bytes().to_vec();
+        invalid[32] ^= 1;
+        runner.handle_link_delivered_data(&invalid);
+        assert!(runner.router.get_outbound_ticket(&source).is_none());
+
+        // The exact duplicate is authenticated after identity recall and must
+        // still teach the ticket, without producing another delivery event.
+        runner.handle_link_delivered_data(message.wire_bytes());
+        assert_eq!(runner.router.get_outbound_ticket(&source), Some(token));
+        assert_eq!(deliveries.load(std::sync::atomic::Ordering::Relaxed), 1);
+        runner.router.save_state(&runner.data_dir).unwrap();
+        let mut restored = LxmRouter::new(lxmf_core::router::RouterConfig::default());
+        restored.load_state(&runner.data_dir).unwrap();
+        assert_eq!(restored.get_outbound_ticket(&source), Some(token));
+        let mut reply = LxMessageDraft::new(
+            source,
+            runner.lxmf_dest_hash,
+            "reply",
+            "uses the persisted ticket",
+            DeliveryMethod::Direct,
+        )
+        .unwrap();
+        restored.prepare_outbound(&mut reply).unwrap();
+        restored
+            .submit_signed(
+                reply
+                    .sign(&runner.identity.get_signing_key().unwrap())
+                    .unwrap(),
+            )
+            .unwrap();
+        let reply = &restored.pending_outbound[0];
+        let mut material = token.to_vec();
+        material.extend_from_slice(&reply.message_id());
+        assert_eq!(
+            reply.recipient_stamp(),
+            Some(&RecipientStamp::Ticket(rns_crypto::sha::truncated_hash(
+                &material
+            )))
+        );
+
+        let archived = runner
+            .messages_dir
+            .join(format!("{}.lxm", hex::encode(message.message_id())));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !archived.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
 
     fn signed_fixture(
         destination: [u8; 16],
