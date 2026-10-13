@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 1.4.0 - 2026-10-12
+
+- Preserve each signed message exactly as received, including binary text and custom fields, and reject ambiguous field definitions.
+- Remove downloaded messages from a propagation node only after the receiving application confirms durable acceptance. Failed items remain available for retry.
+- Keep propagation messages encrypted in storage, quarantine untrusted legacy entries, and require storage recovery before a node becomes available.
+- Keep stamps, encryption, and ticket state consistent across retries and restarts, and reject undecipherable messages instead of treating them as plaintext.
+- Bound background delivery work, keep node downloads responsive during storage operations, and defer excess downloads without dropping valid messages during busy periods.
+- Updated message construction and delivery APIs and require rsReticulum `~1.4.0`. This source-breaking release uses the `~1.4.0` compatibility line.
+
 ## 1.3.0 - 2026-10-12
 
 ### Added

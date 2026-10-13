@@ -46,6 +46,23 @@ pub struct Args {
     #[arg(short = 'p', long = "propagation-node")]
     pub propagation_node: bool,
 
+    /// Quarantine the legacy relay store and initialize the separate v2 store.
+    /// Run only after stopping all old relay writers and their auto-restart jobs.
+    #[arg(long, requires = "relay_writers_stopped")]
+    pub migrate_propagation_store: bool,
+
+    /// Confirm all legacy app/daemon relay writers are stopped for migration.
+    #[arg(long, requires = "migrate_propagation_store")]
+    pub relay_writers_stopped: bool,
+
+    /// Import an independently verified legacy opaque-ingress recovery manifest.
+    #[arg(long, requires_all = ["migrate_propagation_store", "recovery_manifest_sha256"])]
+    pub recover_propagation_manifest: Option<PathBuf>,
+
+    /// Separately approved SHA-256 of the exact recovery manifest file.
+    #[arg(long, requires = "recover_propagation_manifest")]
+    pub recovery_manifest_sha256: Option<String>,
+
     /// Executable to run when a message is received, overriding config.
     #[arg(short = 'i', long = "on-inbound", value_name = "PATH")]
     pub on_inbound: Option<String>,

@@ -404,6 +404,16 @@ pub fn create_router_with_transport(
 /// argument rather than interpolating into a shell string, so untrusted path
 /// contents cannot inject shell metacharacters.
 pub fn execute_on_inbound(command: &str, message_path: &str) -> std::io::Result<()> {
+    execute_on_inbound_with_event(command, message_path, "")
+}
+
+/// Durable propagation outbox events may replay after a crash. Hooks can use
+/// this stable identifier for their own idempotency boundary.
+pub fn execute_on_inbound_with_event(
+    command: &str,
+    message_path: &str,
+    event_id: &str,
+) -> std::io::Result<()> {
     use std::process::Command;
 
     let parts = split_command_line(command)?;
@@ -416,10 +426,15 @@ pub fn execute_on_inbound(command: &str, message_path: &str) -> std::io::Result<
         cmd.arg(arg);
     }
     cmd.arg(message_path);
+    if !event_id.is_empty() {
+        cmd.env("LXMF_EVENT_ID", event_id);
+    }
 
     let status = cmd.status()?;
     if !status.success() {
-        tracing::warn!("on_inbound command exited with status: {}", status);
+        return Err(std::io::Error::other(format!(
+            "on_inbound command exited with status: {status}"
+        )));
     }
     Ok(())
 }

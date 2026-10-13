@@ -97,7 +97,7 @@ def validate_metadata(
 ) -> list[dict[str, object]]:
     require_keys(
         config, {"schemaVersion", "tool", "baseline", "compatibilityFloor", "packages"},
-        "metadata",
+        "metadata", {"approvedBreakingChanges"},
     )
     if config["schemaVersion"] != 2:
         fail("unsupported api-stability schema")
@@ -110,6 +110,10 @@ def validate_metadata(
         config["compatibilityFloor"], {"evidenceCommit", "sourceCommit"},
         "compatibility floor",
     )
+
+    if "approvedBreakingChanges" in config:
+        require_keys(config["approvedBreakingChanges"],
+                     {"releaseLine", "migrationGuide", "removed"}, "approved break")
 
     tool = config.get("tool")
     if not isinstance(tool, dict):

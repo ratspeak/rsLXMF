@@ -13,6 +13,10 @@
 //! 8. `/get` with `[None, received_ids]` purges each downloaded batch before the next chunk.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -31,6 +35,11 @@ use rns_transport::messages::{
 };
 use tokio::sync::{mpsc, oneshot};
 
+use crate::admission::{
+    AdmissionEpochs, AdmissionResolution, AdmissionScope, DownloadAdmissionOutcome,
+    DownloadAdmissionToken, DownloadedPropagationMessage, MAX_DOWNLOAD_ITEMS, SuppressionLedger,
+    SuppressionRecord, retain_response,
+};
 use crate::constants::*;
 use crate::propagation::hex_encode;
 use crate::types::PropagationTransientId;
@@ -48,8 +57,37 @@ pub enum PropagationClientState {
     Receiving,
     /// `/get` with `[None, received_ids]` sent.
     PurgeRequested,
+    /// Download bytes await a durable local application decision.
+    AwaitingAdmission,
+    /// At least one item was retained remotely for retry/revalidation.
+    Partial,
     Complete,
     Failed,
+}
+
+/// Local admission/backoff status; none of these records authorize purge.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PropagationAdmissionStatus {
+    pub suppressed_count: usize,
+    pub deferred_count: usize,
+    pub next_retry: Option<u64>,
+    pub node_records: usize,
+    pub node_capacity: usize,
+    pub ledger_full: bool,
+    pub admission_paused: bool,
+}
+
+/// Per-cycle outcomes distinguish received ciphertext from durable local effects.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PropagationAdmissionCounts {
+    pub downloaded: usize,
+    pub committed: usize,
+    pub duplicate: usize,
+    pub policy_discarded: usize,
+    pub user_deleted: usize,
+    pub rejected: usize,
+    /// Subset of rejected items eligible for transient backoff retry.
+    pub retryable: usize,
 }
 
 /// One coherent public snapshot of a propagation-node download.
@@ -58,8 +96,9 @@ pub struct PropagationTransferStatus {
     pub state: PropagationClientState,
     pub progress: f64,
     pub data_size: Option<usize>,
-    /// Number of message blobs decoded from the completed response.
+    /// Number of durably accepted decisions, including duplicates/discards.
     pub result: Option<usize>,
+    pub admission: PropagationAdmissionCounts,
 }
 
 impl Default for PropagationTransferStatus {
@@ -69,6 +108,7 @@ impl Default for PropagationTransferStatus {
             progress: 0.0,
             data_size: None,
             result: None,
+            admission: PropagationAdmissionCounts::default(),
         }
     }
 }
@@ -164,6 +204,9 @@ pub struct PropagationClient {
     outbound_propagation_node: Option<[u8; 16]>,
     link: Option<Link>,
     link_id: Option<[u8; 16]>,
+    link_request_result: Option<
+        oneshot::Receiver<Result<(), rns_transport::link_messages::LinkRequestDispatchError>>,
+    >,
     attached_interface: Option<InterfaceId>,
     endpoint_release_queued: bool,
     pending_endpoint_bind: Option<PendingEndpointBind>,
@@ -180,8 +223,23 @@ pub struct PropagationClient {
     available_messages: Vec<Vec<u8>>,
     /// Messages we already have locally.
     local_messages: HashSet<Vec<u8>>,
+    local_message_expiry: HashMap<Vec<u8>, u64>,
     /// Phase 2 response: downloaded LXMF message data.
-    received_messages: Vec<Vec<u8>>,
+    received_messages: Vec<DownloadedPropagationMessage>,
+    admission_tx: mpsc::UnboundedSender<AdmissionResolution>,
+    admission_rx: mpsc::UnboundedReceiver<AdmissionResolution>,
+    admission_generation: u64,
+    current_admission_generation: Arc<AtomicU64>,
+    pending_admissions: HashSet<AdmissionScope>,
+    admission_started: Option<Instant>,
+    admission_progress: Option<Instant>,
+    admission_failures: usize,
+    suppression: SuppressionLedger,
+    admission_epochs: AdmissionEpochs,
+    suppression_updates: Vec<SuppressionRecord>,
+    suppression_persist_failed: bool,
+    suppression_dirty: bool,
+    suppression_revision: u64,
     /// IDs of messages successfully received (drives the Phase 3 purge).
     received_ids: Vec<Vec<u8>>,
     pending_haves: VecDeque<Vec<u8>>,
@@ -212,6 +270,7 @@ impl PropagationClient {
         identity_key: Option<Ed25519PrivateKey>,
     ) -> Self {
         let (event_tx, event_rx) = mpsc::channel(256);
+        let (admission_tx, admission_rx) = mpsc::unbounded_channel();
         let (endpoint_lifecycle_tx, endpoint_lifecycle_rx) = mpsc::unbounded_channel();
         Self {
             transport_tx,
@@ -220,6 +279,7 @@ impl PropagationClient {
             outbound_propagation_node: None,
             link: None,
             link_id: None,
+            link_request_result: None,
             attached_interface: None,
             endpoint_release_queued: false,
             pending_endpoint_bind: None,
@@ -233,7 +293,22 @@ impl PropagationClient {
             identity_key,
             available_messages: Vec::new(),
             local_messages: HashSet::new(),
+            local_message_expiry: HashMap::new(),
             received_messages: Vec::new(),
+            admission_tx,
+            admission_rx,
+            admission_generation: 0,
+            current_admission_generation: Arc::new(AtomicU64::new(0)),
+            pending_admissions: HashSet::new(),
+            admission_started: None,
+            admission_progress: None,
+            admission_failures: 0,
+            suppression: SuppressionLedger::default(),
+            admission_epochs: AdmissionEpochs::default(),
+            suppression_updates: Vec::new(),
+            suppression_persist_failed: false,
+            suppression_dirty: false,
+            suppression_revision: 0,
             received_ids: Vec::new(),
             pending_haves: VecDeque::new(),
             pending_wants: VecDeque::new(),
@@ -264,10 +339,12 @@ impl PropagationClient {
     }
 
     pub fn add_local_message(&mut self, transient_id: PropagationTransientId) {
+        self.local_message_expiry.remove(transient_id.as_slice());
         self.local_messages.insert(transient_id.to_vec());
     }
 
     pub fn add_local_message_id(&mut self, transient_id: Vec<u8>) {
+        self.local_message_expiry.remove(&transient_id);
         self.local_messages.insert(transient_id);
     }
 
@@ -276,6 +353,49 @@ impl PropagationClient {
         I: IntoIterator<Item = Vec<u8>>,
     {
         self.local_messages = transient_ids.into_iter().collect();
+        self.local_message_expiry.clear();
+    }
+
+    pub fn replace_durable_haves(
+        &mut self,
+        haves: impl IntoIterator<Item = crate::admission::DurableHave>,
+    ) {
+        self.local_messages.clear();
+        self.local_message_expiry.clear();
+        for have in haves {
+            self.remember_durable_have(have);
+        }
+        self.prune_expired_haves(crate::now_f64() as u64);
+    }
+    fn remember_durable_have(&mut self, have: crate::admission::DurableHave) {
+        self.local_messages.insert(have.transient_id.to_vec());
+        match have.expires_at {
+            Some(expiry) => {
+                self.local_message_expiry
+                    .insert(have.transient_id.to_vec(), expiry);
+            }
+            None => {
+                self.local_message_expiry
+                    .remove(have.transient_id.as_slice());
+            }
+        }
+    }
+    fn prune_expired_haves(&mut self, now: u64) {
+        self.local_message_expiry.retain(|id, expiry| {
+            if now >= *expiry {
+                self.local_messages.remove(id);
+                false
+            } else {
+                true
+            }
+        });
+        // Recheck immediately before the next purge, including long cycles.
+        if self.request.is_none() {
+            self.pending_haves
+                .retain(|id| self.local_messages.contains(id));
+            self.received_ids
+                .retain(|id| self.local_messages.contains(id));
+        }
     }
 
     pub fn set_retain_synced_on_node(&mut self, retain: bool) {
@@ -286,9 +406,104 @@ impl PropagationClient {
         &self.available_messages
     }
 
-    pub fn take_received_messages(&mut self) -> Vec<Vec<u8>> {
+    /// Move payloads and their single-use admission tokens into the durable
+    /// adapter. Raw-byte credit follows every Bytes clone across cancellation.
+    pub fn take_downloaded_messages(&mut self) -> Vec<DownloadedPropagationMessage> {
         self.unread_bytes = 0;
         std::mem::take(&mut self.received_messages)
+    }
+
+    /// Install only persisted suppression state. It never supplies purge authority.
+    pub fn set_suppression_ledger(&mut self, ledger: SuppressionLedger, epochs: AdmissionEpochs) {
+        self.suppression = ledger;
+        self.suppression_revision = self.suppression_revision.wrapping_add(1);
+        self.admission_epochs = epochs;
+        self.suppression_persist_failed = false;
+        self.suppression_dirty = false;
+        self.suppression_updates.clear();
+    }
+    pub fn update_admission_epochs(&mut self, epochs: AdmissionEpochs) {
+        if self.admission_epochs != epochs {
+            self.suppression_revision = self.suppression_revision.wrapping_add(1);
+        }
+        self.admission_epochs = epochs;
+        self.prune_suppression();
+    }
+    fn prune_suppression(&mut self) {
+        let before = self.suppression.records().count();
+        self.suppression
+            .prune(crate::now_f64() as u64, self.admission_epochs);
+        if self.suppression.records().count() != before {
+            self.suppression_dirty = true;
+            self.suppression_revision = self.suppression_revision.wrapping_add(1);
+        }
+    }
+    pub fn admission_status(&self) -> PropagationAdmissionStatus {
+        let identity = self.identity_hash();
+        let node = self.outbound_propagation_node.unwrap_or([0; 16]);
+        let now = crate::now_f64() as u64;
+        let mut status = PropagationAdmissionStatus {
+            node_capacity: SuppressionLedger::PER_NODE,
+            ledger_full: self.suppression.saturated(identity, node),
+            ..Default::default()
+        };
+        for record in self
+            .suppression
+            .records()
+            .filter(|record| record.scope.identity == identity && record.scope.node == node)
+        {
+            status.node_records += 1;
+            if record.active(now, self.admission_epochs) {
+                if record.reason.is_transient() {
+                    status.deferred_count += 1;
+                } else {
+                    status.suppressed_count += 1;
+                }
+                status.next_retry = Some(
+                    status
+                        .next_retry
+                        .map_or(record.next_retry, |n| n.min(record.next_retry)),
+                );
+            }
+        }
+        status.admission_paused =
+            self.suppression_persist_failed || self.suppression_dirty || status.ledger_full;
+        status
+    }
+    pub fn suppression_ledger(&self) -> &SuppressionLedger {
+        &self.suppression
+    }
+    /// Covers inserts, removals, expiry, epoch changes and restored snapshots.
+    pub fn suppression_revision(&self) -> u64 {
+        self.suppression_revision
+    }
+    /// A slow checkpoint must never reinstall an older ledger over new state.
+    pub fn acknowledge_suppression_persistence(&mut self, revision: u64) -> bool {
+        if revision != self.suppression_revision {
+            return false;
+        }
+        self.suppression_dirty = false;
+        self.suppression_persist_failed = false;
+        self.suppression_updates.clear();
+        true
+    }
+    pub fn suppression_persistence_pending(&self) -> bool {
+        self.suppression_dirty
+    }
+    pub fn take_suppression_updates(&mut self) -> Vec<SuppressionRecord> {
+        std::mem::take(&mut self.suppression_updates)
+    }
+    /// The adapter must report a failed durable suppression update. Automatic
+    /// new wants pause until persisted state is installed after recovery.
+    pub fn suppression_persistence_failed(&mut self) {
+        self.suppression_persist_failed = true;
+    }
+
+    fn identity_hash(&self) -> [u8; 16] {
+        self.identity_pub
+            .as_ref()
+            .map(|key| rns_crypto::sha::truncated_hash(key))
+            .unwrap_or([0; 16])
     }
 
     pub const fn state(&self) -> PropagationClientState {
@@ -304,7 +519,9 @@ impl PropagationClient {
     pub fn acknowledge_transfer(&mut self) -> bool {
         if !matches!(
             self.status.state,
-            PropagationClientState::Complete | PropagationClientState::Failed
+            PropagationClientState::Complete
+                | PropagationClientState::Partial
+                | PropagationClientState::Failed
         ) {
             return false;
         }
@@ -319,10 +536,15 @@ impl PropagationClient {
 
     /// Start a propagation download, limiting newly requested messages.
     /// `None` and zero mirror Python's `PR_ALL_MESSAGES`.
-    /// Drain previously received messages before restarting, including after a
-    /// failed purge or cancellation. A refused start never discards results.
+    /// Move live downloads into the durable adapter before restarting. Failure
+    /// or cancellation drops the client-owned queue and revokes its tokens;
+    /// already moved payload/worker owners retain their memory leases.
     pub fn start_download_with_limit(&mut self, max_messages: Option<usize>) -> bool {
-        if !self.received_messages.is_empty() {
+        self.prune_suppression();
+        if !self.received_messages.is_empty()
+            || self.suppression_persist_failed
+            || self.suppression_dirty
+        {
             return false;
         }
         let node_hash = match self.outbound_propagation_node {
@@ -333,13 +555,16 @@ impl PropagationClient {
             self.status.state,
             PropagationClientState::Idle
                 | PropagationClientState::Complete
+                | PropagationClientState::Partial
                 | PropagationClientState::Failed
         ) {
             return false;
         }
         if matches!(
             self.status.state,
-            PropagationClientState::Complete | PropagationClientState::Failed
+            PropagationClientState::Complete
+                | PropagationClientState::Partial
+                | PropagationClientState::Failed
         ) {
             self.cleanup();
         }
@@ -377,14 +602,20 @@ impl PropagationClient {
         let mut raw = header.pack();
         raw.extend_from_slice(&request_data);
 
-        if !self.queue_transport(TransportMessage::Outbound(OutboundRequest {
-            raw: Bytes::from(raw),
-            destination_hash: node_hash,
-        })) {
+        let (request_tx, request_rx) = oneshot::channel();
+        if !self.queue_transport(TransportMessage::SendLinkRequest {
+            request: OutboundRequest {
+                raw: Bytes::from(raw),
+                destination_hash: node_hash,
+            },
+            result_tx: request_tx,
+        }) {
             tracing::warn!("failed to stage propagation client Link request");
             self.pending_transport.clear();
             return false;
         }
+
+        self.link_request_result = Some(request_rx);
 
         self.status = PropagationTransferStatus {
             state: PropagationClientState::LinkEstablishing,
@@ -401,6 +632,13 @@ impl PropagationClient {
         self.identified = false;
         self.available_messages.clear();
         self.received_messages.clear();
+        self.admission_generation = self.admission_generation.wrapping_add(1);
+        self.current_admission_generation
+            .store(self.admission_generation, Ordering::Release);
+        self.pending_admissions.clear();
+        self.admission_failures = 0;
+        self.admission_started = None;
+        self.admission_progress = None;
         self.received_ids.clear();
         self.pending_haves.clear();
         self.pending_wants.clear();
@@ -447,7 +685,7 @@ impl PropagationClient {
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
                     self.pending_transport.clear();
-                    self.status.state = PropagationClientState::Failed;
+                    self.fail();
                     break;
                 }
             }
@@ -588,7 +826,7 @@ impl PropagationClient {
                         "propagation client Link endpoint send rejected"
                     );
                     if current {
-                        self.status.state = PropagationClientState::Failed;
+                        self.fail();
                     }
                     if pending.final_send {
                         self.queue_endpoint_cleanup(pending.link_id);
@@ -596,12 +834,12 @@ impl PropagationClient {
                 }
                 Err(oneshot::error::TryRecvError::Closed) => {
                     if current {
-                        self.status.state = PropagationClientState::Failed;
+                        self.fail();
                     }
                 }
                 Err(oneshot::error::TryRecvError::Empty) => {
                     if current && pending.queued_at.elapsed() >= Duration::from_secs(120) {
-                        self.status.state = PropagationClientState::Failed;
+                        self.fail();
                     } else if current || pending.final_send {
                         still_pending.push(pending);
                     }
@@ -648,7 +886,7 @@ impl PropagationClient {
                 );
                 self.attached_interface = None;
                 self.pending_endpoint_bind = None;
-                self.status.state = PropagationClientState::Failed;
+                self.fail();
             }
         }
 
@@ -662,7 +900,7 @@ impl PropagationClient {
                     self.status.state = PropagationClientState::LinkEstablished;
                     self.started_at = Some(Instant::now());
                 } else {
-                    self.status.state = PropagationClientState::Failed;
+                    self.fail();
                 }
             }
             Ok(
@@ -670,7 +908,7 @@ impl PropagationClient {
                 | LinkEndpointBindResult::InterfaceUnavailable,
             )
             | Err(oneshot::error::TryRecvError::Closed) => {
-                self.status.state = PropagationClientState::Failed;
+                self.fail();
             }
             Err(oneshot::error::TryRecvError::Empty) => {
                 self.pending_endpoint_bind = Some(pending);
@@ -678,7 +916,25 @@ impl PropagationClient {
         }
     }
 
+    fn poll_link_request(&mut self) {
+        let Some(mut receiver) = self.link_request_result.take() else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(%error,"Link request rejected by transport");
+                self.fail();
+            }
+            Err(oneshot::error::TryRecvError::Closed) => {
+                self.fail();
+            }
+            Err(oneshot::error::TryRecvError::Empty) => self.link_request_result = Some(receiver),
+        }
+    }
+
     pub fn drain_events(&mut self, known_identities: &std::collections::HashMap<String, [u8; 64]>) {
+        self.poll_link_request();
         self.poll_endpoint_control();
         let mut events = Vec::new();
         while let Ok(event) = self.event_rx.try_recv() {
@@ -694,7 +950,10 @@ impl PropagationClient {
                     self.handle_link_closed(link_id, None);
                 }
                 DestinationEvent::InboundPacket {
-                    raw, interface_id, ..
+                    raw,
+                    interface_id,
+                    interface_owner,
+                    ..
                 } => {
                     let (header, data_offset) = match rns_wire::header::PacketHeader::unpack(&raw) {
                         Ok(h) => h,
@@ -753,11 +1012,12 @@ impl PropagationClient {
                                         .expect("known_identities values are [u8; 64]; slice [32..64] is always 32 bytes");
                                 if let Ok(verify_key) = Ed25519PublicKey::from_bytes(&ed25519_bytes)
                                 {
-                                    self.handle_link_proof(
+                                    self.handle_link_proof_with_owner(
                                         data,
                                         &verify_key,
                                         &ed25519_bytes,
                                         interface_id,
+                                        interface_owner,
                                     );
                                 }
                             }
@@ -766,7 +1026,7 @@ impl PropagationClient {
                             if let Some(plaintext) =
                                 self.link.as_ref().and_then(|link| link.decrypt(data).ok())
                             {
-                                self.handle_response_plaintext(&plaintext);
+                                self.handle_response_owned(Bytes::from(plaintext));
                             }
                         }
                         rns_wire::context::PacketContext::ResourceReq => {
@@ -820,18 +1080,29 @@ impl PropagationClient {
             self.inbound_resources.clear();
             self.inbound_split_resources.clear();
             self.segment_routing.clear();
-            self.status.state = PropagationClientState::Failed;
+            self.fail();
         }
 
         verified
     }
 
+    #[cfg(test)]
     fn handle_link_proof(
         &mut self,
         proof_data: &[u8],
         verify_key: &Ed25519PublicKey,
         ed25519_pub: &[u8; 32],
         interface_id: InterfaceId,
+    ) {
+        self.handle_link_proof_with_owner(proof_data, verify_key, ed25519_pub, interface_id, None)
+    }
+    fn handle_link_proof_with_owner(
+        &mut self,
+        proof_data: &[u8],
+        verify_key: &Ed25519PublicKey,
+        ed25519_pub: &[u8; 32],
+        interface_id: InterfaceId,
+        interface_owner: Option<rns_transport::InterfaceOwnerId>,
     ) {
         let link = match self.link.as_mut() {
             Some(l) => l,
@@ -864,6 +1135,7 @@ impl PropagationClient {
             let (result_tx, result_rx) = oneshot::channel();
             if !self.queue_transport(TransportMessage::BindLinkEndpoint {
                 binding: LinkEndpointBinding {
+                    interface_owner,
                     link_id,
                     interface_id,
                     role: LinkEndpointRole::Initiator,
@@ -871,7 +1143,7 @@ impl PropagationClient {
                 lifecycle_tx: self.endpoint_lifecycle_tx.clone(),
                 result_tx,
             }) {
-                self.status.state = PropagationClientState::Failed;
+                self.fail();
                 return;
             }
             self.pending_endpoint_bind = Some(PendingEndpointBind {
@@ -899,7 +1171,7 @@ impl PropagationClient {
                 self.handle_list_response(response_data);
             }
             PropagationClientState::GetRequested => {
-                self.handle_get_response(response_data);
+                self.handle_get_response_owned(Bytes::copy_from_slice(response_data));
             }
             PropagationClientState::PurgeRequested => {
                 self.handle_purge_response(response_data);
@@ -937,7 +1209,7 @@ impl PropagationClient {
             || (adv.total_segments > 1 && !adv.flags.split)
             || adv.random_hash.len() != RANDOM_HASH_SIZE
         {
-            self.status.state = PropagationClientState::Failed;
+            self.fail();
             return;
         }
         let logical_hash = if adv.flags.split {
@@ -950,7 +1222,7 @@ impl PropagationClient {
                 || response.total_segments != adv.total_segments
                 || response.data_size != adv.data_size
             {
-                self.status.state = PropagationClientState::Failed;
+                self.fail();
                 return;
             }
             if adv.segment_index < response.next_segment
@@ -959,11 +1231,11 @@ impl PropagationClient {
                 return;
             }
             if adv.segment_index != response.next_segment || response.current_segment.is_some() {
-                self.status.state = PropagationClientState::Failed;
+                self.fail();
                 return;
             }
         } else if adv.segment_index != 1 {
-            self.status.state = PropagationClientState::Failed;
+            self.fail();
             return;
         }
 
@@ -978,7 +1250,7 @@ impl PropagationClient {
             }
             self.receiving_for = Some(self.status.state);
         } else if self.receiving_for.is_none() {
-            self.status.state = PropagationClientState::Failed;
+            self.fail();
             return;
         }
         self.status.state = PropagationClientState::Receiving;
@@ -989,7 +1261,7 @@ impl PropagationClient {
                 || adv.segment_index == 0
                 || adv.segment_index > adv.total_segments
             {
-                self.status.state = PropagationClientState::Failed;
+                self.fail();
                 return;
             }
 
@@ -998,7 +1270,7 @@ impl PropagationClient {
                 .entry(adv.original_hash)
                 .or_insert_with(|| MultiSegmentInbound::new(adv.total_segments, adv.original_hash));
             if entry.total_segments != adv.total_segments {
-                self.status.state = PropagationClientState::Failed;
+                self.fail();
                 return;
             }
             self.segment_routing.insert(
@@ -1030,7 +1302,7 @@ impl PropagationClient {
             map_hashes,
             rtt,
         ) else {
-            self.status.state = PropagationClientState::Failed;
+            self.fail();
             return;
         };
 
@@ -1080,7 +1352,7 @@ impl PropagationClient {
                     control_actions.push((rns_wire::context::PacketContext::ResourceReq, req));
                 }
                 TransferAction::Failed(_) => {
-                    self.status.state = PropagationClientState::Failed;
+                    self.fail();
                     return;
                 }
                 _ => {}
@@ -1166,7 +1438,7 @@ impl PropagationClient {
                 );
             }
             TransferAction::Failed(_) => {
-                self.status.state = PropagationClientState::Failed;
+                self.fail();
             }
             _ => {}
         }
@@ -1207,7 +1479,7 @@ impl PropagationClient {
         if let Some(link) = self.link.as_mut() {
             link.untrack_resource(&resource_hash);
         }
-        self.status.state = PropagationClientState::Failed;
+        self.fail();
     }
 
     fn complete_resource(&mut self, resource_hash: [u8; 32]) {
@@ -1225,13 +1497,13 @@ impl PropagationClient {
             match transfer.complete(Some(&decrypt_fn)) {
                 Ok(result) => result,
                 Err(_) => {
-                    self.status.state = PropagationClientState::Failed;
+                    self.fail();
                     return;
                 }
             }
         };
         if !self.send_resource_proof(&proof) {
-            self.status.state = PropagationClientState::Failed;
+            self.fail();
             return;
         }
         let route = self.segment_routing.remove(&resource_hash);
@@ -1254,7 +1526,7 @@ impl PropagationClient {
         }
 
         let Some(pending) = self.pending_endpoint_sends.last_mut() else {
-            self.status.state = PropagationClientState::Failed;
+            self.fail();
             return;
         };
         pending.success = EndpointSendSuccess::ResourceProof {
@@ -1282,7 +1554,7 @@ impl PropagationClient {
             .checked_add(assembled.len())
             .filter(|total| *total <= MAX_RESOURCE_SIZE && *total <= response.data_size)
         else {
-            self.status.state = PropagationClientState::Failed;
+            self.fail();
             return;
         };
         response.assembled_bytes = total;
@@ -1290,7 +1562,7 @@ impl PropagationClient {
         response.next_segment += 1;
         response.waiting_since = Instant::now();
         if response.next_segment > response.total_segments && total != response.data_size {
-            self.status.state = PropagationClientState::Failed;
+            self.fail();
             return;
         }
         if let Some(route) = route {
@@ -1300,7 +1572,7 @@ impl PropagationClient {
                     .set_segment_data(route.segment_index, assembled)
                     .is_err()
                 {
-                    self.status.state = PropagationClientState::Failed;
+                    self.fail();
                     return;
                 }
                 if let Some(meta) = metadata {
@@ -1310,7 +1582,7 @@ impl PropagationClient {
                     match coord.reassemble() {
                         Ok(payload) => complete_payload = Some(payload),
                         Err(_) => {
-                            self.status.state = PropagationClientState::Failed;
+                            self.fail();
                             return;
                         }
                     }
@@ -1318,26 +1590,17 @@ impl PropagationClient {
             }
             if let Some(payload) = complete_payload {
                 self.inbound_split_resources.remove(&route.original_hash);
-                self.handle_resource_response_payload(&payload);
+                self.handle_resource_response_owned(Bytes::from(payload));
             }
         } else {
-            self.handle_resource_response_payload(&assembled);
+            self.handle_resource_response_owned(Bytes::from(assembled));
         }
     }
 
-    fn handle_resource_response_payload(&mut self, payload: &[u8]) {
-        if !Link::parse_response_plaintext(payload)
-            .ok()
-            .is_some_and(|(id, _)| {
-                self.request
-                    .as_ref()
-                    .is_some_and(|request| request.id == id)
-            })
-        {
-            self.status.state = PropagationClientState::Failed;
-            return;
+    fn handle_resource_response_owned(&mut self, payload: Bytes) {
+        if !self.handle_response_owned(payload) {
+            self.fail();
         }
-        self.handle_response_plaintext(payload);
     }
 
     fn send_encrypted_resource_control(
@@ -1376,7 +1639,7 @@ impl PropagationClient {
             raw: Bytes::from(raw),
             destination_hash: link_id,
         }) {
-            self.status.state = PropagationClientState::Failed;
+            self.fail();
             false
         } else if let Some(link) = self.link.as_mut() {
             link.record_tx(payload.len());
@@ -1445,7 +1708,7 @@ impl PropagationClient {
         let value: rmpv::Value = match Self::decode_response_value(response_data) {
             Ok(v) => v,
             Err(_) => {
-                self.status.state = PropagationClientState::Failed;
+                self.fail();
                 return;
             }
         };
@@ -1469,63 +1732,184 @@ impl PropagationClient {
                 self.send_get_request();
             }
         } else {
-            self.status.state = PropagationClientState::Failed;
+            self.fail();
         }
     }
 
-    /// Validate and reserve the complete batch before publishing any result or
-    /// purge ID. A node may return a subset (or nothing) for a requested chunk.
-    fn handle_get_response(&mut self, response_data: &[u8]) {
-        let Ok(rmpv::Value::Array(items)) = Self::decode_response_value(response_data) else {
-            self.status.state = PropagationClientState::Failed;
-            return;
-        };
+    /// Validate type/count, exact requested TID membership, duplicates and full
+    /// byte budget before publishing any item. Payload ranges borrow one owner.
+    fn handle_get_response_owned(&mut self, response_data: Bytes) {
         let count = match self.request.as_ref().map(|request| request.kind) {
             Some(RequestKind::Get(count)) => count,
-            _ => 0,
-        };
-        if count > 0 && items.len() > count {
-            self.status.state = PropagationClientState::Failed;
-            return;
-        }
-        let mut batch_bytes = 0usize;
-        for item in &items {
-            let rmpv::Value::Binary(data) = item else {
-                self.status.state = PropagationClientState::Failed;
+            _ => {
+                self.fail();
                 return;
-            };
-            let Some(bytes) = batch_bytes.checked_add(data.len()) else {
-                self.status.state = PropagationClientState::Failed;
-                return;
-            };
-            batch_bytes = bytes;
-        }
-        let Some(unread_bytes) = self
-            .unread_bytes
-            .checked_add(batch_bytes)
-            .filter(|bytes| *bytes <= self.unread_limit)
-        else {
-            tracing::warn!(
-                reason = "result_capacity",
-                "propagation downloaded batch exceeds unread result capacity"
-            );
-            self.status.state = PropagationClientState::Failed;
+            }
+        };
+        let parsed = (|| {
+            let mut cursor = std::io::Cursor::new(response_data.as_ref());
+            let n = rmp::decode::read_array_len(&mut cursor).map_err(|_| ())? as usize;
+            if n > count || n > MAX_DOWNLOAD_ITEMS {
+                return Err(());
+            }
+            let wanted: HashSet<_> = self
+                .pending_wants
+                .iter()
+                .take(count)
+                .map(Vec::as_slice)
+                .collect();
+            let mut seen = HashSet::new();
+            let mut ranges = Vec::with_capacity(n);
+            for _ in 0..n {
+                let len = rmp::decode::read_bin_len(&mut cursor).map_err(|_| ())? as usize;
+                let start = cursor.position() as usize;
+                let end = start
+                    .checked_add(len)
+                    .filter(|end| *end <= response_data.len())
+                    .ok_or(())?;
+                let tid = rns_crypto::sha::full_hash(&response_data[start..end]);
+                if !wanted.contains(tid.as_slice()) || !seen.insert(tid) {
+                    return Err(());
+                }
+                ranges.push((start..end, tid));
+                cursor.set_position(end as u64);
+            }
+            if cursor.position() as usize != response_data.len() {
+                return Err(());
+            }
+            Ok(ranges)
+        })();
+        let Ok(ranges) = parsed else {
+            self.fail();
             return;
         };
-        self.unread_bytes = unread_bytes;
-        self.finish_request(response_data);
+        let Ok(data) = retain_response(response_data, self.unread_limit) else {
+            self.fail();
+            return;
+        };
+        self.finish_request(&[]);
         self.pending_wants.drain(..count);
-        self.status.result = Some(self.status.result.unwrap_or(0).saturating_add(items.len()));
-        for item in items {
-            let rmpv::Value::Binary(data) = item else {
-                unreachable!("batch validated above")
+        self.admission_generation = self.admission_generation.wrapping_add(1);
+        self.current_admission_generation
+            .store(self.admission_generation, Ordering::Release);
+        let identity = self.identity_hash();
+        let node = self.outbound_propagation_node.unwrap_or([0; 16]);
+        self.unread_bytes = data.len();
+        self.status.admission.downloaded = self
+            .status
+            .admission
+            .downloaded
+            .saturating_add(ranges.len());
+        for (range, transient_id) in ranges {
+            let scope = AdmissionScope {
+                identity,
+                node,
+                transient_id,
             };
-            self.received_ids
-                .push(rns_crypto::sha::full_hash(&data).to_vec());
-            self.received_messages.push(data);
+            self.pending_admissions.insert(scope);
+            let token = DownloadAdmissionToken::new(
+                scope,
+                self.admission_generation,
+                self.current_admission_generation.clone(),
+                self.admission_tx.clone(),
+            );
+            self.received_messages
+                .push(DownloadedPropagationMessage::new(data.slice(range), token));
         }
-        self.status.progress = 1.0;
-        self.send_next_chunk();
+        if self.pending_admissions.is_empty() {
+            self.send_next_chunk();
+        } else {
+            self.status.state = PropagationClientState::AwaitingAdmission;
+            self.admission_started = Some(Instant::now());
+            self.admission_progress = self.admission_started;
+        }
+    }
+
+    #[cfg(test)]
+    fn handle_get_response(&mut self, data: &[u8]) {
+        self.handle_get_response_owned(Bytes::copy_from_slice(data));
+    }
+
+    fn poll_admissions(&mut self) {
+        while let Ok(result) = self.admission_rx.try_recv() {
+            if result.generation != self.admission_generation
+                || !self.pending_admissions.remove(&result.scope)
+            {
+                continue;
+            }
+            self.admission_progress = Some(Instant::now());
+            match result.outcome {
+                DownloadAdmissionOutcome::Accepted(receipt) => {
+                    match receipt.record().disposition {
+                        crate::admission::DurableDisposition::Committed => {
+                            self.status.admission.committed += 1
+                        }
+                        crate::admission::DurableDisposition::Duplicate => {
+                            self.status.admission.duplicate += 1
+                        }
+                        crate::admission::DurableDisposition::PolicyDiscard => {
+                            self.status.admission.policy_discarded += 1
+                        }
+                        crate::admission::DurableDisposition::UserDeleted => {
+                            self.status.admission.user_deleted += 1
+                        }
+                    }
+                    self.remember_durable_have(crate::admission::DurableHave::from_record(
+                        receipt.record(),
+                    ));
+                    self.received_ids.push(result.scope.transient_id.to_vec());
+                    self.status.result = Some(self.status.result.unwrap_or(0).saturating_add(1));
+                    if self.suppression.get(&receipt.record().scope).is_some() {
+                        self.suppression.remove(&receipt.record().scope);
+                        self.suppression_dirty = true;
+                        self.suppression_revision = self.suppression_revision.wrapping_add(1);
+                    }
+                }
+                DownloadAdmissionOutcome::Rejected(reason) => {
+                    self.admission_failures += 1;
+                    self.status.admission.rejected += 1;
+                    self.status.admission.retryable += usize::from(reason.is_transient());
+                    let now = crate::now_f64() as u64;
+                    match self.suppression.record_failure(
+                        result.scope,
+                        reason,
+                        self.admission_epochs,
+                        now,
+                    ) {
+                        Ok(record) => {
+                            self.suppression_updates.push(record.clone());
+                            self.suppression_dirty = true;
+                            self.suppression_revision = self.suppression_revision.wrapping_add(1);
+                        }
+                        Err(_) => self.suppression_persist_failed = true,
+                    }
+                }
+            }
+        }
+        if self.status.state == PropagationClientState::AwaitingAdmission {
+            if self.pending_admissions.is_empty() {
+                self.admission_started = None;
+                self.admission_progress = None;
+                self.send_next_chunk();
+            } else if self
+                .admission_started
+                .is_some_and(|t| t.elapsed() >= Duration::from_secs(600))
+                || self
+                    .admission_progress
+                    .is_some_and(|t| t.elapsed() >= Duration::from_secs(120))
+            {
+                // Revokes authority only. External payload/worker leases remain live.
+                self.admission_generation = self.admission_generation.wrapping_add(1);
+                self.current_admission_generation
+                    .store(self.admission_generation, Ordering::Release);
+                self.admission_failures += self.pending_admissions.len();
+                self.status.admission.rejected += self.pending_admissions.len();
+                self.status.admission.retryable += self.pending_admissions.len();
+                self.pending_admissions.clear();
+                self.received_messages.clear();
+                self.send_next_chunk();
+            }
+        }
     }
 
     fn decode_response_value(data: &[u8]) -> Result<rmpv::Value, ()> {
@@ -1542,7 +1926,7 @@ impl PropagationClient {
     fn handle_purge_response(&mut self, response_data: &[u8]) {
         if !matches!(Self::decode_response_value(response_data), Ok(rmpv::Value::Array(items)) if items.is_empty())
         {
-            self.status.state = PropagationClientState::Failed;
+            self.fail();
             return;
         }
         match self.finish_request(response_data) {
@@ -1558,19 +1942,22 @@ impl PropagationClient {
     }
 
     pub fn tick(&mut self) {
+        self.prune_suppression();
+        self.poll_link_request();
         self.flush_pending_transport();
         self.poll_endpoint_control();
         if self.status.state == PropagationClientState::Failed {
             self.cleanup();
             return;
         }
+        self.poll_admissions();
 
         if let Some(started) = self.started_at
             && started.elapsed() > self.timeout
             && self.status.state == PropagationClientState::LinkEstablishing
         {
             self.cleanup();
-            self.status.state = PropagationClientState::Failed;
+            self.fail();
             return;
         }
 
@@ -1583,7 +1970,7 @@ impl PropagationClient {
                         && response.waiting_since.elapsed() > request.timeout
                 })
         }) {
-            self.status.state = PropagationClientState::Failed;
+            self.fail();
             self.cleanup();
             return;
         }
@@ -1603,9 +1990,9 @@ impl PropagationClient {
                     rns_wire::flags::PacketType::Data,
                     &payload,
                 );
-                self.status.state = PropagationClientState::Failed;
+                self.fail();
             }
-            Some(LinkAction::Closed(_)) => self.status.state = PropagationClientState::Failed,
+            Some(LinkAction::Closed(_)) => self.fail(),
             Some(LinkAction::None) | None => {}
         }
 
@@ -1619,7 +2006,7 @@ impl PropagationClient {
                 match transfer.check_timeout() {
                     TransferAction::SendRequest(request) => retry_requests.push(request),
                     TransferAction::Failed(_) => {
-                        self.status.state = PropagationClientState::Failed;
+                        self.fail();
                         break;
                     }
                     _ => {}
@@ -1649,8 +2036,11 @@ impl PropagationClient {
             PropagationClientState::ListRequested
             | PropagationClientState::GetRequested
             | PropagationClientState::Receiving
-            | PropagationClientState::PurgeRequested => {}
-            PropagationClientState::Complete | PropagationClientState::Failed => {
+            | PropagationClientState::PurgeRequested
+            | PropagationClientState::AwaitingAdmission => {}
+            PropagationClientState::Complete
+            | PropagationClientState::Partial
+            | PropagationClientState::Failed => {
                 self.cleanup();
             }
         }
@@ -1691,7 +2081,7 @@ impl PropagationClient {
         if let Some(outbound) = outbound
             && !self.queue_link_endpoint(outbound)
         {
-            self.status.state = PropagationClientState::Failed;
+            self.fail();
         }
     }
 
@@ -1704,6 +2094,7 @@ impl PropagationClient {
     /// Snapshot selection once per cycle. Haves are purged before any wants;
     /// the configured message count limits the entire cycle, not each chunk.
     fn send_get_request(&mut self) {
+        self.prune_expired_haves(crate::now_f64() as u64);
         self.pending_haves.clear();
         self.pending_wants.clear();
         let mut seen = HashSet::new();
@@ -1716,6 +2107,23 @@ impl PropagationClient {
                     self.pending_haves.push_back(id.clone());
                 }
             } else if self.pending_wants.len() < self.max_messages.unwrap_or(usize::MAX) {
+                let Ok(transient_id) = <[u8; 32]>::try_from(id.as_slice()) else {
+                    continue;
+                };
+                let scope = AdmissionScope {
+                    identity: self.identity_hash(),
+                    node: self.outbound_propagation_node.unwrap_or([0; 16]),
+                    transient_id,
+                };
+                if self.suppression_persist_failed
+                    || self.suppression.saturated(scope.identity, scope.node)
+                    || self
+                        .suppression
+                        .get(&scope)
+                        .is_some_and(|r| r.active(crate::now_f64() as u64, self.admission_epochs))
+                {
+                    continue;
+                }
                 self.pending_wants.push_back(id.clone());
             }
         }
@@ -1751,7 +2159,10 @@ impl PropagationClient {
             - 1;
         let mut low = 0;
         // Every valid transient ID consumes at least its 32 payload bytes.
-        let mut high = ids.len().min(MAX_EFFICIENT_SIZE / 32);
+        let mut high = ids
+            .len()
+            .min(MAX_DOWNLOAD_ITEMS)
+            .min(MAX_EFFICIENT_SIZE / 32);
         while low < high {
             let count = low + (high - low).div_ceil(2);
             if self.chunk_body(&ids[..count], get).len() <= MAX_EFFICIENT_SIZE - overhead {
@@ -1764,9 +2175,13 @@ impl PropagationClient {
     }
 
     fn send_next_chunk(&mut self) {
-        if self.request.is_some() || self.status.state == PropagationClientState::Failed {
+        if self.request.is_some()
+            || !self.pending_admissions.is_empty()
+            || self.status.state == PropagationClientState::Failed
+        {
             return;
         }
+        self.prune_expired_haves(crate::now_f64() as u64);
         if !self.received_ids.is_empty() {
             self.send_purge_request();
         } else if !self.pending_haves.is_empty() {
@@ -1778,6 +2193,8 @@ impl PropagationClient {
                 .collect();
             let (count, data) = self.bounded_chunk(&ids, false);
             self.send_get_path_request(&data, RequestKind::Haves(count));
+        } else if self.suppression_dirty || self.suppression_persist_failed {
+            self.status.state = PropagationClientState::AwaitingAdmission;
         } else if !self.pending_wants.is_empty() {
             let ids: Vec<_> = self
                 .pending_wants
@@ -1790,7 +2207,11 @@ impl PropagationClient {
             self.status.data_size = None;
             self.send_get_path_request(&data, RequestKind::Get(count));
         } else {
-            self.status.state = PropagationClientState::Complete;
+            self.status.state = if self.admission_failures == 0 {
+                PropagationClientState::Complete
+            } else {
+                PropagationClientState::Partial
+            };
             self.status.progress = 1.0;
             self.status.result.get_or_insert(0);
         }
@@ -1803,27 +2224,27 @@ impl PropagationClient {
 
     fn send_get_path_request(&mut self, request_data: &[u8], kind: RequestKind) -> bool {
         if self.request.is_some() {
-            self.status.state = PropagationClientState::Failed;
+            self.fail();
             return false;
         }
         let Some(link) = self.link.as_mut() else {
-            self.status.state = PropagationClientState::Failed;
+            self.fail();
             return false;
         };
         let timeout = link.default_request_timeout().max(Duration::from_secs(60));
         let Ok((packed, id)) = link.prepare_request(MESSAGE_GET_PATH, Some(request_data), timeout)
         else {
-            self.status.state = PropagationClientState::Failed;
+            self.fail();
             return false;
         };
         if packed.len() > MAX_EFFICIENT_SIZE {
             link.fail_pending_request(&id);
-            self.status.state = PropagationClientState::Failed;
+            self.fail();
             return false;
         }
         let Some(generation) = self.next_request_generation.checked_add(1) else {
             link.fail_pending_request(&id);
-            self.status.state = PropagationClientState::Failed;
+            self.fail();
             return false;
         };
         self.next_request_generation = generation;
@@ -1832,7 +2253,7 @@ impl PropagationClient {
         let outbound = if resource {
             let Some(keys) = link.session_keys() else {
                 link.fail_pending_request(&id);
-                self.status.state = PropagationClientState::Failed;
+                self.fail();
                 return false;
             };
             let Ok(mut transfer) = OutboundTransfer::new_encrypted(
@@ -1842,7 +2263,7 @@ impl PropagationClient {
                 keys,
             ) else {
                 link.fail_pending_request(&id);
-                self.status.state = PropagationClientState::Failed;
+                self.fail();
                 return false;
             };
             transfer.resource.flags.is_request = true;
@@ -1861,7 +2282,7 @@ impl PropagationClient {
                 Ok(data) => Some(data),
                 Err(_) => {
                     link.fail_pending_request(&id);
-                    self.status.state = PropagationClientState::Failed;
+                    self.fail();
                     return false;
                 }
             }
@@ -1917,7 +2338,7 @@ impl PropagationClient {
                     &data,
                 );
             }
-            Some(TransferAction::Failed(_)) => self.status.state = PropagationClientState::Failed,
+            Some(TransferAction::Failed(_)) => self.fail(),
             _ => {}
         }
     }
@@ -1961,9 +2382,9 @@ impl PropagationClient {
                         rns_wire::context::PacketContext::ResourceIcl,
                         &hash,
                     );
-                    self.status.state = PropagationClientState::Failed;
+                    self.fail();
                 }
-                TransferAction::Failed(_) => self.status.state = PropagationClientState::Failed,
+                TransferAction::Failed(_) => self.fail(),
                 _ => {}
             }
             if self.status.state == PropagationClientState::Failed {
@@ -2039,26 +2460,56 @@ impl PropagationClient {
         Some(request.kind)
     }
 
-    fn handle_response_plaintext(&mut self, data: &[u8]) {
-        let Ok((id, response)) = Link::parse_response_plaintext(data) else {
-            return;
+    fn handle_response_owned(&mut self, data: Bytes) -> bool {
+        let mut cursor = std::io::Cursor::new(data.as_ref());
+        if rmp::decode::read_array_len(&mut cursor).ok() != Some(2)
+            || rmp::decode::read_bin_len(&mut cursor).ok() != Some(16)
+        {
+            return false;
+        }
+        let start = cursor.position() as usize;
+        let Some(id) = data.get(start..start + 16) else {
+            return false;
         };
-        if !self
-            .request
-            .as_ref()
-            .is_some_and(|request| request.id == id && Some(request.link_id) == self.link_id)
-        {
-            return;
+        if !self.request.as_ref().is_some_and(|request| {
+            request.id.as_slice() == id && Some(request.link_id) == self.link_id
+        }) {
+            return false;
         }
-        if !matches!(Self::decode_response_value(data), Ok(rmpv::Value::Array(fields)) if fields.len() == 2 && matches!(&fields[0], rmpv::Value::Binary(_)) && fields[1].is_array())
-        {
-            self.status.state = PropagationClientState::Failed;
-            return;
+        let payload = data.slice(start + 16..);
+        if matches!(
+            self.request.as_ref().map(|r| r.kind),
+            Some(RequestKind::Get(_))
+        ) {
+            self.handle_get_response_owned(payload);
+        } else {
+            self.handle_response_data(&payload);
         }
-        self.handle_response_data(&response);
+        true
+    }
+
+    fn revoke_admissions(&mut self) {
+        self.admission_generation = self.admission_generation.wrapping_add(1);
+        self.current_admission_generation
+            .store(self.admission_generation, Ordering::Release);
+        self.pending_admissions.clear();
+        self.received_messages.clear();
+        self.unread_bytes = 0;
+        self.admission_started = None;
+        self.admission_progress = None;
+    }
+    fn fail(&mut self) {
+        // Revoke at the failure observation, before an adapter or later tick
+        // could accept a completed blocking worker under the old generation.
+        self.revoke_admissions();
+        self.status.state = PropagationClientState::Failed;
     }
 
     fn cleanup(&mut self) {
+        self.link_request_result = None;
+        self.pending_transport
+            .retain(|message| !matches!(message, TransportMessage::SendLinkRequest { .. }));
+        self.revoke_admissions();
         self.request = None;
         if let Some(link_id) = self.link_id {
             self.pending_transport.retain(|message| {
@@ -2115,12 +2566,59 @@ impl PropagationClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    pub(super) fn fixture_download(
+        client: &PropagationClient,
+        data: Vec<u8>,
+    ) -> DownloadedPropagationMessage {
+        let scope = AdmissionScope {
+            identity: client.identity_hash(),
+            node: client.outbound_propagation_node.unwrap_or([0; 16]),
+            transient_id: rns_crypto::sha::full_hash(&data),
+        };
+        let token = DownloadAdmissionToken::new(
+            scope,
+            client.admission_generation,
+            client.current_admission_generation.clone(),
+            client.admission_tx.clone(),
+        );
+        DownloadedPropagationMessage::new(
+            retain_response(data.into(), client.unread_limit).unwrap(),
+            token,
+        )
+    }
+    pub(super) fn downloaded_bytes(messages: &[DownloadedPropagationMessage]) -> Vec<Vec<u8>> {
+        messages.iter().map(|m| m.data().to_vec()).collect()
+    }
+
     use rns_protocol::resource::OutboundTransfer;
 
+    fn prime_get(client: &mut PropagationClient, messages: &[Vec<u8>]) {
+        client.pending_wants = messages
+            .iter()
+            .map(|bytes| rns_crypto::sha::full_hash(bytes).to_vec())
+            .collect();
+        client.status.state = PropagationClientState::GetRequested;
+        client.request = Some(PendingRequest {
+            link_id: [1; 16],
+            generation: 1,
+            id: [2; 16],
+            kind: RequestKind::Get(messages.len()),
+            sender_active: false,
+            outbound: None,
+            response: None,
+            waiting_since: Some(Instant::now()),
+            timeout: Duration::from_secs(60),
+        });
+    }
     fn next_link_request(rx: &mut mpsc::Receiver<TransportMessage>) -> OutboundRequest {
         while let Ok(message) = rx.try_recv() {
             match message {
                 TransportMessage::Outbound(request) => return request,
+                TransportMessage::SendLinkRequest { request, result_tx } => {
+                    let _ = result_tx.send(Ok(()));
+                    return request;
+                }
+
                 TransportMessage::SendLinkEndpoint {
                     request, result_tx, ..
                 } => {
@@ -2235,7 +2733,10 @@ mod tests {
             TransportMessage::RegisterDestination { .. }
         ));
         let outbound = rx.try_recv();
-        assert!(matches!(outbound.unwrap(), TransportMessage::Outbound(_)));
+        assert!(matches!(
+            outbound.unwrap(),
+            TransportMessage::SendLinkRequest { .. }
+        ));
     }
 
     #[test]
@@ -2273,7 +2774,7 @@ mod tests {
         client.tick();
         assert!(matches!(
             rx.try_recv().unwrap(),
-            TransportMessage::Outbound(_)
+            TransportMessage::SendLinkRequest { .. }
         ));
         assert!(client.pending_transport.is_empty());
     }
@@ -2388,11 +2889,15 @@ mod tests {
         let (tx, _rx) = mpsc::channel(16);
         let mut client = PropagationClient::new(tx, None, None);
 
-        client.received_messages.push(vec![0x01, 0x02]);
-        client.received_messages.push(vec![0x03, 0x04]);
+        client
+            .received_messages
+            .push(fixture_download(&client, vec![0x01, 0x02]));
+        client
+            .received_messages
+            .push(fixture_download(&client, vec![0x03, 0x04]));
         assert_eq!(client.received_count(), 2);
 
-        let messages = client.take_received_messages();
+        let messages = client.take_downloaded_messages();
         assert_eq!(messages.len(), 2);
         assert_eq!(client.received_count(), 0);
     }
@@ -2470,18 +2975,21 @@ mod tests {
         let mut buf = Vec::new();
         rmpv::encode::write_value(&mut buf, &response).unwrap();
 
+        prime_get(&mut client, &[msg1.clone(), msg2.clone()]);
         client.handle_get_response(&buf);
         assert_eq!(client.received_messages.len(), 2);
-        assert_eq!(client.received_messages[0], msg1);
-        assert_eq!(client.received_messages[1], msg2);
-        assert_eq!(client.received_ids.len(), 2);
-        assert_eq!(
-            client.received_ids[0],
-            rns_crypto::sha::full_hash(&msg1).to_vec()
+        assert_eq!(client.received_messages[0].data().as_ref(), msg1);
+        assert_eq!(client.received_messages[1].data().as_ref(), msg2);
+        assert!(
+            client.received_ids.is_empty(),
+            "uncommitted bytes grant no purge authority"
         );
-        assert_eq!(client.received_ids[0].len(), 32);
-        assert_eq!(client.transfer_status().progress, 1.0);
-        assert_eq!(client.transfer_status().result, Some(2));
+        assert_eq!(
+            client.received_messages[0].scope().transient_id,
+            rns_crypto::sha::full_hash(&msg1)
+        );
+        assert_eq!(client.state(), PropagationClientState::AwaitingAdmission);
+        assert_eq!(client.transfer_status().result, None);
     }
 
     #[test]
@@ -2490,6 +2998,7 @@ mod tests {
         let mut client = PropagationClient::new(tx, None, None);
         client.status.state = PropagationClientState::GetRequested;
 
+        prime_get(&mut client, &[]);
         let response = rmpv::Value::Array(vec![]);
         let mut buf = Vec::new();
         rmpv::encode::write_value(&mut buf, &response).unwrap();
@@ -2505,9 +3014,11 @@ mod tests {
         client.status.state = PropagationClientState::Receiving;
         client.receiving_for = Some(PropagationClientState::GetRequested);
 
+        prime_get(&mut client, &[]);
         let response = rmpv::Value::Array(vec![]);
         let mut buf = Vec::new();
         rmpv::encode::write_value(&mut buf, &response).unwrap();
+        client.status.state = PropagationClientState::Receiving;
         client.handle_response_data(&buf);
 
         assert_eq!(client.status.state, PropagationClientState::Complete);
@@ -2825,6 +3336,7 @@ mod tests {
         client
             .event_tx
             .try_send(DestinationEvent::InboundPacket {
+                interface_owner: None,
                 raw: link_data_packet(
                     link_id,
                     rns_wire::context::PacketContext::LinkClose,
@@ -2862,6 +3374,7 @@ mod tests {
         client
             .event_tx
             .try_send(DestinationEvent::InboundPacket {
+                interface_owner: None,
                 raw: link_data_packet(link_id, rns_wire::context::PacketContext::LinkClose, &[0u8]),
                 interface_id: 0,
                 metrics: Default::default(),
@@ -2890,6 +3403,7 @@ mod tests {
         client
             .event_tx
             .try_send(DestinationEvent::InboundPacket {
+                interface_owner: None,
                 raw: link_data_packet(
                     link_id,
                     rns_wire::context::PacketContext::LinkClose,
@@ -2909,3 +3423,10 @@ mod tests {
 #[cfg(test)]
 #[path = "propagation_client_tests.rs"]
 mod lifecycle_tests;
+
+impl Drop for PropagationClient {
+    fn drop(&mut self) {
+        self.current_admission_generation
+            .fetch_add(1, Ordering::AcqRel);
+    }
+}

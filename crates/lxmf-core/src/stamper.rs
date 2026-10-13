@@ -96,6 +96,20 @@ pub fn stamp_iteration_cap(cost: u8) -> Option<u64> {
 /// [`stamp_iteration_cap`]; returns `None` when the cap is exhausted or the
 /// cost is unsatisfiable.
 pub fn generate_stamp(material: &[u8], cost: u8, expand_rounds: usize) -> Option<([u8; 32], u32)> {
+    generate_stamp_cancellable(material, cost, expand_rounds, &AtomicBool::new(false))
+}
+
+/// Synchronous bounded worker entry. Cancellation revokes work without claiming
+/// that an async task abort stopped this closure or released its byte owners.
+pub fn generate_stamp_cancellable(
+    material: &[u8],
+    cost: u8,
+    expand_rounds: usize,
+    cancel: &AtomicBool,
+) -> Option<([u8; 32], u32)> {
+    if cancel.load(Ordering::Acquire) {
+        return None;
+    }
     if cost == 0 {
         return Some(([0u8; 32], 0));
     }
@@ -107,7 +121,10 @@ pub fn generate_stamp(material: &[u8], cost: u8, expand_rounds: usize) -> Option
     base_hasher.update(&workblock);
     let mut rng = rand::thread_rng();
 
-    for _ in 0..max_iterations {
+    for iteration in 0..max_iterations {
+        if iteration % 1000 == 0 && cancel.load(Ordering::Acquire) {
+            return None;
+        }
         let stamp = rand_bytes_from(&mut rng);
         let value = stamp_value_from_base(&base_hasher, &stamp);
         if value >= cost as u32 {

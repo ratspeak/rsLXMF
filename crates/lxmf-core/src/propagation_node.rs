@@ -9,7 +9,6 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use crate::constants::*;
-use crate::message::LxMessage;
 use crate::peer::{LxmPeer, OutboundOfferPolicy};
 use crate::propagation::{PropagationEntry, PropagationStore, hex_encode};
 use crate::propagation_admission::PnOfferCandidate;
@@ -55,6 +54,78 @@ pub struct OfferRequestContext<'a> {
     pub remote_identity_hash: Option<&'a [u8; 16]>,
 }
 
+/// Borrow the validated ID lists; never expand untrusted GET input to a Value tree.
+struct BorrowedGetRequest<'a> {
+    wants: Option<&'a [u8]>,
+    haves: Option<&'a [u8]>,
+    limit_bytes: Option<f64>,
+}
+fn parse_get_request(mut input: &[u8]) -> Option<BorrowedGetRequest<'_>> {
+    let count = rmp::decode::read_array_len(&mut input).ok()?;
+    if !(2..=3).contains(&count) {
+        return None;
+    }
+    fn ids<'a>(input: &mut &'a [u8]) -> Option<Option<&'a [u8]>> {
+        if input.first() == Some(&0xc0) {
+            *input = &input[1..];
+            return Some(None);
+        }
+        let count = rmp::decode::read_array_len(input).ok()? as usize;
+        if count > input.len() / 34 {
+            return None;
+        }
+        let start = *input;
+        for _ in 0..count {
+            if rmp::decode::read_bin_len(input).ok()? != 32 || input.len() < 32 {
+                return None;
+            }
+            *input = &input[32..];
+        }
+        Some(Some(&start[..start.len() - input.len()]))
+    }
+    let wants = ids(&mut input)?;
+    let haves = ids(&mut input)?;
+    let limit_bytes = if count == 3 {
+        // Only one scalar number is decoded; containers and strings are refused
+        // before the general decoder can allocate.
+        if !matches!(
+            input.first(),
+            Some(0x00..=0x7f | 0xca..=0xcf | 0xd0..=0xd3 | 0xe0..=0xff)
+        ) {
+            return None;
+        }
+        let value = rmpv::decode::read_value(&mut input).ok()?;
+        let kb = value
+            .as_f64()
+            .or_else(|| value.as_u64().map(|v| v as f64))
+            .or_else(|| value.as_i64().map(|v| v as f64))?;
+        let bytes = kb * BYTES_PER_KILOBYTE as f64;
+        if !kb.is_finite() || kb < 0.0 || !bytes.is_finite() {
+            return None;
+        }
+        Some(bytes)
+    } else {
+        None
+    };
+    input.is_empty().then_some(BorrowedGetRequest {
+        wants,
+        haves,
+        limit_bytes,
+    })
+}
+fn get_ids(input: Option<&[u8]>) -> impl Iterator<Item = PropagationTransientId> + '_ {
+    let mut input = input.unwrap_or_default();
+    std::iter::from_fn(move || {
+        if input.is_empty() {
+            return None;
+        }
+        rmp::decode::read_bin_len(&mut input).expect("validated ID");
+        let id = input[..32].try_into().expect("validated ID length");
+        input = &input[32..];
+        Some(id)
+    })
+}
+
 /// Outcome of [`PropagationNode::handle_get_request`]. Phases 1/3 (and
 /// malformed input) are answered from the store alone; phase 2 returns a
 /// read plan so the embedder performs blocking file I/O after releasing
@@ -76,9 +147,16 @@ impl GetRequestAction {
     /// and admitted by the client's transfer limit. This lets the daemon keep
     /// Python-compatible served-message accounting without repeating I/O.
     pub fn into_response_with_served_count(self) -> (Vec<u8>, u64) {
+        self.into_response_with_served_count_bounded(rns_protocol::resource::MAX_RESOURCE_SIZE)
+    }
+
+    /// Resolve on a blocking worker with its previously reserved local response
+    /// allowance. Complete messages are skipped when they cannot fit.
+    pub fn into_response_with_served_count_bounded(self, maximum: usize) -> (Vec<u8>, u64) {
         match self {
-            GetRequestAction::Respond(bytes) => (bytes, 0),
-            GetRequestAction::ServeFiles(plan) => plan.serve_with_count(),
+            GetRequestAction::Respond(bytes) if bytes.len() <= maximum => (bytes, 0),
+            GetRequestAction::Respond(_) => (vec![0xc0], 0),
+            GetRequestAction::ServeFiles(plan) => plan.serve_with_count_bounded(maximum),
         }
     }
 }
@@ -88,6 +166,7 @@ impl GetRequestAction {
 #[derive(Debug)]
 pub struct GetServePlan {
     reads: Vec<PlannedRead>,
+    retirements: PropagationRetirementPlan,
     /// Client transfer limit in bytes (wire value is kB ×1000, Python parity).
     limit_bytes: Option<f64>,
 }
@@ -96,6 +175,7 @@ pub struct GetServePlan {
 struct PlannedRead {
     path: PathBuf,
     stamped: bool,
+    stored_size: usize,
 }
 
 impl GetServePlan {
@@ -109,31 +189,166 @@ impl GetServePlan {
     }
 
     fn serve_with_count(&self) -> (Vec<u8>, u64) {
-        use rmpv::Value;
+        self.serve_with_count_bounded(rns_protocol::resource::MAX_RESOURCE_SIZE)
+    }
 
+    fn serve_with_count_bounded(&self, maximum: usize) -> (Vec<u8>, u64) {
+        let maximum = maximum.min(rns_protocol::resource::MAX_RESOURCE_SIZE);
+        if maximum < 5 {
+            return (vec![0xc0], 0);
+        }
+
+        if self.retirements.persist().is_err() {
+            return (vec![0xc0], 0);
+        }
         const PER_MESSAGE_OVERHEAD: f64 = 16.0;
         let mut cumulative_size: f64 = 24.0;
-        let mut messages: Vec<Value> = Vec::new();
+        // Reserve one fixed-size output image. A single bounded verified file
+        // exists alongside it; no stripped copy or recursive Value tree does.
+        let mut response = Vec::new();
+        let allocation = self
+            .reads
+            .iter()
+            .fold(5usize, |size, read| {
+                size.saturating_add(read.stored_size).saturating_add(5)
+            })
+            .min(maximum);
+        if response.try_reserve_exact(allocation).is_err() {
+            return (vec![0xc0], 0);
+        }
+        let mut served = 0u32;
 
         for read in &self.reads {
-            let Ok(data) = std::fs::read(&read.path) else {
+            let Some(payload_size) =
+                read.stored_size
+                    .checked_sub(if read.stamped { 32 } else { 0 })
+            else {
                 continue;
             };
-            let next_size = cumulative_size + data.len() as f64 + PER_MESSAGE_OVERHEAD;
+            let prefix = if payload_size <= u8::MAX as usize {
+                2
+            } else if payload_size <= u16::MAX as usize {
+                3
+            } else {
+                5
+            };
+            let array_prefix = if served + 1 < 16 {
+                1
+            } else if served < u16::MAX as u32 {
+                3
+            } else {
+                5
+            };
+            if payload_size
+                .checked_add(prefix)
+                .and_then(|size| response.len().checked_add(size))
+                .and_then(|size| size.checked_add(array_prefix))
+                .is_none_or(|size| size > maximum)
+            {
+                continue;
+            }
+            let next_size = cumulative_size + read.stored_size as f64 + PER_MESSAGE_OVERHEAD;
             if self.limit_bytes.is_some_and(|limit| next_size > limit) {
                 continue;
             }
-            cumulative_size = next_size;
-            let payload = if read.stamped && data.len() >= 32 {
-                data[..data.len() - 32].to_vec()
-            } else {
-                data
+            let Ok(data) = crate::propagation_store_v2::read_validated_file_bounded(
+                &read.path,
+                read.stored_size,
+            ) else {
+                continue;
             };
-            messages.push(Value::Binary(payload));
+            if data.len() != read.stored_size {
+                continue;
+            }
+            cumulative_size = next_size;
+            if prefix == 2 {
+                response.extend_from_slice(&[0xc4, payload_size as u8]);
+            } else if prefix == 3 {
+                response.push(0xc5);
+                response.extend_from_slice(&(payload_size as u16).to_be_bytes());
+            } else {
+                response.push(0xc6);
+                response.extend_from_slice(&(payload_size as u32).to_be_bytes());
+            }
+            response.extend_from_slice(&data[..payload_size]);
+            served += 1;
         }
 
-        let served = messages.len() as u64;
-        (crate::encode_value(&Value::Array(messages)), served)
+        // Prepend the canonical array header in the already reserved buffer.
+        let header: Vec<u8> = if served < 16 {
+            vec![0x90 | served as u8]
+        } else if served <= u16::MAX as u32 {
+            let mut h = vec![0xdc];
+            h.extend_from_slice(&(served as u16).to_be_bytes());
+            h
+        } else {
+            let mut h = vec![0xdd];
+            h.extend_from_slice(&served.to_be_bytes());
+            h
+        };
+        let payload_len = response.len();
+        let final_len = payload_len + header.len();
+        response.resize(final_len, 0);
+        response.copy_within(0..payload_len, header.len());
+        response[..header.len()].copy_from_slice(&header);
+        response.truncate(final_len);
+        (response, u64::from(served))
+    }
+}
+
+/// Committed retirements become invisible immediately, including to snapshots
+/// captured while a blocking deletion worker was running. A node later reaps
+/// counters under its short owner lock.
+#[derive(Debug, Default)]
+struct RetiredEntries {
+    ids: std::sync::Mutex<HashSet<PathBuf>>,
+    generation: std::sync::atomic::AtomicU64,
+}
+impl RetiredEntries {
+    fn contains(&self, id: &PathBuf) -> bool {
+        self.ids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(id)
+    }
+    fn commit(&self, id: PathBuf) {
+        if self
+            .ids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id)
+        {
+            // Rust 1.99 renamed this operation; keep the identical Rust 1.89 API.
+            #[allow(deprecated)]
+            let _ = self.generation.fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |v| Some(v.saturating_add(1)),
+            );
+        }
+    }
+}
+/// Blocking durable cull/purge work. Capture under the node lock; run on a
+/// bounded blocking worker after releasing it. Failed publication retains the
+/// active entry and cannot authorize a successful remote purge response.
+#[derive(Debug)]
+pub struct PropagationRetirementPlan {
+    entries: Vec<PathBuf>,
+    retired: std::sync::Arc<RetiredEntries>,
+}
+impl PropagationRetirementPlan {
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+    pub fn persist(&self) -> std::io::Result<()> {
+        for path in &self.entries {
+            if self.retired.contains(path) {
+                continue;
+            }
+            crate::propagation_store_v2::retire_object(path)?;
+            self.retired.commit(path.clone());
+        }
+        Ok(())
     }
 }
 
@@ -152,11 +367,103 @@ pub fn read_planned_messages(
 ) -> Vec<(PropagationTransientId, Vec<u8>)> {
     plan.iter()
         .filter_map(|read| {
-            std::fs::read(&read.path)
+            crate::propagation_store_v2::read_validated_file(&read.path)
                 .ok()
                 .map(|data| (read.transient_id, data))
         })
         .collect()
+}
+
+/// An opaque stamped deposit with validated stamp work. Construction does not
+/// claim the relay can decrypt or mathematically identify ciphertext.
+#[derive(Debug)]
+pub struct ValidatedOpaquePropagationBlob {
+    bytes: bytes::Bytes,
+    transient_id: PropagationTransientId,
+    stamp_value: u8,
+}
+impl ValidatedOpaquePropagationBlob {
+    pub fn validate(bytes: bytes::Bytes, minimum_stamp_cost: u8) -> Option<Self> {
+        if bytes.len() < DESTINATION_LENGTH + 1 + 32
+            || bytes.len() > rns_protocol::resource::MAX_RESOURCE_SIZE
+        {
+            return None;
+        }
+        let body = &bytes[..bytes.len() - 32];
+        let stamp: &[u8; 32] = bytes[bytes.len() - 32..].try_into().ok()?;
+        let transient_id = rns_crypto::sha::full_hash(body);
+        let workblock =
+            crate::stamper::stamp_workblock(&transient_id, STAMP_WORKBLOCK_EXPAND_ROUNDS_PN);
+        let stamp_value = crate::stamper::stamp_value(&workblock, stamp).min(255) as u8;
+        (stamp_value >= minimum_stamp_cost).then_some(Self {
+            bytes,
+            transient_id,
+            stamp_value,
+        })
+    }
+    pub fn transient_id(&self) -> PropagationTransientId {
+        self.transient_id
+    }
+    pub fn stamp_value(&self) -> u8 {
+        self.stamp_value
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PropagationAdmissionOutcome {
+    Pending,
+    Committed,
+    Failed,
+}
+#[derive(Debug)]
+struct AdmissionReservation {
+    content_hash: [u8; 32],
+    size: usize,
+    result: tokio::sync::watch::Sender<PropagationAdmissionOutcome>,
+}
+impl Drop for AdmissionReservation {
+    fn drop(&mut self) {
+        if *self.result.borrow() == PropagationAdmissionOutcome::Pending {
+            self.result
+                .send_replace(PropagationAdmissionOutcome::Failed);
+        }
+    }
+}
+/// Await only outside validation/storage worker slots. This observer cannot
+/// persist, commit, revoke, or manufacture another admission's authority.
+#[derive(Debug)]
+pub struct PropagationAdmissionWaiter {
+    result: tokio::sync::watch::Receiver<PropagationAdmissionOutcome>,
+}
+impl PropagationAdmissionWaiter {
+    pub async fn wait(mut self) -> PropagationAdmissionOutcome {
+        loop {
+            let current = *self.result.borrow_and_update();
+            if current != PropagationAdmissionOutcome::Pending {
+                return current;
+            }
+            if self.result.changed().await.is_err() {
+                return PropagationAdmissionOutcome::Failed;
+            }
+        }
+    }
+}
+/// Revalidate retained ciphertext and its committed provenance off the actor
+/// before a duplicate can earn a proof.
+#[derive(Debug)]
+pub struct PropagationDuplicateCheck {
+    path: PathBuf,
+}
+impl PropagationDuplicateCheck {
+    pub fn verify(self) -> std::io::Result<()> {
+        crate::propagation_store_v2::verify_committed_object(&self.path)
+    }
+}
+#[derive(Debug)]
+pub enum PropagationAdmission {
+    Reserved(Box<PropagationStoreWritePlan>),
+    CommittedDuplicate(PropagationDuplicateCheck),
+    Pending(PropagationAdmissionWaiter),
+    Rejected,
 }
 
 /// One propagation-store admission reserved under the node lock. Persist it
@@ -165,6 +472,8 @@ pub fn read_planned_messages(
 pub struct PropagationStoreWritePlan {
     entry: PropagationEntry,
     data: Vec<u8>,
+    manifest: crate::propagation_store_v2::EntryManifest,
+    reservation: std::sync::Arc<AdmissionReservation>,
     path: Option<PathBuf>,
 }
 
@@ -178,14 +487,22 @@ impl PropagationStoreWritePlan {
     }
 
     /// Perform the potentially blocking durable write. Disk-backed nodes use
-    /// atomic temp-file replacement; in-memory nodes complete immediately.
+    /// strict platform publication; volatile nodes cannot acknowledge storage.
     pub fn persist(self) -> std::io::Result<PersistedPropagationStoreWrite> {
-        if let Some(ref path) = self.path {
-            crate::persist::write_file_atomic(path, &self.data)?;
+        let path = self.path.as_ref().ok_or_else(|| {
+            std::io::Error::other("volatile propagation nodes cannot issue durable admission")
+        })?;
+        if crate::propagation_store_v2::deletion_path(path).exists() {
+            return Err(std::io::Error::other(
+                "prior relay deletion needs reconciliation before readmission",
+            ));
         }
+        let (manifest, path) =
+            crate::propagation_store_v2::publish_object(path, &self.manifest, &self.data)?;
         Ok(PersistedPropagationStoreWrite {
-            entry: self.entry,
-            path: self.path,
+            entry: manifest.entry(),
+            path: Some(path),
+            reservation: self.reservation,
         })
     }
 }
@@ -196,6 +513,7 @@ impl PropagationStoreWritePlan {
 pub struct PersistedPropagationStoreWrite {
     entry: PropagationEntry,
     path: Option<PathBuf>,
+    reservation: std::sync::Arc<AdmissionReservation>,
 }
 
 #[derive(Debug, Clone)]
@@ -327,6 +645,8 @@ pub struct PropagationNode {
     sync_sessions: HashMap<[u8; 16], SyncSession>,
     pub dest_hash: [u8; 16],
     storage_path: Option<PathBuf>,
+    object_paths: HashMap<PropagationTransientId, PathBuf>,
+    _store_lock: Option<std::fs::File>,
     /// Transitional pre-1.1 behavior; removed when the daemon-lifetime
     /// `PnInboundAdmission` becomes the live throttle owner.
     last_offer_times: HashMap<[u8; 16], f64>,
@@ -338,7 +658,9 @@ pub struct PropagationNode {
     /// duplicate acceptance and storage-cap oversubscription while I/O is in
     /// flight.
     pending_write_ids: HashSet<PropagationTransientId>,
+    pending_admissions: HashMap<PropagationTransientId, std::sync::Weak<AdmissionReservation>>,
     pending_write_bytes: usize,
+    retired: std::sync::Arc<RetiredEntries>,
 }
 
 impl PropagationNode {
@@ -350,11 +672,19 @@ impl PropagationNode {
             sync_sessions: HashMap::new(),
             dest_hash,
             storage_path: None,
+            object_paths: HashMap::new(),
+            _store_lock: None,
             last_offer_times: HashMap::new(),
             offer_generation: 0,
             pending_write_ids: HashSet::new(),
+            pending_admissions: HashMap::new(),
             pending_write_bytes: 0,
+            retired: std::sync::Arc::new(RetiredEntries::default()),
         }
+    }
+
+    pub fn is_durable(&self) -> bool {
+        self.storage_path.is_some()
     }
 
     pub fn min_stamp_cost(&self) -> u8 {
@@ -366,7 +696,11 @@ impl PropagationNode {
     }
 
     pub fn offer_generation(&self) -> u64 {
-        self.offer_generation
+        self.offer_generation.saturating_add(
+            self.retired
+                .generation
+                .load(std::sync::atomic::Ordering::Acquire),
+        )
     }
 
     /// Apply the daemon's destination deny policy to the authoritative hosted
@@ -404,17 +738,21 @@ impl PropagationNode {
         dest_hash: [u8; 16],
         storage_path: PathBuf,
     ) -> std::io::Result<Self> {
-        std::fs::create_dir_all(&storage_path)?;
+        let (storage_path, lock) = crate::propagation_store_v2::open_locked_store(&storage_path)?;
         let mut node = Self {
             config,
             store: PropagationStore::new(),
             sync_sessions: HashMap::new(),
             dest_hash,
             storage_path: Some(storage_path),
+            object_paths: HashMap::new(),
+            _store_lock: Some(lock),
             last_offer_times: HashMap::new(),
             offer_generation: 0,
             pending_write_ids: HashSet::new(),
+            pending_admissions: HashMap::new(),
             pending_write_bytes: 0,
+            retired: std::sync::Arc::new(RetiredEntries::default()),
         };
         node.load_from_disk()?;
         Ok(node)
@@ -425,6 +763,7 @@ impl PropagationNode {
         entry: PropagationEntry,
         data: Vec<u8>,
     ) -> Option<PropagationStoreWritePlan> {
+        self.reap_retired();
         let transient_id = entry.transient_id;
         if self.store.contains(&transient_id) || self.pending_write_ids.contains(&transient_id) {
             return None;
@@ -441,17 +780,40 @@ impl PropagationNode {
             return None;
         }
 
+        let (result, _) = tokio::sync::watch::channel(PropagationAdmissionOutcome::Pending);
+        let reservation = std::sync::Arc::new(AdmissionReservation {
+            content_hash: rns_crypto::sha::full_hash(&data),
+            size: data.len(),
+            result,
+        });
+        self.pending_admissions
+            .insert(transient_id, std::sync::Arc::downgrade(&reservation));
         self.pending_write_ids.insert(transient_id);
         self.pending_write_bytes = self.pending_write_bytes.saturating_add(data.len());
+        let manifest = crate::propagation_store_v2::EntryManifest::from_entry(&entry, &data);
         let path = self
             .storage_path
             .as_ref()
-            .map(|dir| dir.join(entry.filename()));
-        Some(PropagationStoreWritePlan { entry, data, path })
+            .map(|dir| dir.join("objects").join(manifest.filename()));
+        Some(PropagationStoreWritePlan {
+            entry,
+            data,
+            manifest,
+            reservation,
+            path,
+        })
     }
 
     /// Release a reservation after a failed blocking write.
     pub fn abort_store_write(&mut self, transient_id: &PropagationTransientId, size: usize) {
+        if self
+            .pending_admissions
+            .get(transient_id)
+            .is_some_and(|weak| weak.upgrade().is_some())
+        {
+            return;
+        }
+        self.pending_admissions.remove(transient_id);
         if self.pending_write_ids.remove(transient_id) {
             self.pending_write_bytes = self.pending_write_bytes.saturating_sub(size);
         }
@@ -462,22 +824,31 @@ impl PropagationNode {
     pub fn commit_store_write(&mut self, persisted: PersistedPropagationStoreWrite) -> bool {
         let transient_id = persisted.entry.transient_id;
         let size = persisted.entry.size;
+        if self
+            .pending_admissions
+            .get(&transient_id)
+            .and_then(|weak| weak.upgrade())
+            .is_none_or(|owner| !std::sync::Arc::ptr_eq(&owner, &persisted.reservation))
+        {
+            return false;
+        }
+        self.pending_admissions.remove(&transient_id);
         if !self.pending_write_ids.remove(&transient_id) {
-            if let Some(path) = persisted.path {
-                let _ = std::fs::remove_file(path);
-            }
             return false;
         }
         self.pending_write_bytes = self.pending_write_bytes.saturating_sub(size);
-
-        let inserted = self.store.insert(persisted.entry);
+        let inserted = !self.store.contains(&transient_id) && self.store.insert(persisted.entry);
         if inserted {
+            if let Some(path) = persisted.path {
+                self.object_paths.insert(transient_id, path);
+            }
             self.advance_offer_generation();
-        } else if let Some(path) = persisted.path {
-            // Reservation loss/duplicate commit is exceptional; cleanup is a
-            // short best-effort operation and never occurs on normal traffic.
-            let _ = std::fs::remove_file(path);
         }
+        persisted.reservation.result.send_replace(if inserted {
+            PropagationAdmissionOutcome::Committed
+        } else {
+            PropagationAdmissionOutcome::Failed
+        });
         inserted
     }
 
@@ -498,117 +869,6 @@ impl PropagationNode {
         }
     }
 
-    /// Returns `true` if the message was stored, `false` on duplicate, overflow,
-    /// pack failure, oversized message, or insufficient stamp.
-    #[tracing::instrument(
-        level = "debug",
-        name = "propagation.accept_message",
-        skip_all,
-        fields(
-            transient_id = message.transient_id.as_ref().map(|tid| hex::encode(&tid[..8])),
-            size = message.content.len(),
-        ),
-    )]
-    pub fn plan_accept_message(
-        &mut self,
-        message: &LxMessage,
-    ) -> Option<PropagationStoreWritePlan> {
-        let hash = message.hash?;
-
-        let transient_id = message.transient_id.unwrap_or(hash);
-        if self.store.contains(&transient_id) {
-            return None;
-        }
-
-        let packed = message.pack().ok()?;
-        let msg_size = packed.len();
-
-        if msg_size > self.config.max_message_size {
-            return None;
-        }
-
-        // Compute stamp value via HKDF workblock over full_hash(packed) using
-        // PN expand rounds. Matches Python LXStamper.validate_pn_stamp().
-        let sv = if let Some(ref stamp) = message.stamp {
-            let transient_id_full = rns_crypto::sha::full_hash(&packed);
-            let workblock = crate::stamper::stamp_workblock(
-                &transient_id_full,
-                crate::constants::STAMP_WORKBLOCK_EXPAND_ROUNDS_PN,
-            );
-            if let Ok(stamp) = <&[u8; 32]>::try_from(stamp.as_slice()) {
-                crate::stamper::stamp_value(&workblock, stamp) as u8
-            } else {
-                0
-            }
-        } else {
-            0
-        };
-
-        if self.config.min_stamp_cost > 0 && sv < self.config.min_stamp_cost {
-            return None;
-        }
-
-        let mut entry =
-            PropagationEntry::new(transient_id, hash, message.destination_hash, msg_size, sv);
-        entry.stored_at = message.timestamp;
-
-        self.reserve_store_write(entry, packed)
-    }
-
-    pub fn accept_message(&mut self, message: &LxMessage) -> bool {
-        let Some(plan) = self.plan_accept_message(message) else {
-            return false;
-        };
-        self.persist_reserved(plan)
-    }
-
-    /// Store an already propagation-packed LXMF blob (`dest_hash || encrypted_data`).
-    ///
-    /// This is the normal client -> propagation-node ingress path. Unlike
-    /// [`Self::accept_message`], the node cannot decrypt or unpack this data;
-    /// it indexes by the transient ID and serves the raw blob back to the
-    /// destination client during `/get`.
-    pub fn plan_accept_propagated_blob(
-        &mut self,
-        lxmf_data: &[u8],
-        stamp_value: u8,
-    ) -> Option<PropagationStoreWritePlan> {
-        if lxmf_data.len() < DESTINATION_LENGTH + 1 {
-            return None;
-        }
-        if self.config.min_stamp_cost > 0 && stamp_value < self.config.min_stamp_cost {
-            return None;
-        }
-
-        let transient_id = rns_crypto::sha::full_hash(lxmf_data);
-        if self.store.contains(&transient_id) {
-            return None;
-        }
-        if lxmf_data.len() > self.config.max_message_size {
-            return None;
-        }
-
-        let mut destination_hash = [0u8; 16];
-        destination_hash.copy_from_slice(&lxmf_data[..DESTINATION_LENGTH]);
-
-        let entry = PropagationEntry::new(
-            transient_id,
-            transient_id,
-            destination_hash,
-            lxmf_data.len(),
-            stamp_value,
-        );
-
-        self.reserve_store_write(entry, lxmf_data.to_vec())
-    }
-
-    pub fn accept_propagated_blob(&mut self, lxmf_data: &[u8], stamp_value: u8) -> bool {
-        let Some(plan) = self.plan_accept_propagated_blob(lxmf_data, stamp_value) else {
-            return false;
-        };
-        self.persist_reserved(plan)
-    }
-
     /// Store a validated propagated LXMF blob with its propagation-node stamp.
     ///
     /// Canonical propagation-node storage mirrors upstream Python: keep
@@ -621,38 +881,86 @@ impl PropagationNode {
         stamp_data: &[u8; 32],
         stamp_value: u8,
     ) -> Option<PropagationStoreWritePlan> {
-        if lxmf_data.len() < DESTINATION_LENGTH + 1 {
+        let mut bytes = Vec::with_capacity(lxmf_data.len().checked_add(32)?);
+        if lxmf_data.len().checked_add(32)? > self.config.max_message_size {
             return None;
         }
-        if self.config.min_stamp_cost > 0 && stamp_value < self.config.min_stamp_cost {
+        bytes.extend_from_slice(lxmf_data);
+        bytes.extend_from_slice(stamp_data);
+        let blob =
+            ValidatedOpaquePropagationBlob::validate(bytes.into(), self.config.min_stamp_cost)?;
+        if blob.stamp_value() != stamp_value {
             return None;
         }
-
-        let transient_id = rns_crypto::sha::full_hash(lxmf_data);
-        if self.store.contains(&transient_id) {
-            return None;
+        match self.plan_opaque_admission(blob) {
+            PropagationAdmission::Reserved(plan) => Some(*plan),
+            _ => None,
         }
-
-        let mut stored_data = Vec::with_capacity(lxmf_data.len() + stamp_data.len());
-        stored_data.extend_from_slice(lxmf_data);
-        stored_data.extend_from_slice(stamp_data);
-
-        if stored_data.len() > self.config.max_message_size {
-            return None;
+    }
+    /// Preferred network admission API. Same-TID exact-image duplicates share
+    /// the original completion and never perform a second disk write.
+    pub fn plan_opaque_admission(
+        &mut self,
+        blob: ValidatedOpaquePropagationBlob,
+    ) -> PropagationAdmission {
+        self.reap_retired();
+        // Clear cancelled reservation accounting only after its actual owner
+        // has exited; a weak observer never prolongs ownership or byte leases.
+        let stale = self
+            .pending_admissions
+            .iter()
+            .filter_map(|(id, weak)| weak.upgrade().is_none().then_some(*id))
+            .collect::<Vec<_>>();
+        for id in stale {
+            self.pending_admissions.remove(&id);
+            self.pending_write_ids.remove(&id);
         }
-
-        let mut destination_hash = [0u8; 16];
-        destination_hash.copy_from_slice(&lxmf_data[..DESTINATION_LENGTH]);
-
+        self.pending_write_bytes = self
+            .pending_admissions
+            .values()
+            .filter_map(|w| w.upgrade())
+            .fold(0usize, |n, r| n.saturating_add(r.size));
+        if !self.is_durable()
+            || blob.stamp_value < self.config.min_stamp_cost
+            || blob.bytes.len() > self.config.max_message_size
+        {
+            return PropagationAdmission::Rejected;
+        }
+        if self.contains(&blob.transient_id) {
+            return self
+                .object_paths
+                .get(&blob.transient_id)
+                .cloned()
+                .map(|path| {
+                    PropagationAdmission::CommittedDuplicate(PropagationDuplicateCheck { path })
+                })
+                .unwrap_or(PropagationAdmission::Rejected);
+        }
+        if let Some(owner) = self
+            .pending_admissions
+            .get(&blob.transient_id)
+            .and_then(|w| w.upgrade())
+        {
+            if owner.content_hash != rns_crypto::sha::full_hash(&blob.bytes) {
+                return PropagationAdmission::Rejected;
+            }
+            return PropagationAdmission::Pending(PropagationAdmissionWaiter {
+                result: owner.result.subscribe(),
+            });
+        }
+        let mut destination = [0; 16];
+        destination.copy_from_slice(&blob.bytes[..16]);
         let entry = PropagationEntry::new_stamped(
-            transient_id,
-            transient_id,
-            destination_hash,
-            stored_data.len(),
-            stamp_value,
+            blob.transient_id,
+            blob.transient_id,
+            destination,
+            blob.bytes.len(),
+            blob.stamp_value,
         );
-
-        self.reserve_store_write(entry, stored_data)
+        match self.reserve_store_write(entry, blob.bytes.to_vec()) {
+            Some(plan) => PropagationAdmission::Reserved(Box::new(plan)),
+            None => PropagationAdmission::Rejected,
+        }
     }
 
     pub fn accept_stamped_propagated_blob(
@@ -670,155 +978,104 @@ impl PropagationNode {
     }
 
     fn load_from_disk(&mut self) -> std::io::Result<()> {
-        let dir = match &self.storage_path {
-            Some(d) => d,
-            None => return Ok(()),
-        };
-
-        if !dir.exists() {
+        let Some(root) = self.storage_path.as_ref() else {
             return Ok(());
-        }
-
-        let mut loaded = 0;
-        let mut quarantined = 0;
-        for entry in std::fs::read_dir(dir)? {
-            // One unreadable directory entry or file must not abort the whole
-            // store load — quarantine it and keep loading the rest.
-            let entry = match entry {
-                Ok(e) => e,
-                Err(e) => {
-                    tracing::warn!(error = %e, "skipping unreadable messagestore entry");
-                    quarantined += 1;
-                    continue;
-                }
-            };
-            let path = entry.path();
-            if !path.is_file() {
+        };
+        crate::propagation_store_v2::reconcile_deletions(root)?;
+        let objects = root.join("objects");
+        for file in std::fs::read_dir(&objects)? {
+            let path = file?.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("active") {
                 continue;
             }
-
-            let filename = match path.file_name().and_then(|f| f.to_str()) {
-                Some(f) => f.to_string(),
-                None => continue,
-            };
-
-            if filename.ends_with(".peer")
-                || filename.ends_with(".msgpack")
-                || filename.ends_with(".corrupt")
-            {
+            let object = crate::propagation_store_v2::indexed_object(&path)?;
+            if crate::propagation_store_v2::deletion_path(&object).exists() {
                 continue;
             }
-
-            if let Some((tid, ts, sv)) = PropagationEntry::parse_filename(&filename) {
-                let data = match std::fs::read(&path) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        tracing::warn!(
-                            file = %path.display(),
-                            error = %e,
-                            "quarantining unreadable propagation message"
-                        );
-                        let _ = std::fs::rename(&path, path.with_extension("corrupt"));
-                        quarantined += 1;
-                        continue;
-                    }
-                };
-                let size = data.len();
-
-                if self.store.contains(&tid) {
-                    continue;
-                }
-
-                let mut message_hash = [0u8; 32];
-                message_hash.copy_from_slice(&rns_crypto::sha::full_hash(&data));
-
-                // Opaque propagated blobs are stored as `dest_hash || encrypted_data`
-                // and cannot be unpacked by the node. Recover the routing key from
-                // the first 16 bytes before trying the legacy full-message path.
-                let mut destination_hash = [0u8; 16];
-                if data.len() >= DESTINATION_LENGTH {
-                    destination_hash.copy_from_slice(&data[..DESTINATION_LENGTH]);
-                }
-
-                let mut pe =
-                    PropagationEntry::new_stamped(tid, message_hash, destination_hash, size, sv);
-                pe.stored_at = ts;
-
-                // Older app hosts persisted opaque blobs without their PN
-                // stamp. Their filename TID hashes the entire file, whereas
-                // canonical stamped storage hashes the file before its final
-                // 32-byte stamp. Recover that exact legacy representation so
-                // client /get cannot truncate ciphertext after a restart.
-                // This distinguishes storage format, not stamp authenticity;
-                // retain the existing policy for other opaque/malformed files.
-                if data.len() > DESTINATION_LENGTH && message_hash == tid {
-                    pe.stamped = false;
-                }
-
-                if let Ok(msg) = LxMessage::unpack(&data) {
-                    pe.message_hash = msg.hash.unwrap_or([0u8; 32]);
-                    pe.destination_hash = msg.destination_hash;
-                    pe.stamped = false;
-                }
-
-                if self.store.insert(pe) {
-                    loaded += 1;
-                }
+            let (meta, _) = crate::propagation_store_v2::read_manifest(&object)?;
+            crate::propagation_store_v2::verify_committed_object(&object)?;
+            if self.store.contains(&meta.transient_id) {
+                return Err(std::io::Error::other("duplicate relay TID"));
             }
+            self.object_paths.insert(meta.transient_id, object);
+            self.store.insert(meta.entry());
         }
-
-        if loaded > 0 || quarantined > 0 {
-            tracing::info!(loaded, quarantined, "loaded propagation messages from disk");
-        }
-        if loaded > 0 {
+        if !self.store.is_empty() {
             self.advance_offer_generation();
         }
-
         Ok(())
     }
-
-    /// Periodic maintenance: cull expired entries, enforce the storage cap by
-    /// weight (Python `clean_message_store` parity — makes room for new
-    /// messages instead of wedging at the ingest reject), and clean up
-    /// orphaned files.
-    pub fn tick(&mut self) {
-        let before = self.store.len();
-        self.store.cull_expired(self.config.max_message_age);
-        self.store.cull_by_weight(self.config.max_storage);
-        let after = self.store.len();
-
-        if before != after {
-            self.advance_offer_generation();
-        }
-
-        if before > after
-            && let Some(ref dir) = self.storage_path
-        {
-            self.cleanup_orphaned_files(dir);
+    fn eligible(&self, id: &PropagationTransientId) -> bool {
+        self.object_paths
+            .get(id)
+            .is_none_or(|path| !self.retired.contains(path))
+    }
+    fn reap_retired(&mut self) {
+        let removed =
+            std::mem::take(&mut *self.retired.ids.lock().unwrap_or_else(|e| e.into_inner()));
+        let ids = self
+            .object_paths
+            .iter()
+            .filter_map(|(id, path)| removed.contains(path).then_some(*id))
+            .collect::<Vec<_>>();
+        for id in ids {
+            self.store.remove(&id);
+            self.object_paths.remove(&id);
         }
     }
-
-    fn cleanup_orphaned_files(&self, dir: &std::path::Path) {
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if !path.is_file() {
-                    continue;
-                }
-                let filename = match path.file_name().and_then(|f| f.to_str()) {
-                    Some(f) => f.to_string(),
-                    None => continue,
-                };
-                if filename.ends_with(".peer") || filename.ends_with(".msgpack") {
-                    continue;
-                }
-                if let Some((tid, _, _)) = PropagationEntry::parse_filename(&filename)
-                    && !self.store.contains(&tid)
-                {
-                    let _ = std::fs::remove_file(&path);
-                }
+    fn retirement_plan(
+        &self,
+        ids: impl IntoIterator<Item = PropagationTransientId>,
+    ) -> PropagationRetirementPlan {
+        let entries = ids
+            .into_iter()
+            .filter(|id| self.eligible(id))
+            .filter_map(|id| self.object_paths.get(&id).cloned())
+            .collect();
+        PropagationRetirementPlan {
+            entries,
+            retired: std::sync::Arc::clone(&self.retired),
+        }
+    }
+    /// Select maintenance without filesystem IO. The caller runs persist off
+    /// the actor and drops this plan after actual completion.
+    pub fn plan_maintenance(&mut self) -> PropagationRetirementPlan {
+        self.reap_retired();
+        let now = crate::now_f64();
+        let cutoff = now - self.config.max_message_age as f64;
+        let mut ids = Vec::new();
+        let mut remaining = self.store.total_size();
+        let mut weighted = Vec::new();
+        for entry in self.store.entries() {
+            if entry.stored_at < cutoff {
+                ids.push(entry.transient_id);
+                remaining = remaining.saturating_sub(entry.size);
+            } else {
+                weighted.push((
+                    entry.transient_id,
+                    self.store.compute_weight(entry, now),
+                    entry.size,
+                ));
             }
         }
+        weighted.sort_by(|a, b| b.1.total_cmp(&a.1));
+        for (id, _, size) in weighted {
+            if remaining <= self.config.max_storage {
+                break;
+            }
+            ids.push(id);
+            remaining = remaining.saturating_sub(size);
+        }
+        self.retirement_plan(ids)
+    }
+    /// Blocking compatibility wrapper. Async hosts use plan_maintenance and
+    /// execute its durable operations on their bounded storage worker.
+    pub fn tick(&mut self) {
+        let plan = self.plan_maintenance();
+        if let Err(error) = plan.persist() {
+            tracing::warn!(%error,"relay maintenance remains pending");
+        }
+        self.reap_retired();
     }
 
     /// When `peer_min_stamp_cost` is `Some`, include only messages whose stamp
@@ -833,10 +1090,15 @@ impl PropagationNode {
             Some(min_cost) if min_cost > 0 => self
                 .store
                 .entries()
-                .filter(|e| e.stamp_value >= min_cost)
+                .filter(|e| self.eligible(&e.transient_id) && e.stamp_value >= min_cost)
                 .map(|e| e.transient_id)
                 .collect(),
-            _ => self.store.transient_ids(),
+            _ => self
+                .store
+                .entries()
+                .filter(|e| self.eligible(&e.transient_id))
+                .map(|e| e.transient_id)
+                .collect(),
         }
     }
 
@@ -853,7 +1115,10 @@ impl PropagationNode {
     }
 
     pub fn message_count(&self) -> usize {
-        self.store.len()
+        self.store
+            .entries()
+            .filter(|e| self.eligible(&e.transient_id))
+            .count()
     }
 
     /// Count live store entries not yet handled by one peer. The daemon's
@@ -866,16 +1131,22 @@ impl PropagationNode {
     ) -> usize {
         self.store
             .entries()
-            .filter(|entry| !handled_messages.contains(&entry.transient_id))
+            .filter(|entry| {
+                self.eligible(&entry.transient_id)
+                    && !handled_messages.contains(&entry.transient_id)
+            })
             .count()
     }
 
     pub fn total_size(&self) -> usize {
-        self.store.total_size()
+        self.store
+            .entries()
+            .filter(|e| self.eligible(&e.transient_id))
+            .fold(0usize, |n, e| n.saturating_add(e.size))
     }
 
     pub fn contains(&self, transient_id: &PropagationTransientId) -> bool {
-        self.store.contains(transient_id)
+        self.eligible(transient_id) && self.store.contains(transient_id)
     }
 
     pub fn get_session(&self, peer_hash: &[u8; 16]) -> Option<&SyncSession> {
@@ -1005,7 +1276,7 @@ impl PropagationNode {
                 local_hash,
                 remote_hash,
                 self.config.peering_cost,
-                |transient_id| self.store.contains(transient_id),
+                |transient_id| self.contains(transient_id),
             ) {
                 Ok(evaluation) => evaluation.into_wire_response(),
                 Err(error) => error.wire_response(),
@@ -1032,7 +1303,7 @@ impl PropagationNode {
             &remote_identity_hash,
             self.config.peering_cost,
             self.config.max_offer_size,
-            |transient_id| self.store.contains(transient_id),
+            |transient_id| self.contains(transient_id),
         )
     }
 
@@ -1051,113 +1322,115 @@ impl PropagationNode {
         request_data: &[u8],
         client_dest_hash: &[u8; 16],
     ) -> GetRequestAction {
-        use rmpv::Value;
-
-        let value: rmpv::Value = match rmpv::decode::read_value(&mut &request_data[..]) {
-            Ok(v) => v,
-            Err(_) => return GetRequestAction::Respond(crate::encode_value(&Value::Nil)),
-        };
-
-        let arr = match value.as_array() {
-            Some(a) if a.len() >= 2 => a,
-            _ => return GetRequestAction::Respond(crate::encode_value(&Value::Nil)),
-        };
-
-        let wants_is_nil = arr[0].is_nil();
-        let haves_is_nil = arr[1].is_nil();
-
-        fn parse_store_id(value: &rmpv::Value) -> Option<PropagationTransientId> {
-            let id_bytes = value.as_slice()?;
-            match id_bytes.len() {
-                32 => {
-                    let mut tid = [0u8; 32];
-                    tid.copy_from_slice(id_bytes);
-                    Some(tid)
-                }
-                _ => None,
-            }
-        }
-
-        if wants_is_nil && haves_is_nil {
-            // Phase 1: list available messages for this client, smallest first.
-            let mut available = self.store.entries_for_destination(client_dest_hash);
-            available.sort_by_key(|e| e.size);
-            let id_list: Vec<Value> = available
-                .iter()
-                .map(|e| Value::Binary(e.transient_id.to_vec()))
-                .collect();
-            GetRequestAction::Respond(crate::encode_value(&Value::Array(id_list)))
-        } else if wants_is_nil && !haves_is_nil {
-            // Phase 3: purge messages the client already received. Python
-            // returns the (empty) response_messages list here.
-            if let Some(haves_arr) = arr[1].as_array() {
-                for have_val in haves_arr {
-                    if let Some(tid) = parse_store_id(have_val) {
-                        self.purge_client_entry(&tid, client_dest_hash);
-                    }
-                }
-            }
-            GetRequestAction::Respond(crate::encode_value(&Value::Array(Vec::new())))
-        } else {
-            // Phase 2: purge haves first (Python order — an ID in both wants
-            // and haves is purged, not served), then resolve wants into a
-            // read plan executed after the node lock is released.
-            if let Some(haves_arr) = arr[1].as_array() {
-                for have_val in haves_arr {
-                    if let Some(tid) = parse_store_id(have_val) {
-                        self.purge_client_entry(&tid, client_dest_hash);
-                    }
-                }
-            }
-
-            let mut reads = Vec::new();
-            if let Some(wants_arr) = arr[0].as_array() {
-                for want_val in wants_arr {
-                    if let (Some(tid), Some(dir)) =
-                        (parse_store_id(want_val), self.storage_path.as_ref())
-                        && let Some(entry) = self.store.get(&tid)
-                    {
-                        // Ownership gate (Python LXMRouter.py:1479): a client
-                        // may only download messages addressed to itself.
-                        if entry.destination_hash == *client_dest_hash {
-                            reads.push(PlannedRead {
-                                path: dir.join(entry.filename()),
-                                stamped: entry.stamped,
-                            });
-                        }
-                    }
-                }
-            }
-
-            // Wire value is decimal kilobytes (Python LXMRouter.py:1471).
-            let limit_bytes = if arr.len() > 2 {
-                arr[2].as_f64().map(|kb| kb * BYTES_PER_KILOBYTE as f64)
-            } else {
-                None
-            };
-
-            GetRequestAction::ServeFiles(GetServePlan { reads, limit_bytes })
-        }
+        self.handle_get_request_bounded(
+            request_data,
+            client_dest_hash,
+            rns_protocol::resource::MAX_RESOURCE_SIZE,
+        )
     }
 
-    /// Remove a store entry on a client's behalf — only when the entry is
-    /// addressed to that client (Python LXMRouter.py:1454 ownership gate);
-    /// foreign transient IDs are ignored.
-    fn purge_client_entry(&mut self, tid: &PropagationTransientId, client_dest_hash: &[u8; 16]) {
-        let owned = self
-            .store
-            .get(tid)
-            .is_some_and(|entry| entry.destination_hash == *client_dest_hash);
-        if !owned {
-            return;
+    /// Plan a GET under a caller-reserved transfer budget. No native I/O occurs
+    /// here; resolve the plan on the worker retaining that reservation.
+    pub fn handle_get_request_bounded(
+        &mut self,
+        request_data: &[u8],
+        client_dest_hash: &[u8; 16],
+        maximum_response_bytes: usize,
+    ) -> GetRequestAction {
+        let Some(request) = parse_get_request(request_data) else {
+            return GetRequestAction::Respond(vec![0xc0]);
+        };
+        let maximum_response_bytes =
+            maximum_response_bytes.min(rns_protocol::resource::MAX_RESOURCE_SIZE);
+        if maximum_response_bytes < 5 {
+            return GetRequestAction::Respond(vec![0xc0]);
         }
-        if let Some(entry) = self.store.remove(tid) {
-            self.advance_offer_generation();
-            if let Some(ref dir) = self.storage_path {
-                let path = dir.join(entry.filename());
-                let _ = std::fs::remove_file(&path);
+        if request.wants.is_none() && request.haves.is_none() {
+            // Select only the smallest IDs that fit. A list request cannot
+            // allocate an index proportional to the entire retained store.
+            let count = maximum_response_bytes.saturating_sub(5) / 34;
+            let mut available = std::collections::BinaryHeap::new();
+            for entry in self.store.entries() {
+                if entry.destination_hash != *client_dest_hash
+                    || !self.eligible(&entry.transient_id)
+                {
+                    continue;
+                }
+                if available.len() < count {
+                    available.push((entry.size, entry.transient_id));
+                } else if available
+                    .peek()
+                    .is_some_and(|largest| (entry.size, entry.transient_id) < *largest)
+                {
+                    available.pop();
+                    available.push((entry.size, entry.transient_id));
+                }
+            }
+            let available = available.into_sorted_vec();
+            let mut response = Vec::with_capacity(5 + 34 * available.len());
+            rmp::encode::write_array_len(&mut response, available.len() as u32).expect("Vec write");
+            for (_, id) in available {
+                response.extend_from_slice(&[0xc4, 32]);
+                response.extend_from_slice(&id);
+            }
+            return GetRequestAction::Respond(response);
+        }
+        // The deferred owner charges 16×raw input and 16 MiB scratch. Charge
+        // every retained ID/path before cloning it; unusual long local paths
+        // cannot exceed that reservation. Failure creates no retirement plan.
+        let mut planning_left = request_data
+            .len()
+            .saturating_mul(8)
+            .saturating_add(8 * 1024 * 1024);
+        let mut retired_ids = HashSet::new();
+        for tid in get_ids(request.haves) {
+            if self
+                .store
+                .get(&tid)
+                .is_some_and(|e| e.destination_hash == *client_dest_hash)
+                && !retired_ids.contains(&tid)
+            {
+                let path_len = self
+                    .object_paths
+                    .get(&tid)
+                    .map_or(0, |p| p.as_os_str().len());
+                let charge = 256usize.saturating_add(path_len.saturating_mul(2));
+                let Some(left) = planning_left.checked_sub(charge) else {
+                    return GetRequestAction::Respond(vec![0xc0]);
+                };
+                planning_left = left;
+                retired_ids.insert(tid);
             }
         }
+        let mut reads = Vec::new();
+        let mut seen = HashSet::new();
+        for tid in get_ids(request.wants) {
+            if let Some(entry) = self.store.get(&tid)
+                && entry.destination_hash == *client_dest_hash
+                && self.eligible(&tid)
+                && !retired_ids.contains(&tid)
+                && !seen.contains(&tid)
+                && let Some(path) = self.object_paths.get(&tid)
+            {
+                let charge = 256usize.saturating_add(path.as_os_str().len().saturating_mul(2));
+                let Some(left) = planning_left.checked_sub(charge) else {
+                    return GetRequestAction::Respond(vec![0xc0]);
+                };
+                planning_left = left;
+                seen.insert(tid);
+                reads.push(PlannedRead {
+                    path: path.clone(),
+                    stamped: entry.stamped,
+                    stored_size: entry.size,
+                });
+            }
+        }
+        let retirements = self.retirement_plan(retired_ids);
+        GetRequestAction::ServeFiles(GetServePlan {
+            reads,
+            retirements,
+            limit_bytes: request.limit_bytes,
+        })
     }
 
     /// Resolve requested transient IDs into store-file read plans (no I/O).
@@ -1167,7 +1440,7 @@ impl PropagationNode {
         &self,
         requested_ids: &[PropagationTransientId],
     ) -> Vec<PlannedMessageRead> {
-        let dir = match &self.storage_path {
+        let _dir = match &self.storage_path {
             Some(d) => d,
             None => return Vec::new(),
         };
@@ -1175,10 +1448,13 @@ impl PropagationNode {
         requested_ids
             .iter()
             .filter_map(|tid| {
-                self.store.get(tid).map(|entry| PlannedMessageRead {
-                    transient_id: *tid,
-                    path: dir.join(entry.filename()),
-                })
+                self.store
+                    .get(tid)
+                    .filter(|_| self.eligible(tid))
+                    .map(|_entry| PlannedMessageRead {
+                        transient_id: *tid,
+                        path: self.object_paths[tid].clone(),
+                    })
             })
             .collect()
     }
@@ -1216,6 +1492,7 @@ impl PropagationNode {
         let candidates = self
             .store
             .entries()
+            .filter(|entry| self.eligible(&entry.transient_id))
             .map(|entry| SyncOfferCandidateSnapshot {
                 transient_id: entry.transient_id,
                 weight: self.store.compute_weight(entry, now),
@@ -1230,7 +1507,7 @@ impl PropagationNode {
 
         SyncOfferPreparationSnapshot {
             policy: policy.clone(),
-            generation: self.offer_generation,
+            generation: self.offer_generation(),
             peer_path,
             candidates,
         }
@@ -1243,11 +1520,11 @@ impl PropagationNode {
         &mut self,
         prepared: PreparedSyncOffer,
     ) -> InstallPreparedSyncOffer {
-        if prepared.generation != self.offer_generation
+        if prepared.generation != self.offer_generation()
             || prepared
                 .selected_ids
                 .iter()
-                .any(|transient_id| !self.store.contains(transient_id))
+                .any(|transient_id| !self.contains(transient_id))
         {
             return InstallPreparedSyncOffer::Stale;
         }
@@ -1421,7 +1698,7 @@ impl PropagationNode {
     /// through on every sync — grow with total propagated volume forever.
     /// Files converge lazily: the next `mark_peer_handled` saves the pruned set.
     fn prune_handled_against_store(&self, peer: &mut LxmPeer) {
-        peer.handled_messages.retain(|id| self.store.contains(id));
+        peer.handled_messages.retain(|id| self.contains(id));
     }
 }
 
@@ -1438,15 +1715,113 @@ impl std::fmt::Debug for PropagationNode {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::constants::DeliveryMethod;
 
-    fn make_signed_message(dest: [u8; 16], src: [u8; 16], title: &str, content: &str) -> LxMessage {
-        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
-        let mut msg = LxMessage::new(dest, src, title, content, DeliveryMethod::Propagated);
-        msg.sign(&key).unwrap();
-        msg
+    // Real opaque relay fixtures: ID derives from ciphertext, and stamp value is
+    // measured from the exact retained blob. Timestamp below is a test arrival
+    // clock, never a mutation of the signed message.
+    #[derive(Clone)]
+    pub(crate) struct OpaqueFixture {
+        pub(crate) data: Vec<u8>,
+        pub(crate) stamp: [u8; 32],
+        pub(crate) value: u8,
+        pub(crate) transient_id: Option<[u8; 32]>,
+        pub(crate) hash: Option<[u8; 32]>,
+        pub(crate) timestamp: f64,
+    }
+    impl OpaqueFixture {
+        pub(crate) fn message_id(&self) -> [u8; 32] {
+            self.transient_id.unwrap()
+        }
+    }
+    pub(crate) fn fixture_stamp(data: &[u8], cost: u8) -> ([u8; 32], u32) {
+        let id = rns_crypto::sha::full_hash(data);
+        let block = crate::stamper::stamp_workblock(
+            &id,
+            crate::constants::STAMP_WORKBLOCK_EXPAND_ROUNDS_PN,
+        );
+        // Exact value makes filtering fixtures deterministic (cost zero's public
+        // generator shortcut is not a measured stamp strength).
+        for counter in 0..u64::MAX {
+            let mut stamp = [0; 32];
+            stamp[..8].copy_from_slice(&counter.to_be_bytes());
+            let value = crate::stamper::stamp_value(&block, &stamp);
+            if value == u32::from(cost) {
+                return (stamp, value);
+            }
+        }
+        unreachable!()
+    }
+    pub(crate) fn opaque_message(
+        dest: [u8; 16],
+        src: [u8; 16],
+        title: &str,
+        content: &str,
+        method: DeliveryMethod,
+    ) -> OpaqueFixture {
+        let message = crate::message::test_message(dest, src, title, content, method);
+        let identity = rns_identity::identity::Identity::new();
+        let mut data = dest.to_vec();
+        data.extend(identity.encrypt(&message.wire_bytes()[16..], None).unwrap());
+        let transient_id = rns_crypto::sha::full_hash(&data);
+        let (stamp, value) = fixture_stamp(&data, 0);
+        OpaqueFixture {
+            data,
+            stamp,
+            value: value.min(255) as u8,
+            transient_id: Some(transient_id),
+            hash: Some(transient_id),
+            timestamp: crate::now_f64(),
+        }
+    }
+    pub(crate) fn make_signed_message(
+        dest: [u8; 16],
+        src: [u8; 16],
+        title: &str,
+        content: &str,
+    ) -> OpaqueFixture {
+        opaque_message(dest, src, title, content, DeliveryMethod::Propagated)
+    }
+    thread_local! { static FIXTURE_DIRECTORIES: std::cell::RefCell<Vec<tempfile::TempDir>>=const {std::cell::RefCell::new(Vec::new())}; }
+    pub(crate) fn durable_test_node(
+        config: PropagationNodeConfig,
+        dest: [u8; 16],
+    ) -> PropagationNode {
+        let dir = tempfile::tempdir().unwrap();
+        let node = PropagationNode::with_storage(config, dest, dir.path().join("store")).unwrap();
+        FIXTURE_DIRECTORIES.with(|dirs| dirs.borrow_mut().push(dir));
+        node
+    }
+    impl PropagationNode {
+        pub(crate) fn plan_fixture(
+            &mut self,
+            fixture: &OpaqueFixture,
+        ) -> Option<PropagationStoreWritePlan> {
+            let mut plan = self.plan_accept_stamped_propagated_blob(
+                &fixture.data,
+                &fixture.stamp,
+                fixture.value,
+            )?;
+            plan.entry.stored_at = fixture.timestamp;
+            plan.manifest.stored_at = fixture.timestamp;
+            plan.path = self
+                .storage_path
+                .as_ref()
+                .map(|root| root.join("objects").join(plan.manifest.filename()));
+            Some(plan)
+        }
+        pub(crate) fn accept_fixture(&mut self, fixture: &OpaqueFixture) -> bool {
+            let Some(plan) = self.plan_fixture(fixture) else {
+                return false;
+            };
+            self.persist_reserved(plan)
+        }
+        pub(crate) fn accept_blob_fixture(&mut self, data: &[u8], cost: u8) -> bool {
+            let (stamp, value) = fixture_stamp(data, cost);
+            self.accept_stamped_propagated_blob(data, &stamp, value.min(255) as u8)
+        }
     }
 
     fn tid(byte: u8) -> PropagationTransientId {
@@ -1511,20 +1886,20 @@ mod tests {
 
     #[test]
     fn test_accept_message() {
-        let mut node = PropagationNode::new(PropagationNodeConfig::default(), [0xAA; 16]);
+        let mut node = durable_test_node(PropagationNodeConfig::default(), [0xAA; 16]);
         let msg = make_signed_message([0xBB; 16], [0xCC; 16], "Test", "content");
         assert!(msg.hash.is_some());
-        assert!(node.accept_message(&msg));
+        assert!(node.accept_fixture(&msg));
         assert_eq!(node.message_count(), 1);
     }
 
     #[test]
     fn store_write_reservation_blocks_duplicates_until_durable_commit() {
-        let mut node = PropagationNode::new(PropagationNodeConfig::default(), [0xAA; 16]);
+        let mut node = durable_test_node(PropagationNodeConfig::default(), [0xAA; 16]);
         let msg = make_signed_message([0xBB; 16], [0xCC; 16], "Test", "reserved");
-        let plan = node.plan_accept_message(&msg).expect("first reservation");
+        let plan = node.plan_fixture(&msg).expect("first reservation");
         assert_eq!(node.message_count(), 0, "reservation is not served state");
-        assert!(node.plan_accept_message(&msg).is_none());
+        assert!(node.plan_fixture(&msg).is_none());
 
         let persisted = plan.persist().unwrap();
         assert!(node.commit_store_write(persisted));
@@ -1533,51 +1908,47 @@ mod tests {
 
     #[test]
     fn failed_store_write_is_not_inserted_and_releases_reservation() {
-        let root = tempfile::tempdir().unwrap();
-        let store_dir = root.path().join("store");
-        let mut node = PropagationNode::with_storage(
-            PropagationNodeConfig::default(),
-            [0xAA; 16],
-            store_dir.clone(),
-        )
-        .unwrap();
-        let msg = make_signed_message([0xBB; 16], [0xCC; 16], "Test", "durable");
-        let plan = node.plan_accept_message(&msg).expect("reservation");
-        let transient_id = plan.transient_id();
+        let mut node = durable_test_node(PropagationNodeConfig::default(), [0xAA; 16]);
+        let message =
+            make_signed_message([0xBB; 16], [0xCC; 16], "write failure", "preserve retry");
+        let plan = node.plan_fixture(&message).unwrap();
+        let id = plan.transient_id();
         let size = plan.size();
-        std::fs::remove_dir(&store_dir).unwrap();
-
+        let objects = node.storage_path.as_ref().unwrap().join("objects");
+        let saved = objects.with_extension("temporarily-unavailable");
+        std::fs::rename(&objects, &saved).unwrap();
+        std::fs::write(&objects, b"temporary non-directory").unwrap();
         assert!(plan.persist().is_err());
-        node.abort_store_write(&transient_id, size);
+        node.abort_store_write(&id, size);
         assert_eq!(node.message_count(), 0);
-
-        std::fs::create_dir(&store_dir).unwrap();
-        assert!(node.accept_message(&msg));
+        std::fs::remove_file(&objects).unwrap();
+        std::fs::rename(&saved, &objects).unwrap();
+        assert!(node.accept_fixture(&message));
         assert_eq!(node.message_count(), 1);
     }
 
     #[test]
     fn hosted_node_applies_ignored_destination_policy() {
         let destination = [0x44; 16];
-        let mut node = PropagationNode::new(PropagationNodeConfig::default(), [0xAA; 16]);
+        let mut node = durable_test_node(PropagationNodeConfig::default(), [0xAA; 16]);
         node.ignore_destination(destination);
         assert!(node.is_destination_ignored(&destination));
 
         let mut blob = destination.to_vec();
         blob.extend_from_slice(b"encrypted-lxmf");
-        assert!(!node.accept_stamped_propagated_blob(&blob, &[0; 32], 0));
+        assert!(!node.accept_blob_fixture(&blob, 0));
         assert_eq!(node.message_count(), 0);
 
         node.unignore_destination(&destination);
-        assert!(node.accept_stamped_propagated_blob(&blob, &[0; 32], 0));
+        assert!(node.accept_blob_fixture(&blob, 0));
     }
 
     #[test]
     fn unhandled_count_is_derived_from_live_store_and_peer_handled_set() {
-        let mut node = PropagationNode::new(PropagationNodeConfig::default(), [0xAA; 16]);
+        let mut node = durable_test_node(PropagationNodeConfig::default(), [0xAA; 16]);
         let msg = make_signed_message([0xBB; 16], [0xCC; 16], "Test", "content");
         let transient_id = msg.transient_id.or(msg.hash).unwrap();
-        assert!(node.accept_message(&msg));
+        assert!(node.accept_fixture(&msg));
 
         let mut handled = HashSet::new();
         assert_eq!(node.unhandled_message_count(&handled), 1);
@@ -1587,25 +1958,18 @@ mod tests {
 
     #[test]
     fn test_reject_duplicate() {
-        let mut node = PropagationNode::new(PropagationNodeConfig::default(), [0xAA; 16]);
+        let mut node = durable_test_node(PropagationNodeConfig::default(), [0xAA; 16]);
         let msg = make_signed_message([0xBB; 16], [0xCC; 16], "Test", "duplicate");
-        assert!(node.accept_message(&msg));
-        assert!(!node.accept_message(&msg));
+        assert!(node.accept_fixture(&msg));
+        assert!(!node.accept_fixture(&msg));
         assert_eq!(node.message_count(), 1);
     }
 
     #[test]
     fn test_reject_no_hash() {
-        let mut node = PropagationNode::new(PropagationNodeConfig::default(), [0xAA; 16]);
-        let msg = LxMessage::new(
-            [0xBB; 16],
-            [0xCC; 16],
-            "Test",
-            "no hash",
-            DeliveryMethod::Propagated,
-        );
-        assert!(msg.hash.is_none());
-        assert!(!node.accept_message(&msg));
+        let mut node = durable_test_node(PropagationNodeConfig::default(), [0xAA; 16]);
+        assert!(!node.accept_stamped_propagated_blob(&[0; 16], &[0; 32], 0));
+        assert_eq!(node.message_count(), 0);
     }
 
     #[test]
@@ -1614,22 +1978,22 @@ mod tests {
             max_storage: 1,
             ..Default::default()
         };
-        let mut node = PropagationNode::new(config, [0xAA; 16]);
+        let mut node = durable_test_node(config, [0xAA; 16]);
 
         let msg1 = make_signed_message([0xBB; 16], [0xCC; 16], "Test", "msg1");
-        assert!(node.accept_message(&msg1));
+        assert!(node.accept_fixture(&msg1));
 
         let msg2 = make_signed_message([0xBB; 16], [0xCC; 16], "Test", "msg2");
-        assert!(!node.accept_message(&msg2));
+        assert!(!node.accept_fixture(&msg2));
     }
 
     #[test]
     fn test_create_offer() {
-        let mut node = PropagationNode::new(PropagationNodeConfig::default(), [0xAA; 16]);
+        let mut node = durable_test_node(PropagationNodeConfig::default(), [0xAA; 16]);
         let msg1 = make_signed_message([0xBB; 16], [0xCC; 16], "Test", "msg1");
         let msg2 = make_signed_message([0xBB; 16], [0xCC; 16], "Test", "msg2");
-        node.accept_message(&msg1);
-        node.accept_message(&msg2);
+        node.accept_fixture(&msg1);
+        node.accept_fixture(&msg2);
 
         let offer = node.create_offer([0xFF; 16], None);
         assert_eq!(offer.len(), 2);
@@ -1637,14 +2001,14 @@ mod tests {
 
     #[test]
     fn test_create_offer_filtered() {
-        let mut node = PropagationNode::new(PropagationNodeConfig::default(), [0xAA; 16]);
+        let mut node = durable_test_node(PropagationNodeConfig::default(), [0xAA; 16]);
 
         let msg1 = make_signed_message([0xBB; 16], [0xCC; 16], "Test", "msg1");
         let msg2 = make_signed_message([0xBB; 16], [0xCC; 16], "Test", "msg2");
 
         let tid1 = msg1.transient_id.unwrap();
-        node.accept_message(&msg1);
-        node.accept_message(&msg2);
+        node.accept_fixture(&msg1);
+        node.accept_fixture(&msg2);
 
         let all = node.create_offer([0xFF; 16], None);
         assert_eq!(all.len(), 2);
@@ -1658,7 +2022,7 @@ mod tests {
 
     #[test]
     fn authoritative_offer_policy_combines_all_filters_and_real_key() {
-        let mut node = PropagationNode::new(PropagationNodeConfig::default(), [0xAA; 16]);
+        let mut node = durable_test_node(PropagationNodeConfig::default(), [0xAA; 16]);
         insert_offer_entry(&mut node, tid(0x01), 100, 20); // handled
         insert_offer_entry(&mut node, tid(0x02), 100, 12); // low stamp
         insert_offer_entry(&mut node, tid(0x03), 100, 13); // accepted
@@ -1687,7 +2051,7 @@ mod tests {
 
     #[test]
     fn offer_cumulative_limit_is_decimal_and_excludes_exact_boundary() {
-        let mut node = PropagationNode::new(PropagationNodeConfig::default(), [0xAA; 16]);
+        let mut node = durable_test_node(PropagationNodeConfig::default(), [0xAA; 16]);
         insert_offer_entry(&mut node, tid(0x01), 50, 0);
         insert_offer_entry(&mut node, tid(0x02), 50, 0);
         let mut policy = OutboundOfferPolicy::unrestricted([0xBB; 16]);
@@ -1702,7 +2066,7 @@ mod tests {
 
     #[test]
     fn prepared_offer_distinguishes_terminal_filters_from_cumulative_deferral() {
-        let mut node = PropagationNode::new(PropagationNodeConfig::default(), [0xAA; 16]);
+        let mut node = durable_test_node(PropagationNodeConfig::default(), [0xAA; 16]);
         insert_offer_entry(&mut node, tid(0x01), 10, 9); // terminal low stamp
         insert_offer_entry(&mut node, tid(0x02), 100, 20); // selected
         insert_offer_entry(&mut node, tid(0x03), 100, 20); // cumulative deferred
@@ -1724,7 +2088,7 @@ mod tests {
 
     #[test]
     fn all_cumulatively_deferred_candidates_exhaust_unchanged_generation() {
-        let mut node = PropagationNode::new(PropagationNodeConfig::default(), [0xAA; 16]);
+        let mut node = durable_test_node(PropagationNodeConfig::default(), [0xAA; 16]);
         insert_offer_entry(&mut node, tid(0x01), 50, 20);
         insert_offer_entry(&mut node, tid(0x02), 50, 20);
         let mut policy = OutboundOfferPolicy::unrestricted([0xBB; 16]);
@@ -1744,16 +2108,16 @@ mod tests {
 
     #[test]
     fn prepared_offer_revalidates_store_generation_before_install() {
-        let mut node = PropagationNode::new(PropagationNodeConfig::default(), [0xAA; 16]);
+        let mut node = durable_test_node(PropagationNodeConfig::default(), [0xAA; 16]);
         let mut first = vec![0x11; DESTINATION_LENGTH + 1];
         first[0] = 0x01;
-        assert!(node.accept_propagated_blob(&first, 0));
+        assert!(node.accept_blob_fixture(&first, 0));
         let policy = OutboundOfferPolicy::unrestricted([0xBB; 16]);
         let snapshot = node.snapshot_sync_offer_preparation(&policy);
 
         let mut second = vec![0x22; DESTINATION_LENGTH + 1];
         second[0] = 0x02;
-        assert!(node.accept_propagated_blob(&second, 0));
+        assert!(node.accept_blob_fixture(&second, 0));
         let prepared = prepare_sync_offer_snapshot(snapshot);
 
         assert!(matches!(
@@ -1764,7 +2128,8 @@ mod tests {
 
     #[test]
     fn passed_and_persisted_handled_sets_are_unioned() {
-        let dir = std::env::temp_dir().join("lxmf_test_offer_handled_union");
+        let temporary = tempfile::tempdir().unwrap();
+        let dir = temporary.path().join("store");
         let _ = std::fs::remove_dir_all(&dir);
         let mut node = PropagationNode::with_storage(
             PropagationNodeConfig::default(),
@@ -1792,7 +2157,8 @@ mod tests {
 
     #[test]
     fn test_propagation_disk_persistence() {
-        let dir = std::env::temp_dir().join("lxmf_test_prop_persist");
+        let temporary = tempfile::tempdir().unwrap();
+        let dir = temporary.path().join("store");
         let _ = std::fs::remove_dir_all(&dir);
 
         {
@@ -1804,7 +2170,7 @@ mod tests {
             .unwrap();
 
             let msg = make_signed_message([0xBB; 16], [0xCC; 16], "Test", "persistent content");
-            assert!(node.accept_message(&msg));
+            assert!(node.accept_fixture(&msg));
             assert_eq!(node.message_count(), 1);
         }
 
@@ -1824,24 +2190,17 @@ mod tests {
 
     #[test]
     fn test_disk_load_ignores_pre_fix_16_byte_transient_id_filenames() {
-        let dir = std::env::temp_dir().join("lxmf_test_prop_reject_16_byte_ids");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-
-        let old_filename = "aabbccddaabbccddaabbccddaabbccdd_1234567890_0";
-        let mut lxmf_data = vec![0xBB; 16];
-        lxmf_data.extend_from_slice(&[0xCC; 64]);
-        std::fs::write(dir.join(old_filename), &lxmf_data).unwrap();
-
-        let node = PropagationNode::with_storage(
-            PropagationNodeConfig::default(),
-            [0xAA; 16],
-            dir.clone(),
-        )
-        .unwrap();
-        assert_eq!(node.message_count(), 0);
-
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("store");
+        std::fs::create_dir(&legacy).unwrap();
+        let path = legacy.join("aabbccddaabbccddaabbccddaabbccdd_1234567890_0");
+        let evidence = vec![0xCC; 80];
+        std::fs::write(&path, &evidence).unwrap();
+        let error =
+            PropagationNode::with_storage(PropagationNodeConfig::default(), [0xAA; 16], legacy)
+                .unwrap_err();
+        assert!(error.to_string().contains("MigrationRequired"));
+        assert_eq!(std::fs::read(path).unwrap(), evidence);
     }
 
     /// T0-1: `/get` ownership gating — a client may only list, download, and
@@ -1850,7 +2209,8 @@ mod tests {
     fn test_get_request_ownership_gating() {
         use rmpv::Value;
 
-        let dir = std::env::temp_dir().join("lxmf_test_get_ownership");
+        let temporary = tempfile::tempdir().unwrap();
+        let dir = temporary.path().join("store");
         let _ = std::fs::remove_dir_all(&dir);
         let mut node = PropagationNode::with_storage(
             PropagationNodeConfig::default(),
@@ -1863,8 +2223,8 @@ mod tests {
         let client_b = [0xDD; 16];
         let msg_a = make_signed_message(client_a, [0xBB; 16], "Test", "for A");
         let msg_b = make_signed_message(client_b, [0xBB; 16], "Test", "for B");
-        assert!(node.accept_message(&msg_a));
-        assert!(node.accept_message(&msg_b));
+        assert!(node.accept_fixture(&msg_a));
+        assert!(node.accept_fixture(&msg_b));
 
         let tid_a = node.store.entries_for_destination(&client_a)[0].transient_id;
         let tid_b = node.store.entries_for_destination(&client_b)[0].transient_id;
@@ -1893,14 +2253,14 @@ mod tests {
         assert!(node.store.get(&tid_b).is_some());
 
         // A's haves cannot purge B's entry (Phase 3).
-        node.handle_get_request(&encode_req(None, Some(&[tid_b])), &client_a);
+        node.handle_get_request(&encode_req(None, Some(&[tid_b])), &client_a)
+            .into_response();
         assert!(
             node.store.get(&tid_b).is_some(),
             "foreign purge must be ignored"
         );
         assert!(
-            dir.join(node.store.get(&tid_b).unwrap().filename())
-                .exists(),
+            node.object_paths[&tid_b].exists(),
             "B's file must survive A's purge attempt"
         );
 
@@ -1911,8 +2271,9 @@ mod tests {
         assert_eq!(decode_msgs(&resp), 1);
 
         // ...and purge it.
-        node.handle_get_request(&encode_req(None, Some(&[tid_a])), &client_a);
-        assert!(node.store.get(&tid_a).is_none(), "own purge must work");
+        node.handle_get_request(&encode_req(None, Some(&[tid_a])), &client_a)
+            .into_response();
+        assert!(!node.contains(&tid_a), "own purge must work");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1922,52 +2283,44 @@ mod tests {
     /// remaining entries load.
     #[cfg(unix)]
     #[test]
-    fn test_disk_load_quarantines_unreadable_file() {
+    fn test_disk_load_preserves_unreadable_evidence_and_blocks_hosting() {
         use std::os::unix::fs::PermissionsExt;
-
-        let dir = std::env::temp_dir().join("lxmf_test_prop_quarantine");
-        let _ = std::fs::remove_dir_all(&dir);
-
-        {
-            let mut node = PropagationNode::with_storage(
-                PropagationNodeConfig::default(),
-                [0xAA; 16],
-                dir.clone(),
-            )
-            .unwrap();
-            let msg_a = make_signed_message([0xCC; 16], [0xBB; 16], "Test", "loads fine");
-            let msg_b = make_signed_message([0xDD; 16], [0xBB; 16], "Test", "will corrupt");
-            assert!(node.accept_message(&msg_a));
-            assert!(node.accept_message(&msg_b));
-        }
-
-        // Make one stored file unreadable (read() will fail, parse_filename
-        // still succeeds — the load must skip + quarantine it).
-        let victim = std::fs::read_dir(&dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .find(|p| p.is_file() && !p.to_string_lossy().ends_with(".msgpack"))
-            .expect("expected a stored message file");
-        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o000)).unwrap();
-
-        let node = PropagationNode::with_storage(
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("store");
+        let mut node = PropagationNode::with_storage(
             PropagationNodeConfig::default(),
             [0xAA; 16],
-            dir.clone(),
+            path.clone(),
         )
         .unwrap();
-        assert_eq!(
-            node.message_count(),
-            1,
-            "remaining entry must load despite the unreadable file"
+        let good = make_signed_message([0xCC; 16], [0xBB; 16], "healthy", "retained");
+        let bad = make_signed_message([0xDD; 16], [0xBB; 16], "unreadable", "evidence");
+        assert!(node.accept_fixture(&good));
+        assert!(node.accept_fixture(&bad));
+        let good_path = node.object_paths[&good.message_id()].clone();
+        let bad_path = node.object_paths[&bad.message_id()].clone();
+        let good_bytes = std::fs::read(&good_path).unwrap();
+        let bad_bytes = std::fs::read(&bad_path).unwrap();
+        drop(node);
+        std::fs::set_permissions(&bad_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let result = PropagationNode::with_storage(
+            PropagationNodeConfig::default(),
+            [0xAA; 16],
+            path.clone(),
         );
+        std::fs::set_permissions(&bad_path, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert!(
-            victim.with_extension("corrupt").exists(),
-            "unreadable file must be quarantined"
+            result.is_err(),
+            "authoritative committed corruption must block hosting"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(std::fs::read(good_path).unwrap(), good_bytes);
+        assert_eq!(std::fs::read(bad_path).unwrap(), bad_bytes);
+        assert_eq!(
+            PropagationNode::with_storage(PropagationNodeConfig::default(), [0xAA; 16], path)
+                .unwrap()
+                .message_count(),
+            2
+        );
     }
 
     #[test]
@@ -1976,11 +2329,11 @@ mod tests {
             max_message_age: 1,
             ..Default::default()
         };
-        let mut node = PropagationNode::new(config, [0xAA; 16]);
+        let mut node = durable_test_node(config, [0xAA; 16]);
 
         let mut msg = make_signed_message([0xBB; 16], [0xCC; 16], "Test", "will expire");
         msg.timestamp = 1000.0;
-        node.accept_message(&msg);
+        node.accept_fixture(&msg);
         assert_eq!(node.message_count(), 1);
 
         node.tick();
@@ -1998,11 +2351,11 @@ mod tests {
             max_message_age: 1,
             ..Default::default()
         };
-        let mut node = PropagationNode::new(config, [0xAA; 16]);
+        let mut node = durable_test_node(config, [0xAA; 16]);
 
         let mut msg = make_signed_message([0xBB; 16], [0xCC; 16], "Test", "cull then redeliver");
         msg.timestamp = 1000.0;
-        assert!(node.accept_message(&msg), "first accept");
+        assert!(node.accept_fixture(&msg), "first accept");
         assert_eq!(node.message_count(), 1);
 
         node.tick();
@@ -2014,7 +2367,7 @@ mod tests {
             .unwrap()
             .as_secs_f64();
         assert!(
-            node.accept_message(&msg),
+            node.accept_fixture(&msg),
             "same message re-accepted after cull"
         );
         assert_eq!(node.message_count(), 1);
@@ -2030,15 +2383,15 @@ mod tests {
             max_message_age: 1,
             ..Default::default()
         };
-        let mut node = PropagationNode::new(config, [0xAA; 16]);
+        let mut node = durable_test_node(config, [0xAA; 16]);
 
         let mut msg1 = make_signed_message([0xBB; 16], [0xCC; 16], "Test", "first");
         msg1.timestamp = 1000.0; // ancient so tick will cull it
-        assert!(node.accept_message(&msg1));
+        assert!(node.accept_fixture(&msg1));
 
         let msg2 = make_signed_message([0xBB; 16], [0xCC; 16], "Test", "rejected-while-full");
         assert!(
-            !node.accept_message(&msg2),
+            !node.accept_fixture(&msg2),
             "store full, second message must reject"
         );
 
@@ -2047,7 +2400,7 @@ mod tests {
 
         let msg3 = make_signed_message([0xBB; 16], [0xCC; 16], "Test", "accepted-after-cull");
         assert!(
-            node.accept_message(&msg3),
+            node.accept_fixture(&msg3),
             "store has space after cull, next message accepted"
         );
         assert_eq!(node.message_count(), 1);
@@ -2055,7 +2408,7 @@ mod tests {
 
     #[test]
     fn test_tick_enforces_weight_cap() {
-        let mut node = PropagationNode::new(
+        let mut node = durable_test_node(
             PropagationNodeConfig {
                 max_storage: 1,
                 ..PropagationNodeConfig::default()
@@ -2064,7 +2417,7 @@ mod tests {
         );
         let msg = make_signed_message([0xBB; 16], [0xCC; 16], "Test", "weight-cull");
         assert!(
-            node.accept_message(&msg),
+            node.accept_fixture(&msg),
             "ingest cap checks size before insert, first message is admitted"
         );
         assert_eq!(node.message_count(), 1);
@@ -2078,7 +2431,8 @@ mod tests {
 
     #[test]
     fn test_peer_persistence() {
-        let dir = std::env::temp_dir().join("lxmf_test_peer_persist");
+        let temporary = tempfile::tempdir().unwrap();
+        let dir = temporary.path().join("store");
         let _ = std::fs::remove_dir_all(&dir);
 
         let mut node = PropagationNode::with_storage(
@@ -2092,7 +2446,7 @@ mod tests {
         // backed by a live store entry survives; one whose message is gone
         // from the store is dropped.
         let msg = make_signed_message([0xBB; 16], [0xCC; 16], "Test", "peer-persist");
-        assert!(node.accept_message(&msg));
+        assert!(node.accept_fixture(&msg));
         let live_id = node.create_offer_filtered(&HashSet::new())[0];
 
         let mut peer = LxmPeer::new([0xBB; 16]);
@@ -2121,7 +2475,8 @@ mod tests {
 
     #[test]
     fn test_peer_persistence_multiple() {
-        let dir = std::env::temp_dir().join("lxmf_test_peer_persist_multi");
+        let temporary = tempfile::tempdir().unwrap();
+        let dir = temporary.path().join("store");
         let _ = std::fs::remove_dir_all(&dir);
 
         let node = PropagationNode::with_storage(
@@ -2159,58 +2514,29 @@ mod tests {
 
     #[test]
     fn test_disk_cleanup_on_cull() {
-        let dir = std::env::temp_dir().join("lxmf_test_disk_cleanup");
-        let _ = std::fs::remove_dir_all(&dir);
-
-        let config = PropagationNodeConfig {
-            max_message_age: 1,
-            ..Default::default()
-        };
-        let mut node = PropagationNode::with_storage(config, [0xAA; 16], dir.clone()).unwrap();
-
-        let mut msg = make_signed_message([0xBB; 16], [0xCC; 16], "Test", "cleanup test");
-        msg.timestamp = 1000.0;
-        node.accept_message(&msg);
-
-        let file_count = std::fs::read_dir(&dir)
-            .unwrap()
-            .filter(|e| {
-                e.as_ref()
-                    .ok()
-                    .and_then(|e| {
-                        e.path()
-                            .file_name()
-                            .map(|f| !f.to_str().unwrap_or("").ends_with(".peer"))
-                    })
-                    .unwrap_or(false)
-            })
-            .count();
-        assert_eq!(file_count, 1);
-
+        let mut node = durable_test_node(
+            PropagationNodeConfig {
+                max_message_age: 1,
+                ..Default::default()
+            },
+            [0xAA; 16],
+        );
+        let mut message = make_signed_message([0xBB; 16], [0xCC; 16], "cull", "cleanup");
+        message.timestamp = 1000.;
+        assert!(node.accept_fixture(&message));
+        let id = message.message_id();
+        let object = node.object_paths[&id].clone();
+        assert!(object.exists());
+        assert!(object.with_extension("entry").exists());
         node.tick();
         assert_eq!(node.message_count(), 0);
-
-        let remaining = std::fs::read_dir(&dir)
-            .unwrap()
-            .filter(|e| {
-                e.as_ref()
-                    .ok()
-                    .and_then(|e| {
-                        e.path()
-                            .file_name()
-                            .map(|f| !f.to_str().unwrap_or("").ends_with(".peer"))
-                    })
-                    .unwrap_or(false)
-            })
-            .count();
-        assert_eq!(remaining, 0);
-
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!object.exists());
+        assert!(!object.with_extension("entry").exists());
     }
 
     #[test]
     fn test_sync_session_management() {
-        let mut node = PropagationNode::new(PropagationNodeConfig::default(), [0xAA; 16]);
+        let mut node = durable_test_node(PropagationNodeConfig::default(), [0xAA; 16]);
         let peer_hash = [0xBB; 16];
 
         assert!(node.get_session(&peer_hash).is_none());
@@ -2226,7 +2552,7 @@ mod tests {
 
     #[test]
     fn test_offer_request_returns_missing() {
-        let mut node = PropagationNode::new(PropagationNodeConfig::default(), [0xAA; 16]);
+        let mut node = durable_test_node(PropagationNodeConfig::default(), [0xAA; 16]);
 
         let msg1 = make_signed_message([0xBB; 16], [0xCC; 16], "Test", "msg1");
         let msg2 = make_signed_message([0xBB; 16], [0xCC; 16], "Test", "msg2");
@@ -2236,9 +2562,9 @@ mod tests {
         let tid2 = msg2.transient_id.unwrap();
         let tid3 = msg3.transient_id.unwrap();
 
-        node.accept_message(&msg1);
-        node.accept_message(&msg2);
-        node.accept_message(&msg3);
+        node.accept_fixture(&msg1);
+        node.accept_fixture(&msg2);
+        node.accept_fixture(&msg3);
 
         let peer_has = [tid1, tid2];
         let missing = node.offer_request([0xDD; 16], &peer_has);
@@ -2249,10 +2575,10 @@ mod tests {
 
     #[test]
     fn test_offer_request_peer_has_nothing() {
-        let mut node = PropagationNode::new(PropagationNodeConfig::default(), [0xAA; 16]);
+        let mut node = durable_test_node(PropagationNodeConfig::default(), [0xAA; 16]);
 
         let msg = make_signed_message([0xBB; 16], [0xCC; 16], "Test", "content");
-        node.accept_message(&msg);
+        node.accept_fixture(&msg);
 
         let missing = node.offer_request([0xDD; 16], &[]);
         assert_eq!(missing.len(), 1);
@@ -2260,11 +2586,11 @@ mod tests {
 
     #[test]
     fn test_offer_request_peer_has_everything() {
-        let mut node = PropagationNode::new(PropagationNodeConfig::default(), [0xAA; 16]);
+        let mut node = durable_test_node(PropagationNodeConfig::default(), [0xAA; 16]);
 
         let msg = make_signed_message([0xBB; 16], [0xCC; 16], "Test", "content");
         let tid = msg.transient_id.unwrap();
-        node.accept_message(&msg);
+        node.accept_fixture(&msg);
 
         let missing = node.offer_request([0xDD; 16], &[tid]);
         assert!(missing.is_empty());
@@ -2272,7 +2598,8 @@ mod tests {
 
     #[test]
     fn test_message_get_request_with_storage() {
-        let dir = std::env::temp_dir().join("lxmf_test_msg_get");
+        let temporary = tempfile::tempdir().unwrap();
+        let dir = temporary.path().join("store");
         let _ = std::fs::remove_dir_all(&dir);
 
         let mut node = PropagationNode::with_storage(
@@ -2284,22 +2611,24 @@ mod tests {
 
         let msg = make_signed_message([0xBB; 16], [0xCC; 16], "Test", "get request content");
         let tid = msg.transient_id.unwrap();
-        node.accept_message(&msg);
+        node.accept_fixture(&msg);
 
         let results = node.message_get_request(&[tid]);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, tid);
         assert!(!results[0].1.is_empty());
 
-        let unpacked = LxMessage::unpack(&results[0].1);
-        assert!(unpacked.is_ok());
+        let mut expected = msg.data.clone();
+        expected.extend_from_slice(&msg.stamp);
+        assert_eq!(results[0].1, expected);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn test_message_get_request_unknown_id() {
-        let dir = std::env::temp_dir().join("lxmf_test_msg_get_unknown");
+        let temporary = tempfile::tempdir().unwrap();
+        let dir = temporary.path().join("store");
         let _ = std::fs::remove_dir_all(&dir);
 
         let node = PropagationNode::with_storage(
@@ -2325,12 +2654,12 @@ mod tests {
 
     #[test]
     fn test_prepare_sync_offer() {
-        let mut node = PropagationNode::new(PropagationNodeConfig::default(), [0xAA; 16]);
+        let mut node = durable_test_node(PropagationNodeConfig::default(), [0xAA; 16]);
 
         let msg1 = make_signed_message([0xBB; 16], [0xCC; 16], "Test", "sync1");
         let msg2 = make_signed_message([0xBB; 16], [0xCC; 16], "Test", "sync2");
-        node.accept_message(&msg1);
-        node.accept_message(&msg2);
+        node.accept_fixture(&msg1);
+        node.accept_fixture(&msg2);
 
         let peer_hash = [0xDD; 16];
         let offer = node.prepare_sync_offer(peer_hash);
@@ -2341,11 +2670,11 @@ mod tests {
 
     #[test]
     fn test_process_sync_offer_and_get() {
-        let mut node = PropagationNode::new(PropagationNodeConfig::default(), [0xAA; 16]);
+        let mut node = durable_test_node(PropagationNodeConfig::default(), [0xAA; 16]);
 
         let msg1 = make_signed_message([0xBB; 16], [0xCC; 16], "Test", "has_this");
         let tid1 = msg1.transient_id.unwrap();
-        node.accept_message(&msg1);
+        node.accept_fixture(&msg1);
 
         let peer_hash = [0xDD; 16];
         let tid2 = tid(0xEE);
@@ -2361,11 +2690,11 @@ mod tests {
 
     #[test]
     fn test_sync_lifecycle_complete() {
-        let mut node = PropagationNode::new(PropagationNodeConfig::default(), [0xAA; 16]);
+        let mut node = durable_test_node(PropagationNodeConfig::default(), [0xAA; 16]);
         let peer_hash = [0xDD; 16];
 
         let msg = make_signed_message([0xBB; 16], [0xCC; 16], "Test", "lifecycle");
-        node.accept_message(&msg);
+        node.accept_fixture(&msg);
 
         let _offer = node.prepare_sync_offer(peer_hash);
         assert!(node.get_session(&peer_hash).is_some());
@@ -2376,7 +2705,8 @@ mod tests {
 
     #[test]
     fn test_process_sync_get_with_storage() {
-        let dir = std::env::temp_dir().join("lxmf_test_sync_get");
+        let temporary = tempfile::tempdir().unwrap();
+        let dir = temporary.path().join("store");
         let _ = std::fs::remove_dir_all(&dir);
 
         let mut node = PropagationNode::with_storage(
@@ -2388,7 +2718,7 @@ mod tests {
 
         let msg = make_signed_message([0xBB; 16], [0xCC; 16], "Test", "sync get content");
         let tid = msg.transient_id.unwrap();
-        node.accept_message(&msg);
+        node.accept_fixture(&msg);
 
         let get = crate::sync::SyncGet {
             wanted_ids: vec![tid.to_vec()],
@@ -2399,8 +2729,9 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert!(!messages[0].is_empty());
 
-        let unpacked = LxMessage::unpack(&messages[0]);
-        assert!(unpacked.is_ok());
+        let mut expected = msg.data.clone();
+        expected.extend_from_slice(&msg.stamp);
+        assert_eq!(messages[0], expected);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2443,7 +2774,7 @@ mod tests {
             peering_cost: cost,
             ..Default::default()
         };
-        let mut node = PropagationNode::new(config, [0xCC; 16]);
+        let mut node = durable_test_node(config, [0xCC; 16]);
         let key = peering_key(&local_identity, &remote_identity, cost);
 
         use rmpv::Value;
@@ -2478,7 +2809,7 @@ mod tests {
             peering_cost: cost,
             ..Default::default()
         };
-        let node = PropagationNode::new(config, [0xCC; 16]);
+        let node = durable_test_node(config, [0xCC; 16]);
         let mut admission = crate::propagation_admission::PnInboundAdmission::default();
         let candidate = admission
             .preflight_offer([0xDD; 16], Some(remote_identity), std::time::Duration::ZERO)
@@ -2497,7 +2828,7 @@ mod tests {
 
     #[test]
     fn test_handle_offer_request_rejects_empty_peering_key_when_cost_required() {
-        let mut node = PropagationNode::new(PropagationNodeConfig::default(), [0xAA; 16]);
+        let mut node = durable_test_node(PropagationNodeConfig::default(), [0xAA; 16]);
         let local_identity = [0xAA; 16];
         let remote_identity = [0xBB; 16];
 
@@ -2533,8 +2864,30 @@ mod tests {
             peering_cost: cost,
             ..Default::default()
         };
-        let mut node = PropagationNode::new(config, [0xCC; 16]);
-        let key = peering_key(&remote_identity, &local_identity, cost);
+        let mut node = durable_test_node(config, [0xCC; 16]);
+        // A cost-8 stamp for the reverse order can also satisfy the forward
+        // order by chance. Select a deterministic witness for the distinction
+        // this regression asserts, and verify both preconditions explicitly.
+        let rounds = crate::constants::STAMP_WORKBLOCK_EXPAND_ROUNDS_PEERING;
+        let reverse = crate::stamper::stamp_workblock(
+            &[remote_identity.as_slice(), local_identity.as_slice()].concat(),
+            rounds,
+        );
+        let forward = crate::stamper::stamp_workblock(
+            &[local_identity.as_slice(), remote_identity.as_slice()].concat(),
+            rounds,
+        );
+        let key = (0u64..1_000_000)
+            .find_map(|counter| {
+                let mut candidate = [0u8; 32];
+                candidate[..8].copy_from_slice(&counter.to_le_bytes());
+                (crate::stamper::stamp_valid(&candidate, cost, &reverse)
+                    && !crate::stamper::stamp_valid(&candidate, cost, &forward))
+                .then_some(candidate)
+            })
+            .expect("reverse-only deterministic peering stamp");
+        assert!(crate::stamper::stamp_valid(&key, cost, &reverse));
+        assert!(!crate::stamper::stamp_valid(&key, cost, &forward));
 
         use rmpv::Value;
         let offer = Value::Array(vec![
@@ -2561,7 +2914,7 @@ mod tests {
 
     #[test]
     fn test_handle_offer_request_no_identity() {
-        let mut node = PropagationNode::new(PropagationNodeConfig::default(), [0xAA; 16]);
+        let mut node = durable_test_node(PropagationNodeConfig::default(), [0xAA; 16]);
 
         use rmpv::Value;
         let offer = Value::Array(vec![Value::Binary(vec![]), Value::Array(vec![])]);
@@ -2576,7 +2929,7 @@ mod tests {
 
     #[test]
     fn test_handle_offer_request_invalid_data() {
-        let mut node = PropagationNode::new(
+        let mut node = durable_test_node(
             PropagationNodeConfig {
                 peering_cost: 0,
                 ..Default::default()
@@ -2621,7 +2974,8 @@ mod tests {
 
     #[test]
     fn test_handle_get_request_list_phase() {
-        let dir = std::env::temp_dir().join("lxmf_test_get_list");
+        let temporary = tempfile::tempdir().unwrap();
+        let dir = temporary.path().join("store");
         let _ = std::fs::remove_dir_all(&dir);
 
         let mut node = PropagationNode::with_storage(
@@ -2632,7 +2986,7 @@ mod tests {
         .unwrap();
 
         let msg = make_signed_message([0xBB; 16], [0xCC; 16], "Test", "get list content");
-        node.accept_message(&msg);
+        node.accept_fixture(&msg);
 
         use rmpv::Value;
         let request = Value::Array(vec![Value::Nil, Value::Nil]);
@@ -2650,7 +3004,7 @@ mod tests {
 
     #[test]
     fn test_handle_get_request_list_empty() {
-        let mut node = PropagationNode::new(PropagationNodeConfig::default(), [0xAA; 16]);
+        let mut node = durable_test_node(PropagationNodeConfig::default(), [0xAA; 16]);
 
         use rmpv::Value;
         let request = Value::Array(vec![Value::Nil, Value::Nil]);
@@ -2665,7 +3019,8 @@ mod tests {
 
     #[test]
     fn test_accept_propagated_blob_and_get_with_full_hash_id() {
-        let dir = std::env::temp_dir().join("lxmf_test_propagated_blob_get");
+        let temporary = tempfile::tempdir().unwrap();
+        let dir = temporary.path().join("store");
         let _ = std::fs::remove_dir_all(&dir);
 
         let mut node = PropagationNode::with_storage(
@@ -2677,7 +3032,7 @@ mod tests {
 
         let mut lxmf_data = vec![0xBB; 16];
         lxmf_data.extend_from_slice(&[0xCC; 128]);
-        assert!(node.accept_propagated_blob(&lxmf_data, 0));
+        assert!(node.accept_blob_fixture(&lxmf_data, 0));
 
         let full_id = rns_crypto::sha::full_hash(&lxmf_data);
         use rmpv::Value;
@@ -2709,7 +3064,8 @@ mod tests {
 
     #[test]
     fn test_stamped_propagated_blob_strips_only_for_client_download() {
-        let dir = std::env::temp_dir().join("lxmf_test_stamped_blob_get");
+        let temporary = tempfile::tempdir().unwrap();
+        let dir = temporary.path().join("store");
         let _ = std::fs::remove_dir_all(&dir);
 
         let mut node = PropagationNode::with_storage(
@@ -2724,7 +3080,20 @@ mod tests {
         let stamp = [0x5A; 32];
         let full_id = rns_crypto::sha::full_hash(&lxmf_data);
 
-        assert!(node.accept_stamped_propagated_blob(&lxmf_data, &stamp, 0));
+        assert!(
+            node.accept_stamped_propagated_blob(
+                &lxmf_data,
+                &stamp,
+                crate::stamper::stamp_value(
+                    &crate::stamper::stamp_workblock(
+                        &rns_crypto::sha::full_hash(&lxmf_data),
+                        STAMP_WORKBLOCK_EXPAND_ROUNDS_PN
+                    ),
+                    &stamp
+                )
+                .min(255) as u8
+            )
+        );
 
         let peer_results = node.message_get_request(&[full_id]);
         assert_eq!(peer_results.len(), 1);
@@ -2752,7 +3121,8 @@ mod tests {
 
     #[test]
     fn test_reloaded_stamped_blob_strips_for_client_download() {
-        let dir = std::env::temp_dir().join("lxmf_test_stamped_blob_reload_get");
+        let temporary = tempfile::tempdir().unwrap();
+        let dir = temporary.path().join("store");
         let _ = std::fs::remove_dir_all(&dir);
 
         let mut lxmf_data = vec![0xBB; 16];
@@ -2767,7 +3137,20 @@ mod tests {
                 dir.clone(),
             )
             .unwrap();
-            assert!(node.accept_stamped_propagated_blob(&lxmf_data, &stamp, 0));
+            assert!(
+                node.accept_stamped_propagated_blob(
+                    &lxmf_data,
+                    &stamp,
+                    crate::stamper::stamp_value(
+                        &crate::stamper::stamp_workblock(
+                            &rns_crypto::sha::full_hash(&lxmf_data),
+                            STAMP_WORKBLOCK_EXPAND_ROUNDS_PN
+                        ),
+                        &stamp
+                    )
+                    .min(255) as u8
+                )
+            );
         }
 
         let mut reloaded = PropagationNode::with_storage(
@@ -2801,21 +3184,22 @@ mod tests {
             min_stamp_cost: 8,
             ..Default::default()
         };
-        let mut node = PropagationNode::new(config, [0xAA; 16]);
+        let mut node = durable_test_node(config, [0xAA; 16]);
 
         let mut lxmf_data = vec![0xBB; 16];
         lxmf_data.extend_from_slice(&[0xCC; 128]);
 
-        assert!(!node.accept_propagated_blob(&lxmf_data, 7));
+        assert!(!node.accept_blob_fixture(&lxmf_data, 7));
         assert_eq!(node.message_count(), 0);
 
-        assert!(node.accept_propagated_blob(&lxmf_data, 8));
+        assert!(node.accept_blob_fixture(&lxmf_data, 8));
         assert_eq!(node.message_count(), 1);
     }
 
     #[test]
     fn test_opaque_propagated_blob_reload_preserves_destination() {
-        let dir = std::env::temp_dir().join("lxmf_test_propagated_blob_reload");
+        let temporary = tempfile::tempdir().unwrap();
+        let dir = temporary.path().join("store");
         let _ = std::fs::remove_dir_all(&dir);
 
         let mut node = PropagationNode::with_storage(
@@ -2827,7 +3211,7 @@ mod tests {
 
         let mut lxmf_data = vec![0xBB; 16];
         lxmf_data.extend_from_slice(&[0xCC; 128]);
-        assert!(node.accept_propagated_blob(&lxmf_data, 0));
+        assert!(node.accept_blob_fixture(&lxmf_data, 0));
         drop(node);
 
         let mut reloaded = PropagationNode::with_storage(
@@ -2870,120 +3254,76 @@ mod tests {
     #[test]
     fn test_opaque_blob_reload_preserves_bytes_and_accounting_at_minimum_lengths() {
         use rmpv::Value;
-
-        // These are storage-format controls, not authenticated ciphertext or
-        // stamp-validation tests. Retain the existing public ingress minimum.
-        for stamped in [false, true] {
-            for len in [17, 31, 32, 33, 48, 49, 144] {
-                let dir = tempfile::tempdir().unwrap();
-                let mut node = PropagationNode::with_storage(
-                    PropagationNodeConfig::default(),
-                    [0xAA; 16],
-                    dir.path().to_path_buf(),
-                )
-                .unwrap();
-                assert!(!node.accept_propagated_blob(&[0xBB; 16], 0));
-                assert!(!node.accept_stamped_propagated_blob(&[0xBB; 16], &[0; 32], 0));
-                assert_eq!(node.message_count(), 0);
-                let mut blob = vec![0xBB; 16];
-                blob.resize(len, 0xCC);
-                let stamp = [0x5A; 32];
-                let full_id = rns_crypto::sha::full_hash(&blob);
-                let mut stored = blob.clone();
-                if stamped {
-                    stored.extend_from_slice(&stamp);
-                    assert!(node.accept_stamped_propagated_blob(&blob, &stamp, 0));
-                } else {
-                    assert!(node.accept_propagated_blob(&blob, 0));
-                }
-                assert_eq!(node.total_size(), stored.len());
-                let path = dir
-                    .path()
-                    .join(node.store.get(&full_id).unwrap().filename());
-                assert_eq!(std::fs::read(&path).unwrap(), stored);
-                drop(node);
-
-                let mut node = PropagationNode::with_storage(
-                    PropagationNodeConfig::default(),
-                    [0xAA; 16],
-                    dir.path().to_path_buf(),
-                )
-                .unwrap();
-                assert_eq!(node.message_count(), 1);
-                assert_eq!(node.total_size(), stored.len());
-                assert_eq!(node.store.get(&full_id).unwrap().stamped, stamped);
-                // Duplicate admission must neither replace the known format
-                // nor grow the byte/accounting reservation after reload.
-                assert!(!node.accept_propagated_blob(&blob, 0));
-                assert!(!node.accept_stamped_propagated_blob(&blob, &stamp, 0));
-                assert_eq!(node.message_count(), 1);
-                assert_eq!(node.total_size(), stored.len());
-                assert!(node.pending_write_ids.is_empty());
-                assert_eq!(node.pending_write_bytes, 0);
-                let get = Value::Array(vec![
-                    Value::Array(vec![Value::Binary(full_id.to_vec())]),
-                    Value::Array(vec![]),
-                ]);
-                let mut request = Vec::new();
-                rmpv::encode::write_value(&mut request, &get).unwrap();
-                let response = node
-                    .handle_get_request(&request, &[0xBB; 16])
-                    .into_response();
-                let value: Value = rmpv::decode::read_value(&mut &response[..]).unwrap();
-                let messages = value.as_array().unwrap();
-                assert_eq!(messages.len(), 1);
-                assert_eq!(messages[0].as_slice().unwrap(), blob);
-                assert_eq!(
-                    node.message_get_request(&[full_id]),
-                    vec![(full_id, stored.clone())]
-                );
-                assert_eq!(std::fs::read(&path).unwrap(), stored);
-            }
+        for len in [17, 31, 32, 33, 48, 49, 144] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("store");
+            let mut node = PropagationNode::with_storage(
+                PropagationNodeConfig::default(),
+                [0xAA; 16],
+                path.clone(),
+            )
+            .unwrap();
+            assert!(!node.accept_blob_fixture(&[0xBB; 16], 0));
+            let mut blob = vec![0xBB; 16];
+            blob.resize(len, 0xCC);
+            let (stamp, value) = fixture_stamp(&blob, 0);
+            let id = rns_crypto::sha::full_hash(&blob);
+            let mut stored = blob.clone();
+            stored.extend_from_slice(&stamp);
+            assert!(node.accept_stamped_propagated_blob(&blob, &stamp, value as u8));
+            let object = node.object_paths[&id].clone();
+            assert_eq!(std::fs::read(&object).unwrap(), stored);
+            drop(node);
+            let mut node =
+                PropagationNode::with_storage(PropagationNodeConfig::default(), [0xAA; 16], path)
+                    .unwrap();
+            assert_eq!(node.message_count(), 1);
+            assert_eq!(node.total_size(), stored.len());
+            assert!(node.store.get(&id).unwrap().stamped);
+            assert!(!node.accept_stamped_propagated_blob(&blob, &stamp, value as u8));
+            assert!(node.pending_write_ids.is_empty());
+            assert_eq!(node.pending_write_bytes, 0);
+            let request = crate::encode_value(&Value::Array(vec![
+                Value::Array(vec![Value::Binary(id.to_vec())]),
+                Value::Array(vec![]),
+            ]));
+            let response = node
+                .handle_get_request(&request, &[0xBB; 16])
+                .into_response();
+            let decoded = rmpv::decode::read_value(&mut response.as_slice()).unwrap();
+            assert_eq!(decoded.as_array().unwrap()[0].as_slice().unwrap(), blob);
+            assert_eq!(node.message_get_request(&[id]), vec![(id, stored.clone())]);
+            assert_eq!(std::fs::read(object).unwrap(), stored);
         }
     }
 
     #[test]
     fn test_reloaded_legacy_message_keeps_original_get_bytes() {
-        use rmpv::Value;
-
+        // Ordinary startup never promotes a recognizable legacy plaintext LXMF
+        // file into relay provenance, even when its filename uses a real ID.
         let dir = tempfile::tempdir().unwrap();
-        let message = make_signed_message([0xBB; 16], [0xCC; 16], "legacy", "full message");
-        let packed = message.pack().unwrap();
-        let full_id = message.transient_id.or(message.hash).unwrap();
-        assert_ne!(full_id, rns_crypto::sha::full_hash(&packed));
-        let mut node = PropagationNode::with_storage(
-            PropagationNodeConfig::default(),
-            [0xAA; 16],
-            dir.path().to_path_buf(),
-        )
-        .unwrap();
-        assert!(node.accept_message(&message));
-        drop(node);
-        let mut node = PropagationNode::with_storage(
-            PropagationNodeConfig::default(),
-            [0xAA; 16],
-            dir.path().to_path_buf(),
-        )
-        .unwrap();
-        assert_eq!(node.message_count(), 1);
-        assert_eq!(node.total_size(), packed.len());
-        assert!(!node.store.get(&full_id).unwrap().stamped);
-        let get = Value::Array(vec![
-            Value::Array(vec![Value::Binary(full_id.to_vec())]),
-            Value::Array(vec![]),
-        ]);
-        let mut request = Vec::new();
-        rmpv::encode::write_value(&mut request, &get).unwrap();
-        let response = node
-            .handle_get_request(&request, &[0xBB; 16])
-            .into_response();
-        let value: Value = rmpv::decode::read_value(&mut &response[..]).unwrap();
-        assert_eq!(value.as_array().unwrap()[0].as_slice().unwrap(), packed);
+        let legacy = dir.path().join("store");
+        std::fs::create_dir(&legacy).unwrap();
+        let message = crate::message::test_message(
+            [0xBB; 16],
+            [0xCC; 16],
+            "legacy",
+            "full message",
+            DeliveryMethod::Propagated,
+        );
+        let file = legacy.join(format!("{}_100_0", hex::encode(message.message_id())));
+        std::fs::write(&file, message.wire_bytes()).unwrap();
+        assert!(
+            PropagationNode::with_storage(PropagationNodeConfig::default(), [0xAA; 16], legacy)
+                .is_err()
+        );
+        assert_eq!(std::fs::read(file).unwrap(), message.wire_bytes());
     }
 
     #[test]
     fn test_handle_get_request_purge_phase() {
-        let dir = std::env::temp_dir().join("lxmf_test_get_purge");
+        let temporary = tempfile::tempdir().unwrap();
+        let dir = temporary.path().join("store");
         let _ = std::fs::remove_dir_all(&dir);
 
         let mut node = PropagationNode::with_storage(
@@ -2995,7 +3335,7 @@ mod tests {
 
         let msg = make_signed_message([0xBB; 16], [0xCC; 16], "Test", "purge content");
         let tid = msg.transient_id.unwrap();
-        node.accept_message(&msg);
+        node.accept_fixture(&msg);
         assert_eq!(node.message_count(), 1);
 
         use rmpv::Value;
@@ -3014,7 +3354,8 @@ mod tests {
 
     #[test]
     fn test_handle_get_request_get_phase() {
-        let dir = std::env::temp_dir().join("lxmf_test_get_data");
+        let temporary = tempfile::tempdir().unwrap();
+        let dir = temporary.path().join("store");
         let _ = std::fs::remove_dir_all(&dir);
 
         let mut node = PropagationNode::with_storage(
@@ -3026,7 +3367,7 @@ mod tests {
 
         let msg = make_signed_message([0xBB; 16], [0xCC; 16], "Test", "get data content");
         let tid = msg.transient_id.unwrap();
-        node.accept_message(&msg);
+        node.accept_fixture(&msg);
 
         use rmpv::Value;
         let request = Value::Array(vec![
@@ -3051,7 +3392,8 @@ mod tests {
     fn test_get_request_phase2_returns_serve_plan() {
         use rmpv::Value;
 
-        let dir = std::env::temp_dir().join("lxmf_test_get_serve_plan");
+        let temporary = tempfile::tempdir().unwrap();
+        let dir = temporary.path().join("store");
         let _ = std::fs::remove_dir_all(&dir);
         let mut node = PropagationNode::with_storage(
             PropagationNodeConfig::default(),
@@ -3062,7 +3404,7 @@ mod tests {
 
         let mut blob = vec![0xBB; 16];
         blob.extend_from_slice(&[0x11; 64]);
-        assert!(node.accept_propagated_blob(&blob, 0));
+        assert!(node.accept_blob_fixture(&blob, 0));
         let tid = rns_crypto::sha::full_hash(&blob);
 
         let list_req = crate::encode_value(&Value::Array(vec![Value::Nil, Value::Nil]));
@@ -3077,7 +3419,7 @@ mod tests {
         ]));
         assert!(matches!(
             node.handle_get_request(&purge_req, &[0xBB; 16]),
-            GetRequestAction::Respond(_)
+            GetRequestAction::ServeFiles(_)
         ));
 
         let get_req = crate::encode_value(&Value::Array(vec![
@@ -3106,7 +3448,8 @@ mod tests {
     fn test_get_phase_purges_haves_before_serving_wants() {
         use rmpv::Value;
 
-        let dir = std::env::temp_dir().join("lxmf_test_get_purge_first");
+        let temporary = tempfile::tempdir().unwrap();
+        let dir = temporary.path().join("store");
         let _ = std::fs::remove_dir_all(&dir);
         let mut node = PropagationNode::with_storage(
             PropagationNodeConfig::default(),
@@ -3117,7 +3460,7 @@ mod tests {
 
         let mut blob = vec![0xBB; 16];
         blob.extend_from_slice(&[0x22; 48]);
-        assert!(node.accept_propagated_blob(&blob, 0));
+        assert!(node.accept_blob_fixture(&blob, 0));
         let tid = rns_crypto::sha::full_hash(&blob);
 
         let req = crate::encode_value(&Value::Array(vec![
@@ -3142,7 +3485,8 @@ mod tests {
     fn test_get_phase_transfer_limit_python_accounting() {
         use rmpv::Value;
 
-        let dir = std::env::temp_dir().join("lxmf_test_get_limit_accounting");
+        let temporary = tempfile::tempdir().unwrap();
+        let dir = temporary.path().join("store");
         let _ = std::fs::remove_dir_all(&dir);
         let mut node = PropagationNode::with_storage(
             PropagationNodeConfig::default(),
@@ -3163,7 +3507,7 @@ mod tests {
         let blob_b = make_blob(0x02, 350);
         let blob_c = make_blob(0x03, 50);
         for blob in [&blob_a, &blob_b, &blob_c] {
-            assert!(node.accept_propagated_blob(blob, 0));
+            assert!(node.accept_blob_fixture(blob, 0));
         }
 
         let wants: Vec<Value> = [&blob_a, &blob_b, &blob_c]
@@ -3192,7 +3536,8 @@ mod tests {
     fn test_get_list_phase_sorted_smallest_first() {
         use rmpv::Value;
 
-        let dir = std::env::temp_dir().join("lxmf_test_get_list_sorted");
+        let temporary = tempfile::tempdir().unwrap();
+        let dir = temporary.path().join("store");
         let _ = std::fs::remove_dir_all(&dir);
         let mut node = PropagationNode::with_storage(
             PropagationNodeConfig::default(),
@@ -3210,7 +3555,7 @@ mod tests {
         let blob_small = make_blob(0x05, 100);
         let blob_mid = make_blob(0x06, 200);
         for blob in [&blob_large, &blob_small, &blob_mid] {
-            assert!(node.accept_propagated_blob(blob, 0));
+            assert!(node.accept_blob_fixture(blob, 0));
         }
 
         let list_req = crate::encode_value(&Value::Array(vec![Value::Nil, Value::Nil]));
@@ -3239,10 +3584,10 @@ mod tests {
             min_stamp_cost: 8,
             ..Default::default()
         };
-        let mut node = PropagationNode::new(config, [0xAA; 16]);
+        let mut node = durable_test_node(config, [0xAA; 16]);
         let msg = make_signed_message([0xBB; 16], [0xCC; 16], "Test", "unstamped");
 
-        assert!(!node.accept_message(&msg));
+        assert!(!node.accept_fixture(&msg));
         assert_eq!(node.message_count(), 0);
     }
 
@@ -3252,16 +3597,16 @@ mod tests {
             min_stamp_cost: 0,
             ..Default::default()
         };
-        let mut node = PropagationNode::new(config, [0xAA; 16]);
+        let mut node = durable_test_node(config, [0xAA; 16]);
         let msg = make_signed_message([0xBB; 16], [0xCC; 16], "Test", "no_cost");
 
-        assert!(node.accept_message(&msg));
+        assert!(node.accept_fixture(&msg));
         assert_eq!(node.message_count(), 1);
     }
 
     #[test]
     fn test_create_offer_with_stamp_filter() {
-        let mut node = PropagationNode::new(PropagationNodeConfig::default(), [0xAA; 16]);
+        let mut node = durable_test_node(PropagationNodeConfig::default(), [0xAA; 16]);
 
         let entry1 = crate::propagation::PropagationEntry {
             transient_id: tid(0x01),
@@ -3295,5 +3640,140 @@ mod tests {
 
         let all2 = node.create_offer([0xFF; 16], Some(0));
         assert_eq!(all2.len(), 2);
+    }
+    #[test]
+    fn bounded_get_schema_rejects_amplification_and_nonfinite_limits_before_purge() {
+        use rmpv::Value;
+        let temporary = tempfile::tempdir().unwrap();
+        let mut node = PropagationNode::with_storage(
+            PropagationNodeConfig::default(),
+            [1; 16],
+            temporary.path().join("store"),
+        )
+        .unwrap();
+        let blob = vec![0xBB; 100];
+        assert!(node.accept_blob_fixture(&blob, 0));
+        let tid = rns_crypto::sha::full_hash(&blob);
+        for limit in [
+            Value::F64(f64::NAN),
+            Value::F64(f64::INFINITY),
+            Value::F64(-1.),
+            Value::F64(f64::MAX),
+            Value::from("bad"),
+            Value::Nil,
+        ] {
+            let request = crate::encode_value(&Value::Array(vec![
+                Value::Nil,
+                Value::Array(vec![Value::Binary(tid.to_vec())]),
+                limit,
+            ]));
+            assert_eq!(
+                node.handle_get_request_bounded(&request, &[0xBB; 16], 1024)
+                    .into_response_with_served_count_bounded(1024),
+                (vec![0xc0], 0)
+            );
+            assert_eq!(node.message_count(), 1);
+        }
+        for malformed in [
+            vec![0x92, 0xdd, 0xff, 0xff, 0xff, 0xff],
+            vec![0x92, 0x91, 0x90, 0xc0],
+            vec![0x92, 0xc0, 0xc0, 0xc0],
+        ] {
+            assert!(parse_get_request(&malformed).is_none());
+            assert_eq!(node.message_count(), 1);
+        }
+        // More than the historical packet-sized ID count remains valid.
+        let request = crate::encode_value(&Value::Array(vec![
+            Value::Array(vec![Value::Binary(tid.to_vec()); 2048]),
+            Value::Array(vec![]),
+        ]));
+        assert_eq!(
+            get_ids(parse_get_request(&request).unwrap().wants).count(),
+            2048
+        );
+    }
+
+    #[test]
+    fn bounded_get_deduplicates_and_fits_exact_encoded_boundary() {
+        use rmpv::Value;
+        let temporary = tempfile::tempdir().unwrap();
+        let mut node = PropagationNode::with_storage(
+            PropagationNodeConfig::default(),
+            [1; 16],
+            temporary.path().join("store"),
+        )
+        .unwrap();
+        let blob = vec![0xBB; 100];
+        assert!(node.accept_blob_fixture(&blob, 0));
+        let tid = rns_crypto::sha::full_hash(&blob);
+        let request = crate::encode_value(&Value::Array(vec![
+            Value::Array(vec![Value::Binary(tid.to_vec()); 4]),
+            Value::Array(vec![]),
+        ]));
+        let (bytes, count) = node
+            .handle_get_request_bounded(&request, &[0xBB; 16], 103)
+            .into_response_with_served_count_bounded(103);
+        assert_eq!(count, 1);
+        assert_eq!(bytes.len(), 103);
+        assert!(bytes.capacity() <= 103);
+        assert_eq!(
+            rmpv::decode::read_value(&mut bytes.as_slice()).unwrap(),
+            Value::Array(vec![Value::Binary(blob)])
+        );
+        let (bytes, count) = node
+            .handle_get_request_bounded(&request, &[0xBB; 16], 102)
+            .into_response_with_served_count_bounded(102);
+        assert_eq!(count, 0);
+        assert_eq!(bytes, vec![0x90]);
+        assert!(bytes.capacity() <= 102);
+    }
+
+    #[test]
+    fn bounded_get_skips_corrupt_or_grown_file_without_reading_past_plan() {
+        use rmpv::Value;
+        let temporary = tempfile::tempdir().unwrap();
+        let mut node = PropagationNode::with_storage(
+            PropagationNodeConfig::default(),
+            [1; 16],
+            temporary.path().join("store"),
+        )
+        .unwrap();
+        let blob = vec![0xBB; 100];
+        assert!(node.accept_blob_fixture(&blob, 0));
+        let tid = rns_crypto::sha::full_hash(&blob);
+        let request = crate::encode_value(&Value::Array(vec![
+            Value::Array(vec![Value::Binary(tid.to_vec())]),
+            Value::Array(vec![]),
+        ]));
+        let action = node.handle_get_request_bounded(&request, &[0xBB; 16], 103);
+        std::fs::write(&node.object_paths[&tid], vec![0; 4096]).unwrap();
+        assert_eq!(
+            action.into_response_with_served_count_bounded(103),
+            (vec![0x90], 0)
+        );
+    }
+
+    #[test]
+    fn bounded_get_listing_stays_within_reserved_output_capacity() {
+        use rmpv::Value;
+        let temporary = tempfile::tempdir().unwrap();
+        let mut node = PropagationNode::with_storage(
+            PropagationNodeConfig::default(),
+            [1; 16],
+            temporary.path().join("store"),
+        )
+        .unwrap();
+        for n in 0..4 {
+            let mut blob = vec![0xBB; 100 + n];
+            blob[20] = n as u8;
+            assert!(node.accept_blob_fixture(&blob, 0));
+        }
+        let (response, _) = node
+            .handle_get_request_bounded(&[0x92, 0xc0, 0xc0], &[0xBB; 16], 73)
+            .into_response_with_served_count_bounded(73);
+        assert!(response.capacity() <= 73);
+        assert!(
+            matches!(rmpv::decode::read_value(&mut response.as_slice()).unwrap(),Value::Array(ids) if ids.len()==2)
+        );
     }
 }

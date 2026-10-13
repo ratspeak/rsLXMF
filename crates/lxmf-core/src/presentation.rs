@@ -11,6 +11,23 @@ pub const MAX_ADVERTISED_NAME_CHARS: usize = 128;
 /// codepoints, collapses all Unicode whitespace to one ASCII space, and is
 /// truncated by Unicode scalar values rather than UTF-8 bytes.
 pub fn sanitize_name(input: &str, max_chars: usize) -> String {
+    let mut output = sanitize_name_pass(input, max_chars);
+    let rounds = output.nfkd().count().saturating_add(2);
+    for _ in 0..rounds {
+        let next = sanitize_name_pass(&output, max_chars);
+        if next == output {
+            return output;
+        }
+        output = next;
+    }
+    debug_assert!(
+        false,
+        "name normalization exceeded its derived stabilization bound"
+    );
+    String::new()
+}
+
+fn sanitize_name_pass(input: &str, max_chars: usize) -> String {
     if max_chars == 0 {
         return String::new();
     }
@@ -144,6 +161,22 @@ mod tests {
     fn truncation_never_retains_a_separator_without_following_text() {
         assert_eq!(sanitize_name("¡ A", 2), "¡");
         assert_eq!(sanitize_name("A B", 3), "A B");
+    }
+
+    #[test]
+    fn normalization_reaches_fixed_point_after_filtered_separators() {
+        for input in [
+            "A\u{0000}\u{030A}",
+            "e\u{034f}\u{0301}",
+            "o\u{200d}\u{0308}",
+        ] {
+            for limit in 0..8 {
+                let once = sanitize_name(input, limit);
+                assert_eq!(sanitize_name(&once, limit), once);
+                assert_eq!(once.nfkc().collect::<String>(), once);
+            }
+        }
+        assert_eq!(sanitize_name("™", 128), "TM");
     }
 
     proptest! {

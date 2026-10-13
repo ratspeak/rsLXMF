@@ -43,6 +43,8 @@ pub(crate) fn now_f64() -> f64 {
         .as_secs_f64()
 }
 
+pub mod admission;
+pub mod admission_store;
 pub mod constants;
 pub mod delivery_ratchet;
 pub mod discovery_stamper;
@@ -58,6 +60,8 @@ pub mod propagation_admission;
 pub mod propagation_client;
 pub mod propagation_node;
 pub mod propagation_offer;
+pub mod propagation_send;
+pub mod propagation_store_v2;
 pub mod propagation_sync;
 pub mod router;
 pub mod stamper;
@@ -74,7 +78,11 @@ pub mod message_api {
     pub use crate::constants::{
         DeliveryMethod, DeliveryRepresentation, MessageState, UnverifiedReason,
     };
-    pub use crate::message::{AudioField, LxMessage, MessageError};
+    pub use crate::message::{
+        AudioField, EncodedFieldValue, FieldId, FieldMapKey, FieldValue, FieldValueRef, Fields,
+        LxMessage, LxMessageDraft, MessageDecodeLimits, MessageError, MessageMetadata,
+        OwnedVerifiedLxMessage, RecipientStamp, SignedLxMessage, UniqueFieldMap, VerifiedLxMessage,
+    };
     pub use crate::types::{DestinationHash, IdentityHash, MessageId};
 }
 

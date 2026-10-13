@@ -21,12 +21,18 @@ bytes = { workspace = true }
 tracing = { workspace = true }
 rmp = { workspace = true }
 rmp-serde = { workspace = true }
-rmpv = { workspace = true }
+rmpv = { workspace = true, features = ["with-serde"] }
 serde = { workspace = true }
 sha2 = { workspace = true }
 rand = { workspace = true }
 hex = { workspace = true }
 unicode-normalization = { workspace = true }
+
+[target.'cfg(target_os = "ios")'.dependencies]
+objc2 = "0.6"
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.19"
 
 [dev-dependencies]
 tempfile = { workspace = true }

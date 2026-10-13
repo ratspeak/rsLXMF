@@ -87,7 +87,7 @@ impl DeliveryRatchetState {
                     let format = loaded.format();
                     let ring = loaded.into_ring();
                     if format == RatchetRingFormat::LegacyRust {
-                        match ring.save_verified(&ring_path, identity) {
+                        match ring.save_verified_durable(&ring_path, identity) {
                             Ok(()) => tracing::info!(
                                 path = %ring_path.display(),
                                 "migrated legacy Rust ratchet ring to canonical format"
@@ -145,7 +145,7 @@ impl DeliveryRatchetState {
 
         if ring.is_empty() && ring_file_trusted && control_file_trusted {
             let prepared = ring.prepare_rotation_at(wall_now as f64);
-            match prepared.ring().save_verified(&ring_path, identity) {
+            match prepared.ring().save_verified_durable(&ring_path, identity) {
                 Ok(()) => {
                     ring.commit_prepared_rotation(prepared);
                     control = control.with_rotation_at(wall_now);
@@ -161,7 +161,7 @@ impl DeliveryRatchetState {
 
         if control_file_trusted
             && (!control_existed || control_changed)
-            && let Err(error) = control.save_verified(&control_path, identity)
+            && let Err(error) = control.save_verified_durable(&control_path, identity)
         {
             tracing::warn!(
                 path = %control_path.display(),
@@ -241,7 +241,10 @@ impl DeliveryRatchetState {
         let mut ratchet_public = self.ring.current_public_key();
         if rotation_due && self.ring_file_trusted {
             let prepared = self.ring.prepare_rotation_at(wall_now as f64);
-            match prepared.ring().save_verified(&self.ring_path, identity) {
+            match prepared
+                .ring()
+                .save_verified_durable(&self.ring_path, identity)
+            {
                 Ok(()) => {
                     ratchet_public = Some(prepared.public_key());
                     candidate_control = candidate_control.with_rotation_at(wall_now);
@@ -256,7 +259,7 @@ impl DeliveryRatchetState {
         }
 
         candidate_control
-            .save_verified(&self.control_path, identity)
+            .save_verified_durable(&self.control_path, identity)
             .map_err(|source| DeliveryRatchetError::PersistControl {
                 path: self.control_path.clone(),
                 source,
@@ -293,15 +296,31 @@ impl DeliveryRatchetState {
     /// never overwritten by this operation.
     pub fn save(&self, identity: &Identity) {
         if self.ring_file_trusted
-            && let Err(error) = self.ring.save_verified(&self.ring_path, identity)
+            && let Err(error) = self.ring.save_verified_durable(&self.ring_path, identity)
         {
             tracing::warn!(%error, "failed to save ratchet ring");
         }
         if self.control_file_trusted
-            && let Err(error) = self.control.save_verified(&self.control_path, identity)
+            && let Err(error) = self
+                .control
+                .save_verified_durable(&self.control_path, identity)
         {
             tracing::warn!(%error, "failed to save ratchet control state");
         }
+    }
+
+    /// Checked strict checkpoint. Invalid files discovered during load remain
+    /// untouched and prevent a successful checkpoint claim.
+    pub fn save_durable(&self, identity: &Identity) -> std::io::Result<()> {
+        if !self.ring_file_trusted || !self.control_file_trusted {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "ratchet checkpoint contains untrusted state",
+            ));
+        }
+        self.ring.save_verified_durable(&self.ring_path, identity)?;
+        self.control
+            .save_verified_durable(&self.control_path, identity)
     }
 
     pub fn ring_path(&self) -> &Path {

@@ -1,60 +1,60 @@
-//! LXMF message construction, packing, unpacking, and state machine.
+//! Immutable signed LXMF messages and checked outbound construction.
 //!
-//! Python reference: LXMF/LXMessage.py.
-//!
-//! # Wire formats
-//!
-//! Direct / link / opportunistic:
-//! `[dest_hash:16][src_hash:16][signature:64][msgpack([ts, title, content, fields, ?stamp])]`.
-//! Title and content are msgpack `bin` (not `str`) to match Python/C++.
-//!
-//! Propagation (LXMessage.py:434-441):
-//! ```text
-//! encrypted_data     = destination.encrypt(packed[16..])
-//! lxmf_data          = packed[..16] + encrypted_data
-//! transient_id       = full_hash(lxmf_data)
-//! lxmf_data         += ?propagation_stamp
-//! propagation_packed = msgpack([timestamp, [lxmf_data]])
-//! ```
-//!
-//! Signed blob: `dest_hash + src_hash + payload + SHA256(dest_hash + src_hash + payload)`
-//! (LXMessage.py:380-383).
-
-use std::collections::{BTreeMap, BTreeSet};
-use std::io::Write;
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
-
+//! Construct [`LxMessageDraft`], sign it, then finalize its recipient stamp.
+//! Received and finalized messages retain one exact immutable wire image.
+use crate::constants::*;
+use crate::types::PropagationTransientId;
+use bytes::Bytes;
 use rns_crypto::sha::{full_hash, sha256, truncated_hash};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
+use std::collections::BTreeMap;
+use std::io::Write;
+use std::ops::{Deref, DerefMut, Range};
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+mod draft;
+mod field;
+pub use draft::{LxMessageDraft, SignedLxMessage};
+use field::FieldIndex;
+pub use field::{
+    EncodedFieldValue, FieldId, FieldMapKey, FieldValue, FieldValueRef, Fields, UniqueFieldMap,
+};
 
-use crate::constants::*;
-use crate::types::PropagationTransientId;
+/// Lossy projection with a single exact-sized allocation. Standard UTF-8
+/// replacement semantics are preserved, but geometric String growth cannot
+/// exceed the processing lease's three-output-bytes-per-input-byte allowance.
+fn bounded_lossy_text(bytes: &[u8]) -> Cow<'_, str> {
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return Cow::Borrowed(text);
+    }
+    let required = bytes
+        .utf8_chunks()
+        .map(|chunk| chunk.valid().len() + if chunk.invalid().is_empty() { 0 } else { 3 })
+        .sum();
+    let mut text = String::with_capacity(required);
+    for chunk in bytes.utf8_chunks() {
+        text.push_str(chunk.valid());
+        if !chunk.invalid().is_empty() {
+            text.push('\u{fffd}');
+        }
+    }
+    debug_assert_eq!(text.len(), required);
+    Cow::Owned(text)
+}
 
-/// Shared handler invoked on per-message state transitions.
 pub type MessageCallback = Arc<dyn Fn(&LxMessage) + Send + Sync>;
-
-/// A native LXMF audio field borrowed from its enclosing message.
-///
-/// LXMF represents audio as `[mode, bytes]`, where `mode` is one of the
-/// `AM_*` constants and `bytes` is the encoded audio payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AudioField<'a> {
     pub mode: u8,
     pub bytes: &'a [u8],
 }
-
-/// Per-message delivery and failure callbacks.
-///
-/// Invoked by [`LxMessage::notify_delivered`] / [`LxMessage::notify_failed`] when the router
-/// observes a state transition for a tracked outbound message.
 #[derive(Clone, Default)]
 pub struct MessageCallbacks {
     pub on_delivered: Option<MessageCallback>,
     pub on_failed: Option<MessageCallback>,
 }
-
 impl std::fmt::Debug for MessageCallbacks {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MessageCallbacks")
@@ -63,145 +63,390 @@ impl std::fmt::Debug for MessageCallbacks {
             .finish()
     }
 }
-
-/// An LXMF message.
+/// Mutable delivery observations; none can change a message's authenticated bytes.
 #[derive(Debug, Clone)]
-pub struct LxMessage {
-    pub destination_hash: [u8; 16],
-    pub source_hash: [u8; 16],
-    pub title: String,
-    pub content: String,
-    /// Application-level fields keyed by field ID.
-    pub fields: BTreeMap<u8, Vec<u8>>,
-    /// Field IDs whose values are already msgpack-encoded LXMF values.
-    ///
-    /// Most custom fields are byte strings and must serialize as msgpack `bin`.
-    /// Native structured fields such as `FIELD_IMAGE = [format, bytes]` and
-    /// `FIELD_FILE_ATTACHMENTS = [[name, bytes], ...]` must serialize as their
-    /// contained msgpack value instead.
-    pub msgpack_field_ids: BTreeSet<u8>,
-    /// Unix epoch seconds.
-    pub timestamp: f64,
-    pub signature: Option<[u8; 64]>,
-    pub signature_validated: bool,
+pub struct MessageMetadata {
     pub state: MessageState,
     pub method: DeliveryMethod,
-    /// Message stamp, if present.
-    ///
-    /// LXMF uses 32-byte PoW stamps and 16-byte ticket stamps, so this must stay
-    /// byte-sized instead of forcing the PoW length.
-    pub stamp: Option<Vec<u8>>,
-    /// Propagation PoW stamp, if present (32 bytes).
-    pub propagation_stamp: Option<[u8; 32]>,
     pub ratchet_id: Option<[u8; 32]>,
     pub delivery_attempts: u32,
-    /// Unix timestamp of the last delivery attempt; 0.0 means never attempted.
     pub last_delivery_attempt: f64,
-    /// Absolute Unix timestamp before which the message must not be re-attempted.
-    /// Mirrors Python LXMF `LXMessage.next_delivery_attempt`: set to
-    /// `now + PATH_REQUEST_WAIT` after a path request, `now + DELIVERY_RETRY_WAIT`
-    /// after a link attempt. 0.0 = no explicit deadline (router falls back to
-    /// `last_delivery_attempt + DELIVERY_RETRY_WAIT`).
     pub next_delivery_attempt: f64,
-    /// SHA-256 of the packed message.
-    pub hash: Option<[u8; 32]>,
-    /// Alias for [`hash`](Self::hash) set after packing.
-    pub message_id: Option<[u8; 32]>,
-    /// Full hash used by the propagation offer/get protocol.
-    pub transient_id: Option<PropagationTransientId>,
-    /// Destination-required stamp cost for outbound stamp generation.
-    pub stamp_cost: Option<u8>,
-    /// Outbound ticket for stamp bypass (16 bytes).
-    pub outbound_ticket: Option<[u8; 16]>,
-    /// Ask the router to include a reply ticket before this message is signed.
-    ///
-    /// Python reference: `LXMessage.include_ticket`.
-    pub include_ticket: bool,
-    /// Computed stamp value: leading zero bits, or `COST_TICKET`.
-    pub stamp_value: Option<u16>,
     pub unverified_reason: Option<UnverifiedReason>,
     pub representation: DeliveryRepresentation,
     pub transport_encrypted: bool,
-    /// Original msgpack payload bytes, stored on inbound messages so signature verification
-    /// can use the exact bytes that were signed. Avoids re-serialization mismatches for fields
-    /// with complex types (arrays, maps).
-    pub wire_payload: Option<Vec<u8>>,
     pub transport_encryption: Option<String>,
     pub incoming: bool,
-    /// True when the source identity is blackholed at the transport layer.
-    ///
-    /// Python sets this during `unpack_from_bytes` via `Reticulum.is_blackholed`
-    /// (LXMessage.py:172, 803-805); `LXMRouter.lxmf_delivery` then drops such
-    /// messages before processing (LXMRouter.py:1739-1741). Rust unpacking has
-    /// no transport access, so embedders set it from the blackhole query
-    /// surface before processing.
     pub source_blackholed: bool,
-    /// Delivery progress in `0.0..=1.0`.
     pub progress: f64,
-    /// Whether the direct-delivery resource should be bz2-compressed by the RNS layer.
-    ///
-    /// Set optimistically to `true` on outbound construction to mirror Python's
-    /// `LXMessage.auto_compress`. Gets cleared by
-    /// [`determine_compression_support`](Self::determine_compression_support) when a peer's
-    /// announce indicates no `SF_COMPRESSION` capability.
     pub auto_compress: bool,
-    /// Optional per-message delivery / failure callbacks.
     pub callbacks: MessageCallbacks,
 }
-
-impl LxMessage {
-    /// Construct a new outbound message.
-    pub fn new(
-        destination_hash: [u8; 16],
-        source_hash: [u8; 16],
-        title: &str,
-        content: &str,
-        method: DeliveryMethod,
-    ) -> Self {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64();
-
+impl Default for MessageMetadata {
+    fn default() -> Self {
         Self {
-            destination_hash,
-            source_hash,
-            title: title.to_string(),
-            content: content.to_string(),
-            fields: BTreeMap::new(),
-            msgpack_field_ids: BTreeSet::new(),
-            timestamp,
-            signature: None,
-            signature_validated: false,
             state: MessageState::Generating,
-            method,
-            stamp: None,
-            propagation_stamp: None,
+            method: DeliveryMethod::Direct,
             ratchet_id: None,
             delivery_attempts: 0,
-            last_delivery_attempt: 0.0,
-            next_delivery_attempt: 0.0,
-            hash: None,
-            message_id: None,
-            transient_id: None,
-            stamp_cost: None,
-            outbound_ticket: None,
-            include_ticket: false,
-            stamp_value: None,
+            last_delivery_attempt: 0.,
+            next_delivery_attempt: 0.,
             unverified_reason: None,
             representation: DeliveryRepresentation::Unknown,
             transport_encrypted: false,
             transport_encryption: None,
-            wire_payload: None,
             incoming: false,
             source_blackholed: false,
-            progress: 0.0,
+            progress: 0.,
             auto_compress: true,
             callbacks: MessageCallbacks::default(),
         }
     }
-
-    /// Update [`auto_compress`](Self::auto_compress) based on a peer's cached announce app_data.
+}
+/// Local parser/construction profile, independent of transport size admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MessageDecodeLimits {
+    pub max_wire_bytes: usize,
+    pub max_top_level_fields: usize,
+}
+impl Default for MessageDecodeLimits {
+    fn default() -> Self {
+        Self {
+            max_wire_bytes: 134_217_727,
+            max_top_level_fields: 4096,
+        }
+    }
+}
+impl MessageDecodeLimits {
+    fn check_wire(self, length: usize) -> Result<(), MessageError> {
+        if length > self.max_wire_bytes {
+            Err(MessageError::TooLarge {
+                size: length,
+                limit: self.max_wire_bytes,
+            })
+        } else {
+            Ok(())
+        }
+    }
+}
+/// Recipient stamp bytes. Construction does not itself authenticate the stamp.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecipientStamp {
+    Ticket([u8; 16]),
+    ProofOfWork([u8; 32]),
+}
+impl RecipientStamp {
+    pub fn as_bytes(&self) -> &[u8] {
+        match self {
+            Self::Ticket(b) => b,
+            Self::ProofOfWork(b) => b,
+        }
+    }
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        match bytes.len() {
+            16 => Some(Self::Ticket(bytes.try_into().ok()?)),
+            32 => Some(Self::ProofOfWork(bytes.try_into().ok()?)),
+            _ => None,
+        }
+    }
+}
+/// One finalized or received image. All clones share the image and field indexes.
+///
+/// Signed content cannot be assigned after finalization:
+/// ```compile_fail
+/// use lxmf_core::message::LxMessage;
+/// fn change(message: &mut LxMessage) { message.message_id = [0; 32]; }
+/// ```
+/// Recipient stamps must be supplied before the complete image is frozen:
+/// ```compile_fail
+/// use lxmf_core::message::{LxMessage, RecipientStamp};
+/// fn change(message: &mut LxMessage) {
+///     message.stamp = Some(RecipientStamp::Ticket([0; 16]));
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct LxMessage {
+    wire: Bytes,
+    indexes: Arc<[FieldIndex]>,
+    title: Range<usize>,
+    content: Range<usize>,
+    timestamp: f64,
+    message_id: [u8; 32],
+    stamp: Option<RecipientStamp>,
+    limits: MessageDecodeLimits,
+    pub metadata: MessageMetadata,
+}
+impl Deref for LxMessage {
+    type Target = MessageMetadata;
+    fn deref(&self) -> &Self::Target {
+        &self.metadata
+    }
+}
+impl DerefMut for LxMessage {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.metadata
+    }
+}
+/// Source-bound authentication of an immutable message; cannot be constructed by callers.
+/// ```compile_fail
+/// use lxmf_core::message::{LxMessage, VerifiedLxMessage};
+/// fn counterfeit(message: &LxMessage) {
+///     let _ = VerifiedLxMessage { message, source_public_key: [0; 64] };
+/// }
+/// ```
+#[derive(Debug)]
+pub struct VerifiedLxMessage<'a> {
+    message: &'a LxMessage,
+    source_public_key: [u8; 64],
+}
+/// Authentication retained across an asynchronous handoff. The frozen message
+/// clone shares its original wire image and field index; callers cannot replace
+/// either the authenticated bytes or the source key.
+#[derive(Debug)]
+pub struct OwnedVerifiedLxMessage {
+    message: LxMessage,
+    source_public_key: [u8; 64],
+}
+impl OwnedVerifiedLxMessage {
+    pub fn as_verified(&self) -> VerifiedLxMessage<'_> {
+        VerifiedLxMessage {
+            message: &self.message,
+            source_public_key: self.source_public_key,
+        }
+    }
+}
+impl<'a> VerifiedLxMessage<'a> {
+    pub fn message(&self) -> &'a LxMessage {
+        self.message
+    }
+    pub fn source_public_key(&self) -> &[u8; 64] {
+        &self.source_public_key
+    }
+    pub fn to_owned(&self) -> OwnedVerifiedLxMessage {
+        OwnedVerifiedLxMessage {
+            message: self.message.clone(),
+            source_public_key: self.source_public_key,
+        }
+    }
+}
+impl LxMessage {
+    pub fn destination_hash(&self) -> [u8; 16] {
+        self.wire[..16].try_into().expect("parsed header")
+    }
+    pub fn source_hash(&self) -> [u8; 16] {
+        self.wire[16..32].try_into().expect("parsed header")
+    }
+    pub fn signature(&self) -> [u8; 64] {
+        self.wire[32..96].try_into().expect("parsed header")
+    }
+    pub fn message_id(&self) -> [u8; 32] {
+        self.message_id
+    }
+    pub fn timestamp(&self) -> f64 {
+        self.timestamp
+    }
+    pub fn title_bytes(&self) -> &[u8] {
+        &self.wire[self.title.clone()]
+    }
+    pub fn content_bytes(&self) -> &[u8] {
+        &self.wire[self.content.clone()]
+    }
+    pub fn title_text(&self) -> Cow<'_, str> {
+        bounded_lossy_text(self.title_bytes())
+    }
+    pub fn content_text(&self) -> Cow<'_, str> {
+        bounded_lossy_text(self.content_bytes())
+    }
+    pub fn fields(&self) -> Fields<'_> {
+        Fields {
+            wire: &self.wire,
+            indexes: &self.indexes,
+        }
+    }
+    pub fn get_field(&self, id: impl Into<FieldId>) -> Option<FieldValueRef<'_>> {
+        self.fields().get(id)
+    }
+    pub fn recipient_stamp(&self) -> Option<&RecipientStamp> {
+        self.stamp.as_ref()
+    }
+    pub fn wire_bytes(&self) -> &[u8] {
+        &self.wire
+    }
+    /// Shared ownership for asynchronous storage without copying the message.
+    pub fn wire_owned(&self) -> Bytes {
+        self.wire.clone()
+    }
+    pub fn decode_limits(&self) -> MessageDecodeLimits {
+        self.limits
+    }
+    pub fn packed_len(&self) -> Result<usize, MessageError> {
+        Ok(self.wire.len())
+    }
+    pub fn pack(&self) -> Result<Vec<u8>, MessageError> {
+        Ok(self.wire.to_vec())
+    }
+    pub fn pack_payload(&self) -> Result<Vec<u8>, MessageError> {
+        Ok(self.wire[96..].to_vec())
+    }
+    pub fn compute_hash(&self) -> Result<[u8; 32], MessageError> {
+        Ok(self.message_id)
+    }
+    pub fn pack_propagated(&self) -> Result<Vec<u8>, MessageError> {
+        self.pack()
+    }
+    pub fn unpack_propagated(data: &[u8]) -> Result<Self, MessageError> {
+        Self::unpack(data)
+    }
+    pub fn pack_opportunistic_encrypted<F>(&self, encrypt: F) -> Result<Vec<u8>, MessageError>
+    where
+        F: FnOnce(&[u8]) -> Result<Vec<u8>, MessageError>,
+    {
+        encrypt(&self.wire[16..])
+    }
+    /// Check a detached signature only; this grants no source-identity authority.
+    pub fn verify_signature(&self, key: &rns_crypto::ed25519::Ed25519PublicKey) -> bool {
+        let mut signed = Vec::with_capacity(self.wire.len() + 32);
+        signed.extend_from_slice(&self.wire[..32]);
+        if let Some(body) = first_four_msgpack_array_body(&self.wire[96..]) {
+            signed.push(0x94);
+            signed.extend_from_slice(body);
+        } else {
+            signed.extend_from_slice(&self.wire[96..]);
+        }
+        signed.extend_from_slice(&self.message_id);
+        key.verify(&signed, &self.signature()).is_ok()
+    }
+    /// Verify both the claimed LXMF source and its signature, without mutation.
+    pub fn verify(
+        &self,
+        source_public_key: &[u8; 64],
+    ) -> Result<VerifiedLxMessage<'_>, MessageError> {
+        let identity = rns_identity::identity::Identity::from_public_key(source_public_key)
+            .map_err(|_| MessageError::InvalidSignature)?;
+        let expected = rns_identity::destination::Destination::hash_from_name_and_identity(
+            "lxmf.delivery",
+            Some(&identity.hash),
+        );
+        if expected != self.source_hash() {
+            return Err(MessageError::SourceMismatch);
+        }
+        let key = rns_crypto::ed25519::Ed25519PublicKey::from_bytes(
+            source_public_key[32..].try_into().expect("public key half"),
+        )
+        .map_err(|_| MessageError::InvalidSignature)?;
+        if !self.verify_signature(&key) {
+            return Err(MessageError::InvalidSignature);
+        }
+        Ok(VerifiedLxMessage {
+            message: self,
+            source_public_key: *source_public_key,
+        })
+    }
+    pub fn unpack(data: &[u8]) -> Result<Self, MessageError> {
+        let limits = MessageDecodeLimits::default();
+        limits.check_wire(data.len())?;
+        Self::unpack_owned(Bytes::copy_from_slice(data), limits)
+    }
+    pub fn unpack_owned(wire: Bytes, limits: MessageDecodeLimits) -> Result<Self, MessageError> {
+        limits.check_wire(wire.len())?;
+        if wire.len() < 97 {
+            return Err(MessageError::TooShort(wire.len()));
+        }
+        let mut input = &wire[96..];
+        let count = read_msgpack_array_len(&mut input)?;
+        if count < 4 {
+            return Err(MessageError::UnpackFailed("payload array too short".into()));
+        }
+        let timestamp = read_msgpack_float(&mut input)?;
+        let title = read_text_range(&wire, &mut input)?;
+        let content = read_text_range(&wire, &mut input)?;
+        let mut indexes = Vec::new();
+        if input.first().is_some_and(|m| msgpack_marker_is_map(*m)) {
+            let count = read_msgpack_map_len(&mut input)? as usize;
+            if count > limits.max_top_level_fields {
+                return Err(MessageError::TooManyFields);
+            }
+            if count > input.len() / 2 {
+                return Err(MessageError::UnpackFailed("impossible field count".into()));
+            }
+            count
+                .checked_mul(std::mem::size_of::<FieldIndex>())
+                .ok_or(MessageError::TooManyFields)?;
+            indexes
+                .try_reserve_exact(count)
+                .map_err(|_| MessageError::TooManyFields)?;
+            for _ in 0..count {
+                let id = FieldId::try_from(read_msgpack_integer(&mut input)?)?;
+                let start = wire.len() - input.len();
+                skip_msgpack_value(&mut input, 0)?;
+                indexes.push(FieldIndex {
+                    id,
+                    range: start..wire.len() - input.len(),
+                });
+            }
+            indexes.sort_unstable_by_key(|entry| entry.id);
+            if indexes.windows(2).any(|pair| pair[0].id == pair[1].id) {
+                return Err(MessageError::DuplicateField);
+            }
+        } else {
+            skip_msgpack_value(&mut input, 0)?;
+        }
+        let stamp = if count > 4 {
+            read_recipient_stamp(&mut input)?
+        } else {
+            None
+        };
+        let destination = wire[..16].try_into().expect("header");
+        let source = wire[16..32].try_into().expect("header");
+        let message_id = Self::message_id_from_payload(&destination, &source, &wire[96..]);
+        Ok(Self {
+            wire,
+            indexes: indexes.into(),
+            title,
+            content,
+            timestamp,
+            message_id,
+            stamp,
+            limits,
+            metadata: MessageMetadata {
+                incoming: true,
+                ..MessageMetadata::default()
+            },
+        })
+    }
+    /// Stamp checking is pure; the returned value is valid only for this request's policy.
+    pub fn validate_stamp_with_tickets(
+        &self,
+        target_cost: u8,
+        tickets: Option<&[Vec<u8>]>,
+    ) -> bool {
+        self.validated_stamp_value(target_cost, tickets).is_some()
+    }
+    pub fn validated_stamp_value(
+        &self,
+        target_cost: u8,
+        tickets: Option<&[Vec<u8>]>,
+    ) -> Option<u16> {
+        let stamp = self.stamp.as_ref()?.as_bytes();
+        if let Some(tickets) = tickets {
+            for ticket in tickets {
+                if ticket.len() != TICKET_LENGTH {
+                    continue;
+                }
+                let mut material = [0u8; 48];
+                material[..16].copy_from_slice(ticket);
+                material[16..].copy_from_slice(&self.message_id);
+                if stamp == truncated_hash(&material) {
+                    return Some(COST_TICKET);
+                }
+            }
+        }
+        let stamp = <&[u8; 32]>::try_from(stamp).ok()?;
+        let work = crate::stamper::stamp_workblock(&self.message_id, STAMP_WORKBLOCK_EXPAND_ROUNDS);
+        crate::stamper::stamp_valid(stamp, target_cost, &work)
+            .then(|| crate::stamper::stamp_value(&work, stamp) as u16)
+    }
+    /// Update [`auto_compress`](MessageMetadata::auto_compress) based on a peer's cached announce app_data.
     ///
     /// Matches Python `LXMessage.determine_compression_support` — LXMessage.py:510-513.
     /// Fail-open: no cached app_data and legacy peers without a feature list
@@ -247,96 +492,13 @@ impl LxMessage {
         }
     }
 
-    pub fn set_field(&mut self, field_id: u8, data: Vec<u8>) {
-        self.fields.insert(field_id, data);
-        self.msgpack_field_ids.remove(&field_id);
-    }
-
-    /// Set a field value that is already encoded as one complete msgpack value.
-    ///
-    /// Use this for native structured LXMF fields. For example, Python/Sideband
-    /// encode `FIELD_IMAGE` as the value `["webp", image_bytes]`, not as a
-    /// binary blob containing the bytes of that msgpack array.
-    pub fn set_msgpack_field(&mut self, field_id: u8, data: Vec<u8>) -> Result<(), MessageError> {
-        let mut cursor = std::io::Cursor::new(&data);
-        rmpv::decode::read_value(&mut cursor)
-            .map_err(|e| MessageError::PackFailed(format!("invalid msgpack field: {e}")))?;
-        if cursor.position() != data.len() as u64 {
-            return Err(MessageError::PackFailed(
-                "invalid msgpack field: trailing bytes".to_string(),
-            ));
-        }
-        self.fields.insert(field_id, data);
-        self.msgpack_field_ids.insert(field_id);
-        Ok(())
-    }
-
-    /// Encode and install the native LXMF image field without first cloning
-    /// `image_bytes` into an intermediate `rmpv::Value` tree.
-    ///
-    /// The wire value remains exactly `[format, image_bytes]`.
-    pub fn set_image_field(
-        &mut self,
-        format: &str,
-        image_bytes: &[u8],
-    ) -> Result<(), MessageError> {
-        let encoded = rmp_serde::to_vec(&ImageFieldRef {
-            format,
-            bytes: image_bytes,
-        })
-        .map_err(|error| MessageError::PackFailed(error.to_string()))?;
-        self.fields.insert(FIELD_IMAGE, encoded);
-        self.msgpack_field_ids.insert(FIELD_IMAGE);
-        Ok(())
-    }
-
-    /// Encode and install the native LXMF audio field without cloning
-    /// `audio_bytes` into an intermediate `rmpv::Value` tree.
-    ///
-    /// The wire value is exactly `[mode, audio_bytes]`. Audio is independent
-    /// of [`FIELD_FILE_ATTACHMENTS`]; this method never adds or changes a file
-    /// attachment field.
-    pub fn set_audio_field(&mut self, mode: u8, audio_bytes: &[u8]) -> Result<(), MessageError> {
-        let encoded = rmp_serde::to_vec(&AudioFieldRef {
-            mode,
-            bytes: audio_bytes,
-        })
-        .map_err(|error| MessageError::PackFailed(error.to_string()))?;
-        self.fields.insert(FIELD_AUDIO, encoded);
-        self.msgpack_field_ids.insert(FIELD_AUDIO);
-        Ok(())
-    }
-
-    /// Encode and install one native LXMF file attachment without first
-    /// cloning `file_bytes` into an intermediate `rmpv::Value` tree.
-    ///
-    /// The wire value remains exactly `[[file_name, file_bytes]]`.
-    pub fn set_file_attachment_field(
-        &mut self,
-        file_name: &str,
-        file_bytes: &[u8],
-    ) -> Result<(), MessageError> {
-        let encoded = rmp_serde::to_vec(&FileAttachmentsFieldRef {
-            file_name,
-            bytes: file_bytes,
-        })
-        .map_err(|error| MessageError::PackFailed(error.to_string()))?;
-        self.fields.insert(FIELD_FILE_ATTACHMENTS, encoded);
-        self.msgpack_field_ids.insert(FIELD_FILE_ATTACHMENTS);
-        Ok(())
-    }
-
-    pub fn get_field(&self, field_id: u8) -> Option<&Vec<u8>> {
-        self.fields.get(&field_id)
-    }
-
     /// Decode the first native LXMF file attachment while borrowing its bytes
     /// from this message. Only the small filename is allocated.
     pub fn first_file_attachment(&self) -> Result<Option<(String, &[u8])>, MessageError> {
-        let Some(field) = self.fields.get(&FIELD_FILE_ATTACHMENTS) else {
+        let Some(field) = self.fields().get(FIELD_FILE_ATTACHMENTS) else {
             return Ok(None);
         };
-        let mut input = field.as_slice();
+        let mut input = field.encoded();
         if read_msgpack_array_len(&mut input)? == 0 {
             return Ok(None);
         }
@@ -345,8 +507,7 @@ impl LxMessage {
                 "file attachment entry requires name and data".to_string(),
             ));
         }
-        let file_name =
-            String::from_utf8_lossy(read_msgpack_string_or_binary(&mut input)?).into_owned();
+        let file_name = bounded_lossy_text(read_msgpack_string_or_binary(&mut input)?).into_owned();
         let data = read_msgpack_binary(&mut input)?;
         Ok(Some((file_name, data)))
     }
@@ -354,17 +515,16 @@ impl LxMessage {
     /// Decode the native LXMF image field while borrowing its image bytes
     /// from this message. Only the short format string is allocated.
     pub fn image_attachment(&self) -> Result<Option<(String, &[u8])>, MessageError> {
-        let Some(field) = self.fields.get(&FIELD_IMAGE) else {
+        let Some(field) = self.fields().get(FIELD_IMAGE) else {
             return Ok(None);
         };
-        let mut input = field.as_slice();
+        let mut input = field.encoded();
         if read_msgpack_array_len(&mut input)? < 2 {
             return Err(MessageError::UnpackFailed(
                 "image field requires format and data".to_string(),
             ));
         }
-        let format =
-            String::from_utf8_lossy(read_msgpack_string_or_binary(&mut input)?).into_owned();
+        let format = bounded_lossy_text(read_msgpack_string_or_binary(&mut input)?).into_owned();
         let data = read_msgpack_binary(&mut input)?;
         Ok(Some((format, data)))
     }
@@ -376,10 +536,10 @@ impl LxMessage {
     /// reported only by this accessor; it does not invalidate the enclosing
     /// message or its other fields.
     pub fn audio_field(&self) -> Result<Option<AudioField<'_>>, MessageError> {
-        let Some(field) = self.fields.get(&FIELD_AUDIO) else {
+        let Some(field) = self.fields().get(FIELD_AUDIO) else {
             return Ok(None);
         };
-        let mut input = field.as_slice();
+        let mut input = field.encoded();
         let item_count = read_msgpack_array_len(&mut input)?;
         if item_count != 2 {
             return Err(MessageError::UnpackFailed(
@@ -394,124 +554,6 @@ impl LxMessage {
             ));
         }
         Ok(Some(AudioField { mode, bytes }))
-    }
-
-    /// Pack the payload as `msgpack([timestamp, title, content, fields, ?stamp])`.
-    pub fn pack_payload(&self) -> Result<Vec<u8>, MessageError> {
-        self.pack_payload_inner(self.stamp.as_deref())
-    }
-
-    /// Pack the payload for signing, always as a 4-element array with `stamp = None`.
-    ///
-    /// Python strips the stamp element before verification and re-packs as 4 elements
-    /// (LXMessage.py:742-745). Matching that here keeps sign/verify bytes stable.
-    fn pack_payload_for_signing(&self) -> Result<Vec<u8>, MessageError> {
-        self.pack_payload_inner(None)
-    }
-
-    /// Stream the payload directly into one output buffer. Structured LXMF
-    /// fields are already complete MessagePack values, so writing their bytes
-    /// verbatim avoids decoding a potentially large attachment into an owned
-    /// `rmpv::Value` tree merely to encode it again.
-    fn pack_payload_inner(&self, stamp: Option<&[u8]>) -> Result<Vec<u8>, MessageError> {
-        let capacity = self
-            .title
-            .len()
-            .checked_add(self.content.len())
-            .and_then(|length| {
-                self.fields
-                    .values()
-                    .try_fold(length, |total, field| total.checked_add(field.len()))
-            })
-            .and_then(|length| length.checked_add(stamp.map_or(0, <[u8]>::len)))
-            .and_then(|length| length.checked_add(64))
-            .ok_or_else(|| MessageError::PackFailed("packed length overflow".to_string()))?;
-        let mut output = Vec::with_capacity(capacity);
-        self.write_payload(&mut output, stamp)?;
-        Ok(output)
-    }
-
-    fn packed_payload_len(&self, stamp: Option<&[u8]>) -> Result<usize, MessageError> {
-        let mut counter = CountingWriter::default();
-        self.write_payload(&mut counter, stamp)?;
-        Ok(counter.bytes)
-    }
-
-    fn write_payload<W: Write>(
-        &self,
-        writer: &mut W,
-        stamp: Option<&[u8]>,
-    ) -> Result<(), MessageError> {
-        fn length(value: usize, what: &str) -> Result<u32, MessageError> {
-            u32::try_from(value)
-                .map_err(|_| MessageError::PackFailed(format!("{what} exceeds MessagePack limits")))
-        }
-
-        fn packed(error: impl std::fmt::Display) -> MessageError {
-            MessageError::PackFailed(error.to_string())
-        }
-
-        rmp::encode::write_array_len(writer, if stamp.is_some() { 5 } else { 4 })
-            .map_err(packed)?;
-        rmp::encode::write_f64(writer, self.timestamp).map_err(packed)?;
-        rmp::encode::write_bin_len(writer, length(self.title.len(), "title")?).map_err(packed)?;
-        writer.write_all(self.title.as_bytes()).map_err(packed)?;
-        rmp::encode::write_bin_len(writer, length(self.content.len(), "content")?)
-            .map_err(packed)?;
-        writer.write_all(self.content.as_bytes()).map_err(packed)?;
-        rmp::encode::write_map_len(writer, length(self.fields.len(), "field count")?)
-            .map_err(packed)?;
-        for (field_id, field) in &self.fields {
-            rmp::encode::write_uint(writer, u64::from(*field_id)).map_err(packed)?;
-            if self.msgpack_field_ids.contains(field_id) {
-                writer.write_all(field).map_err(packed)?;
-            } else {
-                rmp::encode::write_bin_len(writer, length(field.len(), "field")?)
-                    .map_err(packed)?;
-                writer.write_all(field).map_err(packed)?;
-            }
-        }
-        if let Some(stamp) = stamp {
-            rmp::encode::write_bin_len(writer, length(stamp.len(), "stamp")?).map_err(packed)?;
-            writer.write_all(stamp).map_err(packed)?;
-        }
-        Ok(())
-    }
-
-    /// Exact full wire length without allocating the packed message. This is
-    /// used for application envelope admission before the router constructs
-    /// the one contiguous signing/Resource buffer.
-    pub fn packed_len(&self) -> Result<usize, MessageError> {
-        self.signature.ok_or(MessageError::NotSigned)?;
-        let payload = self.packed_payload_len(self.stamp.as_deref())?;
-        (DESTINATION_LENGTH * 2 + SIGNATURE_LENGTH)
-            .checked_add(payload)
-            .ok_or_else(|| MessageError::PackFailed("packed length overflow".to_string()))
-    }
-
-    /// Pack the full message for wire transmission as
-    /// `dest_hash || src_hash || signature || payload` (Python/C++ Propagated format).
-    pub fn pack(&self) -> Result<Vec<u8>, MessageError> {
-        let sig = self.signature.ok_or(MessageError::NotSigned)?;
-        let payload_len = self.packed_payload_len(self.stamp.as_deref())?;
-        let mut packed =
-            Vec::with_capacity(DESTINATION_LENGTH * 2 + SIGNATURE_LENGTH + payload_len);
-        packed.extend_from_slice(&self.destination_hash);
-        packed.extend_from_slice(&self.source_hash);
-        packed.extend_from_slice(&sig);
-        self.write_payload(&mut packed, self.stamp.as_deref())?;
-        Ok(packed)
-    }
-
-    fn signed_data_for_signing(&self) -> Result<(Vec<u8>, [u8; 32]), MessageError> {
-        let payload_len = self.packed_payload_len(None)?;
-        let mut signed_data = Vec::with_capacity(DESTINATION_LENGTH * 2 + payload_len + 32);
-        signed_data.extend_from_slice(&self.destination_hash);
-        signed_data.extend_from_slice(&self.source_hash);
-        self.write_payload(&mut signed_data, None)?;
-        let message_hash = sha256(&signed_data);
-        signed_data.extend_from_slice(&message_hash);
-        Ok((signed_data, message_hash))
     }
 
     fn message_id_from_payload(
@@ -529,129 +571,6 @@ impl LxMessage {
             hasher.update(payload);
         }
         hasher.finalize().into()
-    }
-
-    /// Pack a message for propagation delivery.
-    ///
-    /// Encrypts everything after the destination hash using `encrypt_fn` (ECIES against the
-    /// destination identity's public key, matching Python `destination.encrypt()`), then wraps
-    /// as `msgpack([timestamp, [lxmf_data]])`. Returns `(propagation_packed, transient_id)`.
-    ///
-    /// Python reference: LXMessage.py:434-441.
-    pub fn pack_propagated_encrypted<F>(
-        &mut self,
-        encrypt_fn: F,
-    ) -> Result<(Vec<u8>, PropagationTransientId), MessageError>
-    where
-        F: FnOnce(&[u8]) -> Result<Vec<u8>, MessageError>,
-    {
-        let (packed, transient_id, _) = self.pack_propagated_encrypted_inner(encrypt_fn, None)?;
-        Ok((packed, transient_id))
-    }
-
-    /// Pack a propagated message and always append a propagation-node stamp.
-    ///
-    /// Python always generates a propagation stamp for `PROPAGATED` messages,
-    /// even when the target cost is zero. A zero-cost stamp is the all-zero
-    /// 32-byte value, which still gives propagation nodes the expected wire
-    /// layout for validation and storage.
-    pub fn pack_propagated_encrypted_with_stamp<F>(
-        &mut self,
-        encrypt_fn: F,
-        target_cost: u8,
-    ) -> Result<(Vec<u8>, PropagationTransientId, u32), MessageError>
-    where
-        F: FnOnce(&[u8]) -> Result<Vec<u8>, MessageError>,
-    {
-        self.pack_propagated_encrypted_inner(encrypt_fn, Some(target_cost))
-    }
-
-    /// Pack the payload that Reticulum carries for Opportunistic delivery.
-    ///
-    /// Python `LXMessage.__as_packet()` encrypts the complete LXMF packet after
-    /// the leading destination hash because the RNS packet header already
-    /// carries that destination. Keeping this helper in core prevents callers
-    /// from reimplementing the destination-prefix stripping differently.
-    pub fn pack_opportunistic_encrypted<F>(&self, encrypt_fn: F) -> Result<Vec<u8>, MessageError>
-    where
-        F: FnOnce(&[u8]) -> Result<Vec<u8>, MessageError>,
-    {
-        let packed = self.pack()?;
-        if packed.len() <= DESTINATION_LENGTH {
-            return Err(MessageError::PackFailed(
-                "packed LXMF message missing opportunistic payload tail".to_string(),
-            ));
-        }
-        encrypt_fn(&packed[DESTINATION_LENGTH..])
-    }
-
-    fn pack_propagated_encrypted_inner<F>(
-        &mut self,
-        encrypt_fn: F,
-        propagation_stamp_cost: Option<u8>,
-    ) -> Result<(Vec<u8>, PropagationTransientId, u32), MessageError>
-    where
-        F: FnOnce(&[u8]) -> Result<Vec<u8>, MessageError>,
-    {
-        let packed = self.pack()?;
-
-        let encrypted_data = encrypt_fn(&packed[DESTINATION_LENGTH..])?;
-
-        let mut lxmf_data = Vec::with_capacity(DESTINATION_LENGTH + encrypted_data.len());
-        lxmf_data.extend_from_slice(&packed[..DESTINATION_LENGTH]);
-        lxmf_data.extend_from_slice(&encrypted_data);
-
-        // transient_id is computed before the propagation stamp is appended.
-        let tid = full_hash(&lxmf_data);
-        self.transient_id = Some(tid);
-
-        let mut stamp_value = 0;
-        if let Some(target_cost) = propagation_stamp_cost
-            && self.propagation_stamp.is_none()
-        {
-            let (stamp, value) = crate::stamper::generate_stamp(
-                &tid,
-                target_cost,
-                crate::constants::STAMP_WORKBLOCK_EXPAND_ROUNDS_PN,
-            )
-            .ok_or_else(|| {
-                MessageError::PackFailed("failed to generate propagation stamp".to_string())
-            })?;
-            self.propagation_stamp = Some(stamp);
-            stamp_value = value;
-        }
-
-        if let Some(ref prop_stamp) = self.propagation_stamp {
-            if stamp_value == 0 {
-                let workblock = crate::stamper::stamp_workblock(
-                    &tid,
-                    crate::constants::STAMP_WORKBLOCK_EXPAND_ROUNDS_PN,
-                );
-                stamp_value = crate::stamper::stamp_value(&workblock, prop_stamp);
-            }
-            lxmf_data.extend_from_slice(prop_stamp);
-        }
-
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64();
-        let entries: [&[u8]; 1] = [&lxmf_data];
-        let wrapper = PropagationWrapperRef {
-            timestamp: now,
-            entries: &entries,
-        };
-        let propagation_packed =
-            rmp_serde::to_vec(&wrapper).map_err(|e| MessageError::PackFailed(e.to_string()))?;
-
-        Ok((propagation_packed, tid, stamp_value))
-    }
-
-    /// Backward-compatible propagation pack when no destination identity is available. Produces
-    /// the same wire format as [`Self::pack`]; prefer [`Self::pack_propagated_encrypted`] when
-    /// encryption is possible.
-    pub fn pack_propagated(&self) -> Result<Vec<u8>, MessageError> {
-        self.pack()
     }
 
     /// Unpack a propagation wrapper `msgpack([timestamp, [lxmf_data, ...]])`, where each entry is
@@ -682,34 +601,31 @@ impl LxMessage {
         data: &[u8],
         max_transfer_bytes: usize,
     ) -> Result<(f64, Vec<Vec<u8>>), MessageError> {
-        if data.len() > max_transfer_bytes {
-            return Err(MessageError::UnpackFailed(format!(
-                "propagation wrapper: {} bytes exceeds transfer limit {}",
-                data.len(),
-                max_transfer_bytes
-            )));
-        }
+        let (timestamp, entries) = parse_propagation_wrapper(data, max_transfer_bytes)?;
+        Ok((
+            timestamp,
+            entries
+                .into_iter()
+                .map(std::borrow::Cow::into_owned)
+                .collect(),
+        ))
+    }
 
-        let (timestamp, entries) = Self::unpack_propagation_wrapper(data)?;
-
-        let max_entries = max_transfer_bytes / Self::MIN_PROPAGATION_ENTRY_SIZE;
-        if entries.len() > max_entries {
-            return Err(MessageError::UnpackFailed(format!(
-                "propagation wrapper: {} entries exceeds maximum {} for transfer limit",
-                entries.len(),
-                max_entries
-            )));
-        }
-        if let Some(undersized) = entries
-            .iter()
-            .position(|e| e.len() < Self::MIN_PROPAGATION_ENTRY_SIZE)
-        {
-            return Err(MessageError::UnpackFailed(format!(
-                "propagation wrapper: entry {} below minimum message size",
-                undersized
-            )));
-        }
-
+    /// Bounded propagation parsing that shares canonical binary entries with
+    /// the received wire image. Legacy arrays of bytes remain accepted, with
+    /// their length checked before allocating the decoded entry.
+    pub fn unpack_propagation_wrapper_owned(
+        data: Bytes,
+        max_transfer_bytes: usize,
+    ) -> Result<(f64, Vec<Bytes>), MessageError> {
+        let (timestamp, entries) = parse_propagation_wrapper(&data, max_transfer_bytes)?;
+        let entries = entries
+            .into_iter()
+            .map(|entry| match entry {
+                std::borrow::Cow::Borrowed(entry) => data.slice_ref(entry),
+                std::borrow::Cow::Owned(entry) => Bytes::from(entry),
+            })
+            .collect();
         Ok((timestamp, entries))
     }
 
@@ -720,356 +636,6 @@ impl LxMessage {
     /// before the stamp is appended.
     pub fn compute_propagation_transient_id(lxmf_data: &[u8]) -> PropagationTransientId {
         full_hash(lxmf_data)
-    }
-
-    /// Unpack a wire message: `dest_hash(16) + src_hash(16) + signature(64) + msgpack_payload`.
-    pub fn unpack(data: &[u8]) -> Result<Self, MessageError> {
-        let min_size = DESTINATION_LENGTH * 2 + SIGNATURE_LENGTH;
-        if data.len() < min_size + 1 {
-            return Err(MessageError::TooShort(data.len()));
-        }
-
-        let mut dest_hash = [0u8; 16];
-        dest_hash.copy_from_slice(&data[..16]);
-
-        let mut src_hash = [0u8; 16];
-        src_hash.copy_from_slice(&data[16..32]);
-
-        let mut signature = [0u8; 64];
-        signature.copy_from_slice(&data[32..96]);
-
-        let payload_data = &data[96..];
-        let payload = Self::unpack_payload_streamed(payload_data)?;
-
-        let hash = Self::message_id_from_payload(&dest_hash, &src_hash, payload_data);
-
-        let mut msg = Self {
-            destination_hash: dest_hash,
-            source_hash: src_hash,
-            title: payload.title,
-            content: payload.content,
-            fields: payload.fields,
-            msgpack_field_ids: payload.msgpack_field_ids,
-            timestamp: payload.timestamp,
-            signature: Some(signature),
-            signature_validated: false,
-            state: MessageState::Generating,
-            method: DeliveryMethod::Direct,
-            stamp: payload.stamp,
-            propagation_stamp: None,
-            ratchet_id: None,
-            delivery_attempts: 0,
-            last_delivery_attempt: 0.0,
-            next_delivery_attempt: 0.0,
-            hash: Some(hash),
-            message_id: Some(hash),
-            transient_id: None,
-            stamp_cost: None,
-            outbound_ticket: None,
-            include_ticket: false,
-            stamp_value: None,
-            unverified_reason: None,
-            representation: DeliveryRepresentation::Unknown,
-            transport_encrypted: false,
-            transport_encryption: None,
-            wire_payload: Some(payload_data.to_vec()),
-            incoming: true,
-            source_blackholed: false,
-            progress: 0.0,
-            auto_compress: true,
-            callbacks: MessageCallbacks::default(),
-        };
-
-        // Default to the message hash for direct messages. Propagation callers
-        // overwrite via [`compute_propagation_transient_id`].
-        msg.transient_id = Some(hash);
-
-        Ok(msg)
-    }
-
-    /// Parse the payload without constructing an owned `rmpv::Value` tree.
-    /// Complex field values are copied once from their exact encoded range;
-    /// large attachment bytes are never duplicated during structural decode.
-    fn unpack_payload_streamed(payload_data: &[u8]) -> Result<MessagePayload, MessageError> {
-        let mut input = payload_data;
-        let item_count = read_msgpack_array_len(&mut input)?;
-        if item_count < 4 {
-            return Err(MessageError::UnpackFailed(format!(
-                "payload array too short: {item_count}"
-            )));
-        }
-
-        let timestamp = read_msgpack_float(&mut input)?;
-        let title = read_msgpack_text_or_empty(&mut input)?;
-        let content = read_msgpack_text_or_empty(&mut input)?;
-
-        let mut fields = BTreeMap::new();
-        let mut msgpack_field_ids = BTreeSet::new();
-        if input
-            .first()
-            .is_some_and(|marker| msgpack_marker_is_map(*marker))
-        {
-            let field_count = read_msgpack_map_len(&mut input)?;
-            for _ in 0..field_count {
-                let key = read_msgpack_integer_u8(&mut input)?;
-                let value_bytes = if input
-                    .first()
-                    .is_some_and(|marker| matches!(*marker, 0xc4..=0xc6))
-                {
-                    read_msgpack_binary(&mut input)?.to_vec()
-                } else {
-                    let encoded = input;
-                    skip_msgpack_value(&mut input, 0)?;
-                    let consumed = encoded.len() - input.len();
-                    msgpack_field_ids.insert(key);
-                    encoded[..consumed].to_vec()
-                };
-                fields.insert(key, value_bytes);
-            }
-        } else {
-            skip_msgpack_value(&mut input, 0)?;
-        }
-
-        let stamp = if item_count > 4 {
-            match input.first().copied() {
-                Some(0xc4..=0xc6) => {
-                    let bytes = read_msgpack_binary(&mut input)?;
-                    (bytes.len() == TICKET_LENGTH || bytes.len() == 32).then(|| bytes.to_vec())
-                }
-                Some(0x90..=0x9f | 0xdc | 0xdd) => {
-                    let count = read_msgpack_array_len(&mut input)? as usize;
-                    if count == TICKET_LENGTH || count == 32 {
-                        let mut bytes = Vec::with_capacity(count);
-                        for _ in 0..count {
-                            bytes.push(read_msgpack_integer_u8(&mut input)?);
-                        }
-                        Some(bytes)
-                    } else {
-                        for _ in 0..count {
-                            skip_msgpack_value(&mut input, 0)?;
-                        }
-                        None
-                    }
-                }
-                Some(0xc0) => {
-                    take_msgpack(&mut input, 1)?;
-                    None
-                }
-                Some(_) => {
-                    skip_msgpack_value(&mut input, 0)?;
-                    None
-                }
-                None => {
-                    return Err(MessageError::UnpackFailed(
-                        "missing MessagePack stamp".to_string(),
-                    ));
-                }
-            }
-        } else {
-            None
-        };
-
-        Ok(MessagePayload {
-            timestamp,
-            title,
-            content,
-            fields,
-            msgpack_field_ids,
-            stamp,
-        })
-    }
-
-    /// Alias for [`Self::unpack`]; all formats share the same
-    /// `dest_hash + src_hash + sig + payload` layout.
-    pub fn unpack_propagated(data: &[u8]) -> Result<Self, MessageError> {
-        Self::unpack(data)
-    }
-
-    pub fn compute_hash(&mut self) -> Result<[u8; 32], MessageError> {
-        let payload = self.pack_payload_for_signing()?;
-        let hash =
-            Self::message_id_from_payload(&self.destination_hash, &self.source_hash, &payload);
-        self.hash = Some(hash);
-        self.message_id = Some(hash);
-        self.transient_id = Some(hash);
-        Ok(hash)
-    }
-
-    /// Sign the message with an identity's signing key.
-    ///
-    /// Signed blob: `dest_hash + src_hash + payload + SHA256(dest_hash + src_hash + payload)`
-    /// (Python LXMessage.py:380-383, shared with C++ ratcom/ratdeck).
-    pub fn sign(
-        &mut self,
-        signing_key: &rns_crypto::ed25519::Ed25519PrivateKey,
-    ) -> Result<(), MessageError> {
-        let (signed_data, message_hash) = self.signed_data_for_signing()?;
-
-        self.signature = Some(signing_key.sign(&signed_data));
-        self.hash = Some(message_hash);
-        self.message_id = Some(message_hash);
-        self.transient_id = Some(message_hash);
-        self.state = MessageState::Outbound;
-        Ok(())
-    }
-
-    /// Sign the message via an external signing function (hardware-identity variant of
-    /// [`Self::sign`]). The signed blob is the same as [`Self::sign`]; `sign_fn` must return a
-    /// 64-byte Ed25519 signature.
-    pub fn sign_with<F, E>(&mut self, sign_fn: F) -> Result<(), MessageError>
-    where
-        F: FnOnce(&[u8]) -> Result<[u8; 64], E>,
-        E: std::fmt::Display,
-    {
-        let (signed_data, message_hash) = self.signed_data_for_signing()?;
-
-        let signature = sign_fn(&signed_data)
-            .map_err(|e| MessageError::PackFailed(format!("signing failed: {e}")))?;
-
-        self.signature = Some(signature);
-        self.hash = Some(message_hash);
-        self.message_id = Some(message_hash);
-        self.transient_id = Some(message_hash);
-        self.state = MessageState::Outbound;
-        Ok(())
-    }
-
-    /// Verify the signature against `verify_key`. Signed blob matches [`Self::sign`].
-    pub fn verify(&mut self, verify_key: &rns_crypto::ed25519::Ed25519PublicKey) -> bool {
-        let sig = match self.signature {
-            Some(s) => s,
-            None => return false,
-        };
-
-        // Build the signed bytes once. Inbound wire payloads are borrowed and
-        // their fifth stamp element is omitted by slicing the first four
-        // encoded elements, avoiding an owned MessagePack value tree.
-        let payload_capacity = self
-            .wire_payload
-            .as_ref()
-            .map_or_else(|| self.packed_payload_len(None).unwrap_or(0), Vec::len);
-        let mut signed_data = Vec::with_capacity(64 + payload_capacity);
-        signed_data.extend_from_slice(&self.destination_hash);
-        signed_data.extend_from_slice(&self.source_hash);
-        if let Some(wire_payload) = self.wire_payload.as_deref() {
-            if let Some(body) = first_four_msgpack_array_body(wire_payload) {
-                signed_data.push(0x94);
-                signed_data.extend_from_slice(body);
-            } else {
-                signed_data.extend_from_slice(wire_payload);
-            }
-        } else if self.write_payload(&mut signed_data, None).is_err() {
-            return false;
-        }
-        let message_hash = sha256(&signed_data);
-        signed_data.extend_from_slice(&message_hash);
-
-        let valid = verify_key.verify(&signed_data, &sig).is_ok();
-        self.signature_validated = valid;
-        if valid {
-            // Fields now own the canonical values needed by the application;
-            // the full duplicate wire payload is no longer needed.
-            self.wire_payload = None;
-        }
-        valid
-    }
-
-    /// Generate or retrieve the PoW stamp for this message.
-    ///
-    /// Priority:
-    /// 1. If an outbound ticket is set, derive a ticket-based stamp
-    ///    `stamp = truncated_hash(ticket || message_id)`.
-    /// 2. If no [`stamp_cost`](Self::stamp_cost) is set, no stamp is needed.
-    /// 3. If a stamp is already cached, return it.
-    /// 4. Otherwise, generate a PoW stamp matching the required cost.
-    ///
-    /// Python reference: LXMessage.py:301-332.
-    pub fn get_stamp(&mut self) -> Option<Vec<u8>> {
-        if let (Some(ticket), Some(message_id)) = (self.outbound_ticket, self.message_id) {
-            let mut material = Vec::with_capacity(TICKET_LENGTH + 32);
-            material.extend_from_slice(&ticket);
-            material.extend_from_slice(&message_id);
-            let hash = truncated_hash(&material).to_vec();
-            self.stamp_value = Some(COST_TICKET);
-            self.stamp = Some(hash.clone());
-            return Some(hash);
-        }
-
-        // 2. No stamp cost required
-        if self.stamp_cost.is_none() {
-            self.stamp_value = None;
-            return None;
-        }
-
-        // 3. Stamp already generated
-        if let Some(stamp) = self.stamp.as_ref() {
-            return Some(stamp.clone());
-        }
-
-        // 4. Generate PoW stamp
-        let cost = self.stamp_cost.unwrap();
-        if let Some(message_id) = self.message_id
-            && let Some((stamp, value)) =
-                crate::stamper::generate_stamp(&message_id, cost, STAMP_WORKBLOCK_EXPAND_ROUNDS)
-        {
-            self.stamp_value = Some(value as u16);
-            self.stamp = Some(stamp.to_vec());
-            return Some(stamp.to_vec());
-        }
-
-        None
-    }
-
-    /// Validate a stamp on this message.
-    ///
-    /// Python reference: LXMessage.py:278-299
-    ///
-    /// Priority order:
-    ///   1. Check against tickets first: `stamp == truncated_hash(ticket + message_id)`
-    ///   2. If no ticket match, validate as PoW stamp
-    pub fn validate_stamp_with_tickets(
-        &mut self,
-        target_cost: u8,
-        tickets: Option<&[Vec<u8>]>,
-    ) -> bool {
-        let message_id = match self.message_id.or(self.hash) {
-            Some(id) => id,
-            None => return false,
-        };
-
-        // A missing stamp can never match a ticket hash or a PoW workblock,
-        // so it is always invalid (Python `validate_stamp`: the ticket loop
-        // compares `self.stamp == hash`, which is False when stamp is None,
-        // then `if self.stamp == None: return False`).
-        let stamp = match self.stamp.as_deref() {
-            Some(s) => s,
-            None => return false,
-        };
-
-        // Ticket-based stamps take precedence over PoW.
-        if let Some(ticket_list) = tickets {
-            for ticket in ticket_list {
-                let mut material = Vec::with_capacity(ticket.len() + 32);
-                material.extend_from_slice(ticket);
-                material.extend_from_slice(&message_id);
-                let expected = truncated_hash(&material);
-                if stamp == expected.as_ref() {
-                    self.stamp_value = Some(COST_TICKET);
-                    return true;
-                }
-            }
-        }
-
-        let Ok(stamp) = <&[u8; 32]>::try_from(stamp) else {
-            return false;
-        };
-        let workblock = crate::stamper::stamp_workblock(&message_id, STAMP_WORKBLOCK_EXPAND_ROUNDS);
-        if crate::stamper::stamp_valid(stamp, target_cost, &workblock) {
-            self.stamp_value = Some(crate::stamper::stamp_value(&workblock, stamp) as u16);
-            return true;
-        }
-
-        false
     }
 
     pub fn cancel(&mut self) {
@@ -1122,7 +688,7 @@ impl LxMessage {
             ));
         }
 
-        let packed = self.pack()?;
+        let packed = self.wire_bytes();
         let encrypted = encrypt_fn(&packed[DESTINATION_LENGTH..])?;
         let mut paper_packed = Vec::with_capacity(DESTINATION_LENGTH + encrypted.len());
         paper_packed.extend_from_slice(&packed[..DESTINATION_LENGTH]);
@@ -1199,12 +765,11 @@ impl LxMessage {
     /// Layout is a msgpack map `{state: u8, lxmf_bytes: bin, transport_encrypted: bool,
     /// transport_encryption: str?, method: u8}`.
     pub fn pack_container(&self) -> Result<Vec<u8>, MessageError> {
-        let packed = self.pack()?;
-        let container = MessageContainer {
+        let container = MessageContainerRef {
             state: self.state as u8,
-            lxmf_bytes: packed,
+            lxmf_bytes: self.wire_bytes(),
             transport_encrypted: self.transport_encrypted,
-            transport_encryption: self.transport_encryption.clone(),
+            transport_encryption: self.transport_encryption.as_deref(),
             method: self.method as u8,
         };
         rmp_serde::to_vec(&container).map_err(|e| MessageError::PackFailed(e.to_string()))
@@ -1212,10 +777,16 @@ impl LxMessage {
 
     /// Unpack a message from a container (Python parity: `unpack_from_file` in LXMessage.py).
     pub fn unpack_container(data: &[u8]) -> Result<Self, MessageError> {
+        if data.len() > MessageDecodeLimits::default().max_wire_bytes + 65_536 {
+            return Err(MessageError::UnpackFailed(
+                "container exceeds size limit".into(),
+            ));
+        }
         let container: MessageContainer =
             rmp_serde::from_slice(data).map_err(|e| MessageError::UnpackFailed(e.to_string()))?;
 
-        let mut msg = Self::unpack(&container.lxmf_bytes)?;
+        let mut msg =
+            Self::unpack_owned(container.lxmf_bytes.into(), MessageDecodeLimits::default())?;
 
         msg.state = match container.state {
             0x00 => MessageState::Generating,
@@ -1252,7 +823,7 @@ impl LxMessage {
     /// message are already exclusive-borrow serialized or hit unique tmp
     /// files, with the rename as the atomic last-writer-wins step.
     pub fn write_to_directory(&self, directory_path: &str) -> Result<String, MessageError> {
-        let hash = self.hash.ok_or(MessageError::NotSigned)?;
+        let hash = self.message_id();
         let file_name = rns_crypto::hex_encode(&hash);
         let file_path = format!("{directory_path}/{file_name}");
 
@@ -1265,10 +836,89 @@ impl LxMessage {
 
     /// Read a message from a container file (Python parity: `unpack_from_file`).
     pub fn read_from_file(file_path: &str) -> Result<Self, MessageError> {
-        let data = std::fs::read(file_path)
+        use std::io::Read;
+        let file = std::fs::File::open(file_path)
             .map_err(|e| MessageError::UnpackFailed(format!("read failed: {e}")))?;
-        Self::unpack_container(&data)
+        let maximum = MessageDecodeLimits::default().max_wire_bytes + 65_536;
+        let mut data = Vec::new();
+        file.take((maximum + 1) as u64)
+            .read_to_end(&mut data)
+            .map_err(|e| MessageError::UnpackFailed(format!("read failed: {e}")))?;
+        let message = Self::unpack_container(&data)?;
+        if let Some(name) = std::path::Path::new(file_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            && name.len() == 64
+            && name.bytes().all(|b| b.is_ascii_hexdigit())
+            && !name.eq_ignore_ascii_case(&hex::encode(message.message_id()))
+        {
+            return Err(MessageError::HistoricalHashMismatch);
+        }
+        Ok(message)
     }
+}
+
+type ParsedPropagationWrapper<'a> = (f64, Vec<std::borrow::Cow<'a, [u8]>>);
+
+fn parse_propagation_wrapper(
+    data: &[u8],
+    max_transfer_bytes: usize,
+) -> Result<ParsedPropagationWrapper<'_>, MessageError> {
+    let invalid =
+        |reason: &str| MessageError::UnpackFailed(format!("propagation wrapper: {reason}"));
+    if data.len() > max_transfer_bytes {
+        return Err(invalid("wire image exceeds transfer limit"));
+    }
+    let mut input = data;
+    if read_msgpack_array_len(&mut input)? != 2 {
+        return Err(invalid("expected timestamp and entries"));
+    }
+    let timestamp = if matches!(input.first(), Some(0xca | 0xcb)) {
+        read_msgpack_float(&mut input)?
+    } else {
+        read_msgpack_integer(&mut input)? as f64
+    };
+    let count = usize::try_from(read_msgpack_array_len(&mut input)?)
+        .map_err(|_| invalid("entry count overflow"))?;
+    // Each accepted entry must be present in this image and meet the size
+    // floor. Refuse forged array lengths before reserving the entry index.
+    let maximum = input.len().min(max_transfer_bytes) / LxMessage::MIN_PROPAGATION_ENTRY_SIZE;
+    if count > maximum {
+        return Err(invalid("entry count exceeds possible transfer size"));
+    }
+    let mut entries = Vec::new();
+    entries
+        .try_reserve_exact(count)
+        .map_err(|_| invalid("entry index allocation failed"))?;
+    for _ in 0..count {
+        let entry = if matches!(input.first(), Some(0xc4..=0xc6)) {
+            std::borrow::Cow::Borrowed(read_msgpack_binary(&mut input)?)
+        } else {
+            let len = usize::try_from(read_msgpack_array_len(&mut input)?)
+                .map_err(|_| invalid("entry length overflow"))?;
+            if len < LxMessage::MIN_PROPAGATION_ENTRY_SIZE || len > input.len() {
+                return Err(invalid("invalid legacy byte-array length"));
+            }
+            let mut decoded = Vec::new();
+            decoded
+                .try_reserve_exact(len)
+                .map_err(|_| invalid("entry allocation failed"))?;
+            for _ in 0..len {
+                decoded.push(read_msgpack_integer_u8_strict(&mut input)?);
+            }
+            std::borrow::Cow::Owned(decoded)
+        };
+        if entry.len() < LxMessage::MIN_PROPAGATION_ENTRY_SIZE {
+            return Err(invalid("entry below minimum message size"));
+        }
+        entries.push(entry);
+    }
+    // rmp-serde's historical convenience API permits trailing bytes. The
+    // bounded ingress API requires one complete wrapper, without hidden data.
+    if !input.is_empty() {
+        return Err(invalid("trailing wrapper data"));
+    }
+    Ok((timestamp, entries))
 }
 
 fn read_msgpack_array_len(input: &mut &[u8]) -> Result<u32, MessageError> {
@@ -1366,17 +1016,6 @@ fn read_msgpack_float(input: &mut &[u8]) -> Result<f64, MessageError> {
     }
 }
 
-fn read_msgpack_text_or_empty(input: &mut &[u8]) -> Result<String, MessageError> {
-    if input
-        .first()
-        .is_some_and(|marker| matches!(*marker, 0xa0..=0xbf | 0xc4..=0xc6 | 0xd9..=0xdb))
-    {
-        return Ok(String::from_utf8_lossy(read_msgpack_string_or_binary(input)?).into_owned());
-    }
-    skip_msgpack_value(input, 0)?;
-    Ok(String::new())
-}
-
 const fn msgpack_marker_is_map(marker: u8) -> bool {
     matches!(marker, 0x80..=0x8f | 0xde | 0xdf)
 }
@@ -1396,46 +1035,7 @@ fn read_msgpack_map_len(input: &mut &[u8]) -> Result<u32, MessageError> {
     }
 }
 
-fn read_msgpack_integer_u8(input: &mut &[u8]) -> Result<u8, MessageError> {
-    let marker = take_msgpack(input, 1)?[0];
-    let value = match marker {
-        0x00..=0x7f => u64::from(marker),
-        0xe0..=0xff => i64::from(marker as i8) as u64,
-        0xcc => u64::from(take_msgpack(input, 1)?[0]),
-        0xcd => u64::from(u16::from_be_bytes(
-            take_msgpack(input, 2)?.try_into().expect("exact length"),
-        )),
-        0xce => u64::from(u32::from_be_bytes(
-            take_msgpack(input, 4)?.try_into().expect("exact length"),
-        )),
-        0xcf => u64::from_be_bytes(take_msgpack(input, 8)?.try_into().expect("exact length")),
-        0xd0 => i64::from(i8::from_be_bytes(
-            take_msgpack(input, 1)?.try_into().expect("exact length"),
-        )) as u64,
-        0xd1 => i64::from(i16::from_be_bytes(
-            take_msgpack(input, 2)?.try_into().expect("exact length"),
-        )) as u64,
-        0xd2 => i64::from(i32::from_be_bytes(
-            take_msgpack(input, 4)?.try_into().expect("exact length"),
-        )) as u64,
-        0xd3 => {
-            i64::from_be_bytes(take_msgpack(input, 8)?.try_into().expect("exact length")) as u64
-        }
-        _ => {
-            return Err(MessageError::UnpackFailed(
-                "expected MessagePack integer".to_string(),
-            ));
-        }
-    };
-    Ok(value as u8)
-}
-
-/// Read any MessagePack integer representation whose value is in `0..=255`.
-///
-/// The general payload decoder retains its historical narrowing behaviour in
-/// `read_msgpack_integer_u8`; native audio modes need strict range validation
-/// so malformed or future wider values cannot alias a known `AM_*` mode.
-fn read_msgpack_integer_u8_strict(input: &mut &[u8]) -> Result<u8, MessageError> {
+fn read_msgpack_integer(input: &mut &[u8]) -> Result<i128, MessageError> {
     let marker = take_msgpack(input, 1)?[0];
     let value = match marker {
         0x00..=0x7f => i128::from(marker),
@@ -1464,15 +1064,16 @@ fn read_msgpack_integer_u8_strict(input: &mut &[u8]) -> Result<u8, MessageError>
         )),
         _ => {
             return Err(MessageError::UnpackFailed(
-                "audio mode is not a MessagePack integer".to_string(),
+                "expected MessagePack integer".to_string(),
             ));
         }
     };
-    u8::try_from(value).map_err(|_| {
-        MessageError::UnpackFailed("audio mode is outside the range 0..=255".to_string())
-    })
+    Ok(value)
 }
 
+fn read_msgpack_integer_u8_strict(input: &mut &[u8]) -> Result<u8, MessageError> {
+    u8::try_from(read_msgpack_integer(input)?).map_err(|_| MessageError::InvalidByte)
+}
 fn skip_msgpack_value(input: &mut &[u8], depth: usize) -> Result<(), MessageError> {
     if depth >= 64 {
         return Err(MessageError::UnpackFailed(
@@ -1601,6 +1202,16 @@ fn skip_msgpack_values(input: &mut &[u8], depth: usize, count: u32) -> Result<()
         skip_msgpack_value(input, depth + 1)?;
     }
     Ok(())
+}
+
+#[derive(Serialize)]
+struct MessageContainerRef<'a> {
+    state: u8,
+    #[serde(serialize_with = "serialize_bytes")]
+    lxmf_bytes: &'a [u8],
+    transport_encrypted: bool,
+    transport_encryption: Option<&'a str>,
+    method: u8,
 }
 
 /// Container format for on-disk message storage. Python parity: `packed_container` dict.
@@ -1773,11 +1384,13 @@ impl serde::Serialize for FileAttachmentsFieldRef<'_> {
     }
 }
 
+#[cfg(test)]
 struct PropagationWrapperRef<'a> {
     timestamp: f64,
     entries: &'a [&'a [u8]],
 }
 
+#[cfg(test)]
 impl serde::Serialize for PropagationWrapperRef<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeTuple;
@@ -1788,8 +1401,10 @@ impl serde::Serialize for PropagationWrapperRef<'_> {
     }
 }
 
+#[cfg(test)]
 struct PropagationEntriesRef<'a>(&'a [&'a [u8]]);
 
+#[cfg(test)]
 impl serde::Serialize for PropagationEntriesRef<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeSeq;
@@ -1801,8 +1416,7 @@ impl serde::Serialize for PropagationEntriesRef<'_> {
     }
 }
 
-/// Msgpack payload. Title and content serialize as `bin` (not `str`) to match Python's
-/// `msgpack.packb(bytes_obj)` and C++'s `mpPackBin()`.
+/// Semantic DTO for explicitly constructing payloads, never an archival authority.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessagePayload {
     pub timestamp: f64,
@@ -1816,10 +1430,8 @@ pub struct MessagePayload {
         deserialize_with = "deserialize_bin_or_str"
     )]
     pub content: String,
-    #[serde(with = "field_map_serde")]
-    pub fields: BTreeMap<u8, Vec<u8>>,
-    #[serde(skip)]
-    pub msgpack_field_ids: BTreeSet<u8>,
+    #[serde(with = "field::map_serde")]
+    pub fields: BTreeMap<FieldId, FieldValue>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -1828,7 +1440,6 @@ pub struct MessagePayload {
     )]
     pub stamp: Option<Vec<u8>>,
 }
-
 fn serialize_as_bin<S: serde::Serializer>(s: &String, serializer: S) -> Result<S::Ok, S::Error> {
     serializer.serialize_bytes(s.as_bytes())
 }
@@ -1853,79 +1464,27 @@ fn deserialize_bin_or_str<'de, D: serde::Deserializer<'de>>(
     deserializer.deserialize_any(BinOrStrVisitor)
 }
 
-/// Custom serde for `BTreeMap<u8, Vec<u8>>` so field values serialize as msgpack `bin` rather
-/// than arrays of ints, matching Python's `msgpack.packb(bytes_obj)`.
-mod field_map_serde {
-    use super::*;
-    use serde::de::{self, MapAccess, Visitor};
-    use serde::ser::SerializeMap;
-    use serde::{Deserializer, Serializer};
-    use std::fmt;
-
-    struct BytesWrapper<'a>(&'a [u8]);
-
-    impl serde::Serialize for BytesWrapper<'_> {
-        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-            serializer.serialize_bytes(self.0)
-        }
-    }
-
-    pub fn serialize<S>(map: &BTreeMap<u8, Vec<u8>>, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let mut m = serializer.serialize_map(Some(map.len()))?;
-        for (k, v) in map {
-            m.serialize_entry(k, &BytesWrapper(v))?;
-        }
-        m.end()
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<BTreeMap<u8, Vec<u8>>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        struct FieldMapVisitor;
-
-        impl<'de> Visitor<'de> for FieldMapVisitor {
-            type Value = BTreeMap<u8, Vec<u8>>;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-                formatter.write_str("a map with u8 keys and byte values")
-            }
-
-            fn visit_map<M>(self, mut access: M) -> Result<Self::Value, M::Error>
-            where
-                M: MapAccess<'de>,
-            {
-                const MAX_FIELD_SIZE: usize = 256 * 1024; // 256 KiB per field
-                const MAX_TOTAL_FIELDS_SIZE: usize = 1024 * 1024; // 1 MiB total
-
-                let mut map = BTreeMap::new();
-                let mut total_size = 0usize;
-                while let Some((key, value)) = access
-                    .next_entry::<u8, Vec<u8>>()
-                    .map_err(de::Error::custom)?
-                {
-                    if value.len() > MAX_FIELD_SIZE {
-                        return Err(de::Error::custom("field exceeds maximum size"));
-                    }
-                    total_size += value.len();
-                    if total_size > MAX_TOTAL_FIELDS_SIZE {
-                        return Err(de::Error::custom("total fields size exceeds maximum"));
-                    }
-                    map.insert(key, value);
-                }
-                Ok(map)
-            }
-        }
-
-        deserializer.deserialize_map(FieldMapVisitor)
-    }
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum MessageError {
+    #[error("stored message hash differs from its historical filename; original retained")]
+    HistoricalHashMismatch,
+    #[error("reply ticket has not been durably committed")]
+    TicketNotCommitted,
+    #[error("message exceeds local profile: {size} > {limit}")]
+    TooLarge { size: usize, limit: usize },
+    #[error("too many LXMF fields")]
+    TooManyFields,
+    #[error("field ID outside MessagePack integer domain")]
+    InvalidFieldId,
+    #[error("duplicate LXMF field ID")]
+    DuplicateField,
+    #[error("integer outside byte range")]
+    InvalidByte,
+    #[error("invalid message signature")]
+    InvalidSignature,
+    #[error("public key does not bind claimed source")]
+    SourceMismatch,
+
     #[error("message too short: {0} bytes")]
     TooShort(usize),
     #[error("pack failed: {0}")]
@@ -1938,1253 +1497,71 @@ pub enum MessageError {
     InvalidUri(String),
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_new_message() {
-        let msg = LxMessage::new(
-            [0xAA; 16],
-            [0xBB; 16],
-            "Hello",
-            "World",
-            DeliveryMethod::Direct,
-        );
-        assert_eq!(msg.state, MessageState::Generating);
-        assert_eq!(msg.method, DeliveryMethod::Direct);
-        assert!(msg.timestamp > 0.0);
-        assert!(msg.signature.is_none());
-        assert!(!msg.signature_validated);
-        // Mirror Python LXMessage.py:145 default.
-        assert!(msg.auto_compress);
+fn read_text_range(wire: &[u8], input: &mut &[u8]) -> Result<Range<usize>, MessageError> {
+    if input
+        .first()
+        .is_some_and(|marker| matches!(*marker,0xa0..=0xbf|0xc4..=0xc6|0xd9..=0xdb))
+    {
+        let bytes = read_msgpack_string_or_binary(input)?;
+        let start = bytes.as_ptr() as usize - wire.as_ptr() as usize;
+        Ok(start..start + bytes.len())
+    } else {
+        skip_msgpack_value(input, 0)?;
+        Ok(0..0)
     }
-
-    #[test]
-    fn test_register_delivery_callback() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        let mut msg = LxMessage::new([0xAA; 16], [0xBB; 16], "t", "c", DeliveryMethod::Direct);
-        let delivered = Arc::new(AtomicBool::new(false));
-        let delivered_clone = delivered.clone();
-        msg.register_delivery_callback(move |_m| {
-            delivered_clone.store(true, Ordering::Relaxed);
-        });
-
-        msg.mark_delivered();
-        assert_eq!(msg.state, MessageState::Delivered);
-        assert!(delivered.load(Ordering::Relaxed));
-    }
-
-    #[test]
-    fn test_register_failed_callback() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        let mut msg = LxMessage::new([0xAA; 16], [0xBB; 16], "t", "c", DeliveryMethod::Direct);
-        let failed = Arc::new(AtomicBool::new(false));
-        let failed_clone = failed.clone();
-        msg.register_failed_callback(move |_m| {
-            failed_clone.store(true, Ordering::Relaxed);
-        });
-
-        msg.mark_failed();
-        assert_eq!(msg.state, MessageState::Failed);
-        assert!(failed.load(Ordering::Relaxed));
-    }
-
-    #[test]
-    fn test_determine_compression_support() {
-        let mut msg = LxMessage::new([0xAA; 16], [0xBB; 16], "t", "c", DeliveryMethod::Direct);
-
-        let supported = {
-            use rmpv::Value;
-            let arr = Value::Array(vec![
-                Value::Binary(b"Peer".to_vec()),
-                Value::from(8u64),
-                Value::Array(vec![Value::from(crate::constants::SF_COMPRESSION as u64)]),
-            ]);
-            crate::encode_value(&arr)
-        };
-        msg.determine_compression_support(Some(&supported));
-        assert!(msg.auto_compress);
-
-        // Explicit feature list omitting SF_COMPRESSION disables compression.
-        let no_compression = {
-            use rmpv::Value;
-            let arr = Value::Array(vec![
-                Value::Binary(b"Peer".to_vec()),
-                Value::from(8u64),
-                Value::Array(vec![]),
-            ]);
-            crate::encode_value(&arr)
-        };
-        msg.determine_compression_support(Some(&no_compression));
-        assert!(!msg.auto_compress);
-
-        // Legacy <=0.9.8 2-element announce has no feature list — fail-open
-        // (Python compression_support_from_app_data returns True, LXMF.py:160).
-        let python_098 = {
-            use rmpv::Value;
-            let arr = Value::Array(vec![Value::Binary(b"Peer".to_vec()), Value::from(8u64)]);
-            crate::encode_value(&arr)
-        };
-        msg.determine_compression_support(Some(&python_098));
-        assert!(msg.auto_compress);
-
-        // No peer data at all — defaults to compression on (LXMessage.py:513).
-        msg.auto_compress = false;
-        msg.determine_compression_support(None);
-        assert!(msg.auto_compress);
-    }
-
-    #[test]
-    fn test_source_blackholed_defaults_false() {
-        // LXMessage.py:172 — source_blackholed initialises false; embedders
-        // flip it from the transport blackhole tables after unpacking.
-        let msg = LxMessage::new([0xAA; 16], [0xBB; 16], "t", "c", DeliveryMethod::Direct);
-        assert!(!msg.source_blackholed);
-
-        let mut outbound = LxMessage::new(
-            [0xAA; 16],
-            [0xBB; 16],
-            "Title",
-            "Content",
-            DeliveryMethod::Direct,
-        );
-        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
-        outbound.sign(&key).unwrap();
-        let packed = outbound.pack().unwrap();
-        let unpacked = LxMessage::unpack(&packed).unwrap();
-        assert!(!unpacked.source_blackholed);
-    }
-
-    #[test]
-    fn test_pack_payload() {
-        let msg = LxMessage::new(
-            [0xAA; 16],
-            [0xBB; 16],
-            "Test",
-            "Content",
-            DeliveryMethod::Direct,
-        );
-        let payload = msg.pack_payload().unwrap();
-        assert!(!payload.is_empty());
-    }
-
-    #[test]
-    fn test_streamed_payload_byte_identical_to_owned() {
-        // The direct writer must produce the same bytes as the serde model for
-        // every ordinary-field stamp variant the protocol emits.
-        let mut fields = BTreeMap::new();
-        fields.insert(FIELD_IMAGE, b"\x00\x01\x02\x03".to_vec());
-        fields.insert(FIELD_AUDIO, b"audio-bytes".to_vec());
-
-        let cases = [None, Some(vec![0xAB; 32]), Some(vec![0xCD; TICKET_LENGTH])];
-        for stamp in cases.iter() {
-            let owned = MessagePayload {
-                timestamp: 1700000000.0,
-                title: "title".to_string(),
-                content: "content body \u{1F600}".to_string(),
-                fields: fields.clone(),
-                msgpack_field_ids: BTreeSet::new(),
-                stamp: stamp.clone(),
-            };
-            let owned_bytes = rmp_serde::to_vec(&owned).unwrap();
-            let mut message = LxMessage::new(
-                [0xAA; 16],
-                [0xBB; 16],
-                "title",
-                "content body \u{1F600}",
-                DeliveryMethod::Direct,
-            );
-            message.timestamp = 1700000000.0;
-            message.fields = fields.clone();
-            message.stamp = stamp.clone();
-            let streamed_bytes = message.pack_payload().unwrap();
-            assert_eq!(
-                owned_bytes,
-                streamed_bytes,
-                "streamed serializer drifted for stamp={:?}",
-                stamp.is_some()
-            );
-        }
-    }
-
-    #[test]
-    fn test_sign_and_verify() {
-        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
-        let pub_key = key.public_key();
-
-        let mut msg = LxMessage::new(
-            [0xAA; 16],
-            [0xBB; 16],
-            "Signed Message",
-            "Content here",
-            DeliveryMethod::Direct,
-        );
-
-        msg.sign(&key).unwrap();
-        assert!(msg.signature.is_some());
-        assert_eq!(msg.state, MessageState::Outbound);
-
-        assert!(msg.verify(&pub_key));
-        assert!(msg.signature_validated);
-    }
-
-    #[test]
-    fn test_sign_verify_wrong_key() {
-        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
-        let wrong_key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
-        let wrong_pub = wrong_key.public_key();
-
-        let mut msg = LxMessage::new(
-            [0xAA; 16],
-            [0xBB; 16],
-            "Test",
-            "Content",
-            DeliveryMethod::Direct,
-        );
-        msg.sign(&key).unwrap();
-        assert!(!msg.verify(&wrong_pub));
-    }
-
-    #[test]
-    fn test_pack_unpack_roundtrip() {
-        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
-
-        let mut msg = LxMessage::new(
-            [0xAA; 16],
-            [0xBB; 16],
-            "Round Trip",
-            "Full content test",
-            DeliveryMethod::Direct,
-        );
-        msg.sign(&key).unwrap();
-
-        let packed = msg.pack().unwrap();
-        assert!(packed.len() > 96);
-        let unpacked = LxMessage::unpack(&packed).unwrap();
-
-        assert_eq!(unpacked.destination_hash, msg.destination_hash);
-        assert_eq!(unpacked.source_hash, msg.source_hash);
-        assert_eq!(unpacked.title, msg.title);
-        assert_eq!(unpacked.content, msg.content);
-        assert_eq!(unpacked.signature, msg.signature);
-        assert!(unpacked.hash.is_some());
-        assert!(unpacked.transient_id.is_some());
-    }
-
-    #[test]
-    fn test_pack_propagated_unpack_roundtrip() {
-        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
-
-        let mut msg = LxMessage::new(
-            [0xAA; 16],
-            [0xBB; 16],
-            "Propagated Round Trip",
-            "Full content test",
-            DeliveryMethod::Propagated,
-        );
-        msg.sign(&key).unwrap();
-
-        let packed = msg.pack_propagated().unwrap();
-        let unpacked = LxMessage::unpack_propagated(&packed).unwrap();
-
-        assert_eq!(unpacked.destination_hash, [0xAA; 16]);
-        assert_eq!(unpacked.source_hash, [0xBB; 16]);
-        assert_eq!(unpacked.title, msg.title);
-        assert_eq!(unpacked.content, msg.content);
-    }
-
-    #[test]
-    fn test_fields() {
-        let mut msg = LxMessage::new([0; 16], [0; 16], "", "", DeliveryMethod::Direct);
-        msg.set_field(FIELD_IMAGE, vec![1, 2, 3]);
-        assert_eq!(msg.get_field(FIELD_IMAGE), Some(&vec![1, 2, 3]));
-        assert_eq!(msg.get_field(FIELD_AUDIO), None);
-    }
-
-    #[test]
-    fn test_msgpack_field_serializes_as_native_value() {
-        use std::io::Cursor;
-
-        let image_value = rmpv::Value::Array(vec![
-            rmpv::Value::String("png".into()),
-            rmpv::Value::Binary(vec![0x89, b'P', b'N', b'G']),
-        ]);
-        let mut image_bytes = Vec::new();
-        rmpv::encode::write_value(&mut image_bytes, &image_value).unwrap();
-
-        let mut msg = LxMessage::new(
-            [0x11; 16],
-            [0x22; 16],
-            "Image",
-            "Has image",
-            DeliveryMethod::Direct,
-        );
-        msg.set_msgpack_field(FIELD_IMAGE, image_bytes.clone())
-            .unwrap();
-
-        let payload = msg.pack_payload().unwrap();
-        let value = rmpv::decode::read_value(&mut Cursor::new(&payload)).unwrap();
-        let arr = value.as_array().unwrap();
-        let fields = arr[3].as_map().unwrap();
-        let (_, field_value) = fields
-            .iter()
-            .find(|(k, _)| k.as_u64() == Some(FIELD_IMAGE as u64))
-            .expect("FIELD_IMAGE present");
-        assert!(
-            field_value.as_array().is_some(),
-            "FIELD_IMAGE must be an LXMF array value, not a bin-wrapped msgpack blob"
-        );
-
-        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
-        msg.sign(&key).unwrap();
-        let packed = msg.pack().unwrap();
-        let unpacked = LxMessage::unpack(&packed).unwrap();
-        assert_eq!(unpacked.get_field(FIELD_IMAGE), Some(&image_bytes));
-        assert!(unpacked.msgpack_field_ids.contains(&FIELD_IMAGE));
-    }
-
-    #[test]
-    fn test_file_attachment_field_serializes_as_native_lxmf_shape() {
-        use std::io::Cursor;
-
-        let attachment_value = rmpv::Value::Array(vec![rmpv::Value::Array(vec![
-            rmpv::Value::String("note.txt".into()),
-            rmpv::Value::Binary(b"hello".to_vec()),
-        ])]);
-        let mut attachment_bytes = Vec::new();
-        rmpv::encode::write_value(&mut attachment_bytes, &attachment_value).unwrap();
-
-        let mut msg = LxMessage::new(
-            [0x11; 16],
-            [0x22; 16],
-            "File",
-            "Has file",
-            DeliveryMethod::Direct,
-        );
-        msg.set_msgpack_field(FIELD_FILE_ATTACHMENTS, attachment_bytes.clone())
-            .unwrap();
-
-        let payload = msg.pack_payload().unwrap();
-        let value = rmpv::decode::read_value(&mut Cursor::new(&payload)).unwrap();
-        let arr = value.as_array().unwrap();
-        let fields = arr[3].as_map().unwrap();
-        let (_, field_value) = fields
-            .iter()
-            .find(|(k, _)| k.as_u64() == Some(FIELD_FILE_ATTACHMENTS as u64))
-            .expect("FIELD_FILE_ATTACHMENTS present");
-        let attachment = field_value.as_array().unwrap()[0].as_array().unwrap();
-        assert_eq!(attachment[0].as_str(), Some("note.txt"));
-        assert_eq!(attachment[1].as_slice(), Some(&b"hello"[..]));
-
-        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
-        msg.sign(&key).unwrap();
-        let packed = msg.pack().unwrap();
-        let unpacked = LxMessage::unpack(&packed).unwrap();
-        assert_eq!(
-            unpacked.get_field(FIELD_FILE_ATTACHMENTS),
-            Some(&attachment_bytes)
-        );
-        assert!(unpacked.msgpack_field_ids.contains(&FIELD_FILE_ATTACHMENTS));
-    }
-
-    #[test]
-    fn typed_image_field_matches_existing_msgpack_wire_value() {
-        let image_bytes = [0x89, b'P', b'N', b'G'];
-        let expected_value = rmpv::Value::Array(vec![
-            rmpv::Value::String("png".into()),
-            rmpv::Value::Binary(image_bytes.to_vec()),
-        ]);
-        let mut expected = Vec::new();
-        rmpv::encode::write_value(&mut expected, &expected_value).unwrap();
-
-        let mut msg = LxMessage::new([0; 16], [0; 16], "", "", DeliveryMethod::Direct);
-        msg.set_image_field("png", &image_bytes).unwrap();
-
-        assert_eq!(msg.get_field(FIELD_IMAGE), Some(&expected));
-        assert!(msg.msgpack_field_ids.contains(&FIELD_IMAGE));
-    }
-
-    #[test]
-    fn typed_audio_field_has_exact_native_wire_value_and_borrows_bytes() {
-        let audio_bytes = [0x4f, 0x67, 0x67, 0x53];
-        let expected = vec![
-            0x92,
-            AM_OPUS_OGG,
-            0xc4,
-            audio_bytes.len() as u8,
-            audio_bytes[0],
-            audio_bytes[1],
-            audio_bytes[2],
-            audio_bytes[3],
-        ];
-
-        let mut msg = LxMessage::new([0; 16], [0; 16], "", "", DeliveryMethod::Direct);
-        msg.set_audio_field(AM_OPUS_OGG, &audio_bytes).unwrap();
-
-        assert_eq!(msg.get_field(FIELD_AUDIO), Some(&expected));
-        assert!(msg.msgpack_field_ids.contains(&FIELD_AUDIO));
-        assert!(!msg.fields.contains_key(&FIELD_FILE_ATTACHMENTS));
-
-        let encoded = msg.get_field(FIELD_AUDIO).unwrap();
-        let encoded_start = encoded.as_ptr() as usize;
-        let encoded_end = encoded_start + encoded.len();
-        let audio = msg.audio_field().unwrap().unwrap();
-        assert_eq!(audio.mode, AM_OPUS_OGG);
-        assert_eq!(audio.bytes, audio_bytes);
-        assert!((encoded_start..encoded_end).contains(&(audio.bytes.as_ptr() as usize)));
-    }
-
-    #[test]
-    fn typed_audio_field_survives_signed_pack_and_unpack() {
-        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
-        let audio_bytes = b"OggS\0typed-audio";
-        let mut outbound = LxMessage::new(
-            [0x11; 16],
-            [0x22; 16],
-            "",
-            "Voice message",
-            DeliveryMethod::Direct,
-        );
-        outbound.set_audio_field(AM_OPUS_OGG, audio_bytes).unwrap();
-        outbound.sign(&key).unwrap();
-
-        let packed = outbound.pack().unwrap();
-        let inbound = LxMessage::unpack(&packed).unwrap();
-        let audio = inbound.audio_field().unwrap().unwrap();
-        assert_eq!(audio.mode, AM_OPUS_OGG);
-        assert_eq!(audio.bytes, audio_bytes);
-        assert_eq!(inbound.content, "Voice message");
-        assert!(inbound.msgpack_field_ids.contains(&FIELD_AUDIO));
-        assert!(!inbound.fields.contains_key(&FIELD_FILE_ATTACHMENTS));
-        assert_eq!(inbound.hash, outbound.hash);
-    }
-
-    #[test]
-    fn audio_field_strictly_validates_shape_mode_and_binary_data() {
-        let malformed = [
-            ("not an array", vec![0xc0]),
-            ("too few elements", vec![0x91, AM_OPUS_OGG]),
-            (
-                "too many elements",
-                vec![0x93, AM_OPUS_OGG, 0xc4, 0x00, 0xc0],
-            ),
-            ("negative mode", vec![0x92, 0xff, 0xc4, 0x00]),
-            ("mode above u8", vec![0x92, 0xcd, 0x01, 0x00, 0xc4, 0x00]),
-            ("mode is not integer", vec![0x92, 0xc0, 0xc4, 0x00]),
-            ("data is not binary", vec![0x92, AM_OPUS_OGG, 0xa0]),
-            ("truncated data", vec![0x92, AM_OPUS_OGG, 0xc4]),
-            ("trailing bytes", vec![0x92, AM_OPUS_OGG, 0xc4, 0x00, 0xc0]),
-        ];
-
-        for (case, encoded) in malformed {
-            let mut msg = LxMessage::new(
-                [0; 16],
-                [0; 16],
-                "",
-                "message remains usable",
-                DeliveryMethod::Direct,
-            );
-            msg.fields.insert(FIELD_AUDIO, encoded);
-            assert!(msg.audio_field().is_err(), "accepted {case}");
-            assert_eq!(msg.content, "message remains usable", "changed {case}");
-        }
-
-        // Any integer encoding is accepted when its value is in range; audio
-        // modes are value-constrained, not encoding-canonicalized.
-        let mut msg = LxMessage::new([0; 16], [0; 16], "", "", DeliveryMethod::Direct);
-        msg.fields
-            .insert(FIELD_AUDIO, vec![0x92, 0xcd, 0x00, 0xff, 0xc4, 0x00]);
-        assert_eq!(
-            msg.audio_field().unwrap(),
-            Some(AudioField {
-                mode: u8::MAX,
-                bytes: &[]
-            })
-        );
-    }
-
-    #[test]
-    fn malformed_audio_field_does_not_invalidate_enclosing_wire_message() {
-        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
-        let malformed = vec![0x93, AM_OPUS_OGG, 0xc4, 0x00, 0xc0];
-        let mut outbound = LxMessage::new(
-            [0x11; 16],
-            [0x22; 16],
-            "",
-            "still delivered",
-            DeliveryMethod::Direct,
-        );
-        outbound
-            .set_msgpack_field(FIELD_AUDIO, malformed.clone())
-            .unwrap();
-        outbound.sign(&key).unwrap();
-
-        let packed = outbound.pack().unwrap();
-        let mut inbound = LxMessage::unpack(&packed).unwrap();
-        assert_eq!(inbound.content, "still delivered");
-        assert_eq!(inbound.get_field(FIELD_AUDIO), Some(&malformed));
-        assert!(inbound.audio_field().is_err());
-        assert!(inbound.verify(&key.public_key()));
-    }
-
-    #[test]
-    fn typed_file_attachment_matches_existing_msgpack_wire_value() {
-        let file_bytes = b"hello";
-        let expected_value = rmpv::Value::Array(vec![rmpv::Value::Array(vec![
-            rmpv::Value::String("note.txt".into()),
-            rmpv::Value::Binary(file_bytes.to_vec()),
-        ])]);
-        let mut expected = Vec::new();
-        rmpv::encode::write_value(&mut expected, &expected_value).unwrap();
-
-        let mut msg = LxMessage::new([0; 16], [0; 16], "", "", DeliveryMethod::Direct);
-        msg.set_file_attachment_field("note.txt", file_bytes)
-            .unwrap();
-
-        assert_eq!(msg.get_field(FIELD_FILE_ATTACHMENTS), Some(&expected));
-        assert!(msg.msgpack_field_ids.contains(&FIELD_FILE_ATTACHMENTS));
-    }
-
-    #[test]
-    fn native_attachment_decoders_borrow_large_payload_bytes() {
-        let file_bytes = vec![0x5a; 2 * 1024 * 1024];
-        let mut msg = LxMessage::new([0; 16], [0; 16], "", "", DeliveryMethod::Direct);
-        msg.set_file_attachment_field("large.bin", &file_bytes)
-            .unwrap();
-        let encoded = msg.get_field(FIELD_FILE_ATTACHMENTS).unwrap();
-        let encoded_start = encoded.as_ptr() as usize;
-        let encoded_end = encoded_start + encoded.len();
-        let (name, borrowed) = msg.first_file_attachment().unwrap().unwrap();
-        assert_eq!(name, "large.bin");
-        assert_eq!(borrowed, file_bytes);
-        assert!((encoded_start..encoded_end).contains(&(borrowed.as_ptr() as usize)));
-
-        msg.set_image_field("webp", &file_bytes).unwrap();
-        let encoded = msg.get_field(FIELD_IMAGE).unwrap();
-        let encoded_start = encoded.as_ptr() as usize;
-        let encoded_end = encoded_start + encoded.len();
-        let (format, borrowed) = msg.image_attachment().unwrap().unwrap();
-        assert_eq!(format, "webp");
-        assert_eq!(borrowed, file_bytes);
-        assert!((encoded_start..encoded_end).contains(&(borrowed.as_ptr() as usize)));
-    }
-
-    #[test]
-    fn verified_inbound_attachment_releases_duplicate_wire_payload() {
-        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
-        let mut outbound = LxMessage::new(
-            [0x11; 16],
-            [0x22; 16],
-            "",
-            "large inbound",
-            DeliveryMethod::Direct,
-        );
-        outbound
-            .set_file_attachment_field("large.bin", &vec![0x77; 2 * 1024 * 1024])
-            .unwrap();
-        outbound.sign(&key).unwrap();
-        outbound.stamp = Some(vec![0x44; TICKET_LENGTH]);
-        let packed = outbound.pack().unwrap();
-
-        let mut inbound = LxMessage::unpack(&packed).unwrap();
-        assert!(inbound.wire_payload.is_some());
-        assert!(inbound.verify(&key.public_key()));
-        assert!(inbound.wire_payload.is_none());
-        let (name, data) = inbound.first_file_attachment().unwrap().unwrap();
-        assert_eq!(name, "large.bin");
-        assert_eq!(data.len(), 2 * 1024 * 1024);
-    }
-
-    #[test]
-    fn exact_packed_len_matches_wire_without_allocating_a_second_message() {
-        let mut msg = LxMessage::new(
-            [0x11; 16],
-            [0x22; 16],
-            "title",
-            "content",
-            DeliveryMethod::Direct,
-        );
-        msg.set_file_attachment_field("large.bin", &vec![0x5a; 2 * 1024 * 1024])
-            .unwrap();
-        msg.signature = Some([0x33; 64]);
-        assert_eq!(msg.packed_len().unwrap(), msg.pack().unwrap().len());
-    }
-
-    #[test]
-    fn test_state_transitions() {
-        let mut msg = LxMessage::new([0; 16], [0; 16], "", "", DeliveryMethod::Direct);
-        assert_eq!(msg.state, MessageState::Generating);
-
-        msg.state = MessageState::Outbound;
-        msg.cancel();
-        assert_eq!(msg.state, MessageState::Cancelled);
-    }
-
-    #[test]
-    fn test_base64url_roundtrip() {
-        use base64::Engine;
-        let data = b"Hello, LXMF World! This is a test message.";
-        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(data);
-        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(&encoded)
-            .unwrap();
-        assert_eq!(decoded, data);
-    }
-
-    #[test]
-    fn test_paper_uri() {
-        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
-
-        let mut msg = LxMessage::new(
-            [0x11; 16],
-            [0x22; 16],
-            "Paper",
-            "Message",
-            DeliveryMethod::Paper,
-        );
-        msg.sign(&key).unwrap();
-
-        let uri = msg
-            .to_paper_uri(|plaintext| Ok(plaintext.to_vec()))
-            .unwrap();
-        assert!(uri.starts_with("lxm://"));
-
-        let decoded =
-            LxMessage::from_paper_uri(&uri, |ciphertext| Ok(ciphertext.to_vec())).unwrap();
-        assert_eq!(decoded.destination_hash, msg.destination_hash);
-        assert_eq!(decoded.title, "Paper");
-        assert_eq!(decoded.method, DeliveryMethod::Paper);
-        assert_eq!(decoded.representation, DeliveryRepresentation::Paper);
-    }
-
-    #[test]
-    fn test_paper_uri_uses_identity_encryption() {
-        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
-        let recipient = rns_identity::identity::Identity::new();
-
-        let mut msg = LxMessage::new(
-            recipient.hash,
-            [0xBB; 16],
-            "Paper",
-            "encrypted",
-            DeliveryMethod::Paper,
-        );
-        msg.sign(&key).unwrap();
-        let plaintext_tail = msg.pack().unwrap()[DESTINATION_LENGTH..].to_vec();
-
-        let uri = msg
-            .to_paper_uri(|plaintext| {
-                recipient
-                    .encrypt(plaintext, None)
-                    .map_err(|e| MessageError::PackFailed(e.to_string()))
-            })
-            .unwrap();
-        let (dest_hash, encrypted_tail) = LxMessage::decode_paper_uri(&uri).unwrap();
-        assert_eq!(dest_hash, recipient.hash);
-        assert_ne!(encrypted_tail, plaintext_tail);
-
-        let decoded = LxMessage::from_paper_uri(&uri, |ciphertext| {
-            recipient
-                .decrypt(ciphertext, None, false)
-                .map_err(|e| MessageError::UnpackFailed(e.to_string()))
-        })
-        .unwrap();
-        assert_eq!(decoded.destination_hash, recipient.hash);
-        assert_eq!(decoded.content, "encrypted");
-    }
-
-    #[test]
-    fn test_sign_sets_hash() {
-        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
-        let mut msg = LxMessage::new(
-            [0xAA; 16],
-            [0xBB; 16],
-            "Hash",
-            "Content",
-            DeliveryMethod::Direct,
-        );
-        assert!(msg.hash.is_none());
-        msg.sign(&key).unwrap();
-        assert!(msg.hash.is_some());
-        // SHA-256(dest_hash || src_hash || payload)
-        let payload = msg.pack_payload().unwrap();
-        let mut hashed_part = Vec::new();
-        hashed_part.extend_from_slice(&msg.destination_hash);
-        hashed_part.extend_from_slice(&msg.source_hash);
-        hashed_part.extend_from_slice(&payload);
-        let expected = rns_crypto::sha::sha256(&hashed_part);
-        assert_eq!(msg.hash.unwrap(), expected);
-    }
-
-    #[test]
-    fn test_unpack_sets_python_message_id() {
-        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
-        let mut msg = LxMessage::new(
-            [0xAA; 16],
-            [0xBB; 16],
-            "Hash",
-            "Content",
-            DeliveryMethod::Direct,
-        );
-        msg.sign(&key).unwrap();
-        let expected = msg.hash.unwrap();
-
-        let unpacked = LxMessage::unpack(&msg.pack().unwrap()).unwrap();
-
-        assert_eq!(unpacked.hash, Some(expected));
-        assert_eq!(unpacked.message_id, Some(expected));
-    }
-
-    #[test]
-    fn test_unpack_hash_strips_stamp() {
-        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
-        let mut msg = LxMessage::new(
-            [0xAA; 16],
-            [0xBB; 16],
-            "Stamped",
-            "Content",
-            DeliveryMethod::Direct,
-        );
-        msg.sign(&key).unwrap();
-        let expected = msg.hash.unwrap();
-        msg.stamp = Some(vec![0x42; 32]);
-
-        let unpacked = LxMessage::unpack(&msg.pack().unwrap()).unwrap();
-
-        assert_eq!(unpacked.hash, Some(expected));
-        assert_eq!(unpacked.message_id, Some(expected));
-    }
-
-    #[test]
-    fn test_sign_verify_with_message_hash_appended() {
-        // Signed data = dest_hash || src_hash || payload || SHA256(dest_hash || src_hash || payload)
-        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
-        let pub_key = key.public_key();
-
-        let mut msg = LxMessage::new(
-            [0x11; 16],
-            [0x22; 16],
-            "Test",
-            "Body",
-            DeliveryMethod::Direct,
-        );
-        msg.sign(&key).unwrap();
-
-        let payload = msg.pack_payload().unwrap();
-        let mut hashed_part = Vec::new();
-        hashed_part.extend_from_slice(&msg.destination_hash);
-        hashed_part.extend_from_slice(&msg.source_hash);
-        hashed_part.extend_from_slice(&payload);
-        let message_hash = rns_crypto::sha::sha256(&hashed_part);
-        let mut signed_data = hashed_part;
-        signed_data.extend_from_slice(&message_hash);
-
-        let sig = msg.signature.unwrap();
-        assert!(pub_key.verify(&signed_data, &sig).is_ok());
-        assert!(msg.verify(&pub_key));
-    }
-
-    #[test]
-    fn test_unpack_bin_encoded_title_content() {
-        // Interop: C++/Python senders emit title/content as msgpack `bin`, not `str`.
-        // Hand-build a 4-element payload: [timestamp, title(bin), content(bin), fields(map)].
-        let mut payload = Vec::new();
-
-        // fixarray of 4 elements
-        payload.push(0x94);
-
-        // float64 timestamp
-        payload.push(0xCB);
-        payload.extend_from_slice(&1700000000.0_f64.to_be_bytes());
-
-        // bin8 "Hello"
-        payload.push(0xC4);
-        payload.push(5);
-        payload.extend_from_slice(b"Hello");
-
-        // bin8 "World body"
-        payload.push(0xC4);
-        payload.push(10);
-        payload.extend_from_slice(b"World body");
-
-        // fixmap of 0 elements
-        payload.push(0x80);
-
-        let mut wire = Vec::new();
-        wire.extend_from_slice(&[0xAA; 16]);
-        wire.extend_from_slice(&[0xBB; 16]);
-        wire.extend_from_slice(&[0x00; 64]);
-        wire.extend_from_slice(&payload);
-
-        let msg = LxMessage::unpack(&wire).unwrap();
-        assert_eq!(msg.title, "Hello");
-        assert_eq!(msg.content, "World body");
-        assert_eq!(msg.destination_hash, [0xAA; 16]);
-        assert_eq!(msg.source_hash, [0xBB; 16]);
-    }
-
-    #[test]
-    fn test_unpack_too_short() {
-        assert!(LxMessage::unpack(&[0; 10]).is_err());
-        // 96-byte header alone is too short -- payload is required
-        assert!(LxMessage::unpack(&[0; 96]).is_err());
-    }
-
-    #[test]
-    fn test_pack_unpack_container_roundtrip() {
-        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
-
-        let mut msg = LxMessage::new(
-            [0xAA; 16],
-            [0xBB; 16],
-            "Container Test",
-            "Content for container",
-            DeliveryMethod::Direct,
-        );
-        msg.sign(&key).unwrap();
-        msg.state = MessageState::Delivered;
-        msg.transport_encrypted = true;
-        msg.transport_encryption = Some("Curve25519".to_string());
-
-        let container_data = msg.pack_container().unwrap();
-        assert!(!container_data.is_empty());
-
-        let unpacked = LxMessage::unpack_container(&container_data).unwrap();
-        assert_eq!(unpacked.state, MessageState::Delivered);
-        assert_eq!(unpacked.method, DeliveryMethod::Direct);
-        assert!(unpacked.transport_encrypted);
-        assert_eq!(unpacked.transport_encryption.as_deref(), Some("Curve25519"));
-        assert_eq!(unpacked.title, "Container Test");
-        assert_eq!(unpacked.content, "Content for container");
-    }
-
-    #[test]
-    fn test_pack_unpack_container_method_variants() {
-        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
-        for method in [
-            DeliveryMethod::Paper,
-            DeliveryMethod::Direct,
-            DeliveryMethod::Propagated,
-        ] {
-            let mut msg = LxMessage::new([0xAA; 16], [0xBB; 16], "t", "c", method);
-            msg.sign(&key).unwrap();
-            let unpacked = LxMessage::unpack_container(&msg.pack_container().unwrap()).unwrap();
-            assert_eq!(
-                unpacked.method, method,
-                "method round-trip for {:?}",
-                method
-            );
-        }
-    }
-
-    #[test]
-    fn test_new_message_fields() {
-        let msg = LxMessage::new([0; 16], [0; 16], "", "", DeliveryMethod::Direct);
-        assert_eq!(msg.representation, DeliveryRepresentation::Unknown);
-        assert!(msg.unverified_reason.is_none());
-        assert!(!msg.transport_encrypted);
-        assert!(!msg.incoming);
-        assert_eq!(msg.progress, 0.0);
-    }
-
-    #[test]
-    fn test_compute_hash() {
-        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
-        let mut msg = LxMessage::new(
-            [0xAA; 16],
-            [0xBB; 16],
-            "Hash Test",
-            "Content",
-            DeliveryMethod::Direct,
-        );
-        msg.sign(&key).unwrap();
-        let hash = msg.compute_hash().unwrap();
-        assert_ne!(hash, [0u8; 32]);
-        assert!(msg.transient_id.is_some());
-    }
-
-    #[test]
-    fn test_sign_sets_message_id() {
-        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
-        let mut msg = LxMessage::new(
-            [0xAA; 16],
-            [0xBB; 16],
-            "Test",
-            "Content",
-            DeliveryMethod::Direct,
-        );
-        assert!(msg.message_id.is_none());
-        msg.sign(&key).unwrap();
-        assert!(msg.message_id.is_some());
-        assert_eq!(msg.message_id, msg.hash);
-    }
-
-    #[test]
-    fn test_pack_propagated_encrypted() {
-        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
-
-        let mut msg = LxMessage::new(
-            [0xAA; 16],
-            [0xBB; 16],
-            "Propagated Encrypted",
-            "Content body here",
-            DeliveryMethod::Propagated,
-        );
-        msg.sign(&key).unwrap();
-
-        let (propagation_packed, tid) = msg
-            .pack_propagated_encrypted(|plaintext| {
-                // Marker-byte prepend stands in for real encryption
-                let mut out = vec![0xFF];
-                out.extend_from_slice(plaintext);
-                Ok(out)
-            })
-            .unwrap();
-
-        assert!(!propagation_packed.is_empty());
-        assert_eq!(msg.transient_id, Some(tid));
-        assert_ne!(tid, [0u8; 32]);
-
-        let (ts, entries) = LxMessage::unpack_propagation_wrapper(&propagation_packed).unwrap();
-        assert!(ts > 0.0);
-        assert_eq!(entries.len(), 1);
-
-        let raw_wrapper =
-            rmpv::decode::read_value(&mut std::io::Cursor::new(&propagation_packed)).unwrap();
-        match raw_wrapper {
-            rmpv::Value::Array(items) => match &items[1] {
-                rmpv::Value::Array(entries) => {
-                    assert!(matches!(entries.first(), Some(rmpv::Value::Binary(_))));
+}
+fn read_recipient_stamp(input: &mut &[u8]) -> Result<Option<RecipientStamp>, MessageError> {
+    match input.first().copied() {
+        Some(0xc4..=0xc6) => Ok(RecipientStamp::from_bytes(read_msgpack_binary(input)?)),
+        Some(0x90..=0x9f | 0xdc | 0xdd) => {
+            let count = read_msgpack_array_len(input)? as usize;
+            if count != 16 && count != 32 {
+                for _ in 0..count {
+                    skip_msgpack_value(input, 0)?;
                 }
-                other => panic!("propagation entries should be msgpack array, got {other:?}"),
-            },
-            other => panic!("propagation wrapper should be msgpack array, got {other:?}"),
-        }
-
-        let lxmf_data = &entries[0];
-        assert_eq!(&lxmf_data[..16], &[0xAA; 16]);
-    }
-
-    /// T0-7: the bounded wrapper decode must reject CPU-amplification shapes
-    /// (junk-stuffed entry lists) cheaply, before per-entry stamp validation
-    /// could build any ~256 KB workblocks; legitimate transfers still pass.
-    #[test]
-    fn test_unpack_propagation_wrapper_bounded() {
-        let entry_floor = LxMessage::MIN_PROPAGATION_ENTRY_SIZE;
-        let limit = 16 * 1024;
-
-        // Hostile: thousands of tiny entries in a small blob.
-        let junk: Vec<Vec<u8>> = (0..2000).map(|_| vec![0xAB; 3]).collect();
-        let hostile = rmp_serde::to_vec(&(1000.0f64, junk)).unwrap();
-        assert!(hostile.len() <= limit, "test blob must fit the limit");
-        assert!(LxMessage::unpack_propagation_wrapper_bounded(&hostile, limit).is_err());
-
-        // Hostile: a single under-floor entry hidden among valid-sized ones.
-        let mixed: Vec<Vec<u8>> = vec![vec![0xAB; entry_floor], vec![0xAB; entry_floor - 1]];
-        let mixed_blob = rmp_serde::to_vec(&(1000.0f64, mixed)).unwrap();
-        assert!(LxMessage::unpack_propagation_wrapper_bounded(&mixed_blob, limit).is_err());
-
-        // Hostile: blob bigger than the configured transfer limit.
-        let oversize: Vec<Vec<u8>> = vec![vec![0xAB; 2 * limit]];
-        let oversize_blob = rmp_serde::to_vec(&(1000.0f64, oversize)).unwrap();
-        assert!(LxMessage::unpack_propagation_wrapper_bounded(&oversize_blob, limit).is_err());
-
-        // Legitimate multi-entry sync passes and round-trips.
-        let good: Vec<Vec<u8>> = (0..8).map(|i| vec![i as u8; entry_floor + 64]).collect();
-        let good_blob = rmp_serde::to_vec(&(1000.0f64, good.clone())).unwrap();
-        let (ts, entries) =
-            LxMessage::unpack_propagation_wrapper_bounded(&good_blob, limit).unwrap();
-        assert_eq!(ts, 1000.0);
-        assert_eq!(entries, good);
-    }
-
-    #[test]
-    fn test_pack_opportunistic_encrypted_strips_destination_hash() {
-        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
-        let mut msg = LxMessage::new(
-            [0xAA; 16],
-            [0xBB; 16],
-            "Opportunistic",
-            "Content body here",
-            DeliveryMethod::Opportunistic,
-        );
-        msg.sign(&key).unwrap();
-        let packed = msg.pack().unwrap();
-        let expected_tail = packed[DESTINATION_LENGTH..].to_vec();
-
-        let encrypted = msg
-            .pack_opportunistic_encrypted(|plaintext| {
-                assert_eq!(plaintext, expected_tail.as_slice());
-                let mut out = vec![0xEE];
-                out.extend_from_slice(plaintext);
-                Ok(out)
+                return Ok(None);
+            }
+            let mut bytes = [0u8; 32];
+            let mut valid = true;
+            for slot in &mut bytes[..count] {
+                match u8::try_from(read_msgpack_integer(input)?) {
+                    Ok(byte) => *slot = byte,
+                    Err(_) => valid = false,
+                }
+            }
+            Ok(if valid {
+                RecipientStamp::from_bytes(&bytes[..count])
+            } else {
+                None
             })
-            .unwrap();
-
-        assert_eq!(encrypted[0], 0xEE);
-        assert_eq!(&encrypted[1..], expected_tail.as_slice());
-    }
-
-    #[test]
-    fn test_propagation_transient_id() {
-        let lxmf_data = vec![0xAA; 100];
-        let tid = LxMessage::compute_propagation_transient_id(&lxmf_data);
-        assert_eq!(tid.len(), 32);
-
-        let tid2 = LxMessage::compute_propagation_transient_id(&lxmf_data);
-        assert_eq!(tid, tid2);
-
-        let other_data = vec![0xBB; 100];
-        let tid3 = LxMessage::compute_propagation_transient_id(&other_data);
-        assert_ne!(tid, tid3);
-    }
-
-    #[test]
-    fn test_propagation_transient_id_matches_full_hash() {
-        use rns_crypto::sha::full_hash;
-
-        let lxmf_data = vec![0x42; 200];
-        let tid = LxMessage::compute_propagation_transient_id(&lxmf_data);
-        let expected_full = full_hash(&lxmf_data);
-        assert_eq!(tid, expected_full);
-    }
-
-    #[test]
-    fn test_get_stamp_with_ticket() {
-        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
-        let mut msg = LxMessage::new(
-            [0xAA; 16],
-            [0xBB; 16],
-            "Ticket",
-            "Test",
-            DeliveryMethod::Direct,
-        );
-        msg.sign(&key).unwrap();
-
-        let ticket = [0x42; 16];
-        msg.outbound_ticket = Some(ticket);
-
-        let stamp = msg.get_stamp();
-        assert!(stamp.is_some());
-        assert_eq!(msg.stamp_value, Some(COST_TICKET));
-
-        // stamp = truncated_hash(ticket || message_id)
-        let message_id = msg.message_id.unwrap();
-        let mut material = Vec::new();
-        material.extend_from_slice(&ticket);
-        material.extend_from_slice(&message_id);
-        let expected = truncated_hash(&material).to_vec();
-        assert_eq!(stamp.unwrap(), expected);
-    }
-
-    #[test]
-    fn test_get_stamp_no_cost() {
-        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
-        let mut msg = LxMessage::new(
-            [0xAA; 16],
-            [0xBB; 16],
-            "NoCost",
-            "Test",
-            DeliveryMethod::Direct,
-        );
-        msg.sign(&key).unwrap();
-        msg.stamp_cost = None;
-
-        let stamp = msg.get_stamp();
-        assert!(stamp.is_none());
-        assert!(msg.stamp_value.is_none());
-    }
-
-    #[test]
-    fn test_validate_stamp_with_ticket() {
-        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
-        let mut msg = LxMessage::new(
-            [0xAA; 16],
-            [0xBB; 16],
-            "Validate Ticket",
-            "Test",
-            DeliveryMethod::Direct,
-        );
-        msg.sign(&key).unwrap();
-
-        let ticket = vec![0x42; 16];
-        let message_id = msg.message_id.unwrap();
-        let mut material = Vec::new();
-        material.extend_from_slice(&ticket);
-        material.extend_from_slice(&message_id);
-        let stamp = truncated_hash(&material).to_vec();
-        msg.stamp = Some(stamp);
-
-        let valid = msg.validate_stamp_with_tickets(16, Some(std::slice::from_ref(&ticket)));
-        assert!(valid);
-        assert_eq!(msg.stamp_value, Some(COST_TICKET));
-    }
-
-    #[test]
-    fn test_validate_stamp_wrong_ticket() {
-        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
-        let mut msg = LxMessage::new(
-            [0xAA; 16],
-            [0xBB; 16],
-            "Wrong Ticket",
-            "Test",
-            DeliveryMethod::Direct,
-        );
-        msg.sign(&key).unwrap();
-        msg.stamp = Some(vec![0xFF; 32]);
-
-        let valid = msg.validate_stamp_with_tickets(16, Some(&[vec![0x42; 16]]));
-        // Must fail both the ticket check and the PoW check
-        assert!(!valid);
-    }
-
-    #[test]
-    fn test_validate_stamp_no_stamp() {
-        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
-        let mut msg = LxMessage::new(
-            [0xAA; 16],
-            [0xBB; 16],
-            "No Stamp",
-            "Test",
-            DeliveryMethod::Direct,
-        );
-        msg.sign(&key).unwrap();
-        msg.stamp = None;
-
-        let valid = msg.validate_stamp_with_tickets(16, None);
-        assert!(!valid);
-    }
-
-    #[test]
-    fn test_pack_propagated_encrypted_with_prop_stamp() {
-        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
-
-        let mut msg = LxMessage::new(
-            [0xAA; 16],
-            [0xBB; 16],
-            "Prop Stamp",
-            "Content",
-            DeliveryMethod::Propagated,
-        );
-        msg.sign(&key).unwrap();
-        msg.propagation_stamp = Some([0xDD; 32]);
-
-        let (propagation_packed, _tid) = msg
-            .pack_propagated_encrypted(|plaintext| Ok(plaintext.to_vec()))
-            .unwrap();
-
-        let (_, entries) = LxMessage::unpack_propagation_wrapper(&propagation_packed).unwrap();
-        assert_eq!(entries.len(), 1);
-
-        // lxmf_data = dest_hash(16) || encrypted_data || propagation_stamp(32)
-        let lxmf_entry = &entries[0];
-        assert_eq!(&lxmf_entry[..16], &[0xAA; 16]);
-        let last_32 = &lxmf_entry[lxmf_entry.len() - 32..];
-        assert_eq!(last_32, &[0xDD; 32]);
-    }
-
-    #[test]
-    fn test_pack_propagated_encrypted_with_zero_cost_stamp() {
-        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
-
-        let mut msg = LxMessage::new(
-            [0xAA; 16],
-            [0xBB; 16],
-            "Prop Stamp",
-            "Content",
-            DeliveryMethod::Propagated,
-        );
-        msg.sign(&key).unwrap();
-
-        let (propagation_packed, _tid, _value) = msg
-            .pack_propagated_encrypted_with_stamp(|plaintext| Ok(plaintext.to_vec()), 0)
-            .unwrap();
-
-        let (_, entries) = LxMessage::unpack_propagation_wrapper(&propagation_packed).unwrap();
-        let lxmf_entry = &entries[0];
-        assert_eq!(lxmf_entry.len(), msg.pack().unwrap().len() + 32);
-        assert_eq!(&lxmf_entry[lxmf_entry.len() - 32..], &[0u8; 32]);
-        assert!(crate::stamper::validate_pn_stamp(lxmf_entry, 0).is_some());
-    }
-
-    #[test]
-    fn test_uri_roundtrip() {
-        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
-        let mut msg = LxMessage::new(
-            [0xAA; 16],
-            [0xBB; 16],
-            "Test",
-            "Hello via paper",
-            DeliveryMethod::Paper,
-        );
-        msg.sign(&key).unwrap();
-
-        let uri = msg.as_uri(|plaintext| Ok(plaintext.to_vec())).unwrap();
-        assert!(uri.starts_with("lxm://"));
-
-        let decoded = LxMessage::from_uri(&uri, |ciphertext| Ok(ciphertext.to_vec())).unwrap();
-        assert_eq!(decoded.content, "Hello via paper");
-        assert_eq!(decoded.title, "Test");
-        assert_eq!(decoded.destination_hash, [0xAA; 16]);
-        assert_eq!(decoded.source_hash, [0xBB; 16]);
-    }
-
-    #[test]
-    fn test_from_uri_invalid_prefix() {
-        let result =
-            LxMessage::from_uri("https://example.com", |ciphertext| Ok(ciphertext.to_vec()));
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_from_uri_invalid_base64() {
-        let result = LxMessage::from_uri("lxm://not-valid-base64!!!", |ciphertext| {
-            Ok(ciphertext.to_vec())
-        });
-        assert!(result.is_err());
-    }
-
-    use proptest::prelude::*;
-
-    proptest! {
-        /// Full LxMessage pack → unpack round-trip over the reasonable
-        /// input space. Explicit `test_pack_unpack_roundtrip` uses one
-        /// hand-picked case; proptest widens to arbitrary title/content
-        /// strings, arbitrary dest/source hashes, and all sendable
-        /// delivery methods. Catches msgpack/serde drift + unicode
-        /// normalization bugs in the title/content payload.
-        #[test]
-        fn proptest_message_pack_unpack_roundtrip(
-            destination_hash: [u8; 16],
-            source_hash: [u8; 16],
-            // Cap string length to keep the test fast; long content is
-            // already covered by test_pack_unpack_container_roundtrip.
-            title in ".{0,128}",
-            content in ".{0,512}",
-            method_idx in 0u8..=2,
-        ) {
-            let method = match method_idx {
-                0 => DeliveryMethod::Opportunistic,
-                1 => DeliveryMethod::Direct,
-                _ => DeliveryMethod::Propagated,
-            };
-            let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
-            let mut msg = LxMessage::new(destination_hash, source_hash, &title, &content, method);
-            msg.sign(&key).unwrap();
-
-            let packed = msg.pack().unwrap();
-            let unpacked = LxMessage::unpack(&packed).unwrap();
-
-            prop_assert_eq!(unpacked.destination_hash, destination_hash);
-            prop_assert_eq!(unpacked.source_hash, source_hash);
-            prop_assert_eq!(&unpacked.title, &title);
-            prop_assert_eq!(&unpacked.content, &content);
-            prop_assert_eq!(unpacked.signature, msg.signature);
         }
+        Some(_) => {
+            skip_msgpack_value(input, 0)?;
+            Ok(None)
+        }
+        None => Err(MessageError::UnpackFailed(
+            "missing MessagePack stamp".into(),
+        )),
     }
+}
+#[cfg(test)]
+mod tests;
+
+/// Test fixtures still cross the production signing/finalization boundary.
+#[cfg(test)]
+pub(crate) fn test_message(
+    destination: [u8; 16],
+    source: [u8; 16],
+    title: &str,
+    content: &str,
+    method: DeliveryMethod,
+) -> LxMessage {
+    LxMessageDraft::new(destination, source, title, content, method)
+        .unwrap()
+        .sign(&rns_crypto::ed25519::Ed25519PrivateKey::from_bytes(
+            &[1; 32],
+        ))
+        .unwrap()
+        .finalize(None)
+        .unwrap()
 }

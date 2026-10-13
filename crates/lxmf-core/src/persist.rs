@@ -34,52 +34,75 @@ pub struct PersistedNodeStats {
     pub unpeered_propagation_rx_bytes: u64,
 }
 
-/// Atomically write `data` to `path`: unique tmp file + flush + fsync + rename.
-///
-/// Tmp name is `<path>.tmp.<pid>.<16 random hex>` so concurrent writers (or
-/// other processes) never collide; the tmp file is unlinked on error. An fsync
-/// failure is logged as a warning and is non-fatal, matching Python
-/// `LXMessage.write_to_directory` — LXMessage.py:674-696 (1.0.1).
+/// Publish exact bytes through the strict platform durability boundary.
+/// CommitUncertain remains an error: readback alone cannot authorize a receipt.
 pub fn write_file_atomic(path: &Path, data: &[u8]) -> io::Result<()> {
-    use std::io::Write;
+    rns_identity::persistence::durable_write(path, data)
+        .map(|_| ())
+        .map_err(io::Error::other)
+}
 
-    let random: [u8; 8] = rand::random();
-    let tmp_name = format!(
-        "{}.tmp.{}.{}",
-        path.file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default(),
-        std::process::id(),
-        hex::encode(random)
-    );
-    let tmp = path.with_file_name(tmp_name);
+/// Suppression state cannot authorize a remote purge. Adapters nevertheless
+/// persist it before allowing the next automatic wants selection.
+pub fn save_suppression(
+    dir: &Path,
+    ledger: &crate::admission::SuppressionLedger,
+) -> io::Result<()> {
+    write_mpk(&dir.join("propagation_suppression_v1"), ledger)
+}
 
-    let result = (|| {
-        let mut file = fs::File::create(&tmp)?;
-        file.write_all(data)?;
-        file.flush()?;
-        if let Err(e) = file.sync_all() {
-            tracing::warn!(
-                "Error while waiting for persist fsync for {}: {e}",
-                tmp.display()
-            );
-        }
-        drop(file);
-        fs::rename(&tmp, path)
-    })();
-
-    if result.is_err()
-        && tmp.exists()
-        && let Err(e) = fs::remove_file(&tmp)
-    {
-        tracing::error!(
-            "Error while cleaning temporary file {} for {}: {e}",
-            tmp.display(),
-            path.display()
-        );
+pub fn load_suppression(dir: &Path) -> io::Result<crate::admission::SuppressionLedger> {
+    // Preserve the existing one-field wrapper while rejecting duplicate keys,
+    // mismatched embedded scope and quota violations before hydration.
+    #[derive(serde::Deserialize)]
+    struct Wire {
+        #[serde(deserialize_with = "suppression_records")]
+        records: Vec<crate::admission::SuppressionRecord>,
     }
+    let wire: Option<Wire> =
+        read_mpk_bounded(&dir.join("propagation_suppression_v1"), 65536 * 512 + 4096)?;
+    crate::admission::SuppressionLedger::from_records(
+        wire.map_or_else(Vec::new, |wire| wire.records),
+    )
+    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+fn suppression_records<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<crate::admission::SuppressionRecord>, D::Error> {
+    struct Records;
+    impl<'de> serde::de::Visitor<'de> for Records {
+        type Value = Vec<crate::admission::SuppressionRecord>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("bounded unique suppression map")
+        }
+        fn visit_map<M: serde::de::MapAccess<'de>>(
+            self,
+            mut map: M,
+        ) -> Result<Self::Value, M::Error> {
+            let mut seen = std::collections::HashSet::new();
+            let mut records = Vec::new();
+            while let Some((scope,record))=map.next_entry::<crate::admission::AdmissionScope,crate::admission::SuppressionRecord>()? {
+                if scope!=record.scope || !seen.insert(scope) || records.len()>=crate::admission::SuppressionLedger::GLOBAL {
+                    return Err(serde::de::Error::custom("invalid suppression scope or capacity"));
+                }
+                records.push(record);
+            }
+            Ok(records)
+        }
+    }
+    deserializer.deserialize_map(Records)
+}
 
-    result
+pub fn save_node_policies(
+    dir: &Path,
+    policies: &HashMap<[u8; 16], crate::propagation_send::AdvertisedNodePolicy>,
+) -> io::Result<()> {
+    write_mpk(&dir.join("propagation_node_policies_v1"), policies)
+}
+pub fn load_node_policies(
+    dir: &Path,
+) -> io::Result<HashMap<[u8; 16], crate::propagation_send::AdvertisedNodePolicy>> {
+    Ok(read_mpk(&dir.join("propagation_node_policies_v1"))?.unwrap_or_default())
 }
 
 fn write_mpk<T: serde::Serialize>(path: &Path, value: &T) -> io::Result<()> {
@@ -92,15 +115,33 @@ fn write_mpk<T: serde::Serialize>(path: &Path, value: &T) -> io::Result<()> {
 }
 
 fn read_mpk<T: serde::de::DeserializeOwned>(path: &Path) -> io::Result<Option<T>> {
-    match fs::read(path) {
-        Ok(bytes) => {
-            let value = rmp_serde::from_slice(&bytes)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            Ok(Some(value))
-        }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e),
+    read_mpk_bounded(path, 64 * 1024 * 1024)
+}
+fn read_mpk_bounded<T: serde::de::DeserializeOwned>(
+    path: &Path,
+    limit: usize,
+) -> io::Result<Option<T>> {
+    use std::io::Read;
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let mut bytes = Vec::new();
+    file.take(limit as u64 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > limit {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "router state exceeds bounded capacity",
+        ));
     }
+    // Allocation-free structural walk precedes serde's collection size hints.
+    // It also rejects trailing roots, deep nesting and truncated huge lengths.
+    let encoded = crate::message::EncodedFieldValue::new(bytes.into())
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    rmp_serde::from_slice(encoded.encoded())
+        .map(Some)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
 pub fn save_stamp_costs(dir: &Path, costs: &HashMap<[u8; 16], StampCostEntry>) -> io::Result<()> {
@@ -111,8 +152,83 @@ pub fn load_stamp_costs(dir: &Path) -> io::Result<HashMap<[u8; 16], StampCostEnt
     Ok(read_mpk(&dir.join(STAMP_COSTS_FILE))?.unwrap_or_default())
 }
 
+/// Process-local revision of a captured ticket state. All production ticket
+/// writes pass through the same path coordinator, so a delayed checkpoint can
+/// never replace a ticket that a newer signing intent already committed.
+#[derive(Debug, Clone)]
+pub(crate) struct TicketPersistenceSnapshot {
+    revision: u64,
+    snapshot: std::sync::Arc<TicketStoreSnapshot>,
+}
+impl TicketPersistenceSnapshot {
+    pub(crate) fn capture(snapshot: TicketStoreSnapshot) -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        // Rust 1.99 renamed this operation; keep the identical Rust 1.89 API.
+        #[allow(deprecated)]
+        let revision = NEXT
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+            .expect("ticket checkpoint revision exhausted");
+        Self {
+            revision,
+            snapshot: std::sync::Arc::new(snapshot),
+        }
+    }
+    pub(crate) fn save(&self, dir: &Path, required: Option<&Ticket>) -> io::Result<()> {
+        use std::sync::{Mutex, OnceLock};
+        struct Latest {
+            revision: u64,
+            committed: bool,
+        }
+        static WRITERS: OnceLock<Mutex<HashMap<std::path::PathBuf, Latest>>> = OnceLock::new();
+        fs::create_dir_all(dir)?;
+        let path = fs::canonicalize(dir)?.join(TICKETS_FILE);
+        let mut writers = WRITERS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .map_err(|_| io::Error::other("ticket persistence coordinator unavailable"))?;
+        if !writers.contains_key(&path) && writers.len() >= 4096 {
+            return Err(io::Error::other("ticket persistence path quota exhausted"));
+        }
+        let latest = writers.entry(path.clone()).or_insert(Latest {
+            revision: self.revision,
+            committed: false,
+        });
+        if self.revision < latest.revision {
+            if !latest.committed {
+                return Err(io::Error::other(
+                    "newer ticket checkpoint is uncertain and must be retried",
+                ));
+            }
+            if let Some(required) = required {
+                let (stored, _) = load_tickets(dir)?;
+                if !stored.inbound.contains(required) {
+                    return Err(io::Error::other(
+                        "newer ticket state no longer contains this signing intent",
+                    ));
+                }
+            }
+            return Ok(());
+        }
+        if required.is_some_and(|required| !self.snapshot.inbound.contains(required)) {
+            return Err(io::Error::other(
+                "ticket snapshot does not contain this signing intent",
+            ));
+        }
+        latest.revision = self.revision;
+        latest.committed = false;
+        // Even an uncertain publication raises the revision floor. Older
+        // snapshots fail closed until this or a newly captured current state
+        // reestablishes the strict barrier. No failed payload is retained by
+        // this bounded process-wide metadata coordinator.
+        write_mpk(&path, &*self.snapshot)?;
+        latest.committed = true;
+        Ok(())
+    }
+}
+
 pub fn save_tickets(dir: &Path, tickets: &TicketStoreSnapshot) -> io::Result<()> {
-    write_mpk(&dir.join(TICKETS_FILE), tickets)
+    TicketPersistenceSnapshot::capture(tickets.clone()).save(dir, None)
 }
 
 #[derive(serde::Deserialize)]

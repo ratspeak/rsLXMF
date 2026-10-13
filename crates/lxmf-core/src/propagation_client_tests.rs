@@ -1,4 +1,5 @@
 //! In-process encrypted peers: every emitted packet is checked at the real MTU.
+use super::tests::{downloaded_bytes, fixture_download};
 use super::*;
 use rmpv::Value;
 use rns_wire::{context::PacketContext as Context, flags::PacketType};
@@ -15,6 +16,8 @@ struct Peer {
     drop_hmu: bool,
     drop_request: bool,
     retries: usize,
+    admission_dir: tempfile::TempDir,
+    admitted: Vec<Vec<u8>>,
 }
 
 impl Peer {
@@ -44,7 +47,50 @@ impl Peer {
             drop_hmu: false,
             drop_request: false,
             retries: 0,
+            admission_dir: tempfile::tempdir().unwrap(),
+            admitted: Vec::new(),
         }
+    }
+
+    /// Protocol-unit-test recipient seam. The simulated decryptor maps each
+    /// opaque response to distinct actually signed bytes; FileAdmissionStore
+    /// must commit them before the client is allowed to send its purge.
+    fn accept_downloads(&mut self) {
+        use crate::admission::{
+            AdmissionRecord, DownloadAdmissionOutcome, DurableAdmissionReceipt, DurableDisposition,
+        };
+        let store = crate::admission_store::FileAdmissionStore::open(
+            self.admission_dir.path(),
+            &self.admission_dir.path().join("messages"),
+        )
+        .unwrap();
+        for downloaded in self.client.take_downloaded_messages() {
+            let (data, token) = downloaded.into_parts();
+            let scope = token.scope();
+            let message = crate::message::test_message(
+                [1; 16],
+                [2; 16],
+                &hex::encode(scope.transient_id),
+                "simulated recipient decryption",
+                crate::constants::DeliveryMethod::Propagated,
+            );
+            let record = AdmissionRecord {
+                scope,
+                message_id: message.message_id(),
+                received_wire_hash: rns_crypto::sha::full_hash(message.wire_bytes()),
+                stored_message_wire_hash: None,
+                disposition: DurableDisposition::Committed,
+                committed_at: 100,
+            };
+            let receipt =
+                DurableAdmissionReceipt::commit(store.prepare(record, message.wire_owned(), false))
+                    .unwrap();
+            self.admitted.push(data.to_vec());
+            token
+                .resolve(DownloadAdmissionOutcome::Accepted(receipt))
+                .unwrap();
+        }
+        self.client.poll_admissions();
     }
 
     fn inject(&mut self, context: Context, payload: &[u8]) {
@@ -65,6 +111,7 @@ impl Peer {
         self.client
             .event_tx
             .try_send(DestinationEvent::InboundPacket {
+                interface_owner: None,
                 raw: raw.into(),
                 interface_id: 7,
                 metrics: Default::default(),
@@ -279,19 +326,20 @@ impl Peer {
     }
 }
 
+fn blob(index: usize) -> Vec<u8> {
+    let mut data = (0u64..5)
+        .flat_map(|v| rns_crypto::sha::full_hash(&v.to_be_bytes()))
+        .collect::<Vec<_>>();
+    data[..8].copy_from_slice(&(index as u64).to_be_bytes());
+    data
+}
 fn ids(n: usize) -> Vec<Vec<u8>> {
     (0..n)
-        .map(|i| rns_crypto::sha::full_hash(&(i as u64).to_be_bytes()).to_vec())
+        .map(|i| rns_crypto::sha::full_hash(&blob(i)).to_vec())
         .collect()
 }
 fn blobs(n: usize) -> Vec<Vec<u8>> {
-    (0..n)
-        .map(|i| {
-            let mut data = ids(5).concat();
-            data[..8].copy_from_slice(&(i as u64).to_be_bytes());
-            data
-        })
-        .collect()
+    (0..n).map(blob).collect()
 }
 fn binary_list(items: &[Vec<u8>]) -> Value {
     Value::Array(items.iter().cloned().map(Value::Binary).collect())
@@ -353,12 +401,22 @@ fn fifty_downloaded_messages_survive_get_and_purge_resource_round_trip() {
     assert_eq!(request.as_array().unwrap()[0], binary_list(&wants));
     peer.response(get_id, binary_list(&messages), true);
     assert_eq!(peer.client.received_count(), 50);
+    assert_eq!(
+        peer.client.state(),
+        PropagationClientState::AwaitingAdmission
+    );
+    peer.accept_downloads();
     let (purge_id, request, _) = peer.request(true);
     assert_eq!(request, Value::Array(vec![Value::Nil, binary_list(&wants)]));
     peer.response(purge_id, empty(), true);
     assert_eq!(peer.client.state(), PropagationClientState::Complete);
     assert_eq!(peer.client.transfer_status().result, Some(50));
-    assert_eq!(peer.client.take_received_messages(), messages);
+    let counts = peer.client.transfer_status().admission;
+    assert_eq!(counts.downloaded, 50);
+    assert_eq!(counts.committed, 50);
+    assert_eq!(counts.rejected, 0);
+    assert_eq!(counts.retryable, 0);
+    assert_eq!(peer.admitted, messages);
     assert_eq!(peer.resource_requests, 2);
     assert_eq!(peer.client.unread_bytes, 0);
 }
@@ -381,6 +439,7 @@ fn early_response_retires_sender_and_ignores_late_proof_cancel_and_receipt() {
         .resource
         .resource_hash;
     peer.response(old_id, binary_list(&blobs(1)), false);
+    peer.accept_downloads();
     let new_request = peer.client.request.as_ref().unwrap();
     assert_ne!(old_id, new_request.id);
     let generation = new_request.generation;
@@ -450,23 +509,23 @@ fn purge_errors_never_complete_or_advance_chunk() {
 #[test]
 fn capacity_failure_precedes_publication_purge_and_cursor_advance() {
     let mut peer = Peer::new();
-    peer.client.unread_limit = 100;
-    peer.client.received_messages.push(vec![1; 20]);
-    peer.client.unread_bytes = 20;
-    peer.client.available_messages = ids(2);
+    peer.client.unread_limit = 80;
+    let retained = vec![fixture_download(&peer.client, vec![1; 20])];
+    let over_limit = vec![vec![2; 60], vec![3; 30]];
+    peer.client.available_messages = over_limit
+        .iter()
+        .map(|bytes| rns_crypto::sha::full_hash(bytes).to_vec())
+        .collect();
     peer.client.send_get_request();
     let (id, _, _) = peer.request(true);
-    peer.response(id, binary_list(&[vec![2; 60], vec![3; 30]]), false);
+    peer.response(id, binary_list(&over_limit), false);
     assert_eq!(peer.client.state(), PropagationClientState::Failed);
     assert_eq!(peer.client.pending_wants.len(), 2);
     assert!(peer.client.received_ids.is_empty());
-    assert_eq!(peer.client.received_messages, vec![vec![1; 20]]);
-    assert_eq!(peer.client.unread_bytes, 20);
+    assert!(peer.client.received_messages.is_empty());
+    assert_eq!(peer.client.unread_bytes, 0);
+    assert_eq!(downloaded_bytes(&retained), vec![vec![1; 20]]);
     assert!(peer.rx.try_recv().is_err(), "overflow must not queue purge");
-    assert!(!peer.client.start_download());
-    peer.client.cancel_download();
-    assert!(!peer.client.start_download());
-    assert_eq!(peer.client.take_received_messages(), vec![vec![1; 20]]);
 }
 
 #[test]
@@ -525,33 +584,37 @@ fn oversized_logical_sets_advance_after_empty_and_partial_chunks() {
     peer.client.available_messages = selected.clone();
     peer.client.available_messages.push(selected[0].clone());
     peer.client.send_get_request();
-    let first = peer.client.request.as_ref().unwrap();
-    let RequestKind::Get(first_count) = first.kind else {
-        panic!()
-    };
-    assert!(first_count < 30_840);
-    assert!(
-        first
-            .outbound
-            .as_ref()
-            .unwrap()
-            .resource
-            .advertisement_data_size
-            <= MAX_EFFICIENT_SIZE
-    );
-    let id = first.id;
-    // Correlated early empty response skips the complete requested chunk.
-    peer.response(id, empty(), false);
-    let RequestKind::Get(tail_count) = peer.client.request.as_ref().unwrap().kind else {
-        panic!()
-    };
-    assert_eq!(first_count + tail_count, 30_840);
-    let tail = peer.client.request.as_ref().unwrap().id;
-    peer.response(tail, binary_list(&blobs(1)), false);
+    let mut consumed = 0;
+    loop {
+        let request = peer.client.request.as_ref().unwrap();
+        let RequestKind::Get(count) = request.kind else {
+            panic!("get chunk expected")
+        };
+        assert!(count <= crate::admission::MAX_DOWNLOAD_ITEMS);
+        assert!(count > 0);
+        if let Some(transfer) = &request.outbound {
+            assert!(transfer.resource.advertisement_data_size <= MAX_EFFICIENT_SIZE);
+        }
+        let id = request.id;
+        if consumed + count < 30_840 {
+            peer.response(id, empty(), false);
+            consumed += count;
+            continue;
+        }
+        assert_eq!(consumed + count, 30_840);
+        peer.response(id, binary_list(&[blob(consumed)]), false);
+        break;
+    }
     assert!(peer.client.pending_wants.is_empty());
+    assert!(peer.client.received_ids.is_empty());
+    assert_eq!(
+        peer.client.state(),
+        PropagationClientState::AwaitingAdmission
+    );
+    peer.accept_downloads();
     assert_eq!(peer.client.received_ids.len(), 1);
-    let purge = peer.client.request.as_ref().unwrap().id;
-    peer.response(purge, empty(), false);
+    let id = peer.client.request.as_ref().unwrap().id;
+    peer.response(id, empty(), false);
     assert_eq!(peer.client.state(), PropagationClientState::Complete);
     assert_eq!(peer.client.transfer_status().result, Some(1));
 }
@@ -563,18 +626,20 @@ fn known_haves_chunks_complete_and_retain_policy_skips_only_known_haves() {
     peer.client.available_messages = selected.clone();
     peer.client.replace_local_message_ids(selected);
     peer.client.send_get_request();
-    let RequestKind::Haves(first) = peer.client.request.as_ref().unwrap().kind else {
-        panic!()
-    };
-    assert!(first < 30_840);
-    let id = peer.client.request.as_ref().unwrap().id;
-    peer.response(id, empty(), false);
-    assert_eq!(peer.client.pending_haves.len(), 30_840 - first);
-    let id = peer.client.request.as_ref().unwrap().id;
-    peer.response(id, empty(), false);
-    assert!(peer.client.pending_haves.is_empty());
+    let mut chunks = 0;
+    while !peer.client.pending_haves.is_empty() {
+        let request = peer.client.request.as_ref().unwrap();
+        let RequestKind::Haves(count) = request.kind else {
+            panic!("haves chunk expected")
+        };
+        assert!(count > 0 && count <= crate::admission::MAX_DOWNLOAD_ITEMS);
+        let id = request.id;
+        peer.response(id, empty(), false);
+        chunks += 1;
+        assert!(chunks <= 8);
+    }
+    assert_eq!(chunks, 8);
     assert_eq!(peer.client.state(), PropagationClientState::Complete);
-
     let mut peer = Peer::new();
     peer.client.available_messages = ids(2);
     peer.client.replace_local_message_ids(ids(1));
@@ -583,7 +648,12 @@ fn known_haves_chunks_complete_and_retain_policy_skips_only_known_haves() {
     let (id, data, _) = peer.request(true);
     assert_eq!(data.as_array().unwrap()[0], binary_list(&ids(2)[1..]));
     assert_eq!(data.as_array().unwrap()[1], empty());
-    peer.response(id, binary_list(&blobs(1)), false);
+    peer.response(id, binary_list(&[blob(1)]), false);
+    assert_eq!(
+        peer.client.state(),
+        PropagationClientState::AwaitingAdmission
+    );
+    peer.accept_downloads();
     assert!(matches!(
         peer.client.request.as_ref().unwrap().kind,
         RequestKind::Purge(1)
@@ -604,15 +674,21 @@ fn hashmap_updates_and_split_responses_keep_exact_request_identity() {
     assert_eq!(peer.client.state(), PropagationClientState::Complete);
 
     let mut peer = Peer::new();
-    peer.client.available_messages = ids(1);
+    let blob = vec![0x5a; MAX_EFFICIENT_SIZE + 100];
+    peer.client.available_messages = vec![rns_crypto::sha::full_hash(&blob).to_vec()];
     peer.client.set_delivery_limit(2000.0);
     peer.client.send_get_request();
     let (id, _, _) = peer.request(true);
     let blob = vec![0x5a; MAX_EFFICIENT_SIZE + 100];
     peer.response(id, binary_list(std::slice::from_ref(&blob)), true);
-    assert_eq!(peer.client.received_messages, vec![blob]);
-    assert_eq!(peer.client.state(), PropagationClientState::PurgeRequested);
+    assert_eq!(downloaded_bytes(&peer.client.received_messages), vec![blob]);
+    assert_eq!(
+        peer.client.state(),
+        PropagationClientState::AwaitingAdmission
+    );
     assert!(peer.client.inbound_split_resources.is_empty());
+    peer.accept_downloads();
+    assert_eq!(peer.client.state(), PropagationClientState::PurgeRequested);
 }
 
 #[test]
@@ -777,10 +853,9 @@ fn advertisement_requires_matching_request_id_and_response_direction() {
 }
 
 #[test]
-fn malformed_batch_is_atomic_and_preserves_prior_results() {
+fn malformed_batch_is_atomic_and_preserves_external_payload_owners() {
     let mut peer = Peer::new();
-    peer.client.received_messages.push(vec![0xab; 20]);
-    peer.client.unread_bytes = 20;
+    let retained = vec![fixture_download(&peer.client, vec![0xab; 20])];
     peer.client.available_messages = ids(2);
     peer.client.send_get_request();
     let (id, _, _) = peer.request(true);
@@ -790,14 +865,15 @@ fn malformed_batch_is_atomic_and_preserves_prior_results() {
         false,
     );
     assert_eq!(peer.client.state(), PropagationClientState::Failed);
-    assert_eq!(peer.client.received_messages, vec![vec![0xab; 20]]);
-    assert_eq!(peer.client.unread_bytes, 20);
+    assert_eq!(downloaded_bytes(&retained), vec![vec![0xab; 20]]);
+    assert!(peer.client.received_messages.is_empty());
+    assert_eq!(peer.client.unread_bytes, 0);
     assert!(peer.client.received_ids.is_empty());
     assert_eq!(peer.client.pending_wants.len(), 2);
 }
 
 #[test]
-fn accepted_results_survive_purge_failure_cancel_and_disconnect_until_drained() {
+fn durable_results_survive_purge_failure_and_external_owners_survive_cancellation() {
     for failure in 0..3 {
         let mut peer = Peer::new();
         let messages = blobs(50);
@@ -806,31 +882,55 @@ fn accepted_results_survive_purge_failure_cancel_and_disconnect_until_drained() 
         let (id, _, _) = peer.request(true);
         peer.response(id, binary_list(&messages), true);
         assert_eq!(peer.client.received_count(), 50);
-        match failure {
-            0 => {
-                let (id, _, _) = peer.request(true);
-                peer.response(id, Value::from(0xf0), false);
-                peer.client.tick();
-            }
-            1 => peer.client.cancel_download(),
-            _ => {
+        assert_eq!(
+            peer.client.state(),
+            PropagationClientState::AwaitingAdmission
+        );
+        if failure == 0 {
+            peer.accept_downloads();
+            let (id, _, _) = peer.request(true);
+            peer.response(id, Value::from(0xf0), false);
+            peer.client.tick();
+            assert_eq!(peer.admitted, messages);
+            assert_eq!(peer.client.local_messages.len(), 50);
+            let store = crate::admission_store::FileAdmissionStore::open(
+                peer.admission_dir.path(),
+                &peer.admission_dir.path().join("messages"),
+            )
+            .unwrap();
+            assert_eq!(store.haves([0; 16], [0xe8; 16], 101).len(), 50);
+        } else {
+            let downloaded = peer.client.take_downloaded_messages();
+            if failure == 1 {
+                peer.client.cancel_download();
+            } else {
                 let teardown = peer.link.teardown(CloseReason::DestinationClosed).unwrap();
                 peer.inject(Context::LinkClose, &teardown);
             }
+            assert!(peer.client.received_messages.is_empty());
+            assert_eq!(downloaded_bytes(&downloaded), messages);
+            assert!(
+                downloaded
+                    .iter()
+                    .all(|item| !item.scope().transient_id.iter().all(|b| *b == 0))
+            );
+            for item in downloaded {
+                let (_, token) = item.into_parts();
+                assert!(!token.is_current());
+            }
+            peer.client.poll_admissions();
+            assert!(peer.client.local_messages.is_empty());
+            assert!(peer.client.received_ids.is_empty());
+            assert!(peer.client.start_download());
+            assert!(peer.client.take_downloaded_messages().is_empty());
         }
-        assert!(!peer.client.start_download());
-        assert_eq!(peer.client.take_received_messages(), messages);
-        assert_eq!(peer.client.unread_bytes, 0);
-        assert!(peer.client.start_download());
-        assert!(peer.client.take_received_messages().is_empty());
     }
 }
 
 #[test]
 fn transport_result_deadline_is_finite_and_retains_results() {
     let mut peer = Peer::new();
-    peer.client.received_messages.push(vec![0x33; 10]);
-    peer.client.unread_bytes = 10;
+    let retained = vec![fixture_download(&peer.client, vec![0x33; 10])];
     peer.client.received_ids = ids(50);
     peer.client.send_purge_request();
     let pending = peer.client.pending_endpoint_sends.last_mut().unwrap();
@@ -838,8 +938,11 @@ fn transport_result_deadline_is_finite_and_retains_results() {
     peer.client.tick();
     assert_eq!(peer.client.state(), PropagationClientState::Failed);
     assert!(peer.client.request.is_none());
-    assert!(!peer.client.start_download());
-    assert_eq!(peer.client.take_received_messages(), vec![vec![0x33; 10]]);
+    assert_eq!(downloaded_bytes(&retained), vec![vec![0x33; 10]]);
+    for item in retained {
+        let (_, token) = item.into_parts();
+        assert!(!token.is_current());
+    }
 }
 
 #[test]
@@ -924,7 +1027,7 @@ fn slow_segment_gets_a_fresh_proof_admission_deadline() {
     let (context, proof, _) = peer.packet();
     assert_eq!(context, Context::ResourcePrf);
     assert!(sender.handle_proof(&proof));
-    assert_eq!(peer.client.received_messages, messages);
+    assert_eq!(downloaded_bytes(&peer.client.received_messages), messages);
 }
 
 #[test]
@@ -934,6 +1037,7 @@ fn response_resource_before_request_proof_retires_only_its_sender() {
     peer.client.send_get_request();
     let (id, _, proof) = peer.request(false);
     peer.response(id, binary_list(&blobs(50)), true);
+    peer.accept_downloads();
     let successor = peer.client.request.as_ref().unwrap().id;
     let generation = peer.client.request.as_ref().unwrap().generation;
     peer.inject(Context::ResourcePrf, &proof.unwrap());
@@ -942,11 +1046,11 @@ fn response_resource_before_request_proof_retires_only_its_sender() {
     let (id, _, _) = peer.request(true);
     peer.response(id, empty(), false);
     assert_eq!(peer.client.state(), PropagationClientState::Complete);
-    assert_eq!(peer.client.received_count(), 50);
+    assert_eq!(peer.admitted.len(), 50);
 }
 
 #[test]
-fn full_then_closed_transport_fails_request_without_losing_accepted_results() {
+fn full_then_closed_transport_fails_request_without_releasing_external_payload() {
     let mut peer = Peer::new();
     while peer
         .client
@@ -954,8 +1058,7 @@ fn full_then_closed_transport_fails_request_without_losing_accepted_results() {
         .try_send(TransportMessage::DeregisterDestination { hash: [0; 16] })
         .is_ok()
     {}
-    peer.client.received_messages.push(vec![1; 12]);
-    peer.client.unread_bytes = 12;
+    let retained = vec![fixture_download(&peer.client, vec![1; 12])];
     peer.client.received_ids = ids(50);
     peer.client.send_purge_request();
     assert_eq!(peer.client.pending_transport.len(), 1);
@@ -964,5 +1067,207 @@ fn full_then_closed_transport_fails_request_without_losing_accepted_results() {
     peer.client.tick();
     assert_eq!(peer.client.state(), PropagationClientState::Failed);
     assert!(peer.client.request.is_none());
-    assert_eq!(peer.client.take_received_messages(), vec![vec![1; 12]]);
+    assert_eq!(downloaded_bytes(&retained), vec![vec![1; 12]]);
+}
+
+#[test]
+fn expired_durable_haves_are_downloaded_instead_of_purged() {
+    use crate::admission::DurableHave;
+    let mut peer = Peer::new();
+    let expired = [0x81; 32];
+    let visible = [0x82; 32];
+    peer.client.replace_durable_haves([
+        DurableHave {
+            transient_id: expired,
+            expires_at: Some(0),
+        },
+        DurableHave {
+            transient_id: visible,
+            expires_at: None,
+        },
+    ]);
+    peer.client.available_messages = vec![expired.to_vec(), visible.to_vec()];
+    peer.client.send_get_request();
+    let (id, request, _) = peer.request(true);
+    assert_eq!(
+        request,
+        Value::Array(vec![Value::Nil, binary_list(&[visible.to_vec()])])
+    );
+    assert!(!peer.client.local_messages.contains(expired.as_slice()));
+    peer.response(id, empty(), false);
+    let (_, request, _) = peer.request(true);
+    assert_eq!(
+        request.as_array().unwrap()[0],
+        binary_list(&[expired.to_vec()])
+    );
+}
+
+#[test]
+fn expiry_preserves_the_counted_request_and_prunes_the_next_purge() {
+    use crate::admission::DurableHave;
+    let mut peer = Peer::new();
+    let all = ids(MAX_DOWNLOAD_ITEMS + 1);
+    let expires_later: [u8; 32] = all.last().unwrap().as_slice().try_into().unwrap();
+    peer.client
+        .replace_durable_haves(all.iter().map(|id| DurableHave {
+            transient_id: id.as_slice().try_into().unwrap(),
+            expires_at: None,
+        }));
+    peer.client.available_messages = all.clone();
+    peer.client.send_get_request();
+    let (id, request, _) = peer.request(true);
+    assert_eq!(
+        request.as_array().unwrap()[1].as_array().unwrap().len(),
+        MAX_DOWNLOAD_ITEMS
+    );
+    assert!(matches!(
+        peer.client.request.as_ref().unwrap().kind,
+        RequestKind::Haves(MAX_DOWNLOAD_ITEMS)
+    ));
+    peer.client
+        .local_message_expiry
+        .insert(expires_later.to_vec(), 1);
+    peer.client.prune_expired_haves(1);
+    // The in-flight response still accounts for exactly its original prefix.
+    assert_eq!(
+        peer.client
+            .pending_haves
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>(),
+        all
+    );
+    assert!(
+        !peer
+            .client
+            .local_messages
+            .contains(expires_later.as_slice())
+    );
+    peer.response(id, empty(), false);
+    assert!(peer.client.pending_haves.is_empty());
+    assert_eq!(peer.client.state(), PropagationClientState::Complete);
+    assert!(
+        peer.rx.is_empty(),
+        "expired tail must not produce another purge"
+    );
+
+    // Fresh accepted receipts use the same last-moment check before purge.
+    peer.client.received_ids = vec![expires_later.to_vec()];
+    peer.client.send_next_chunk();
+    assert!(peer.client.received_ids.is_empty());
+    assert!(peer.rx.is_empty());
+}
+
+#[test]
+fn discard_receipts_expire_after_ninety_days_and_visible_receipts_do_not() {
+    use crate::admission::{AdmissionRecord, AdmissionScope, DurableDisposition, DurableHave};
+    for disposition in [
+        DurableDisposition::Committed,
+        DurableDisposition::Duplicate,
+        DurableDisposition::PolicyDiscard,
+        DurableDisposition::UserDeleted,
+    ] {
+        let record = AdmissionRecord {
+            scope: AdmissionScope {
+                identity: [1; 16],
+                node: [2; 16],
+                transient_id: [3; 32],
+            },
+            message_id: [4; 32],
+            received_wire_hash: [5; 32],
+            stored_message_wire_hash: None,
+            disposition,
+            committed_at: 100,
+        };
+        let have = DurableHave::from_record(&record);
+        if matches!(
+            disposition,
+            DurableDisposition::PolicyDiscard | DurableDisposition::UserDeleted
+        ) {
+            assert_eq!(have.expires_at, Some(100 + 90 * 86400));
+            assert!(have.active(100 + 90 * 86400 - 1));
+            assert!(!have.active(100 + 90 * 86400));
+        } else {
+            assert_eq!(have.expires_at, None);
+            assert!(have.active(u64::MAX));
+        }
+    }
+}
+
+#[test]
+fn stale_suppression_checkpoint_cannot_acknowledge_newer_pruning_or_epochs() {
+    use crate::admission::{AdmissionEpochs, AdmissionScope, SuppressionLedger, SuppressionReason};
+    for expired in [true, false] {
+        let mut peer = Peer::new();
+        let mut ledger = SuppressionLedger::default();
+        let epochs = AdmissionEpochs::default();
+        let at = if expired { 0 } else { crate::now_f64() as u64 };
+        ledger
+            .record_failure(
+                AdmissionScope {
+                    identity: [1; 16],
+                    node: [2; 16],
+                    transient_id: [3; 32],
+                },
+                SuppressionReason::InvalidStamp,
+                epochs,
+                at,
+            )
+            .unwrap();
+        peer.client.set_suppression_ledger(ledger, epochs);
+        let checkpoint = peer.client.suppression_revision();
+        if expired {
+            peer.client.prune_suppression();
+        } else {
+            peer.client.update_admission_epochs(AdmissionEpochs {
+                policy: [1; 32],
+                ..epochs
+            });
+        }
+        peer.client.suppression_persist_failed = true;
+        assert_eq!(peer.client.suppression_ledger().records().count(), 0);
+        assert_ne!(peer.client.suppression_revision(), checkpoint);
+        assert!(!peer.client.acknowledge_suppression_persistence(checkpoint));
+        assert!(peer.client.suppression_persistence_pending());
+        assert!(peer.client.suppression_persist_failed);
+        assert!(
+            peer.client
+                .acknowledge_suppression_persistence(peer.client.suppression_revision())
+        );
+        assert!(!peer.client.suppression_persistence_pending());
+        assert!(!peer.client.suppression_persist_failed);
+        assert_eq!(peer.client.suppression_ledger().records().count(), 0);
+    }
+}
+
+#[test]
+fn rejected_and_retryable_download_counts_never_become_purge_authority() {
+    use crate::admission::{DownloadAdmissionOutcome, SuppressionReason};
+    let mut peer = Peer::new();
+    let messages = blobs(2);
+    peer.client.available_messages = ids(2);
+    peer.client.send_get_request();
+    let (id, _, _) = peer.request(true);
+    peer.response(id, binary_list(&messages), false);
+    for (item, reason) in peer.client.take_downloaded_messages().into_iter().zip([
+        SuppressionReason::InvalidSignature,
+        SuppressionReason::MissingKey,
+    ]) {
+        let (_, token) = item.into_parts();
+        token
+            .resolve(DownloadAdmissionOutcome::Rejected(reason))
+            .unwrap();
+    }
+    peer.client.poll_admissions();
+    let counts = peer.client.transfer_status().admission;
+    assert_eq!(counts.downloaded, 2);
+    assert_eq!(counts.rejected, 2);
+    assert_eq!(counts.retryable, 1);
+    assert_eq!(
+        counts.committed + counts.duplicate + counts.policy_discarded + counts.user_deleted,
+        0
+    );
+    assert!(peer.client.local_messages.is_empty());
+    assert!(peer.client.received_ids.is_empty());
+    assert!(peer.rx.is_empty(), "no durable acceptance means no purge");
 }

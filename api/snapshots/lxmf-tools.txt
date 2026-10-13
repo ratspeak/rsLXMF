@@ -72,6 +72,7 @@ pub fn lxmf_tools::daemon::PythonLxmdConfig::from_config(&rns_runtime::config::C
 pub fn lxmf_tools::daemon::create_router(&lxmf_tools::daemon::DaemonConfig) -> lxmf_core::router::LxmRouter
 pub fn lxmf_tools::daemon::create_router_with_transport(&lxmf_tools::daemon::DaemonConfig, tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>) -> lxmf_core::router::LxmRouter
 pub fn lxmf_tools::daemon::execute_on_inbound(&str, &str) -> core::io::error::Result<()>
+pub fn lxmf_tools::daemon::execute_on_inbound_with_event(&str, &str, &str) -> core::io::error::Result<()>
 pub fn lxmf_tools::daemon::persist_inbound_and_execute(&std::path::Path, &[u8], core::option::Option<&str>) -> core::io::error::Result<()>
 pub mod lxmf_tools::lxmd_cli
 pub enum lxmf_tools::lxmd_cli::SendMethod
@@ -84,10 +85,14 @@ pub struct lxmf_tools::lxmd_cli::Args
 pub lxmf_tools::lxmd_cli::Args::config: core::option::Option<alloc::string::String>
 pub lxmf_tools::lxmd_cli::Args::exampleconfig: bool
 pub lxmf_tools::lxmd_cli::Args::identity: core::option::Option<std::path::PathBuf>
+pub lxmf_tools::lxmd_cli::Args::migrate_propagation_store: bool
 pub lxmf_tools::lxmd_cli::Args::on_inbound: core::option::Option<alloc::string::String>
 pub lxmf_tools::lxmd_cli::Args::peers: bool
 pub lxmf_tools::lxmd_cli::Args::propagation_node: bool
 pub lxmf_tools::lxmd_cli::Args::quiet: u8
+pub lxmf_tools::lxmd_cli::Args::recover_propagation_manifest: core::option::Option<std::path::PathBuf>
+pub lxmf_tools::lxmd_cli::Args::recovery_manifest_sha256: core::option::Option<alloc::string::String>
+pub lxmf_tools::lxmd_cli::Args::relay_writers_stopped: bool
 pub lxmf_tools::lxmd_cli::Args::remote: core::option::Option<alloc::string::String>
 pub lxmf_tools::lxmd_cli::Args::rnsconfig: core::option::Option<alloc::string::String>
 pub lxmf_tools::lxmd_cli::Args::send: core::option::Option<alloc::vec::Vec<alloc::string::String>>

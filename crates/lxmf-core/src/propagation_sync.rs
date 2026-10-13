@@ -136,6 +136,9 @@ pub struct PropagationSyncTask {
     pub propagation_node: Arc<Mutex<PropagationNode>>,
     link: Option<Link>,
     link_id: Option<[u8; 16]>,
+    link_request_result: Option<
+        oneshot::Receiver<Result<(), rns_transport::link_messages::LinkRequestDispatchError>>,
+    >,
     attached_interface: Option<InterfaceId>,
     pending_endpoint_bind: Option<PendingEndpointBind>,
     pending_endpoint_sends: Vec<PendingEndpointSend>,
@@ -189,6 +192,7 @@ impl PropagationSyncTask {
             ))),
             link: None,
             link_id: None,
+            link_request_result: None,
             attached_interface: None,
             pending_endpoint_bind: None,
             pending_endpoint_sends: Vec::new(),
@@ -248,6 +252,7 @@ impl PropagationSyncTask {
             )?)),
             link: None,
             link_id: None,
+            link_request_result: None,
             attached_interface: None,
             pending_endpoint_bind: None,
             pending_endpoint_sends: Vec::new(),
@@ -303,6 +308,7 @@ impl PropagationSyncTask {
             propagation_node,
             link: None,
             link_id: None,
+            link_request_result: None,
             attached_interface: None,
             pending_endpoint_bind: None,
             pending_endpoint_sends: Vec::new(),
@@ -648,17 +654,28 @@ impl PropagationSyncTask {
         self.link_establishment_rate = None;
     }
 
-    pub fn accept_message(&mut self, msg: &crate::message::LxMessage) -> bool {
-        self.propagation_node
-            .lock()
-            .map(|mut node| node.accept_message(msg))
-            .unwrap_or(false)
-    }
-
     /// Drain inbound events from transport.
     ///
     /// `known_identities` maps dest_hash_hex -> 64-byte public key, used for link proof validation.
+    fn poll_link_request(&mut self) {
+        let Some(mut receiver) = self.link_request_result.take() else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(%error,"Link request rejected by transport");
+                self.state = SyncTaskState::Failed;
+            }
+            Err(oneshot::error::TryRecvError::Closed) => {
+                self.state = SyncTaskState::Failed;
+            }
+            Err(oneshot::error::TryRecvError::Empty) => self.link_request_result = Some(receiver),
+        }
+    }
+
     pub fn drain_events(&mut self, known_identities: &HashMap<String, [u8; 64]>) {
+        self.poll_link_request();
         self.poll_endpoint_control();
         let mut events = Vec::new();
         while let Ok(event) = self.event_rx.try_recv() {
@@ -671,7 +688,10 @@ impl PropagationSyncTask {
                     self.handle_link_closed(link_id, None);
                 }
                 DestinationEvent::InboundPacket {
-                    raw, interface_id, ..
+                    raw,
+                    interface_id,
+                    interface_owner,
+                    ..
                 } => {
                     let (header, data_offset) = match rns_wire::header::PacketHeader::unpack(&raw) {
                         Ok(h) => h,
@@ -724,11 +744,12 @@ impl PropagationSyncTask {
                                 let ed25519_bytes: [u8; 32] = pub_key[32..64].try_into().unwrap();
                                 if let Ok(verify_key) = Ed25519PublicKey::from_bytes(&ed25519_bytes)
                                 {
-                                    self.handle_link_proof(
+                                    self.handle_link_proof_with_owner(
                                         data,
                                         &verify_key,
                                         &ed25519_bytes,
                                         interface_id,
+                                        interface_owner,
                                     );
                                 }
                             }
@@ -918,12 +939,23 @@ impl PropagationSyncTask {
         verified
     }
 
+    #[cfg(test)]
     fn handle_link_proof(
         &mut self,
         proof_data: &[u8],
         verify_key: &Ed25519PublicKey,
         ed25519_pub: &[u8; 32],
         interface_id: InterfaceId,
+    ) {
+        self.handle_link_proof_with_owner(proof_data, verify_key, ed25519_pub, interface_id, None)
+    }
+    fn handle_link_proof_with_owner(
+        &mut self,
+        proof_data: &[u8],
+        verify_key: &Ed25519PublicKey,
+        ed25519_pub: &[u8; 32],
+        interface_id: InterfaceId,
+        interface_owner: Option<rns_transport::InterfaceOwnerId>,
     ) {
         let proof_result = match self.link.as_mut() {
             Some(link) => link.validate_proof(proof_data, verify_key, ed25519_pub),
@@ -956,6 +988,7 @@ impl PropagationSyncTask {
                 let (result_tx, result_rx) = oneshot::channel();
                 if !self.queue_transport(TransportMessage::BindLinkEndpoint {
                     binding: LinkEndpointBinding {
+                        interface_owner,
                         link_id,
                         interface_id,
                         role: LinkEndpointRole::Initiator,
@@ -1084,6 +1117,7 @@ impl PropagationSyncTask {
     }
 
     pub fn tick(&mut self) {
+        self.poll_link_request();
         if !self.flush_pending_transport() && self.state != SyncTaskState::Idle {
             self.state = SyncTaskState::Failed;
         }
@@ -1428,14 +1462,20 @@ impl PropagationSyncTask {
         let mut raw = header.pack();
         raw.extend_from_slice(&request_data);
 
-        if !self.queue_transport(TransportMessage::Outbound(OutboundRequest {
-            raw: Bytes::from(raw),
-            destination_hash: node_hash,
-        })) {
+        let (request_tx, request_rx) = oneshot::channel();
+        if !self.queue_transport(TransportMessage::SendLinkRequest {
+            request: OutboundRequest {
+                raw: Bytes::from(raw),
+                destination_hash: node_hash,
+            },
+            result_tx: request_tx,
+        }) {
             tracing::warn!("propagation sync transport closed before Link request");
             self.state = SyncTaskState::Failed;
             return false;
         }
+
+        self.link_request_result = Some(request_rx);
 
         let mut peer = LxmPeer::new(node_hash);
         peer.begin_sync();
@@ -1720,6 +1760,9 @@ impl PropagationSyncTask {
 
     /// Python LXMPeer.py:540-542.
     fn cleanup_sync(&mut self) {
+        self.link_request_result = None;
+        self.pending_transport
+            .retain(|message| !matches!(message, TransportMessage::SendLinkRequest { .. }));
         // No transfer packet should survive the attempt it belongs to. The
         // teardown and deregistration below form a new ordered tail. Preserve
         // a teardown already emitted by Link::tick() when it closed the link.
@@ -1801,11 +1844,38 @@ impl PropagationSyncTask {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn test_task(tx: mpsc::Sender<TransportMessage>, dest: [u8; 16]) -> PropagationSyncTask {
+        PropagationSyncTask::with_shared_node(
+            tx,
+            Arc::new(Mutex::new(
+                crate::propagation_node::tests::durable_test_node(
+                    PropagationNodeConfig::default(),
+                    dest,
+                ),
+            )),
+        )
+    }
+    impl PropagationSyncTask {
+        fn accept_fixture(
+            &mut self,
+            message: &crate::propagation_node::tests::OpaqueFixture,
+        ) -> bool {
+            self.propagation_node
+                .lock()
+                .unwrap()
+                .accept_fixture(message)
+        }
+    }
 
     fn next_link_request(rx: &mut mpsc::Receiver<TransportMessage>) -> OutboundRequest {
         while let Ok(message) = rx.try_recv() {
             match message {
                 TransportMessage::Outbound(request) => return request,
+                TransportMessage::SendLinkRequest { request, result_tx } => {
+                    let _ = result_tx.send(Ok(()));
+                    return request;
+                }
+
                 TransportMessage::SendLinkEndpoint {
                     request, result_tx, ..
                 } => {
@@ -1918,7 +1988,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(4);
         let (initiator, responder) = active_link_pair([0x42; 16]);
         let link_id = initiator.link_id;
-        let mut task = PropagationSyncTask::new(tx, [0xAA; 16]);
+        let mut task = test_task(tx, [0xAA; 16]);
         task.link_id = Some(link_id);
         task.link = Some(initiator);
         task.attached_interface = Some(0);
@@ -1960,6 +2030,7 @@ mod tests {
         let encrypted = responder.encrypt(plaintext).unwrap();
         task.event_tx
             .try_send(DestinationEvent::InboundPacket {
+                interface_owner: None,
                 raw: link_data_packet(link_id, context, &encrypted),
                 interface_id: 0,
                 metrics: Default::default(),
@@ -1990,7 +2061,7 @@ mod tests {
         request.extend_from_slice(&resource_hash);
         request.extend_from_slice(&requested_hash);
 
-        let mut task = PropagationSyncTask::new(tx, [0xAA; 16]);
+        let mut task = test_task(tx, [0xAA; 16]);
         task.link_id = Some(link_id);
         task.link = Some(initiator);
         task.attached_interface = Some(0);
@@ -2051,7 +2122,7 @@ mod tests {
         request.extend_from_slice(&transfer.resource.map_hashes[hashmap_len - 1]);
         request.extend_from_slice(&resource_hash);
 
-        let mut task = PropagationSyncTask::new(tx, [0xAA; 16]);
+        let mut task = test_task(tx, [0xAA; 16]);
         task.link_id = Some(link_id);
         task.link = Some(initiator);
         task.attached_interface = Some(0);
@@ -2097,7 +2168,7 @@ mod tests {
         request.extend_from_slice(&transfer.resource.map_hashes[0]);
         request.extend_from_slice(&resource_hash);
 
-        let mut task = PropagationSyncTask::new(tx, [0xAA; 16]);
+        let mut task = test_task(tx, [0xAA; 16]);
         task.link_id = Some(link_id);
         task.link = Some(initiator);
         task.attached_interface = Some(0);
@@ -2146,7 +2217,7 @@ mod tests {
             .unwrap();
             let transfer = transfers.pop_front().unwrap();
             let resource_hash = transfer.resource.resource_hash;
-            let mut task = PropagationSyncTask::new(tx, [0xAA; 16]);
+            let mut task = test_task(tx, [0xAA; 16]);
             task.link_id = Some(link_id);
             task.link = Some(initiator);
             task.attached_interface = Some(0);
@@ -2213,7 +2284,7 @@ mod tests {
         assert_eq!(reassembled, payload);
 
         let (tx, _rx) = mpsc::channel(4);
-        let mut task = PropagationSyncTask::new(tx, [0xAA; 16]);
+        let mut task = test_task(tx, [0xAA; 16]);
         task.state = SyncTaskState::Transferring;
         task.node_dest_hash = Some([0x43; 16]);
         task.active_transfer = transfers.pop_front();
@@ -2263,7 +2334,7 @@ mod tests {
     #[test]
     fn test_sync_task_creation() {
         let (tx, _rx) = mpsc::channel(16);
-        let task = PropagationSyncTask::new(tx, [0xAA; 16]);
+        let task = test_task(tx, [0xAA; 16]);
         assert_eq!(task.state, SyncTaskState::Idle);
         assert_eq!(task.message_count(), 0);
     }
@@ -2271,7 +2342,7 @@ mod tests {
     #[test]
     fn test_set_node() {
         let (tx, _rx) = mpsc::channel(16);
-        let mut task = PropagationSyncTask::new(tx, [0xAA; 16]);
+        let mut task = test_task(tx, [0xAA; 16]);
         assert!(task.node_dest_hash.is_none());
 
         task.set_node([0xBB; 16]);
@@ -2281,45 +2352,46 @@ mod tests {
     #[test]
     fn test_accept_message() {
         let (tx, _rx) = mpsc::channel(16);
-        let mut task = PropagationSyncTask::new(tx, [0xAA; 16]);
+        let mut task = test_task(tx, [0xAA; 16]);
 
-        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
-        let mut msg = crate::message::LxMessage::new(
+        let _key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
+        let msg = crate::propagation_node::tests::opaque_message(
             [0xBB; 16],
             [0xCC; 16],
             "Test",
             "sync test content",
             crate::constants::DeliveryMethod::Propagated,
         );
-        msg.sign(&key).unwrap();
 
-        assert!(task.accept_message(&msg));
+        assert!(task.accept_fixture(&msg));
         assert_eq!(task.message_count(), 1);
     }
 
     #[test]
     fn test_shared_node_store_is_live() {
         let (tx, mut rx) = mpsc::channel(64);
-        let shared_node = Arc::new(Mutex::new(PropagationNode::new(
-            PropagationNodeConfig::default(),
-            [0xAA; 16],
-        )));
+        let shared_node = Arc::new(Mutex::new(
+            crate::propagation_node::tests::durable_test_node(
+                PropagationNodeConfig::default(),
+                [0xAA; 16],
+            ),
+        ));
         let mut task = PropagationSyncTask::with_shared_node(tx, shared_node.clone());
         task.set_node([0xBB; 16]);
         make_sync_due(&mut task);
 
         assert_eq!(task.message_count(), 0);
 
-        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
-        let mut msg = crate::message::LxMessage::new(
+        let _key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
+        let msg = crate::propagation_node::tests::opaque_message(
             [0xBB; 16],
             [0xCC; 16],
             "Test",
             "shared node content",
             crate::constants::DeliveryMethod::Propagated,
         );
-        msg.sign(&key).unwrap();
-        assert!(shared_node.lock().unwrap().accept_message(&msg));
+
+        assert!(shared_node.lock().unwrap().accept_fixture(&msg));
 
         assert_eq!(task.message_count(), 1);
         task.tick();
@@ -2333,7 +2405,7 @@ mod tests {
     #[test]
     fn test_idle_no_node_configured() {
         let (tx, _rx) = mpsc::channel(16);
-        let mut task = PropagationSyncTask::new(tx, [0xAA; 16]);
+        let mut task = test_task(tx, [0xAA; 16]);
         task.tick();
         assert_eq!(task.state, SyncTaskState::Idle);
     }
@@ -2341,7 +2413,7 @@ mod tests {
     #[test]
     fn test_idle_no_messages() {
         let (tx, _rx) = mpsc::channel(16);
-        let mut task = PropagationSyncTask::new(tx, [0xAA; 16]);
+        let mut task = test_task(tx, [0xAA; 16]);
         task.set_node([0xBB; 16]);
         make_sync_due(&mut task);
         task.tick();
@@ -2351,20 +2423,20 @@ mod tests {
     #[test]
     fn test_starts_sync_when_ready() {
         let (tx, mut rx) = mpsc::channel(64);
-        let mut task = PropagationSyncTask::new(tx, [0xAA; 16]);
+        let mut task = test_task(tx, [0xAA; 16]);
         task.set_node([0xBB; 16]);
         make_sync_due(&mut task);
 
-        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
-        let mut msg = crate::message::LxMessage::new(
+        let _key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
+        let msg = crate::propagation_node::tests::opaque_message(
             [0xBB; 16],
             [0xCC; 16],
             "Test",
             "content",
             crate::constants::DeliveryMethod::Propagated,
         );
-        msg.sign(&key).unwrap();
-        task.accept_message(&msg);
+
+        task.accept_fixture(&msg);
 
         task.tick();
         assert_eq!(task.state, SyncTaskState::Establishing);
@@ -2376,26 +2448,29 @@ mod tests {
             TransportMessage::RegisterDestination { .. }
         ));
         let outbound = rx.try_recv();
-        assert!(matches!(outbound.unwrap(), TransportMessage::Outbound(_)));
+        assert!(matches!(
+            outbound.unwrap(),
+            TransportMessage::SendLinkRequest { .. }
+        ));
     }
 
     #[test]
     fn test_sync_timeout() {
         let (tx, _rx) = mpsc::channel(64);
-        let mut task = PropagationSyncTask::new(tx, [0xAA; 16]);
+        let mut task = test_task(tx, [0xAA; 16]);
         task.set_node([0xBB; 16]);
         make_sync_due(&mut task);
 
-        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
-        let mut msg = crate::message::LxMessage::new(
+        let _key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
+        let msg = crate::propagation_node::tests::opaque_message(
             [0xBB; 16],
             [0xCC; 16],
             "Test",
             "content",
             crate::constants::DeliveryMethod::Propagated,
         );
-        msg.sign(&key).unwrap();
-        task.accept_message(&msg);
+
+        task.accept_fixture(&msg);
 
         task.tick();
         assert_eq!(task.state, SyncTaskState::Establishing);
@@ -2423,7 +2498,7 @@ mod tests {
             link_keys,
         )
         .unwrap();
-        let mut task = PropagationSyncTask::new(tx, [0xAA; 16]);
+        let mut task = test_task(tx, [0xAA; 16]);
         task.link = Some(initiator);
         task.link_id = Some(link_id);
         task.attached_interface = Some(0);
@@ -2456,7 +2531,7 @@ mod tests {
             link_keys,
         )
         .unwrap();
-        let mut task = PropagationSyncTask::new(tx, [0xAA; 16]);
+        let mut task = test_task(tx, [0xAA; 16]);
         task.link = Some(initiator);
         task.link_id = Some(link_id);
         task.attached_interface = Some(0);
@@ -2484,7 +2559,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(1);
         tx.try_send(TransportMessage::DeregisterDestination { hash: [0x01; 16] })
             .unwrap();
-        let mut task = PropagationSyncTask::new(tx, [0xAA; 16]);
+        let mut task = test_task(tx, [0xAA; 16]);
 
         assert!(task.request_sync_now([0xBB; 16]));
         assert_eq!(task.pending_transport.len(), 2);
@@ -2500,7 +2575,7 @@ mod tests {
         task.tick();
         assert!(matches!(
             rx.try_recv().unwrap(),
-            TransportMessage::Outbound(_)
+            TransportMessage::SendLinkRequest { .. }
         ));
         assert!(task.pending_transport.is_empty());
     }
@@ -2510,7 +2585,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(1);
         tx.try_send(TransportMessage::DeregisterDestination { hash: [0; 16] })
             .unwrap();
-        let mut task = PropagationSyncTask::new(tx, [0xAA; 16]);
+        let mut task = test_task(tx, [0xAA; 16]);
         task.state = SyncTaskState::Offering;
         for index in 0..PropagationSyncTask::PENDING_TRANSPORT_LIMIT {
             assert!(
@@ -2541,7 +2616,7 @@ mod tests {
         let responder_public = responder_key.public_key();
         let (_responder, proof) =
             Link::new_responder(&request_data, &responder_key, node_hash, 1).unwrap();
-        let mut task = PropagationSyncTask::new(tx, [0xAA; 16]);
+        let mut task = test_task(tx, [0xAA; 16]);
         task.node_dest_hash = Some(node_hash);
         task.link_id = Some(link.link_id);
         task.link = Some(link);
@@ -2580,7 +2655,7 @@ mod tests {
         .unwrap();
         let transfer = transfers.pop_front().unwrap();
         let resource_hash = transfer.resource.resource_hash;
-        let mut task = PropagationSyncTask::new(tx, [0xAA; 16]);
+        let mut task = test_task(tx, [0xAA; 16]);
         task.link_id = Some(link_id);
         task.link = Some(initiator);
         task.attached_interface = Some(4);
@@ -2590,6 +2665,7 @@ mod tests {
         let encrypted = responder.encrypt(&resource_hash).unwrap();
         task.event_tx
             .try_send(DestinationEvent::InboundPacket {
+                interface_owner: None,
                 raw: link_data_packet(
                     link_id,
                     rns_wire::context::PacketContext::ResourceRcl,
@@ -2608,23 +2684,27 @@ mod tests {
     #[test]
     fn test_cleanup_deregisters() {
         let (tx, mut rx) = mpsc::channel(64);
-        let mut task = PropagationSyncTask::new(tx, [0xAA; 16]);
+        let mut task = test_task(tx, [0xAA; 16]);
         task.set_node([0xBB; 16]);
         make_sync_due(&mut task);
 
-        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
-        let mut msg = crate::message::LxMessage::new(
+        let _key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
+        let msg = crate::propagation_node::tests::opaque_message(
             [0xBB; 16],
             [0xCC; 16],
             "Test",
             "content",
             crate::constants::DeliveryMethod::Propagated,
         );
-        msg.sign(&key).unwrap();
-        task.accept_message(&msg);
+
+        task.accept_fixture(&msg);
 
         task.tick();
-        while rx.try_recv().is_ok() {}
+        while let Ok(message) = rx.try_recv() {
+            if let TransportMessage::SendLinkRequest { result_tx, .. } = message {
+                let _ = result_tx.send(Ok(()));
+            }
+        }
 
         task.state = SyncTaskState::Complete;
         task.tick();
@@ -2636,7 +2716,7 @@ mod tests {
     #[test]
     fn rejected_endpoint_send_fails_the_sync_owner() {
         let (tx, mut rx) = mpsc::channel(64);
-        let mut task = PropagationSyncTask::new(tx, [0xAA; 16]);
+        let mut task = test_task(tx, [0xAA; 16]);
         let link_id = [0xD8; 16];
         task.link_id = Some(link_id);
         task.state = SyncTaskState::Offering;
@@ -2662,7 +2742,7 @@ mod tests {
     #[test]
     fn test_authenticated_remote_link_close_fails_and_cleans_up() {
         let (tx, mut rx) = mpsc::channel(64);
-        let mut task = PropagationSyncTask::new(tx, [0xAA; 16]);
+        let mut task = test_task(tx, [0xAA; 16]);
         let node_hash = [0xE3; 16];
         let (link, mut responder_link) = active_link_pair(node_hash);
         let link_id = link.link_id;
@@ -2681,6 +2761,7 @@ mod tests {
             .expect("remote active link emits authenticated teardown");
         task.event_tx
             .try_send(DestinationEvent::InboundPacket {
+                interface_owner: None,
                 raw: link_data_packet(
                     link_id,
                     rns_wire::context::PacketContext::LinkClose,
@@ -2704,7 +2785,7 @@ mod tests {
     #[test]
     fn test_unauthenticated_link_close_is_ignored() {
         let (tx, _rx) = mpsc::channel(64);
-        let mut task = PropagationSyncTask::new(tx, [0xAA; 16]);
+        let mut task = test_task(tx, [0xAA; 16]);
         let node_hash = [0xE4; 16];
         let (link, _responder_link) = active_link_pair(node_hash);
         let link_id = link.link_id;
@@ -2716,6 +2797,7 @@ mod tests {
 
         task.event_tx
             .try_send(DestinationEvent::InboundPacket {
+                interface_owner: None,
                 raw: link_data_packet(link_id, rns_wire::context::PacketContext::LinkClose, &[0u8]),
                 interface_id: 0,
                 metrics: Default::default(),
@@ -2730,7 +2812,7 @@ mod tests {
     #[test]
     fn test_handle_offer_response_have_all() {
         let (tx, _rx) = mpsc::channel(16);
-        let mut task = PropagationSyncTask::new(tx, [0xAA; 16]);
+        let mut task = test_task(tx, [0xAA; 16]);
         task.set_node([0xBB; 16]);
         task.state = SyncTaskState::AwaitingResponse;
 
@@ -2741,21 +2823,23 @@ mod tests {
     #[test]
     fn empty_policy_selection_completes_without_sending_offer_request() {
         let (tx, mut rx) = mpsc::channel(16);
-        let shared_node = Arc::new(Mutex::new(PropagationNode::new(
-            PropagationNodeConfig::default(),
-            [0xAA; 16],
-        )));
-        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
-        let mut message = crate::message::LxMessage::new(
+        let shared_node = Arc::new(Mutex::new(
+            crate::propagation_node::tests::durable_test_node(
+                PropagationNodeConfig::default(),
+                [0xAA; 16],
+            ),
+        ));
+        let _key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
+        let message = crate::propagation_node::tests::opaque_message(
             [0xBB; 16],
             [0xCC; 16],
             "Test",
             "already handled",
             crate::constants::DeliveryMethod::Propagated,
         );
-        message.sign(&key).unwrap();
+
         let transient_id = message.transient_id.unwrap();
-        assert!(shared_node.lock().unwrap().accept_message(&message));
+        assert!(shared_node.lock().unwrap().accept_fixture(&message));
 
         let node_hash = [0xDD; 16];
         let (link, _responder) = active_link_pair(node_hash);
@@ -2780,21 +2864,23 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn production_policy_preparation_runs_through_bounded_worker() {
         let (tx, mut rx) = mpsc::channel(16);
-        let shared_node = Arc::new(Mutex::new(PropagationNode::new(
-            PropagationNodeConfig::default(),
-            [0xAA; 16],
-        )));
-        let key = Ed25519PrivateKey::generate();
-        let mut message = crate::message::LxMessage::new(
+        let shared_node = Arc::new(Mutex::new(
+            crate::propagation_node::tests::durable_test_node(
+                PropagationNodeConfig::default(),
+                [0xAA; 16],
+            ),
+        ));
+        let _key = Ed25519PrivateKey::generate();
+        let message = crate::propagation_node::tests::opaque_message(
             [0xBB; 16],
             [0xCC; 16],
             "Test",
             "already handled async",
             crate::constants::DeliveryMethod::Propagated,
         );
-        message.sign(&key).unwrap();
+
         let transient_id = message.transient_id.unwrap();
-        assert!(shared_node.lock().unwrap().accept_message(&message));
+        assert!(shared_node.lock().unwrap().accept_fixture(&message));
 
         let node_hash = [0xDD; 16];
         let mut task = PropagationSyncTask::with_shared_node(tx, shared_node);
@@ -2823,21 +2909,23 @@ mod tests {
     fn terminal_offer_filters_are_exposed_and_complete_without_wire_offer() {
         let (tx, mut rx) = mpsc::channel(16);
         let node_hash = [0xDD; 16];
-        let shared_node = Arc::new(Mutex::new(PropagationNode::new(
-            PropagationNodeConfig::default(),
-            [0xAA; 16],
-        )));
+        let shared_node = Arc::new(Mutex::new(
+            crate::propagation_node::tests::durable_test_node(
+                PropagationNodeConfig::default(),
+                [0xAA; 16],
+            ),
+        ));
         let low = vec![0x11; 64];
         let oversized = vec![0x22; 700];
-        assert!(shared_node.lock().unwrap().accept_propagated_blob(&low, 9));
+        assert!(shared_node.lock().unwrap().accept_blob_fixture(&low, 0));
         assert!(
             shared_node
                 .lock()
                 .unwrap()
-                .accept_propagated_blob(&oversized, 20)
+                .accept_blob_fixture(&oversized, 2)
         );
         let mut policy = OutboundOfferPolicy::unrestricted(node_hash);
-        policy.minimum_stamp_cost = 10;
+        policy.minimum_stamp_cost = 1;
         policy.propagation_transfer_limit = Some(0.5);
         let mut task = PropagationSyncTask::with_shared_node(tx, shared_node);
         task.set_node(node_hash);
@@ -2861,7 +2949,8 @@ mod tests {
 
     #[test]
     fn have_all_exposes_every_offered_id_for_authoritative_persistence() {
-        let dir = std::env::temp_dir().join("lxmf_sync_have_all_persist");
+        let temporary = tempfile::tempdir().unwrap();
+        let dir = temporary.path().join("store");
         let _ = std::fs::remove_dir_all(&dir);
         let node_hash = [0xBB; 16];
         let node = PropagationNode::with_storage(
@@ -2871,17 +2960,17 @@ mod tests {
         )
         .unwrap();
         let shared_node = Arc::new(Mutex::new(node));
-        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
+        let _key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
         for content in ["first", "second"] {
-            let mut message = crate::message::LxMessage::new(
+            let message = crate::propagation_node::tests::opaque_message(
                 [0xCC; 16],
                 [0xDD; 16],
                 "Test",
                 content,
                 crate::constants::DeliveryMethod::Propagated,
             );
-            message.sign(&key).unwrap();
-            assert!(shared_node.lock().unwrap().accept_message(&message));
+
+            assert!(shared_node.lock().unwrap().accept_fixture(&message));
         }
         let policy = OutboundOfferPolicy::unrestricted(node_hash);
         let offered = {
@@ -2907,7 +2996,8 @@ mod tests {
 
     #[test]
     fn want_some_is_intersected_with_offer_and_marks_complement_handled() {
-        let dir = std::env::temp_dir().join("lxmf_sync_want_some_bound");
+        let temporary = tempfile::tempdir().unwrap();
+        let dir = temporary.path().join("store");
         let _ = std::fs::remove_dir_all(&dir);
         let node_hash = [0xBB; 16];
         let node = PropagationNode::with_storage(
@@ -2917,17 +3007,17 @@ mod tests {
         )
         .unwrap();
         let shared_node = Arc::new(Mutex::new(node));
-        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
+        let _key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
         for content in ["first", "second"] {
-            let mut message = crate::message::LxMessage::new(
+            let message = crate::propagation_node::tests::opaque_message(
                 [0xCC; 16],
                 [0xDD; 16],
                 "Test",
                 content,
                 crate::constants::DeliveryMethod::Propagated,
             );
-            message.sign(&key).unwrap();
-            assert!(shared_node.lock().unwrap().accept_message(&message));
+
+            assert!(shared_node.lock().unwrap().accept_fixture(&message));
         }
         let policy = OutboundOfferPolicy::unrestricted(node_hash);
         let offered = {
@@ -2959,7 +3049,7 @@ mod tests {
     #[test]
     fn test_handle_offer_response_error() {
         let (tx, _rx) = mpsc::channel(16);
-        let mut task = PropagationSyncTask::new(tx, [0xAA; 16]);
+        let mut task = test_task(tx, [0xAA; 16]);
         task.set_node([0xBB; 16]);
         task.state = SyncTaskState::AwaitingResponse;
 
@@ -2970,21 +3060,21 @@ mod tests {
     #[test]
     fn test_handle_offer_response_want_all_no_storage() {
         let (tx, _rx) = mpsc::channel(16);
-        let mut task = PropagationSyncTask::new(tx, [0xAA; 16]);
+        let mut task = test_task(tx, [0xAA; 16]);
         task.set_node([0xBB; 16]);
         task.state = SyncTaskState::AwaitingResponse;
 
         // In-memory store -- message_get_request returns empty, so WantAll -> Complete.
-        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
-        let mut msg = crate::message::LxMessage::new(
+        let _key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
+        let msg = crate::propagation_node::tests::opaque_message(
             [0xBB; 16],
             [0xCC; 16],
             "Test",
             "content",
             crate::constants::DeliveryMethod::Propagated,
         );
-        msg.sign(&key).unwrap();
-        task.accept_message(&msg);
+
+        task.accept_fixture(&msg);
 
         task.handle_offer_response(OfferResponse::WantAll);
         assert_eq!(task.state, SyncTaskState::Complete);
@@ -2993,7 +3083,7 @@ mod tests {
     #[test]
     fn test_handle_offer_response_want_some() {
         let (tx, _rx) = mpsc::channel(16);
-        let mut task = PropagationSyncTask::new(tx, [0xAA; 16]);
+        let mut task = test_task(tx, [0xAA; 16]);
         task.set_node([0xBB; 16]);
         task.state = SyncTaskState::AwaitingResponse;
 
@@ -3004,7 +3094,8 @@ mod tests {
 
     #[test]
     fn test_handle_offer_response_want_some_with_storage() {
-        let dir = std::env::temp_dir().join("lxmf_test_sync_want_some");
+        let temporary = tempfile::tempdir().unwrap();
+        let dir = temporary.path().join("store");
         let _ = std::fs::remove_dir_all(&dir);
 
         let (tx, _rx) = mpsc::channel(16);
@@ -3012,17 +3103,17 @@ mod tests {
         task.set_node([0xBB; 16]);
         task.state = SyncTaskState::AwaitingResponse;
 
-        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
-        let mut msg = crate::message::LxMessage::new(
+        let _key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
+        let msg = crate::propagation_node::tests::opaque_message(
             [0xBB; 16],
             [0xCC; 16],
             "Test",
             "want some content",
             crate::constants::DeliveryMethod::Propagated,
         );
-        msg.sign(&key).unwrap();
+
         let tid = msg.transient_id.unwrap();
-        task.accept_message(&msg);
+        task.accept_fixture(&msg);
 
         let policy = OutboundOfferPolicy::unrestricted([0xBB; 16]);
         task.propagation_node
@@ -3048,23 +3139,24 @@ mod tests {
 
     #[test]
     fn want_all_builds_one_timestamped_resource_batch_and_waits_for_proof() {
-        let dir = std::env::temp_dir().join("lxmf_test_sync_one_batch");
+        let temporary = tempfile::tempdir().unwrap();
+        let dir = temporary.path().join("store");
         let _ = std::fs::remove_dir_all(&dir);
         let node_hash = [0xBB; 16];
         let (tx, _rx) = mpsc::channel(16);
         let mut task = PropagationSyncTask::with_storage(tx, [0xAA; 16], dir.clone()).unwrap();
         task.set_node(node_hash);
-        let key = Ed25519PrivateKey::generate();
+        let _key = Ed25519PrivateKey::generate();
         for content in ["one", "two"] {
-            let mut message = crate::message::LxMessage::new(
+            let message = crate::propagation_node::tests::opaque_message(
                 [0xCC; 16],
                 [0xDD; 16],
                 "Test",
                 content,
                 crate::constants::DeliveryMethod::Propagated,
             );
-            message.sign(&key).unwrap();
-            assert!(task.accept_message(&message));
+
+            assert!(task.accept_fixture(&message));
         }
         let policy = OutboundOfferPolicy::unrestricted(node_hash);
         task.propagation_node
@@ -3092,22 +3184,23 @@ mod tests {
 
     #[test]
     fn vanished_requested_file_fails_retryably_for_peer_backoff() {
-        let dir = std::env::temp_dir().join("lxmf_test_sync_vanished_batch");
+        let temporary = tempfile::tempdir().unwrap();
+        let dir = temporary.path().join("store");
         let _ = std::fs::remove_dir_all(&dir);
         let node_hash = [0xBB; 16];
         let (tx, _rx) = mpsc::channel(16);
         let mut task = PropagationSyncTask::with_storage(tx, [0xAA; 16], dir.clone()).unwrap();
         task.set_node(node_hash);
-        let key = Ed25519PrivateKey::generate();
-        let mut message = crate::message::LxMessage::new(
+        let _key = Ed25519PrivateKey::generate();
+        let message = crate::propagation_node::tests::opaque_message(
             [0xCC; 16],
             [0xDD; 16],
             "Test",
             "vanish",
             crate::constants::DeliveryMethod::Propagated,
         );
-        message.sign(&key).unwrap();
-        assert!(task.accept_message(&message));
+
+        assert!(task.accept_fixture(&message));
         let policy = OutboundOfferPolicy::unrestricted(node_hash);
         let (generation, reads) = {
             let mut node = task.propagation_node.lock().unwrap();
@@ -3153,22 +3246,22 @@ mod tests {
     #[test]
     fn test_peer_created_on_sync_start() {
         let (tx, _rx) = mpsc::channel(64);
-        let mut task = PropagationSyncTask::new(tx, [0xAA; 16]);
+        let mut task = test_task(tx, [0xAA; 16]);
         task.set_node([0xBB; 16]);
         make_sync_due(&mut task);
 
         assert!(task.peer().is_none());
 
-        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
-        let mut msg = crate::message::LxMessage::new(
+        let _key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
+        let msg = crate::propagation_node::tests::opaque_message(
             [0xBB; 16],
             [0xCC; 16],
             "Test",
             "content",
             crate::constants::DeliveryMethod::Propagated,
         );
-        msg.sign(&key).unwrap();
-        task.accept_message(&msg);
+
+        task.accept_fixture(&msg);
 
         task.tick();
         assert_eq!(task.state, SyncTaskState::Establishing);
@@ -3181,7 +3274,7 @@ mod tests {
     #[test]
     fn request_sync_now_starts_without_waiting_for_interval() {
         let (tx, _rx) = mpsc::channel(64);
-        let mut task = PropagationSyncTask::new(tx, [0xAA; 16]);
+        let mut task = test_task(tx, [0xAA; 16]);
 
         task.request_sync_now([0xBB; 16]);
 
@@ -3194,7 +3287,7 @@ mod tests {
     #[test]
     fn active_sync_rejects_different_request_without_mutating_target_or_policy() {
         let (tx, _rx) = mpsc::channel(64);
-        let mut task = PropagationSyncTask::new(tx, [0xAA; 16]);
+        let mut task = test_task(tx, [0xAA; 16]);
         let policy_a = OutboundOfferPolicy::unrestricted([0xA1; 16]);
         let policy_b = OutboundOfferPolicy::unrestricted([0xB2; 16]);
 
@@ -3207,7 +3300,7 @@ mod tests {
     #[test]
     fn cancel_peer_sync_clears_active_pending_and_session_state() {
         let (tx, _rx) = mpsc::channel(64);
-        let mut task = PropagationSyncTask::new(tx, [0xAA; 16]);
+        let mut task = test_task(tx, [0xAA; 16]);
         let peer_hash = [0xA1; 16];
         assert!(task.request_sync_now_with_policy(OutboundOfferPolicy::unrestricted(peer_hash)));
         task.handled_updates.push([0x44; 32]);
@@ -3233,7 +3326,7 @@ mod tests {
     #[test]
     fn terminal_results_advance_generation_only_on_success_and_must_be_drained() {
         let (tx, _rx) = mpsc::channel(64);
-        let mut task = PropagationSyncTask::new(tx, [0xAA; 16]);
+        let mut task = test_task(tx, [0xAA; 16]);
         task.node_dest_hash = Some([0xA1; 16]);
         task.active_offer_generation = Some(7);
         task.generation_exhausted = false;
@@ -3277,7 +3370,7 @@ mod tests {
     #[test]
     fn terminal_result_carries_python_peer_accounting_deltas() {
         let (tx, _rx) = mpsc::channel(64);
-        let mut task = PropagationSyncTask::new(tx, [0xAA; 16]);
+        let mut task = test_task(tx, [0xAA; 16]);
         task.node_dest_hash = Some([0xC3; 16]);
         task.offered_count = 11;
         task.outgoing_count = 7;
@@ -3307,7 +3400,7 @@ mod tests {
         let (_responder, proof_data) =
             Link::new_responder(&request_data, &responder_key, node_hash, 1).unwrap();
 
-        let mut task = PropagationSyncTask::new(tx, [0xAA; 16]);
+        let mut task = test_task(tx, [0xAA; 16]);
         let local_key = Ed25519PrivateKey::generate();
         let mut local_pub = [0x33; 64];
         local_pub[32..].copy_from_slice(&local_key.public_key().to_bytes());
@@ -3318,16 +3411,16 @@ mod tests {
         task.peer = Some(LxmPeer::new(node_hash));
         task.state = SyncTaskState::Establishing;
 
-        let message_key = Ed25519PrivateKey::generate();
-        let mut message = crate::message::LxMessage::new(
+        let _message_key = Ed25519PrivateKey::generate();
+        let message = crate::propagation_node::tests::opaque_message(
             [0xCC; 16],
             [0xDD; 16],
             "Test",
             "identify ordering",
             crate::constants::DeliveryMethod::Propagated,
         );
-        message.sign(&message_key).unwrap();
-        assert!(task.accept_message(&message));
+
+        assert!(task.accept_fixture(&message));
         task.offer_policy = Some(OutboundOfferPolicy::unrestricted(node_hash));
 
         task.handle_link_proof(&proof_data, &responder_pub, &responder_pub.to_bytes(), 0);
@@ -3359,20 +3452,20 @@ mod tests {
     #[test]
     fn test_peer_cleared_on_cleanup() {
         let (tx, mut rx) = mpsc::channel(64);
-        let mut task = PropagationSyncTask::new(tx, [0xAA; 16]);
+        let mut task = test_task(tx, [0xAA; 16]);
         task.set_node([0xBB; 16]);
         make_sync_due(&mut task);
 
-        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
-        let mut msg = crate::message::LxMessage::new(
+        let _key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
+        let msg = crate::propagation_node::tests::opaque_message(
             [0xBB; 16],
             [0xCC; 16],
             "Test",
             "content",
             crate::constants::DeliveryMethod::Propagated,
         );
-        msg.sign(&key).unwrap();
-        task.accept_message(&msg);
+
+        task.accept_fixture(&msg);
 
         task.tick();
         while rx.try_recv().is_ok() {}

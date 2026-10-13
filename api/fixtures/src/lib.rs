@@ -57,3 +57,32 @@ pub mod delivery_ownership {
         });
     }
 }
+
+/// Reviewed immutable construction, full-width keys and source-bound verification.
+pub mod immutable_messages {
+    use lxmf_core::message_api::{
+        DeliveryMethod, FieldId, LxMessage, LxMessageDraft, MessageError, RecipientStamp,
+        VerifiedLxMessage,
+    };
+    pub fn with_external_signer<F, E>(signer: F) -> Result<LxMessage, MessageError>
+    where
+        F: FnOnce(&[u8]) -> Result<[u8; 64], E>,
+        E: std::fmt::Display,
+    {
+        let mut draft =
+            LxMessageDraft::new([1; 16], [2; 16], "title", "content", DeliveryMethod::Direct)?;
+        draft.set_field(FieldId::from(u64::MAX), vec![1, 2])?;
+        draft.set_msgpack_field(FieldId::from(i64::MIN), vec![0x91, 0x01])?;
+        let signed = draft.sign_with(signer)?;
+        let _id = signed.message_id();
+        signed.finalize(Some(RecipientStamp::Ticket([0; 16])))
+    }
+    pub fn inspect<'a>(
+        message: &'a LxMessage,
+        public_key: &[u8; 64],
+    ) -> Result<VerifiedLxMessage<'a>, MessageError> {
+        let _same_owner = message.wire_owned();
+        let _custom = message.fields().get(u64::MAX);
+        message.verify(public_key)
+    }
+}

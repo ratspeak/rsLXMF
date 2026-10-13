@@ -288,9 +288,72 @@ pub enum DeliveryState {
     Failed,
 }
 
+/// Payload ownership for a reusable Link. Terminal settlement removes the
+/// immutable image and callbacks; the idle Link retains no message body.
+#[derive(Debug)]
+pub struct RetainedDeliveryMessage {
+    image: Option<LxMessage>,
+    metadata: crate::message::MessageMetadata,
+    id: [u8; 32],
+}
+impl From<LxMessage> for RetainedDeliveryMessage {
+    fn from(mut message: LxMessage) -> Self {
+        let metadata = std::mem::take(&mut message.metadata);
+        Self {
+            id: message.message_id(),
+            image: Some(message),
+            metadata,
+        }
+    }
+}
+impl std::ops::Deref for RetainedDeliveryMessage {
+    type Target = crate::message::MessageMetadata;
+    fn deref(&self) -> &Self::Target {
+        &self.metadata
+    }
+}
+impl std::ops::DerefMut for RetainedDeliveryMessage {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.metadata
+    }
+}
+impl RetainedDeliveryMessage {
+    pub fn message_id(&self) -> [u8; 32] {
+        self.id
+    }
+    pub fn retained_wire_bytes(&self) -> usize {
+        self.image
+            .as_ref()
+            .map_or(0, |message| message.wire_bytes().len())
+    }
+    fn pack(&self) -> Result<Vec<u8>, crate::message::MessageError> {
+        self.image
+            .as_ref()
+            .ok_or_else(|| {
+                crate::message::MessageError::PackFailed("delivery payload already settled".into())
+            })?
+            .pack()
+    }
+    fn mark_rejected(&mut self) {
+        self.metadata.state = crate::constants::MessageState::Rejected;
+    }
+    fn release(&mut self) {
+        self.image = None;
+        self.metadata = crate::message::MessageMetadata::default();
+    }
+    fn take(&mut self) -> LxMessage {
+        let mut message = self
+            .image
+            .take()
+            .expect("active delivery owns one immutable payload");
+        message.metadata = std::mem::take(&mut self.metadata);
+        message
+    }
+}
+
 /// An in-progress link-based delivery.
 pub struct PendingDelivery {
-    pub message: LxMessage,
+    pub message: RetainedDeliveryMessage,
     pub dest_hash: [u8; 16],
     pub packed_override: Option<Vec<u8>>,
     pub auto_compress: bool,
@@ -309,6 +372,9 @@ pub struct PendingDelivery {
     /// an initiator that never receives LRPROOF should fail on the Link
     /// establishment clock, not on the active-link inactivity clock.
     pub establishment_timeout: Duration,
+    link_request_result: Option<
+        oneshot::Receiver<Result<(), rns_transport::link_messages::LinkRequestDispatchError>>,
+    >,
     /// Ordinary Link-packet proof window, installed when the packet is
     /// locally admitted. Resource transfers use their own progress watchdog.
     pub timeout: Duration,
@@ -349,7 +415,7 @@ struct QueuedDelivery {
 
 impl QueuedDelivery {
     fn new(message: LxMessage, packed_override: Option<Vec<u8>>, auto_compress: bool) -> Self {
-        let msg_hash = message.hash;
+        let msg_hash = Some(message.message_id());
         Self {
             message,
             packed_override,
@@ -384,7 +450,7 @@ impl PendingDelivery {
         let Some(next) = self.queued.pop_front() else {
             return false;
         };
-        self.message = next.message;
+        self.message = next.message.into();
         self.packed_override = next.packed_override;
         self.auto_compress = next.auto_compress;
         self.transfer = None;
@@ -421,7 +487,7 @@ impl BackchannelProofKey {
 
 struct PendingBackchannelStart {
     receiver: ReadyReceipt<Result<BackchannelSendReceipt, BackchannelSendError>>,
-    message: LxMessage,
+    message: RetainedDeliveryMessage,
     dest_hash: [u8; 16],
     link_id: [u8; 16],
     requested_at: Instant,
@@ -462,6 +528,7 @@ struct EarlyBackchannelResourceConclusion {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkDeliveryStartError {
+    InvalidTiming,
     TransportFull,
     TransportClosed,
 }
@@ -469,6 +536,7 @@ pub enum LinkDeliveryStartError {
 impl fmt::Display for LinkDeliveryStartError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidTiming => f.write_str("invalid link establishment timing"),
             Self::TransportFull => f.write_str("transport full"),
             Self::TransportClosed => f.write_str("transport closed"),
         }
@@ -1147,7 +1215,7 @@ impl LinkDeliveryManager {
                 ));
                 results.push(DeliveryResult::Failed {
                     link_id: delivery.link_id,
-                    msg_hash: delivery.message.hash,
+                    msg_hash: Some(delivery.message.message_id()),
                     dest_hash: delivery.dest_hash,
                     message: delivery.message,
                     reason: reason.to_string(),
@@ -1324,7 +1392,7 @@ impl LinkDeliveryManager {
             }
         };
         let auto_compress = message.auto_compress;
-        let msg_hash = message.hash;
+        let msg_hash = Some(message.message_id());
         let attempts = message.delivery_attempts;
         let (result_tx, result_rx) = oneshot::channel();
         let command = BackchannelSendCommand {
@@ -1384,7 +1452,7 @@ impl LinkDeliveryManager {
         self.pending_backchannel_starts
             .push(PendingBackchannelStart {
                 receiver: result_rx.into(),
-                message,
+                message: message.into(),
                 dest_hash,
                 link_id,
                 requested_at: Instant::now(),
@@ -1451,7 +1519,7 @@ impl LinkDeliveryManager {
                 .get_mut(&link_id)
                 .filter(|delivery| delivery.reusable)
             {
-                let msg_hash = message.hash;
+                let msg_hash = Some(message.message_id());
                 let attempts = message.delivery_attempts;
                 let state = delivery.state;
                 let link_state = delivery.link.state;
@@ -1514,7 +1582,7 @@ impl LinkDeliveryManager {
             }
         }
 
-        let msg_hash = message.hash;
+        let msg_hash = Some(message.message_id());
         let attempts = message.delivery_attempts;
         let link_id = self.start_delivery_inner(
             message,
@@ -1565,9 +1633,17 @@ impl LinkDeliveryManager {
             auto_compress,
             reusable,
         } = options;
-        let msg_hash = message.hash;
+        let msg_hash = Some(message.message_id());
         let (mut link, request_data) = Link::new_initiator(dest_hash, hops);
-        link.extend_establishment_timeout(timing.first_hop_timeout().as_secs_f64());
+        if link
+            .try_extend_establishment_timeout(timing.first_hop_timeout().as_secs_f64())
+            .is_err()
+        {
+            return Err(LinkDeliveryStartFailure {
+                error: LinkDeliveryStartError::InvalidTiming,
+                message: Box::new(message),
+            });
+        }
         let link_id = link.link_id;
         let pending_count = self.pending_count();
 
@@ -1634,10 +1710,14 @@ impl LinkDeliveryManager {
             app_name: "lxmf.delivery.link".to_string(),
             delivery_tx: Some(self.event_tx.clone()),
         });
-        outbound_permit.send(TransportMessage::Outbound(OutboundRequest {
-            raw: Bytes::from(raw),
-            destination_hash: dest_hash,
-        }));
+        let (request_tx, request_rx) = oneshot::channel();
+        outbound_permit.send(TransportMessage::SendLinkRequest {
+            request: OutboundRequest {
+                raw: Bytes::from(raw),
+                destination_hash: dest_hash,
+            },
+            result_tx: request_tx,
+        });
 
         let establishment_timeout = timing.timeout_for_hops(hops);
         let establishment_timeout_secs = establishment_timeout.as_secs_f64();
@@ -1647,7 +1727,7 @@ impl LinkDeliveryManager {
         self.pending.insert(
             link_id,
             PendingDelivery {
-                message,
+                message: message.into(),
                 dest_hash,
                 packed_override,
                 auto_compress,
@@ -1658,6 +1738,7 @@ impl LinkDeliveryManager {
                 remaining_segments: None,
                 packet_proof_hash: None,
                 establishment_timeout,
+                link_request_result: Some(request_rx),
                 timeout: Duration::from_secs_f64(timeout_secs),
                 msg_hash,
                 failure_reason: None,
@@ -1693,6 +1774,28 @@ impl LinkDeliveryManager {
         );
 
         Ok(link_id)
+    }
+
+    fn poll_link_requests(&mut self) {
+        for delivery in self.pending.values_mut() {
+            let Some(mut receiver) = delivery.link_request_result.take() else {
+                continue;
+            };
+            match receiver.try_recv() {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    delivery.state = DeliveryState::Failed;
+                    delivery.failure_reason = Some(error.to_string());
+                }
+                Err(oneshot::error::TryRecvError::Closed) => {
+                    delivery.state = DeliveryState::Failed;
+                    delivery.failure_reason = Some("Link request transport unavailable".into());
+                }
+                Err(oneshot::error::TryRecvError::Empty) => {
+                    delivery.link_request_result = Some(receiver)
+                }
+            }
+        }
     }
 
     fn poll_packet_dispatches(&mut self) {
@@ -1946,6 +2049,7 @@ impl LinkDeliveryManager {
     /// Call before [`Self::tick`] each cycle. Routes `LRPROOF`, `ResourceHmu`, `ResourceReq`,
     /// and `ResourcePrf` contexts to their handlers.
     pub fn drain_events(&mut self, known_identities: &HashMap<String, [u8; 64]>) {
+        self.poll_link_requests();
         self.poll_endpoint_control();
         let mut events = Vec::with_capacity(32);
         if let Some(event) = self.ready_event.take() {
@@ -1964,7 +2068,10 @@ impl LinkDeliveryManager {
                     self.handle_link_closed(&link_id, None);
                 }
                 DestinationEvent::InboundPacket {
-                    raw, interface_id, ..
+                    raw,
+                    interface_id,
+                    interface_owner,
+                    ..
                 } => {
                     let (header, data_offset) = match rns_wire::header::PacketHeader::unpack(&raw) {
                         Ok(h) => h,
@@ -2021,12 +2128,13 @@ impl LinkDeliveryManager {
                                     if let Ok(verify_key) =
                                         Ed25519PublicKey::from_bytes(&ed25519_bytes)
                                     {
-                                        self.handle_link_proof(
+                                        self.handle_link_proof_with_owner(
                                             &link_id,
                                             data,
                                             &verify_key,
                                             &ed25519_bytes,
                                             interface_id,
+                                            interface_owner,
                                         );
                                     }
                                 } else {
@@ -2063,12 +2171,13 @@ impl LinkDeliveryManager {
                                         if let Ok(verify_key) =
                                             Ed25519PublicKey::from_bytes(&ed25519_bytes)
                                         {
-                                            self.handle_link_proof(
+                                            self.handle_link_proof_with_owner(
                                                 &link_id,
                                                 data,
                                                 &verify_key,
                                                 &ed25519_bytes,
                                                 interface_id,
+                                                interface_owner,
                                             );
                                         }
                                     } else {
@@ -2167,6 +2276,24 @@ impl LinkDeliveryManager {
         identity_ed25519_pub: &[u8; 32],
         interface_id: InterfaceId,
     ) -> bool {
+        self.handle_link_proof_with_owner(
+            link_id,
+            proof_data,
+            identity_verify_key,
+            identity_ed25519_pub,
+            interface_id,
+            None,
+        )
+    }
+    pub fn handle_link_proof_with_owner(
+        &mut self,
+        link_id: &[u8; 16],
+        proof_data: &[u8],
+        identity_verify_key: &Ed25519PublicKey,
+        identity_ed25519_pub: &[u8; 32],
+        interface_id: InterfaceId,
+        interface_owner: Option<rns_transport::InterfaceOwnerId>,
+    ) -> bool {
         let Some(delivery) = self.pending.get_mut(link_id) else {
             return false;
         };
@@ -2203,6 +2330,7 @@ impl LinkDeliveryManager {
                     destination_hash: *link_id,
                 };
                 let binding = LinkEndpointBinding {
+                    interface_owner,
                     link_id: *link_id,
                     interface_id,
                     role: LinkEndpointRole::Initiator,
@@ -2270,7 +2398,25 @@ impl LinkDeliveryManager {
         let Some(delivery) = self.pending.get_mut(link_id) else {
             return false;
         };
-        if !delivery.reusable || !delivery.link.is_active() {
+        if !delivery.link.is_active() {
+            return false;
+        }
+        let Ok(plaintext) = delivery.link.decrypt(encrypted_data) else {
+            return false;
+        };
+        delivery.link.record_inbound();
+        delivery.link.record_rx(encrypted_data.len());
+        if !delivery.reusable {
+            let mut input = plaintext.as_slice();
+            let rejection = rmpv::decode::read_value(&mut input).ok();
+            if input.is_empty()
+                && matches!(rejection, Some(rmpv::Value::Array(ref a)) if a.len() == 1 && a[0].as_u64() == Some(245))
+            {
+                delivery.message.mark_rejected();
+                delivery.state = DeliveryState::Rejected;
+                delivery.failure_reason = Some("propagation node rejected stamp".to_string());
+                return true;
+            }
             return false;
         }
 
@@ -2293,12 +2439,6 @@ impl LinkDeliveryManager {
         };
         let mut proof_raw = proof_header.pack();
         proof_raw.extend_from_slice(&proof_data);
-        delivery.link.record_inbound();
-        delivery.link.record_rx(encrypted_data.len());
-        let Ok(plaintext) = delivery.link.decrypt(encrypted_data) else {
-            return false;
-        };
-
         if let Err(reason) = stage_link_endpoint_with_success(
             &self.transport_tx,
             &mut self.pending_transport,
@@ -2744,6 +2884,7 @@ impl LinkDeliveryManager {
 
     /// Drive pending deliveries forward; call periodically after [`Self::drain_events`].
     pub fn tick(&mut self) -> Vec<DeliveryResult> {
+        self.poll_link_requests();
         let mut results = self.tick_backchannels();
         self.poll_endpoint_control();
         if let Err(reason) = flush_staged_transport(&self.transport_tx, &mut self.pending_transport)
@@ -3349,7 +3490,7 @@ impl LinkDeliveryManager {
                     self.pending_backchannel_deliveries.insert(
                         key,
                         PendingBackchannelDelivery {
-                            message: start.message,
+                            message: start.message.take(),
                             dest_hash: start.dest_hash,
                             link_id: start.link_id,
                             representation,
@@ -3506,7 +3647,7 @@ impl LinkDeliveryManager {
                 ));
                 results.push(DeliveryResult::Failed {
                     link_id: delivery.link_id,
-                    msg_hash: delivery.message.hash,
+                    msg_hash: Some(delivery.message.message_id()),
                     dest_hash: delivery.dest_hash,
                     message: delivery.message,
                     reason,
@@ -3953,7 +4094,7 @@ impl LinkDeliveryManager {
                 ));
                 Some(DeliveryResult::Rejected {
                     link_id: delivery.link_id,
-                    msg_hash: delivery.message.hash,
+                    msg_hash: Some(delivery.message.message_id()),
                     dest_hash: delivery.dest_hash,
                     message: delivery.message,
                     reason,
@@ -3978,7 +4119,7 @@ impl LinkDeliveryManager {
                 ));
                 Some(DeliveryResult::Failed {
                     link_id: delivery.link_id,
-                    msg_hash: delivery.message.hash,
+                    msg_hash: Some(delivery.message.message_id()),
                     dest_hash: delivery.dest_hash,
                     message: delivery.message,
                     reason,
@@ -4021,7 +4162,7 @@ impl LinkDeliveryManager {
         );
         Some(DeliveryResult::Complete {
             link_id: delivery.link_id,
-            msg_hash: delivery.message.hash,
+            msg_hash: Some(delivery.message.message_id()),
         })
     }
 
@@ -4243,11 +4384,9 @@ impl LinkDeliveryManager {
             return results;
         }
 
-        if let Some(pos) = self
-            .pending_backchannel_starts
-            .iter()
-            .position(|start| !start.cancelled && start.message.hash == Some(msg_hash))
-        {
+        if let Some(pos) = self.pending_backchannel_starts.iter().position(|start| {
+            !start.cancelled && Some(start.message.message_id()) == Some(msg_hash)
+        }) {
             let start = self.pending_backchannel_starts.remove(pos);
             self.remove_backchannel_owner(start.dest_hash, start.link_id);
             results.push(self.retain_failed_backchannel_start(start, reason.to_string()));
@@ -4258,7 +4397,9 @@ impl LinkDeliveryManager {
         let pending_key = self
             .pending_backchannel_deliveries
             .iter()
-            .find_map(|(key, delivery)| (delivery.message.hash == Some(msg_hash)).then_some(*key));
+            .find_map(|(key, delivery)| {
+                (Some(delivery.message.message_id()) == Some(msg_hash)).then_some(*key)
+            });
         if let Some(key) = pending_key
             && let Some(delivery) = self.pending_backchannel_deliveries.remove(&key)
         {
@@ -4287,7 +4428,7 @@ impl LinkDeliveryManager {
             ));
             results.push(DeliveryResult::Failed {
                 link_id: delivery.link_id,
-                msg_hash: delivery.message.hash,
+                msg_hash: Some(delivery.message.message_id()),
                 dest_hash: delivery.dest_hash,
                 message: delivery.message,
                 reason: reason.to_string(),
@@ -4374,22 +4515,16 @@ impl LinkDeliveryManager {
         if let Some(index) = self
             .pending_backchannel_starts
             .iter()
-            .position(|start| start.message.hash == Some(msg_hash))
+            .position(|start| Some(start.message.message_id()) == Some(msg_hash))
         {
             let start = &mut self.pending_backchannel_starts[index];
             if start.cancelled {
                 return false;
             }
             start.cancelled = true;
-            let mut placeholder = LxMessage::new(
-                start.dest_hash,
-                start.message.source_hash,
-                "",
-                "",
-                start.message.method,
-            );
-            placeholder.hash = start.message.hash;
-            start.message = placeholder;
+            // The adapter owns any dispatched bytes and its leases. Retain
+            // only the exact receipt waiter needed to cancel late settlement.
+            start.message.release();
             if start.cancellation_aware {
                 start.receiver.close();
                 if let Ok(receipt) = start.receiver.try_recv() {
@@ -4405,7 +4540,9 @@ impl LinkDeliveryManager {
         let pending_key = self
             .pending_backchannel_deliveries
             .iter()
-            .find_map(|(key, delivery)| (delivery.message.hash == Some(msg_hash)).then_some(*key));
+            .find_map(|(key, delivery)| {
+                (Some(delivery.message.message_id()) == Some(msg_hash)).then_some(*key)
+            });
         if let Some(key) = pending_key {
             let delivery = self.pending_backchannel_deliveries.remove(&key).unwrap();
             self.cancel_backchannel_packet_key(key, delivery.packet_cancellation);
@@ -4562,7 +4699,7 @@ impl LinkDeliveryManager {
         for start in &self.pending_backchannel_starts {
             if !start.cancelled
                 && start.closed_reason.is_none()
-                && start.message.hash == Some(msg_hash)
+                && Some(start.message.message_id()) == Some(msg_hash)
             {
                 return Some((start.requested_at, BACKCHANNEL_SEND_COMMAND_TIMEOUT));
             }
@@ -4570,19 +4707,22 @@ impl LinkDeliveryManager {
         self.pending_backchannel_deliveries
             .iter()
             .find_map(|(key, delivery)| {
-                (!delivery.link_closed && delivery.message.hash == Some(msg_hash)).then(|| {
-                    let mut wait = delivery.wait.unwrap_or(BackchannelWaitWindow {
-                        started_at: delivery.started_at,
-                        timeout: BACKCHANNEL_DELIVERY_TIMEOUT,
-                        awaiting_admission: false,
-                    });
-                    if delivery.wait.is_some() && matches!(key, BackchannelProofKey::Resource(..)) {
-                        wait.timeout = wait
-                            .timeout
-                            .saturating_add(BACKCHANNEL_RESOURCE_OBSERVATION_GRACE);
-                    }
-                    (wait.started_at, wait.timeout)
-                })
+                (!delivery.link_closed && Some(delivery.message.message_id()) == Some(msg_hash))
+                    .then(|| {
+                        let mut wait = delivery.wait.unwrap_or(BackchannelWaitWindow {
+                            started_at: delivery.started_at,
+                            timeout: BACKCHANNEL_DELIVERY_TIMEOUT,
+                            awaiting_admission: false,
+                        });
+                        if delivery.wait.is_some()
+                            && matches!(key, BackchannelProofKey::Resource(..))
+                        {
+                            wait.timeout = wait
+                                .timeout
+                                .saturating_add(BACKCHANNEL_RESOURCE_OBSERVATION_GRACE);
+                        }
+                        (wait.started_at, wait.timeout)
+                    })
             })
     }
 
@@ -4623,7 +4763,7 @@ impl LinkDeliveryManager {
         }
 
         for start in &self.pending_backchannel_starts {
-            if !start.cancelled && start.message.hash == Some(msg_hash) {
+            if !start.cancelled && Some(start.message.message_id()) == Some(msg_hash) {
                 return Some(MessageDeliverySnapshot {
                     link_id: start.link_id,
                     dest_hash: start.dest_hash,
@@ -4643,7 +4783,7 @@ impl LinkDeliveryManager {
         }
 
         for (key, delivery) in &self.pending_backchannel_deliveries {
-            if delivery.message.hash == Some(msg_hash) {
+            if Some(delivery.message.message_id()) == Some(msg_hash) {
                 let link_id = match key {
                     BackchannelProofKey::Packet(link_id, _)
                     | BackchannelProofKey::Resource(link_id, _) => *link_id,
@@ -4820,9 +4960,30 @@ fn queued_delivery_event(
     }
 }
 
+trait DeliveryObservation {
+    fn observed_message_id(&self) -> [u8; 32];
+    fn observed_attempts(&self) -> u32;
+}
+impl DeliveryObservation for LxMessage {
+    fn observed_message_id(&self) -> [u8; 32] {
+        self.message_id()
+    }
+    fn observed_attempts(&self) -> u32 {
+        self.delivery_attempts
+    }
+}
+impl DeliveryObservation for RetainedDeliveryMessage {
+    fn observed_message_id(&self) -> [u8; 32] {
+        self.id
+    }
+    fn observed_attempts(&self) -> u32 {
+        self.delivery_attempts
+    }
+}
+
 struct BackchannelDeliveryEventInput<'a> {
     kind: LxmfDeliveryEventKind,
-    message: &'a LxMessage,
+    message: &'a dyn DeliveryObservation,
     dest_hash: [u8; 16],
     link_id: [u8; 16],
     representation: DeliveryRepresentation,
@@ -4838,8 +4999,8 @@ fn backchannel_delivery_event(input: BackchannelDeliveryEventInput<'_>) -> LxmfD
         method: LxmfDeliveryEventMethod::Direct,
         link_id: input.link_id,
         dest_hash: input.dest_hash,
-        msg_hash: input.message.hash,
-        attempts: input.message.delivery_attempts,
+        msg_hash: Some(input.message.observed_message_id()),
+        attempts: input.message.observed_attempts(),
         progress: input.progress,
         representation: input.representation,
         link_state: input.link_state,
@@ -4877,18 +5038,11 @@ fn fail_backchannel_start_in_place(
         link_state: LinkState::Closed,
         delivery_state: DeliveryState::Failed,
     }));
-    let placeholder = LxMessage::new(
-        start.dest_hash,
-        start.message.source_hash,
-        "",
-        "",
-        start.message.method,
-    );
-    let message = std::mem::replace(&mut start.message, placeholder);
+    let message = start.message.take();
     start.cancelled = true;
     DeliveryResult::Failed {
         link_id: start.link_id,
-        msg_hash: message.hash,
+        msg_hash: Some(message.message_id()),
         dest_hash: start.dest_hash,
         message,
         reason,
@@ -4979,6 +5133,8 @@ fn finish_reusable_delivery(
         return;
     }
 
+    delivery.message.release();
+    delivery.packed_override = None;
     delivery.state = DeliveryState::Idle;
 }
 
@@ -4992,6 +5148,8 @@ fn finish_unsuccessful_reusable_delivery(delivery: &mut PendingDelivery) {
         return;
     }
 
+    delivery.message.release();
+    delivery.packed_override = None;
     delivery.state = DeliveryState::Idle;
 }
 
@@ -5047,17 +5205,10 @@ fn push_failed_delivery_and_queue(
 }
 
 /// Move the potentially large attachment-bearing message into its terminal
-/// result. Reusable Link sessions retain only a tiny placeholder until the
-/// next queued message replaces it, avoiding a full deep clone on failure.
+/// result. Reusable Link sessions retain only delivery observations until the
+/// next queued message replaces them; no placeholder signed image is created.
 fn take_current_delivery_message(delivery: &mut PendingDelivery) -> LxMessage {
-    let placeholder = LxMessage::new(
-        delivery.dest_hash,
-        delivery.message.source_hash,
-        "",
-        "",
-        delivery.message.method,
-    );
-    std::mem::replace(&mut delivery.message, placeholder)
+    delivery.message.take()
 }
 
 fn fail_queued_deliveries(
@@ -6094,15 +6245,16 @@ mod tests {
         let (tx, _rx) = mpsc::channel(64);
         let mut mgr = LinkDeliveryManager::new(tx, None, None);
         let signing_key = Ed25519PrivateKey::generate();
-        let mut message = LxMessage::new(
+        let message = crate::message::LxMessageDraft::new(
             [0xAA; 16],
             [0xBB; 16],
             "Timed",
             "cancel remains local",
             crate::constants::DeliveryMethod::Direct,
-        );
-        message.sign(&signing_key).unwrap();
-        let message_hash = message.hash.unwrap();
+        )
+        .unwrap();
+        let message = message.sign(&signing_key).unwrap().finalize(None).unwrap();
+        let message_hash = message.message_id();
         let timing = LinkEstablishmentTiming::from_first_hop_bitrate(3_515);
         let expected = timing.timeout_for_hops(3);
 
@@ -6127,6 +6279,10 @@ mod tests {
         while let Ok(message) = rx.try_recv() {
             match message {
                 TransportMessage::Outbound(request) => return request.raw.to_vec(),
+                TransportMessage::SendLinkRequest { request, result_tx } => {
+                    let _ = result_tx.send(Ok(()));
+                    return request.raw.to_vec();
+                }
                 TransportMessage::SendLinkEndpoint {
                     request, result_tx, ..
                 } => {
@@ -6293,6 +6449,7 @@ mod tests {
         proof_raw.extend_from_slice(&proof_data);
         mgr.event_tx
             .try_send(DestinationEvent::InboundPacket {
+                interface_owner: None,
                 raw: proof_raw.into(),
                 interface_id: 0,
                 metrics: Default::default(),
@@ -6309,15 +6466,19 @@ mod tests {
     }
 
     fn timing_message(label: &str) -> LxMessage {
-        let mut message = LxMessage::new(
+        let message = crate::message::LxMessageDraft::new(
             [0xAA; 16],
             [0xBB; 16],
             label,
             "bounded delivery",
             crate::constants::DeliveryMethod::Direct,
-        );
-        message.sign(&Ed25519PrivateKey::generate()).unwrap();
+        )
+        .unwrap();
         message
+            .sign(&Ed25519PrivateKey::generate())
+            .unwrap()
+            .finalize(None)
+            .unwrap()
     }
 
     #[tokio::test]
@@ -6353,12 +6514,13 @@ mod tests {
                 driver_tx,
             ),
         );
+        let interface_owner = actor.interfaces[&7].owner.id();
         let dispatch = actor.link_endpoint_dispatch_handle();
         let (tx, mut rx) = mpsc::channel(32);
         let mut mgr = LinkDeliveryManager::new(tx, None, None);
         mgr.set_link_endpoint_dispatch_handle(dispatch.clone());
         let message = timing_message("cancel before exact bind");
-        let hash = message.hash.unwrap();
+        let hash = message.message_id();
         let dest = [0x95; 16];
         let link_id = mgr.start_delivery(message, dest, 1).unwrap();
         let raw = next_outbound(&mut rx);
@@ -6366,7 +6528,14 @@ mod tests {
         let key = Ed25519PrivateKey::generate();
         let (_, proof) = Link::new_responder(&raw[offset..], &key, dest, 1).unwrap();
         let public = key.public_key();
-        assert!(mgr.handle_link_proof(&link_id, &proof, &public, &public.to_bytes(), 7));
+        assert!(mgr.handle_link_proof_with_owner(
+            &link_id,
+            &proof,
+            &public,
+            &public.to_bytes(),
+            7,
+            Some(interface_owner)
+        ));
         assert!(mgr.pending[&link_id].link.is_active());
         assert!(mgr.cancel_delivery_by_message_hash(hash));
         assert!(mgr.pending_endpoint_binds.is_empty());
@@ -6376,6 +6545,7 @@ mod tests {
         let receipt = dispatch
             .try_bind(
                 LinkEndpointBinding {
+                    interface_owner: Some(interface_owner),
                     link_id,
                     interface_id: 7,
                     role: LinkEndpointRole::Initiator,
@@ -6429,6 +6599,7 @@ mod tests {
             actor
                 .path_table
                 .insert(dest, PathEntry::new(None, 1, 7, InterfaceMode::Full));
+            let interface_owner = actor.interfaces[&7].owner.id();
             let dispatch = actor.link_endpoint_dispatch_handle();
             let task = tokio::spawn(actor.run());
             let mut mgr = LinkDeliveryManager::new(tx.clone(), None, None);
@@ -6438,7 +6609,7 @@ mod tests {
                 timing_message("second"),
                 timing_message("third"),
             ];
-            let hashes = messages.each_ref().map(|message| message.hash.unwrap());
+            let hashes = messages.each_ref().map(|message| message.message_id());
             let payloads = messages.each_mut().map(|message| message.pack().unwrap());
             let [first, second, third] = messages;
             let link_id = mgr.start_delivery(first, dest, 1).unwrap();
@@ -6457,7 +6628,14 @@ mod tests {
             if mode != 1 {
                 assert!(mgr.cancel_delivery_by_message_hash(hashes[cancelled_index]));
             }
-            assert!(mgr.handle_link_proof(&link_id, &proof, &public, &public.to_bytes(), 7));
+            assert!(mgr.handle_link_proof_with_owner(
+                &link_id,
+                &proof,
+                &public,
+                &public.to_bytes(),
+                7,
+                Some(interface_owner)
+            ));
             if mode == 1 {
                 assert!(mgr.cancel_delivery_by_message_hash(hashes[0]));
                 assert!(mgr.pending_endpoint_binds.contains_key(&link_id));
@@ -6540,6 +6718,7 @@ mod tests {
         actor
             .path_table
             .insert(dest, PathEntry::new(None, 1, 7, InterfaceMode::Full));
+        let interface_owner = actor.interfaces[&7].owner.id();
         let handle = actor.link_endpoint_dispatch_handle();
         let actor_task = tokio::spawn(actor.run());
         let identity = Ed25519PrivateKey::generate();
@@ -6552,7 +6731,7 @@ mod tests {
         );
         mgr.set_link_endpoint_dispatch_handle(handle);
         let message = timing_message("exact driver admission");
-        let message_hash = message.hash.unwrap();
+        let message_hash = message.message_id();
         let link_id = if packed {
             mgr.start_packed_delivery(message, dest, 1, b"packed propagation".to_vec(), false)
                 .unwrap()
@@ -6567,7 +6746,14 @@ mod tests {
         let key = Ed25519PrivateKey::generate();
         let (mut responder, proof) = Link::new_responder(&raw[offset..], &key, dest, 1).unwrap();
         let public = key.public_key();
-        assert!(mgr.handle_link_proof(&link_id, &proof, &public, &public.to_bytes(), 7));
+        assert!(mgr.handle_link_proof_with_owner(
+            &link_id,
+            &proof,
+            &public,
+            &public.to_bytes(),
+            7,
+            Some(interface_owner)
+        ));
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 mgr.poll_endpoint_control();
@@ -6706,7 +6892,7 @@ mod tests {
             ));
             mgr.pending.get_mut(&link_id).unwrap().link.rtt = Some(rtt);
             let fading = timing_message("fade");
-            let fading_hash = fading.hash.unwrap();
+            let fading_hash = fading.message_id();
             assert_eq!(mgr.start_delivery(fading, dest, 1).unwrap(), link_id);
             assert!(mgr.tick().is_empty());
             let TransportMessage::SendLinkEndpoint { result_tx, .. } = rx.try_recv().unwrap()
@@ -6731,7 +6917,7 @@ mod tests {
             assert!(proof_window.0.elapsed() < Duration::from_secs(1));
 
             let queued = timing_message("queued behind fade");
-            let queued_hash = queued.hash.unwrap();
+            let queued_hash = queued.message_id();
             assert_eq!(mgr.start_delivery(queued, dest, 1).unwrap(), link_id);
             assert!(mgr.message_timeout_window(queued_hash).is_none());
             // Even a still-active Link must not hide the missing packet proof.
@@ -6785,7 +6971,7 @@ mod tests {
         let responder_key = Ed25519PrivateKey::generate();
         let dest = [0x93; 16];
         let first = timing_message("proof beats local acknowledgement");
-        let first_hash = first.hash.unwrap();
+        let first_hash = first.message_id();
         let (link_id, responder) =
             establish_active_delivery(&mut mgr, &mut rx, first, &responder_key, dest);
         mgr.tick();
@@ -6807,7 +6993,7 @@ mod tests {
         ));
         assert!(mgr.message_timeout_window(first_hash).is_none());
         let next = timing_message("next packet");
-        let next_hash = next.hash.unwrap();
+        let next_hash = next.message_id();
         mgr.start_delivery(next, dest, 1).unwrap();
         mgr.tick();
         let next_window = mgr.message_timeout_window(next_hash).unwrap();
@@ -6833,7 +7019,7 @@ mod tests {
             let peer_key = Ed25519PrivateKey::generate();
             let dest = [0x25; 16];
             let first = timing_message("old packet proof owner");
-            let first_hash = first.hash.unwrap();
+            let first_hash = first.message_id();
             let (link_id, peer) =
                 establish_active_delivery(&mut mgr, &mut rx, first, &peer_key, dest);
             mgr.pending.get_mut(&link_id).unwrap().link.rtt = Some(Duration::from_secs(1));
@@ -6847,7 +7033,7 @@ mod tests {
                 ))
                 .unwrap();
             let next = timing_message("new packet proof owner");
-            let next_hash = next.hash.unwrap();
+            let next_hash = next.message_id();
             let next_packed = next.pack().unwrap();
             assert_eq!(mgr.start_delivery(next, dest, 1).unwrap(), link_id);
             if cancel_first {
@@ -6912,10 +7098,14 @@ mod tests {
         let mut mgr = LinkDeliveryManager::new(tx, None, None);
         let peer_key = Ed25519PrivateKey::generate();
         let dest = [0x26; 16];
-        let mut resource = timing_message("cancel active Resource");
-        resource.content = "resource body".repeat(1_000);
-        resource.sign(&Ed25519PrivateKey::generate()).unwrap();
-        let cancelled_hash = resource.hash.unwrap();
+        let resource = crate::message::test_message(
+            [0xAA; 16],
+            [0xBB; 16],
+            "cancel active Resource",
+            &"resource body".repeat(1_000),
+            crate::constants::DeliveryMethod::Direct,
+        );
+        let cancelled_hash = resource.message_id();
         let (link_id, peer) =
             establish_active_delivery(&mut mgr, &mut rx, resource, &peer_key, dest);
         mgr.pending.get_mut(&link_id).unwrap().link.rtt = Some(Duration::from_secs(1));
@@ -6941,7 +7131,7 @@ mod tests {
             timing_message("queued after Resource one"),
             timing_message("queued after Resource two"),
         ];
-        let hashes = followers.each_ref().map(|message| message.hash.unwrap());
+        let hashes = followers.each_ref().map(|message| message.message_id());
         let packed = followers.each_mut().map(|message| message.pack().unwrap());
         for message in followers {
             assert_eq!(mgr.start_delivery(message, dest, 1).unwrap(), link_id);
@@ -7012,7 +7202,7 @@ mod tests {
             let new_resource = [0x2A; 32];
             mgr.register_backchannel(dest, link_id);
             let first = timing_message("old same-Link Resource");
-            let first_hash = first.hash.unwrap();
+            let first_hash = first.message_id();
             mgr.start_backchannel_delivery(first, dest).unwrap();
             command_rx
                 .try_recv()
@@ -7039,7 +7229,7 @@ mod tests {
                 );
             }
             let next = timing_message("new same-Link Resource");
-            let next_hash = next.hash.unwrap();
+            let next_hash = next.message_id();
             mgr.start_backchannel_delivery(next, dest).unwrap();
             let next_receipt = command_rx.try_recv().unwrap();
             let command_window = mgr.message_timeout_window(next_hash).unwrap();
@@ -7153,7 +7343,7 @@ mod tests {
             let peer_key = Ed25519PrivateKey::generate();
             let dest = [0x2B; 16];
             let first = timing_message("historical idle delivery");
-            let historical_hash = first.hash.unwrap();
+            let historical_hash = first.message_id();
             let retry_same_hash = first.clone();
             let (link_id, peer) =
                 establish_active_delivery(&mut mgr, &mut rx, first, &peer_key, dest);
@@ -7177,6 +7367,8 @@ mod tests {
                 }] if *hash == historical_hash));
             }
             assert_eq!(mgr.pending[&link_id].state, DeliveryState::Idle);
+            assert_eq!(mgr.pending[&link_id].message.retained_wire_bytes(), 0);
+            assert!(mgr.pending[&link_id].packed_override.is_none());
             assert_eq!(mgr.pending[&link_id].msg_hash, Some(historical_hash));
             assert_eq!(mgr.pending_count(), 0);
             mgr.take_delivery_events();
@@ -7194,7 +7386,7 @@ mod tests {
             // The same logical hash is not globally blacklisted: a new queued
             // attempt is a live owner and remains independently cancellable.
             let next = timing_message("future distinct owner");
-            let next_hash = next.hash.unwrap();
+            let next_hash = next.message_id();
             let next_packed = next.pack().unwrap();
             assert_eq!(mgr.start_delivery(next, dest, 1).unwrap(), link_id);
             assert_eq!(
@@ -7243,7 +7435,7 @@ mod tests {
         let resource_hash = [0x96; 32];
         mgr.register_backchannel(dest, link_id);
         let message = timing_message("slow resource");
-        let hash = message.hash.unwrap();
+        let hash = message.message_id();
         mgr.start_backchannel_delivery(message, dest).unwrap();
         let command = cmd_rx.try_recv().unwrap();
         let original = Instant::now() - Duration::from_secs(400);
@@ -7320,7 +7512,7 @@ mod tests {
         mgr.register_backchannel(dest, link_id);
         mgr.set_backchannel_sender(command_tx.clone());
         let legacy = timing_message("legacy cancellation policy");
-        let legacy_hash = legacy.hash.unwrap();
+        let legacy_hash = legacy.message_id();
         mgr.start_backchannel_delivery(legacy, dest).unwrap();
         let legacy_command = commands.try_recv().unwrap();
         mgr.set_cancellation_aware_backchannel_sender(command_tx.clone());
@@ -7338,7 +7530,7 @@ mod tests {
             .unwrap();
         assert!(mgr.tick().is_empty());
         let aware = timing_message("cancellation-aware command not yet issued");
-        let aware_hash = aware.hash.unwrap();
+        let aware_hash = aware.message_id();
         mgr.start_backchannel_delivery(aware, dest).unwrap();
         let aware_command = commands.try_recv().unwrap();
         mgr.set_backchannel_sender(command_tx.clone());
@@ -7349,7 +7541,7 @@ mod tests {
         );
         assert!(mgr.message_delivery_snapshot(aware_hash).is_none());
         let already_published = timing_message("published before cancellation close");
-        let published_hash = already_published.hash.unwrap();
+        let published_hash = already_published.message_id();
         mgr.set_cancellation_aware_backchannel_sender(command_tx);
         mgr.start_backchannel_delivery(already_published, dest)
             .unwrap();
@@ -7370,7 +7562,7 @@ mod tests {
         assert!(
             mgr.pending_backchannel_starts
                 .iter()
-                .all(|start| start.message.hash != Some(published_hash))
+                .all(|start| Some(start.message.message_id()) != Some(published_hash))
         );
         assert!(mgr.tick().is_empty());
     }
@@ -7384,15 +7576,34 @@ mod tests {
         let dest = [0x53; 16];
         let old_link = [0x54; 16];
         mgr.register_backchannel(dest, old_link);
-        for _ in 0..256 {
-            mgr.start_backchannel_delivery(timing_message("bounded receipt reservation"), dest)
-                .unwrap();
+        for index in 0..256 {
+            let message = if index == 0 {
+                crate::message::test_message(
+                    [0xAA; 16],
+                    [0xBB; 16],
+                    "bounded receipt reservation",
+                    &"large cancelled payload".repeat(100_000),
+                    crate::constants::DeliveryMethod::Direct,
+                )
+            } else {
+                timing_message("bounded receipt reservation")
+            };
+            mgr.start_backchannel_delivery(message, dest).unwrap();
         }
-        let cancelled_hash = mgr.pending_backchannel_starts[0].message.hash.unwrap();
-        mgr.pending_backchannel_starts[0].message.content =
-            "large cancelled payload".repeat(100_000);
+        let cancelled_hash = mgr.pending_backchannel_starts[0].message.message_id();
+        assert!(
+            mgr.pending_backchannel_starts[0]
+                .message
+                .retained_wire_bytes()
+                > 2_000_000
+        );
         assert!(mgr.cancel_delivery_by_message_hash(cancelled_hash));
-        assert!(mgr.pending_backchannel_starts[0].message.content.is_empty());
+        assert!(
+            mgr.pending_backchannel_starts[0]
+                .message
+                .retained_wire_bytes()
+                == 0
+        );
         for start in &mut mgr.pending_backchannel_starts {
             start.requested_at = Instant::now() - Duration::from_secs(11);
         }
@@ -7402,7 +7613,7 @@ mod tests {
         assert!(
             mgr.pending_backchannel_starts
                 .iter()
-                .all(|start| start.message.content.is_empty())
+                .all(|start| start.message.retained_wire_bytes() == 0)
         );
         let new_link = [0x55; 16];
         mgr.register_backchannel(dest, new_link);
@@ -7476,7 +7687,7 @@ mod tests {
                 let old_link = [0x32; 16];
                 let replacement = [0x33; 16];
                 let message = timing_message("old owner must not evict replacement");
-                let hash = message.hash.unwrap();
+                let hash = message.message_id();
                 mgr.register_backchannel(dest, old_link);
                 mgr.start_backchannel_delivery(message, dest).unwrap();
                 let command = commands.try_recv().unwrap();
@@ -7570,6 +7781,7 @@ mod tests {
                     driver_tx,
                 ),
             );
+            let interface_owner = actor.interfaces[&7].owner.id();
             let dispatch = actor.link_endpoint_dispatch_handle();
             let actor_task = tokio::spawn(actor.run());
             let link_id = [0x59; 16];
@@ -7578,6 +7790,7 @@ mod tests {
             let token = dispatch
                 .try_bind(
                     LinkEndpointBinding {
+                        interface_owner: Some(interface_owner),
                         link_id,
                         interface_id: 7,
                         role: LinkEndpointRole::Responder,
@@ -7597,7 +7810,7 @@ mod tests {
             }
             mgr.register_backchannel(dest, link_id);
             let message = timing_message("cancel exact actor packet");
-            let hash = message.hash.unwrap();
+            let hash = message.message_id();
             mgr.start_backchannel_delivery(message, dest).unwrap();
             let command = command_rx.try_recv().unwrap();
             let raw = link_data_packet(
@@ -7709,7 +7922,7 @@ mod tests {
         let mut mgr = LinkDeliveryManager::new(tx, None, None);
         let key = Ed25519PrivateKey::generate();
         let message = timing_message("legacy queued packet");
-        let hash = message.hash.unwrap();
+        let hash = message.message_id();
         let (link_id, _) = establish_active_delivery(&mut mgr, &mut rx, message, &key, [0x63; 16]);
         mgr.pending.get_mut(&link_id).unwrap().link.rtt = Some(Duration::from_millis(1));
         assert!(mgr.tick().is_empty());
@@ -7743,7 +7956,7 @@ mod tests {
         let resource_hash = [0x66; 32];
         mgr.register_backchannel(dest, link_id);
         let message = timing_message("queued resource phase renewal");
-        let hash = message.hash.unwrap();
+        let hash = message.message_id();
         mgr.start_backchannel_delivery(message, dest).unwrap();
         cmd_rx
             .try_recv()
@@ -7858,15 +8071,16 @@ mod tests {
         );
 
         let sign_key = Ed25519PrivateKey::generate();
-        let mut msg = LxMessage::new(
+        let msg = crate::message::LxMessageDraft::new(
             [0xAA; 16],
             [0xBB; 16],
             "Backchannel",
             "packet proof",
             crate::constants::DeliveryMethod::Direct,
-        );
-        msg.sign(&sign_key).unwrap();
-        let msg_hash = msg.hash;
+        )
+        .unwrap();
+        let msg = msg.sign(&sign_key).unwrap().finalize(None).unwrap();
+        let msg_hash = Some(msg.message_id());
 
         let report = mgr.start_backchannel_delivery(msg, dest_hash).unwrap();
         assert_eq!(report.link_id, link_id);
@@ -7930,15 +8144,16 @@ mod tests {
         mgr.register_backchannel(dest_hash, link_id);
 
         let sign_key = Ed25519PrivateKey::generate();
-        let mut msg = LxMessage::new(
+        let msg = crate::message::LxMessageDraft::new(
             [0xAA; 16],
             [0xBB; 16],
             "Backchannel",
             "proof raced receipt",
             crate::constants::DeliveryMethod::Direct,
-        );
-        msg.sign(&sign_key).unwrap();
-        let msg_hash = msg.hash;
+        )
+        .unwrap();
+        let msg = msg.sign(&sign_key).unwrap().finalize(None).unwrap();
+        let msg_hash = Some(msg.message_id());
 
         mgr.start_backchannel_delivery(msg, dest_hash).unwrap();
         let command = cmd_rx.try_recv().expect("backchannel send command");
@@ -7980,14 +8195,15 @@ mod tests {
         assert!(mgr.early_backchannel_proofs.is_empty());
         assert_eq!(mgr.pending_count(), 0);
 
-        let mut next = LxMessage::new(
+        let next = crate::message::LxMessageDraft::new(
             [0xAA; 16],
             [0xBB; 16],
             "Backchannel",
             "next delivery is not blocked",
             crate::constants::DeliveryMethod::Direct,
-        );
-        next.sign(&sign_key).unwrap();
+        )
+        .unwrap();
+        let next = next.sign(&sign_key).unwrap().finalize(None).unwrap();
         mgr.start_backchannel_delivery(next, dest_hash).unwrap();
         assert!(cmd_rx.try_recv().is_ok());
     }
@@ -8005,15 +8221,17 @@ mod tests {
         mgr.register_backchannel(dest_hash, link_id);
 
         let sign_key = Ed25519PrivateKey::generate();
-        let mut msg = LxMessage::new(
+        let msg = crate::message::LxMessageDraft::new(
             [0xAA; 16],
             [0xBB; 16],
             "Backchannel",
             "proof then close then receipt",
             crate::constants::DeliveryMethod::Direct,
-        );
-        msg.sign(&sign_key).unwrap();
-        let msg_hash = msg.hash;
+        )
+        .unwrap();
+        let msg = msg.sign(&sign_key).unwrap().finalize(None).unwrap();
+        let message_id = msg.message_id();
+        let msg_hash = Some(message_id);
 
         mgr.start_backchannel_delivery(msg, dest_hash).unwrap();
         let command = cmd_rx.try_recv().expect("backchannel send command");
@@ -8025,7 +8243,7 @@ mod tests {
         assert!(!mgr.delivery_link_available(&dest_hash));
         assert_eq!(mgr.pending_count(), 1);
         assert_eq!(mgr.early_backchannel_proofs.len(), 1);
-        let settling = mgr.message_delivery_snapshot(msg_hash.unwrap()).unwrap();
+        let settling = mgr.message_delivery_snapshot(message_id).unwrap();
         assert_eq!(settling.link_state, LinkState::Closed);
         assert_eq!(mgr.stats().pending_backchannel_starts, 1);
 
@@ -8074,15 +8292,16 @@ mod tests {
         mgr.register_backchannel(dest_hash, link_id);
 
         let sign_key = Ed25519PrivateKey::generate();
-        let mut msg = LxMessage::new(
+        let msg = crate::message::LxMessageDraft::new(
             [0xAA; 16],
             [0xBB; 16],
             "Backchannel",
             "cancel before resource receipt",
             crate::constants::DeliveryMethod::Direct,
-        );
-        msg.sign(&sign_key).unwrap();
-        let msg_hash = msg.hash.unwrap();
+        )
+        .unwrap();
+        let msg = msg.sign(&sign_key).unwrap().finalize(None).unwrap();
+        let msg_hash = msg.message_id();
 
         mgr.start_backchannel_delivery(msg, dest_hash).unwrap();
         let command = cmd_rx.try_recv().expect("backchannel send command");
@@ -8123,15 +8342,16 @@ mod tests {
         mgr.register_backchannel(dest_hash, link_id);
 
         let sign_key = Ed25519PrivateKey::generate();
-        let mut msg = LxMessage::new(
+        let msg = crate::message::LxMessageDraft::new(
             [0xAA; 16],
             [0xBB; 16],
             "Backchannel",
             "cancel before packet receipt",
             crate::constants::DeliveryMethod::Direct,
-        );
-        msg.sign(&sign_key).unwrap();
-        let msg_hash = msg.hash.unwrap();
+        )
+        .unwrap();
+        let msg = msg.sign(&sign_key).unwrap().finalize(None).unwrap();
+        let msg_hash = msg.message_id();
 
         mgr.start_backchannel_delivery(msg, dest_hash).unwrap();
         let command = cmd_rx.try_recv().expect("backchannel send command");
@@ -8167,15 +8387,16 @@ mod tests {
         mgr.register_backchannel(dest_hash, link_id);
 
         let sign_key = Ed25519PrivateKey::generate();
-        let mut msg = LxMessage::new(
+        let msg = crate::message::LxMessageDraft::new(
             [0xAA; 16],
             [0xBB; 16],
             "Backchannel",
             "cancel installed resource",
             crate::constants::DeliveryMethod::Direct,
-        );
-        msg.sign(&sign_key).unwrap();
-        let msg_hash = msg.hash.unwrap();
+        )
+        .unwrap();
+        let msg = msg.sign(&sign_key).unwrap().finalize(None).unwrap();
+        let msg_hash = msg.message_id();
 
         mgr.start_backchannel_delivery(msg, dest_hash).unwrap();
         cmd_rx
@@ -8217,15 +8438,16 @@ mod tests {
         mgr.register_backchannel(dest_hash, link_id);
 
         let sign_key = Ed25519PrivateKey::generate();
-        let mut msg = LxMessage::new(
+        let msg = crate::message::LxMessageDraft::new(
             [0xAA; 16],
             [0xBB; 16],
             "Backchannel",
             "resource rejected",
             crate::constants::DeliveryMethod::Direct,
-        );
-        msg.sign(&sign_key).unwrap();
-        let msg_hash = msg.hash;
+        )
+        .unwrap();
+        let msg = msg.sign(&sign_key).unwrap().finalize(None).unwrap();
+        let msg_hash = Some(msg.message_id());
 
         mgr.start_backchannel_delivery(msg, dest_hash).unwrap();
         cmd_rx
@@ -8291,15 +8513,16 @@ mod tests {
         mgr.register_backchannel(dest_hash, link_id);
 
         let sign_key = Ed25519PrivateKey::generate();
-        let mut msg = LxMessage::new(
+        let msg = crate::message::LxMessageDraft::new(
             [0xAA; 16],
             [0xBB; 16],
             "Backchannel",
             "rejection before resource receipt",
             crate::constants::DeliveryMethod::Direct,
-        );
-        msg.sign(&sign_key).unwrap();
-        let msg_hash = msg.hash;
+        )
+        .unwrap();
+        let msg = msg.sign(&sign_key).unwrap().finalize(None).unwrap();
+        let msg_hash = Some(msg.message_id());
 
         mgr.start_backchannel_delivery(msg, dest_hash).unwrap();
         let command = cmd_rx.try_recv().expect("backchannel send command");
@@ -8386,15 +8609,17 @@ mod tests {
         mgr.register_backchannel(dest_hash, link_id);
 
         let sign_key = Ed25519PrivateKey::generate();
-        let mut msg = LxMessage::new(
+        let msg = crate::message::LxMessageDraft::new(
             [0xAA; 16],
             [0xBB; 16],
             "Backchannel",
             "rejection then close then receipt",
             crate::constants::DeliveryMethod::Direct,
-        );
-        msg.sign(&sign_key).unwrap();
-        let msg_hash = msg.hash;
+        )
+        .unwrap();
+        let msg = msg.sign(&sign_key).unwrap().finalize(None).unwrap();
+        let message_id = msg.message_id();
+        let msg_hash = Some(message_id);
 
         mgr.start_backchannel_delivery(msg, dest_hash).unwrap();
         let command = cmd_rx.try_recv().expect("backchannel send command");
@@ -8410,7 +8635,7 @@ mod tests {
         assert!(mgr.fail_backchannel_link(link_id, "link closed").is_empty());
         assert_eq!(mgr.pending_count(), 1);
         assert!(!mgr.delivery_link_available(&dest_hash));
-        let settling = mgr.message_delivery_snapshot(msg_hash.unwrap()).unwrap();
+        let settling = mgr.message_delivery_snapshot(message_id).unwrap();
         assert_eq!(settling.link_state, LinkState::Closed);
         assert_eq!(mgr.stats().pending_backchannel_starts, 1);
 
@@ -8457,15 +8682,16 @@ mod tests {
         mgr.register_backchannel(dest_hash, link_id);
 
         let sign_key = Ed25519PrivateKey::generate();
-        let mut msg = LxMessage::new(
+        let msg = crate::message::LxMessageDraft::new(
             [0xAA; 16],
             [0xBB; 16],
             "Backchannel",
             "send failure",
             crate::constants::DeliveryMethod::Direct,
-        );
-        msg.sign(&sign_key).unwrap();
-        let msg_hash = msg.hash;
+        )
+        .unwrap();
+        let msg = msg.sign(&sign_key).unwrap().finalize(None).unwrap();
+        let msg_hash = Some(msg.message_id());
 
         mgr.start_backchannel_delivery(msg, dest_hash).unwrap();
         let command = cmd_rx.try_recv().expect("backchannel send command");
@@ -8533,15 +8759,16 @@ mod tests {
         mgr.register_backchannel(dest_hash, link_id);
 
         let sign_key = Ed25519PrivateKey::generate();
-        let mut msg = LxMessage::new(
+        let msg = crate::message::LxMessageDraft::new(
             [0xAA; 16],
             [0xBB; 16],
             "Backchannel",
             "closed while awaiting proof",
             crate::constants::DeliveryMethod::Direct,
-        );
-        msg.sign(&sign_key).unwrap();
-        let msg_hash = msg.hash;
+        )
+        .unwrap();
+        let msg = msg.sign(&sign_key).unwrap().finalize(None).unwrap();
+        let msg_hash = Some(msg.message_id());
 
         mgr.start_backchannel_delivery(msg, dest_hash).unwrap();
         let command = cmd_rx.try_recv().expect("backchannel send command");
@@ -8632,15 +8859,16 @@ mod tests {
         let mut mgr = LinkDeliveryManager::new(tx, None, None);
         let dest_hash = [0xD3; 16];
         let sign_key = Ed25519PrivateKey::generate();
-        let mut msg = LxMessage::new(
+        let msg = crate::message::LxMessageDraft::new(
             [0xAA; 16],
             [0xBB; 16],
             "Direct",
             "stale reusable delivery",
             crate::constants::DeliveryMethod::Direct,
-        );
-        msg.sign(&sign_key).unwrap();
-        let msg_hash = msg.hash.unwrap();
+        )
+        .unwrap();
+        let msg = msg.sign(&sign_key).unwrap().finalize(None).unwrap();
+        let msg_hash = msg.message_id();
 
         let link_id = mgr.start_delivery(msg, dest_hash, 1).unwrap();
         if let Some(delivery) = mgr.pending.get_mut(&link_id) {
@@ -8682,15 +8910,16 @@ mod tests {
         let dest_hash = [0xD4; 16];
         let link_id = [0xE4; 16];
         let sign_key = Ed25519PrivateKey::generate();
-        let mut msg = LxMessage::new(
+        let msg = crate::message::LxMessageDraft::new(
             [0xAA; 16],
             [0xBB; 16],
             "Backchannel",
             "stale backchannel delivery",
             crate::constants::DeliveryMethod::Direct,
-        );
-        msg.sign(&sign_key).unwrap();
-        let msg_hash = msg.hash.unwrap();
+        )
+        .unwrap();
+        let msg = msg.sign(&sign_key).unwrap().finalize(None).unwrap();
+        let msg_hash = msg.message_id();
 
         mgr.register_backchannel(dest_hash, link_id);
         mgr.start_backchannel_delivery(msg, dest_hash).unwrap();
@@ -8719,7 +8948,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(64);
         let mut mgr = LinkDeliveryManager::new(tx, None, None);
 
-        let msg = LxMessage::new(
+        let msg = crate::message::test_message(
             [0xAA; 16],
             [0xBB; 16],
             "Test Subject",
@@ -8768,14 +8997,14 @@ mod tests {
         let mut mgr = LinkDeliveryManager::new(tx, None, None);
         let dest_hash = [0xCD; 16];
 
-        let first = LxMessage::new(
+        let first = crate::message::test_message(
             [0xAA; 16],
             [0xBB; 16],
             "First",
             "first queued message",
             crate::constants::DeliveryMethod::Direct,
         );
-        let second = LxMessage::new(
+        let second = crate::message::test_message(
             [0xAA; 16],
             [0xBB; 16],
             "Second",
@@ -8803,7 +9032,12 @@ mod tests {
             TransportMessage::RegisterDestination { .. }
         ));
         let request = rx.try_recv().unwrap();
-        assert!(matches!(request, TransportMessage::Outbound(_)));
+        match request {
+            TransportMessage::SendLinkRequest { result_tx, .. } => {
+                let _ = result_tx.send(Ok(()));
+            }
+            other => panic!("expected Link request admission, got {other:?}"),
+        }
         assert!(
             rx.try_recv().is_err(),
             "second message must wait on the cached pending link"
@@ -8829,7 +9063,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(64);
         let mut mgr = LinkDeliveryManager::new(tx, None, None);
         let dest_hash = [0xC1; 16];
-        let msg = LxMessage::new(
+        let msg = crate::message::test_message(
             [0xAA; 16],
             [0xBB; 16],
             "Propagation",
@@ -8858,14 +9092,15 @@ mod tests {
         let sign_key = Ed25519PrivateKey::generate();
         let dest_hash = [0xCE; 16];
 
-        let mut first = LxMessage::new(
+        let first = crate::message::LxMessageDraft::new(
             [0xAA; 16],
             [0xBB; 16],
             "First",
             "first direct message",
             crate::constants::DeliveryMethod::Direct,
-        );
-        first.sign(&sign_key).unwrap();
+        )
+        .unwrap();
+        let first = first.sign(&sign_key).unwrap().finalize(None).unwrap();
         let (link_id, responder_link) =
             establish_active_delivery(&mut mgr, &mut rx, first, &responder_key, dest_hash);
 
@@ -8884,14 +9119,15 @@ mod tests {
             DeliveryState::Idle
         );
 
-        let mut second = LxMessage::new(
+        let second = crate::message::LxMessageDraft::new(
             [0xAA; 16],
             [0xBB; 16],
             "Second",
             "second direct message",
             crate::constants::DeliveryMethod::Direct,
-        );
-        second.sign(&sign_key).unwrap();
+        )
+        .unwrap();
+        let second = second.sign(&sign_key).unwrap().finalize(None).unwrap();
         let report = mgr
             .start_delivery_with_report(second, dest_hash, 1)
             .unwrap();
@@ -8933,14 +9169,15 @@ mod tests {
         let sign_key = Ed25519PrivateKey::generate();
         let dest_hash = [0xCF; 16];
 
-        let mut msg = LxMessage::new(
+        let msg = crate::message::LxMessageDraft::new(
             [0xAA; 16],
             [0xBB; 16],
             "Identify",
             "identify after delivery",
             crate::constants::DeliveryMethod::Direct,
-        );
-        msg.sign(&sign_key).unwrap();
+        )
+        .unwrap();
+        let msg = msg.sign(&sign_key).unwrap().finalize(None).unwrap();
         let (link_id, mut responder_link) =
             establish_active_delivery(&mut mgr, &mut rx, msg, &responder_key, dest_hash);
 
@@ -8979,14 +9216,15 @@ mod tests {
         let sign_key = Ed25519PrivateKey::generate();
         let dest_hash = [0xC7; 16];
 
-        let mut msg = LxMessage::new(
+        let msg = crate::message::LxMessageDraft::new(
             [0xAA; 16],
             [0xBB; 16],
             "Initial",
             "initial direct message",
             crate::constants::DeliveryMethod::Direct,
-        );
-        msg.sign(&sign_key).unwrap();
+        )
+        .unwrap();
+        let msg = msg.sign(&sign_key).unwrap().finalize(None).unwrap();
         let (link_id, responder_link) =
             establish_active_delivery(&mut mgr, &mut rx, msg, &responder_key, dest_hash);
 
@@ -9005,6 +9243,7 @@ mod tests {
         let packet_hash = rns_wire::hash::packet_hash(&raw, rns_wire::flags::HeaderType::Header1);
         mgr.event_tx
             .try_send(DestinationEvent::InboundPacket {
+                interface_owner: None,
                 raw: raw.clone(),
                 interface_id: 0,
                 metrics: Default::default(),
@@ -9099,14 +9338,15 @@ mod tests {
         let responder_key = Ed25519PrivateKey::generate();
         let sign_key = Ed25519PrivateKey::generate();
         let dest_hash = [0xE7; 16];
-        let mut msg = LxMessage::new(
+        let msg = crate::message::LxMessageDraft::new(
             [0xAA; 16],
             [0xBB; 16],
             "Initial",
             "establish reusable link",
             crate::constants::DeliveryMethod::Direct,
-        );
-        msg.sign(&sign_key).unwrap();
+        )
+        .unwrap();
+        let msg = msg.sign(&sign_key).unwrap().finalize(None).unwrap();
         let (link_id, responder_link) =
             establish_active_delivery(&mut mgr, &mut rx, msg, &responder_key, dest_hash);
         assert!(mgr.tick().is_empty());
@@ -9144,6 +9384,7 @@ mod tests {
             let encrypted_advertisement = responder_link.encrypt(&advertisement).unwrap();
             mgr.event_tx
                 .try_send(DestinationEvent::InboundPacket {
+                    interface_owner: None,
                     raw: link_data_packet(
                         link_id,
                         rns_wire::context::PacketContext::ResourceAdv,
@@ -9173,6 +9414,7 @@ mod tests {
                             if let TransferAction::SendPart(_, part) = action {
                                 mgr.event_tx
                                     .try_send(DestinationEvent::InboundPacket {
+                                        interface_owner: None,
                                         raw: link_data_packet(
                                             link_id,
                                             rns_wire::context::PacketContext::Resource,
@@ -9223,14 +9465,15 @@ mod tests {
         let responder_key = Ed25519PrivateKey::generate();
         let sign_key = Ed25519PrivateKey::generate();
         let dest_hash = [0xE8; 16];
-        let mut msg = LxMessage::new(
+        let msg = crate::message::LxMessageDraft::new(
             [0xAA; 16],
             [0xBB; 16],
             "Initial",
             "establish reusable link",
             crate::constants::DeliveryMethod::Direct,
-        );
-        msg.sign(&sign_key).unwrap();
+        )
+        .unwrap();
+        let msg = msg.sign(&sign_key).unwrap().finalize(None).unwrap();
         let (link_id, responder_link) =
             establish_active_delivery(&mut mgr, &mut rx, msg, &responder_key, dest_hash);
         assert!(mgr.tick().is_empty());
@@ -9252,6 +9495,7 @@ mod tests {
         let encrypted = responder_link.encrypt(&advertisement).unwrap();
         mgr.event_tx
             .try_send(DestinationEvent::InboundPacket {
+                interface_owner: None,
                 raw: link_data_packet(
                     link_id,
                     rns_wire::context::PacketContext::ResourceAdv,
@@ -9283,14 +9527,15 @@ mod tests {
         let responder_key = Ed25519PrivateKey::generate();
         let sign_key = Ed25519PrivateKey::generate();
         let dest_hash = [0xE9; 16];
-        let mut msg = LxMessage::new(
+        let msg = crate::message::LxMessageDraft::new(
             [0xAA; 16],
             [0xBB; 16],
             "Initial",
             "establish reusable link",
             crate::constants::DeliveryMethod::Direct,
-        );
-        msg.sign(&sign_key).unwrap();
+        )
+        .unwrap();
+        let msg = msg.sign(&sign_key).unwrap().finalize(None).unwrap();
         let (link_id, responder_link) =
             establish_active_delivery(&mut mgr, &mut rx, msg, &responder_key, dest_hash);
         assert!(mgr.tick().is_empty());
@@ -9312,6 +9557,7 @@ mod tests {
         let encrypted_advertisement = responder_link.encrypt(&advertisement).unwrap();
         mgr.event_tx
             .try_send(DestinationEvent::InboundPacket {
+                interface_owner: None,
                 raw: link_data_packet(
                     link_id,
                     rns_wire::context::PacketContext::ResourceAdv,
@@ -9332,6 +9578,7 @@ mod tests {
         let encrypted_cancel = responder_link.encrypt(&resource_hash).unwrap();
         mgr.event_tx
             .try_send(DestinationEvent::InboundPacket {
+                interface_owner: None,
                 raw: link_data_packet(
                     link_id,
                     rns_wire::context::PacketContext::ResourceIcl,
@@ -9355,14 +9602,15 @@ mod tests {
         let responder_key = Ed25519PrivateKey::generate();
         let sign_key = Ed25519PrivateKey::generate();
         let dest_hash = [0xEA; 16];
-        let mut msg = LxMessage::new(
+        let msg = crate::message::LxMessageDraft::new(
             [0xAA; 16],
             [0xBB; 16],
             "Initial",
             "establish reusable link",
             crate::constants::DeliveryMethod::Direct,
-        );
-        msg.sign(&sign_key).unwrap();
+        )
+        .unwrap();
+        let msg = msg.sign(&sign_key).unwrap().finalize(None).unwrap();
         let (link_id, responder_link) =
             establish_active_delivery(&mut mgr, &mut rx, msg, &responder_key, dest_hash);
         assert!(mgr.tick().is_empty());
@@ -9383,6 +9631,7 @@ mod tests {
         };
         mgr.event_tx
             .try_send(DestinationEvent::InboundPacket {
+                interface_owner: None,
                 raw: link_data_packet(
                     link_id,
                     rns_wire::context::PacketContext::ResourceAdv,
@@ -9413,6 +9662,7 @@ mod tests {
         }
         mgr.event_tx
             .try_send(DestinationEvent::InboundPacket {
+                interface_owner: None,
                 raw: link_data_packet(link_id, rns_wire::context::PacketContext::Resource, &part),
                 interface_id: 0,
                 metrics: Default::default(),
@@ -9440,14 +9690,15 @@ mod tests {
         let responder_key = Ed25519PrivateKey::generate();
         let sign_key = Ed25519PrivateKey::generate();
         let dest_hash = [0xEB; 16];
-        let mut msg = LxMessage::new(
+        let msg = crate::message::LxMessageDraft::new(
             [0xAA; 16],
             [0xBB; 16],
             "Initial",
             "establish reusable link",
             crate::constants::DeliveryMethod::Direct,
-        );
-        msg.sign(&sign_key).unwrap();
+        )
+        .unwrap();
+        let msg = msg.sign(&sign_key).unwrap().finalize(None).unwrap();
         let (link_id, responder_link) =
             establish_active_delivery(&mut mgr, &mut rx, msg, &responder_key, dest_hash);
         assert!(mgr.tick().is_empty());
@@ -9486,14 +9737,15 @@ mod tests {
         let sign_key = Ed25519PrivateKey::generate();
         let dest_hash = [0xD7; 16];
 
-        let mut msg = LxMessage::new(
+        let msg = crate::message::LxMessageDraft::new(
             [0xAC; 16],
             [0xBC; 16],
             "Initial",
             "header2 direct reply",
             crate::constants::DeliveryMethod::Direct,
-        );
-        msg.sign(&sign_key).unwrap();
+        )
+        .unwrap();
+        let msg = msg.sign(&sign_key).unwrap().finalize(None).unwrap();
         let (link_id, responder_link) =
             establish_active_delivery(&mut mgr, &mut rx, msg, &responder_key, dest_hash);
 
@@ -9516,6 +9768,7 @@ mod tests {
         let packet_hash = rns_wire::hash::packet_hash(&raw, rns_wire::flags::HeaderType::Header2);
         mgr.event_tx
             .try_send(DestinationEvent::InboundPacket {
+                interface_owner: None,
                 raw: raw.clone(),
                 interface_id: 0,
                 metrics: Default::default(),
@@ -9547,7 +9800,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(1);
         let mut mgr = LinkDeliveryManager::new(tx, None, None);
 
-        let msg = LxMessage::new(
+        let msg = crate::message::test_message(
             [0; 16],
             [0; 16],
             "Full",
@@ -9576,7 +9829,7 @@ mod tests {
         drop(rx);
         let mut mgr = LinkDeliveryManager::new(tx, None, None);
 
-        let msg = LxMessage::new(
+        let msg = crate::message::test_message(
             [0; 16],
             [0; 16],
             "Closed",
@@ -9600,7 +9853,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(64);
         let mut mgr = LinkDeliveryManager::new(tx, None, None);
 
-        let msg = LxMessage::new(
+        let msg = crate::message::test_message(
             [0; 16],
             [0; 16],
             "Timeout",
@@ -9620,8 +9873,14 @@ mod tests {
         );
 
         while let Ok(message) = rx.try_recv() {
-            if let TransportMessage::SendLinkEndpoint { result_tx, .. } = message {
-                let _ = result_tx.send(LinkEndpointSendResult::Sent);
+            match message {
+                TransportMessage::SendLinkEndpoint { result_tx, .. } => {
+                    let _ = result_tx.send(LinkEndpointSendResult::Sent);
+                }
+                TransportMessage::SendLinkRequest { result_tx, .. } => {
+                    let _ = result_tx.send(Ok(()));
+                }
+                _ => {}
             }
         }
 
@@ -9653,15 +9912,16 @@ mod tests {
         let mut mgr = LinkDeliveryManager::new(tx, None, None);
 
         let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
-        let mut msg = LxMessage::new(
+        let msg = crate::message::LxMessageDraft::new(
             [0xAA; 16],
             [0xBB; 16],
             "Large Message",
             &"x".repeat(1000),
             crate::constants::DeliveryMethod::Direct,
-        );
-        msg.sign(&key).unwrap();
-        let expected_hash = msg.hash;
+        )
+        .unwrap();
+        let msg = msg.sign(&key).unwrap().finalize(None).unwrap();
+        let expected_hash = Some(msg.message_id());
 
         let link_id = mgr.start_delivery(msg, [0xCC; 16], 1).unwrap();
         let delivery = mgr.pending.get(&link_id).unwrap();
@@ -9674,14 +9934,15 @@ mod tests {
         let mut mgr = LinkDeliveryManager::new(tx, None, None);
 
         let sign_key = Ed25519PrivateKey::generate();
-        let mut msg = LxMessage::new(
+        let msg = crate::message::LxMessageDraft::new(
             [0xAA; 16],
             [0xBB; 16],
             "Split Direct",
             &"x".repeat(MAX_EFFICIENT_SIZE + 256),
             crate::constants::DeliveryMethod::Direct,
-        );
-        msg.sign(&sign_key).unwrap();
+        )
+        .unwrap();
+        let msg = msg.sign(&sign_key).unwrap().finalize(None).unwrap();
         assert!(msg.pack().unwrap().len() > MAX_EFFICIENT_SIZE);
 
         let responder_key = Ed25519PrivateKey::generate();
@@ -9719,14 +9980,15 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(2);
         let mut mgr = LinkDeliveryManager::new(tx.clone(), None, None);
         let signing_key = Ed25519PrivateKey::generate();
-        let mut message = LxMessage::new(
+        let message = crate::message::LxMessageDraft::new(
             [0xA0; 16],
             [0xB0; 16],
             "backpressure",
             "payload",
             crate::constants::DeliveryMethod::Direct,
-        );
-        message.sign(&signing_key).unwrap();
+        )
+        .unwrap();
+        let message = message.sign(&signing_key).unwrap().finalize(None).unwrap();
         let destination_hash = [0xC0; 16];
         let link_id = mgr.start_delivery(message, destination_hash, 1).unwrap();
         let request_raw = next_outbound(&mut rx);
@@ -9786,14 +10048,15 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(64);
         let mut mgr = LinkDeliveryManager::new(tx, None, None);
         let signing_key = Ed25519PrivateKey::generate();
-        let mut message = LxMessage::new(
+        let message = crate::message::LxMessageDraft::new(
             [0xA8; 16],
             [0xB8; 16],
             "endpoint result",
             "must fail closed",
             crate::constants::DeliveryMethod::Direct,
-        );
-        message.sign(&signing_key).unwrap();
+        )
+        .unwrap();
+        let message = message.sign(&signing_key).unwrap().finalize(None).unwrap();
         let responder_key = Ed25519PrivateKey::generate();
         let (link_id, _) =
             establish_active_delivery(&mut mgr, &mut rx, message, &responder_key, [0xC8; 16]);
@@ -9823,14 +10086,15 @@ mod tests {
         let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel();
         mgr.set_inbound_packet_sender(inbound_tx);
         let signing_key = Ed25519PrivateKey::generate();
-        let mut message = LxMessage::new(
+        let message = crate::message::LxMessageDraft::new(
             [0xA1; 16],
             [0xB1; 16],
             "interface",
             "gate",
             crate::constants::DeliveryMethod::Direct,
-        );
-        message.sign(&signing_key).unwrap();
+        )
+        .unwrap();
+        let message = message.sign(&signing_key).unwrap().finalize(None).unwrap();
         let responder_key = Ed25519PrivateKey::generate();
         let (link_id, responder) =
             establish_active_delivery(&mut mgr, &mut rx, message, &responder_key, [0xC1; 16]);
@@ -9844,6 +10108,7 @@ mod tests {
         let encrypted = responder.encrypt(b"wrong-interface").unwrap();
         mgr.event_tx
             .try_send(DestinationEvent::InboundPacket {
+                interface_owner: None,
                 raw: link_data_packet(link_id, rns_wire::context::PacketContext::None, &encrypted),
                 interface_id: 99,
                 metrics: Default::default(),
@@ -9866,14 +10131,15 @@ mod tests {
         let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel();
         mgr.set_inbound_packet_sender(inbound_tx);
         let signing_key = Ed25519PrivateKey::generate();
-        let mut message = LxMessage::new(
+        let message = crate::message::LxMessageDraft::new(
             [0xA2; 16],
             [0xB2; 16],
             "proof",
             "before plaintext",
             crate::constants::DeliveryMethod::Direct,
-        );
-        message.sign(&signing_key).unwrap();
+        )
+        .unwrap();
+        let message = message.sign(&signing_key).unwrap().finalize(None).unwrap();
         let responder_key = Ed25519PrivateKey::generate();
         let (link_id, responder) =
             establish_active_delivery(&mut mgr, &mut rx, message, &responder_key, [0xC2; 16]);
@@ -9884,6 +10150,7 @@ mod tests {
         let encrypted = responder.encrypt(b"must-not-publish").unwrap();
         mgr.event_tx
             .try_send(DestinationEvent::InboundPacket {
+                interface_owner: None,
                 raw: link_data_packet(link_id, rns_wire::context::PacketContext::None, &encrypted),
                 interface_id: 0,
                 metrics: Default::default(),
@@ -9902,7 +10169,7 @@ mod tests {
     fn invalid_direct_lrproof_does_not_block_later_valid_interface_binding() {
         let (tx, mut rx) = mpsc::channel(64);
         let mut mgr = LinkDeliveryManager::new(tx, None, None);
-        let message = LxMessage::new(
+        let message = crate::message::test_message(
             [0xA3; 16],
             [0xB3; 16],
             "proof",
@@ -9957,7 +10224,7 @@ mod tests {
         let first = establish_active_delivery(
             &mut mgr,
             &mut rx,
-            LxMessage::new(
+            crate::message::test_message(
                 [1; 16],
                 [2; 16],
                 "first",
@@ -9971,7 +10238,7 @@ mod tests {
         let second = establish_active_delivery(
             &mut mgr,
             &mut rx,
-            LxMessage::new(
+            crate::message::test_message(
                 [4; 16],
                 [5; 16],
                 "second",
@@ -9986,6 +10253,7 @@ mod tests {
         mgr.endpoint_lifecycle_tx
             .send(LinkEndpointLifecycleEvent {
                 binding: LinkEndpointBinding {
+                    interface_owner: None,
                     link_id: first,
                     interface_id: 0,
                     role: LinkEndpointRole::Initiator,
@@ -10016,7 +10284,7 @@ mod tests {
         ] {
             let (tx, mut rx) = mpsc::channel(64);
             let mut mgr = LinkDeliveryManager::new(tx, None, None);
-            let mut message = LxMessage::new(
+            let mut message = crate::message::test_message(
                 [0xA5; 16],
                 [0xB5; 16],
                 "byte progress",
@@ -10024,7 +10292,6 @@ mod tests {
                 crate::constants::DeliveryMethod::Direct,
             );
             message.auto_compress = compress;
-            message.sign(&Ed25519PrivateKey::generate()).unwrap();
             let (link_id, _) = establish_active_delivery(
                 &mut mgr,
                 &mut rx,
@@ -10087,7 +10354,7 @@ mod tests {
         for stale in [false, true] {
             let (tx, mut rx) = mpsc::channel(64);
             let mut mgr = LinkDeliveryManager::new(tx, None, None);
-            let mut message = LxMessage::new(
+            let mut message = crate::message::test_message(
                 [0xA4; 16],
                 [0xB4; 16],
                 "resource liveness",
@@ -10095,7 +10362,6 @@ mod tests {
                 crate::constants::DeliveryMethod::Direct,
             );
             message.auto_compress = false;
-            message.sign(&Ed25519PrivateKey::generate()).unwrap();
             let (link_id, responder) = establish_active_delivery(
                 &mut mgr,
                 &mut rx,
@@ -10130,6 +10396,7 @@ mod tests {
             for (payload, interface_id) in [(vec![0; encrypted.len()], 0), (encrypted.clone(), 9)] {
                 mgr.event_tx
                     .try_send(DestinationEvent::InboundPacket {
+                        interface_owner: None,
                         raw: link_data_packet(
                             link_id,
                             rns_wire::context::PacketContext::ResourceReq,
@@ -10148,6 +10415,7 @@ mod tests {
             }
             mgr.event_tx
                 .try_send(DestinationEvent::InboundPacket {
+                    interface_owner: None,
                     raw: link_data_packet(
                         link_id,
                         rns_wire::context::PacketContext::ResourceReq,
@@ -10177,14 +10445,15 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(64);
         let mut mgr = LinkDeliveryManager::new(tx, None, None);
         let signing_key = Ed25519PrivateKey::generate();
-        let mut message = LxMessage::new(
+        let message = crate::message::LxMessageDraft::new(
             [0xA4; 16],
             [0xB4; 16],
             "progressive resource",
             &"x".repeat(4_000),
             crate::constants::DeliveryMethod::Direct,
-        );
-        message.sign(&signing_key).unwrap();
+        )
+        .unwrap();
+        let message = message.sign(&signing_key).unwrap().finalize(None).unwrap();
         let responder_key = Ed25519PrivateKey::generate();
         let destination_hash = [0xC4; 16];
         let (link_id, _responder) =
@@ -10215,15 +10484,15 @@ mod tests {
         let mut mgr = LinkDeliveryManager::new(tx, None, None);
         let sign_key = Ed25519PrivateKey::generate();
         let message = |text: &str| {
-            let mut msg = LxMessage::new(
+            let msg = crate::message::LxMessageDraft::new(
                 [0xAA; 16],
                 [0xBB; 16],
                 text,
                 &"x".repeat(600),
                 crate::constants::DeliveryMethod::Direct,
-            );
-            msg.sign(&sign_key).unwrap();
-            msg
+            )
+            .unwrap();
+            msg.sign(&sign_key).unwrap().finalize(None).unwrap()
         };
         let dest = [0xCC; 16];
         let responder_key = Ed25519PrivateKey::generate();
@@ -10254,14 +10523,15 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(512);
         let mut mgr = LinkDeliveryManager::new(tx, None, None);
         let key = Ed25519PrivateKey::generate();
-        let mut msg = LxMessage::new(
+        let msg = crate::message::LxMessageDraft::new(
             [0xAA; 16],
             [0xBB; 16],
             "first",
             &"x".repeat(600),
             crate::constants::DeliveryMethod::Direct,
-        );
-        msg.sign(&key).unwrap();
+        )
+        .unwrap();
+        let msg = msg.sign(&key).unwrap().finalize(None).unwrap();
         let responder_key = Ed25519PrivateKey::generate();
         let dest = [0xCC; 16];
         let (link, _) =
@@ -10302,15 +10572,16 @@ mod tests {
         let mut mgr = LinkDeliveryManager::new(tx, None, None);
 
         let sign_key = Ed25519PrivateKey::generate();
-        let mut msg = LxMessage::new(
+        let msg = crate::message::LxMessageDraft::new(
             [0xAA; 16],
             [0xBB; 16],
             "Snapshot Direct",
             &"x".repeat(MAX_EFFICIENT_SIZE + 256),
             crate::constants::DeliveryMethod::Direct,
-        );
-        msg.sign(&sign_key).unwrap();
-        let msg_hash = msg.hash.unwrap();
+        )
+        .unwrap();
+        let msg = msg.sign(&sign_key).unwrap().finalize(None).unwrap();
+        let msg_hash = msg.message_id();
 
         let responder_key = Ed25519PrivateKey::generate();
         let dest_hash = [0xCC; 16];
@@ -10337,15 +10608,16 @@ mod tests {
         let mut mgr = LinkDeliveryManager::new(tx, None, None);
 
         let sign_key = Ed25519PrivateKey::generate();
-        let mut msg = LxMessage::new(
+        let msg = crate::message::LxMessageDraft::new(
             [0xAA; 16],
             [0xBB; 16],
             "Cancel Direct",
             &"x".repeat(MAX_EFFICIENT_SIZE + 256),
             crate::constants::DeliveryMethod::Direct,
-        );
-        msg.sign(&sign_key).unwrap();
-        let msg_hash = msg.hash.unwrap();
+        )
+        .unwrap();
+        let msg = msg.sign(&sign_key).unwrap().finalize(None).unwrap();
+        let msg_hash = msg.message_id();
 
         let responder_key = Ed25519PrivateKey::generate();
         let dest_hash = [0xC8; 16];
@@ -10397,14 +10669,15 @@ mod tests {
         let mut mgr = LinkDeliveryManager::new(tx, None, None);
 
         let sign_key = Ed25519PrivateKey::generate();
-        let mut msg = LxMessage::new(
+        let msg = crate::message::LxMessageDraft::new(
             [0xAA; 16],
             [0xBB; 16],
             "Split Direct",
             &"y".repeat(MAX_EFFICIENT_SIZE + 128),
             crate::constants::DeliveryMethod::Direct,
-        );
-        msg.sign(&sign_key).unwrap();
+        )
+        .unwrap();
+        let msg = msg.sign(&sign_key).unwrap().finalize(None).unwrap();
 
         let responder_key = Ed25519PrivateKey::generate();
         let dest_hash = [0xCC; 16];
@@ -10473,14 +10746,15 @@ mod tests {
         let mut mgr = LinkDeliveryManager::new(tx, None, None);
 
         let sign_key = Ed25519PrivateKey::generate();
-        let mut msg = LxMessage::new(
+        let msg = crate::message::LxMessageDraft::new(
             [0xAA; 16],
             [0xBB; 16],
             "Resource Reject",
             &"z".repeat(1000),
             crate::constants::DeliveryMethod::Direct,
-        );
-        msg.sign(&sign_key).unwrap();
+        )
+        .unwrap();
+        let msg = msg.sign(&sign_key).unwrap().finalize(None).unwrap();
 
         let responder_key = Ed25519PrivateKey::generate();
         let dest_hash = [0xCC; 16];
@@ -10527,14 +10801,15 @@ mod tests {
         let mut mgr = LinkDeliveryManager::new(tx, None, None);
 
         let sign_key = Ed25519PrivateKey::generate();
-        let mut msg = LxMessage::new(
+        let msg = crate::message::LxMessageDraft::new(
             [0xAA; 16],
             [0xBB; 16],
             "Remote Close",
             "close before delivery proof",
             crate::constants::DeliveryMethod::Direct,
-        );
-        msg.sign(&sign_key).unwrap();
+        )
+        .unwrap();
+        let msg = msg.sign(&sign_key).unwrap().finalize(None).unwrap();
 
         let responder_key = Ed25519PrivateKey::generate();
         let dest_hash = [0xCD; 16];
@@ -10548,6 +10823,7 @@ mod tests {
             .expect("remote active link emits authenticated teardown");
         mgr.event_tx
             .try_send(DestinationEvent::InboundPacket {
+                interface_owner: None,
                 raw: link_data_packet(
                     link_id,
                     rns_wire::context::PacketContext::LinkClose,
@@ -10576,14 +10852,15 @@ mod tests {
         let mut mgr = LinkDeliveryManager::new(tx, None, None);
 
         let sign_key = Ed25519PrivateKey::generate();
-        let mut msg = LxMessage::new(
+        let msg = crate::message::LxMessageDraft::new(
             [0xAA; 16],
             [0xBB; 16],
             "Bad Close",
             "ignore invalid close packet",
             crate::constants::DeliveryMethod::Direct,
-        );
-        msg.sign(&sign_key).unwrap();
+        )
+        .unwrap();
+        let msg = msg.sign(&sign_key).unwrap().finalize(None).unwrap();
 
         let responder_key = Ed25519PrivateKey::generate();
         let dest_hash = [0xCE; 16];
@@ -10592,6 +10869,7 @@ mod tests {
 
         mgr.event_tx
             .try_send(DestinationEvent::InboundPacket {
+                interface_owner: None,
                 raw: link_data_packet(link_id, rns_wire::context::PacketContext::LinkClose, &[0u8]),
                 interface_id: 0,
                 metrics: Default::default(),
@@ -10612,14 +10890,15 @@ mod tests {
         let mut mgr = LinkDeliveryManager::new(tx, None, None);
 
         let sign_key = Ed25519PrivateKey::generate();
-        let mut msg = LxMessage::new(
+        let msg = crate::message::LxMessageDraft::new(
             [0xAA; 16],
             [0xBB; 16],
             "Small Direct",
             "fits in one link packet",
             crate::constants::DeliveryMethod::Direct,
-        );
-        msg.sign(&sign_key).unwrap();
+        )
+        .unwrap();
+        let msg = msg.sign(&sign_key).unwrap().finalize(None).unwrap();
         let packed = msg.pack().unwrap();
 
         let responder_key = Ed25519PrivateKey::generate();
@@ -10684,6 +10963,7 @@ mod tests {
         proof_raw.extend_from_slice(&proof_data);
         mgr.event_tx
             .try_send(DestinationEvent::InboundPacket {
+                interface_owner: None,
                 raw: proof_raw.into(),
                 interface_id: 0,
                 metrics: Default::default(),
@@ -10708,14 +10988,15 @@ mod tests {
         let mut mgr = LinkDeliveryManager::new(tx, None, None);
 
         let sign_key = Ed25519PrivateKey::generate();
-        let mut msg = LxMessage::new(
+        let msg = crate::message::LxMessageDraft::new(
             [0xAA; 16],
             [0xBB; 16],
             "Small Direct",
             "fits in one link packet",
             crate::constants::DeliveryMethod::Direct,
-        );
-        msg.sign(&sign_key).unwrap();
+        )
+        .unwrap();
+        let msg = msg.sign(&sign_key).unwrap().finalize(None).unwrap();
 
         let responder_key = Ed25519PrivateKey::generate();
         let dest_hash = [0xCC; 16];
@@ -10730,6 +11011,7 @@ mod tests {
             .expect("remote active link emits authenticated teardown after proof");
         mgr.event_tx
             .try_send(DestinationEvent::InboundPacket {
+                interface_owner: None,
                 raw: link_data_packet(
                     link_id,
                     rns_wire::context::PacketContext::LinkClose,
