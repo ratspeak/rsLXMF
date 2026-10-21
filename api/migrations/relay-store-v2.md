@@ -13,7 +13,10 @@ explicit offline migration. An incomplete migration, invalid committed record,
 unsupported filesystem, or unavailable storage prevents hosting. Daemons fail
 startup when required relay storage is unavailable. Applications retain the
 user's hosting preference but show hosting as unavailable until recovery succeeds.
-There is no automatic in-memory fallback for a durable host.
+There is no automatic in-memory fallback for a durable host. Startup checks each
+committed record's index, provenance, size and destination without rereading
+whole message bodies; every read verifies the full body, and a body that fails
+is not served.
 
 Stop every process that can write the store, including service supervisors and
 scheduled restarts. Then run the candidate daemon against the correct config:

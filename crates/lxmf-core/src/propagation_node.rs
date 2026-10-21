@@ -1000,7 +1000,7 @@ impl PropagationNode {
                 continue;
             }
             let (meta, _) = crate::propagation_store_v2::read_manifest(&object)?;
-            crate::propagation_store_v2::verify_committed_object(&object)?;
+            crate::propagation_store_v2::check_committed_on_load(&object, &meta)?;
             if self.store.contains(&meta.transient_id) {
                 return Err(std::io::Error::other("duplicate relay TID"));
             }

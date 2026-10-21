@@ -308,6 +308,25 @@ pub(crate) fn verify_committed_object(path: &Path) -> io::Result<()> {
     check_index(path, &meta, &encoded)
 }
 
+/// Startup check for an indexed record: readable, committed size and
+/// destination prefix. Publication completed its barriers before any proof,
+/// duplicates renew them, and every read revalidates the body, so restart must
+/// not reread and re-flush the whole store.
+pub(crate) fn check_committed_on_load(path: &Path, meta: &EntryManifest) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_file() || metadata.len() != meta.size as u64 {
+        return Err(invalid("relay object does not match its committed size"));
+    }
+    let mut destination = [0u8; 16];
+    File::open(path)?.read_exact(&mut destination)?;
+    if destination != meta.destination {
+        return Err(invalid(
+            "relay object does not match its committed destination",
+        ));
+    }
+    Ok(())
+}
+
 /// Both the manifest and complete bytes are checked at the final read boundary.
 /// An unresolved durable deletion always defeats a previously prepared read.
 pub(crate) fn read_validated_file(path: &Path) -> io::Result<Vec<u8>> {

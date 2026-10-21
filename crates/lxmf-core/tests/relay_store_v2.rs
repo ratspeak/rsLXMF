@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use lxmf_core::propagation_node::{
     PropagationAdmission, PropagationAdmissionOutcome, PropagationNode, PropagationNodeConfig,
-    ValidatedOpaquePropagationBlob,
+    ValidatedOpaquePropagationBlob, read_planned_messages,
 };
 use rmpv::Value;
 fn payload(destination: [u8; 16]) -> Bytes {
@@ -67,6 +67,27 @@ async fn duplicate_waits_for_exact_commit_and_rechecks_retained_files() {
     assert!(check.verify().is_err());
     drop(node);
     assert!(PropagationNode::with_storage(PropagationNodeConfig::default(), [1; 16], old).is_err());
+}
+#[test]
+fn restart_skips_body_rereads_and_never_serves_a_damaged_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = dir.path().join("store");
+    let mut node =
+        PropagationNode::with_storage(PropagationNodeConfig::default(), [1; 16], store.clone())
+            .unwrap();
+    let bytes = payload([2; 16]);
+    let tid = validated(bytes.clone()).transient_id();
+    let plan = reserve(&mut node, bytes);
+    assert!(node.commit_store_write(plan.persist().unwrap()));
+    let path = node.plan_message_reads(&[tid]).pop().unwrap().path;
+    drop(node);
+    let mut damaged = std::fs::read(&path).unwrap();
+    *damaged.last_mut().unwrap() ^= 0xff;
+    std::fs::write(&path, &damaged).unwrap();
+    let reopened =
+        PropagationNode::with_storage(PropagationNodeConfig::default(), [1; 16], store).unwrap();
+    assert_eq!(reopened.message_count(), 1);
+    assert!(read_planned_messages(&reopened.plan_message_reads(&[tid])).is_empty());
 }
 #[tokio::test]
 async fn cancelled_reservation_releases_waiters_without_authority_and_can_retry() {

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Start a propagation node without rereading and flushing every stored message, so restarts with large stores no longer delay announces and hosting. Each message is still verified when it is served.
+
 ## 1.4.0 - 2026-10-12
 
 - Preserve each signed message exactly as received, including binary text and custom fields, and reject ambiguous field definitions.
