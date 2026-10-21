@@ -6755,7 +6755,9 @@ mod tests {
             }))
             .unwrap();
         assert!(ld.tick().is_empty());
-        let original = Instant::now() - Duration::from_secs(400);
+        let Some(original) = Instant::now().checked_sub(Duration::from_secs(400)) else {
+            return; // Windows clocks count from boot; fresh runners can't backdate this far.
+        };
         runner.handle_delivery_accounting_event(LinkManagerAccountingEvent::OutboundResourceWait {
             link_id,
             resource_id: resource_hash,

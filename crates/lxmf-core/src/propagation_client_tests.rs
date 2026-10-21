@@ -193,7 +193,9 @@ impl Peer {
             packets += 1;
             assert!(packets < 20_000, "bounded request peer loop");
             if self.rx.is_empty() {
-                receiver.last_activity = Instant::now() - Duration::from_secs(1000);
+                // Past this peer's watchdog (seconds at its 10 ms RTT), yet within
+                // a freshly booted Windows clock.
+                receiver.last_activity = Instant::now() - Duration::from_secs(30);
                 receiver.req_sent = Some(receiver.last_activity);
                 let TransferAction::SendRequest(request) = receiver.check_timeout() else {
                     panic!("receiver should retry its missing window");
@@ -533,12 +535,12 @@ fn request_resource_progress_is_not_a_fixed_120_second_operation() {
     let mut peer = Peer::new();
     peer.client.received_ids = ids(50);
     peer.client.send_purge_request();
-    peer.client.started_at = Some(Instant::now() - Duration::from_secs(600));
+    peer.client.started_at = Some(ago_or_skip!(Duration::from_secs(600)));
     peer.client.tick();
     assert_eq!(peer.client.state(), PropagationClientState::PurgeRequested);
     let (id, _, _) = peer.request(true);
     let request = peer.client.request.as_mut().unwrap();
-    request.waiting_since = Some(Instant::now() - request.timeout - Duration::from_secs(1));
+    request.waiting_since = Some(ago_or_skip!(request.timeout + Duration::from_secs(1)));
     peer.client.tick();
     assert_eq!(peer.client.state(), PropagationClientState::Failed);
     assert!(peer.client.request.is_none());
@@ -563,7 +565,7 @@ fn lost_advertisement_retries_same_resource_and_eventually_fails() {
             .outbound
             .as_mut()
             .unwrap()
-            .started_at = Instant::now() - Duration::from_secs(100_000);
+            .started_at = ago_or_skip!(Duration::from_secs(100_000));
         peer.client.drive_outbound_request();
         if peer.client.state() != PropagationClientState::Failed {
             let (context, payload, _) = peer.packet();
@@ -934,7 +936,7 @@ fn transport_result_deadline_is_finite_and_retains_results() {
     peer.client.received_ids = ids(50);
     peer.client.send_purge_request();
     let pending = peer.client.pending_endpoint_sends.last_mut().unwrap();
-    pending.queued_at = Instant::now() - Duration::from_secs(121);
+    pending.queued_at = ago_or_skip!(Duration::from_secs(121));
     peer.client.tick();
     assert_eq!(peer.client.state(), PropagationClientState::Failed);
     assert!(peer.client.request.is_none());
@@ -957,7 +959,7 @@ fn packet_response_wait_begins_after_transport_admission() {
             .waiting_since
             .is_none()
     );
-    peer.client.started_at = Some(Instant::now() - Duration::from_secs(600));
+    peer.client.started_at = Some(ago_or_skip!(Duration::from_secs(600)));
     peer.client.tick();
     assert_eq!(peer.client.state(), PropagationClientState::ListRequested);
     let (id, _, _) = peer.request(true);
@@ -995,7 +997,7 @@ fn slow_segment_gets_a_fresh_proof_admission_deadline() {
     peer.inject(Context::ResourceAdv, &peer.link.encrypt(&adv).unwrap());
     let (context, request, _) = peer.packet();
     assert_eq!(context, Context::ResourceReq);
-    peer.client.started_at = Some(Instant::now() - Duration::from_secs(600));
+    peer.client.started_at = Some(ago_or_skip!(Duration::from_secs(600)));
     peer.client
         .request
         .as_mut()
@@ -1003,7 +1005,7 @@ fn slow_segment_gets_a_fresh_proof_admission_deadline() {
         .response
         .as_mut()
         .unwrap()
-        .waiting_since = Instant::now() - Duration::from_secs(600);
+        .waiting_since = ago_or_skip!(Duration::from_secs(600));
     for action in sender.handle_request(&peer.link.decrypt(&request).unwrap()) {
         let TransferAction::SendPart(_, data) = action else {
             panic!()

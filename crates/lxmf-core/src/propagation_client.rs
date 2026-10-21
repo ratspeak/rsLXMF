@@ -3397,7 +3397,7 @@ mod tests {
         client.link_id = Some(initiator.link_id);
         client.link = Some(initiator);
         client.status.state = PropagationClientState::Receiving;
-        client.started_at = Some(Instant::now() - Duration::from_secs(600));
+        client.started_at = Some(ago_or_skip!(Duration::from_secs(600)));
         client.timeout = Duration::ZERO;
 
         client.tick();

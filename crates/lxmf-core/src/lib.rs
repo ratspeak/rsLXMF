@@ -43,6 +43,18 @@ pub(crate) fn now_f64() -> f64 {
         .as_secs_f64()
 }
 
+/// `Instant::now() - age`, or return from the test when the monotonic clock is
+/// younger than `age`: Windows counts from boot, so fresh CI runners can't.
+#[cfg(test)]
+macro_rules! ago_or_skip {
+    ($age:expr) => {
+        match std::time::Instant::now().checked_sub($age) {
+            Some(instant) => instant,
+            None => return,
+        }
+    };
+}
+
 pub mod admission;
 pub mod admission_store;
 pub mod constants;

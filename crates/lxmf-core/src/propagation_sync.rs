@@ -2504,7 +2504,7 @@ mod tests {
         task.attached_interface = Some(0);
         task.active_transfer = Some(transfer);
         task.state = SyncTaskState::Transferring;
-        task.sync_started = Some(Instant::now() - Duration::from_secs(600));
+        task.sync_started = Some(ago_or_skip!(Duration::from_secs(600)));
         task.sync_timeout = Duration::ZERO;
 
         task.tick();
@@ -2540,8 +2540,7 @@ mod tests {
 
         task.tick();
         let _first_advertisement = rx.try_recv().unwrap();
-        task.active_transfer.as_mut().unwrap().started_at =
-            Instant::now() - Duration::from_secs(60);
+        task.active_transfer.as_mut().unwrap().started_at = ago_or_skip!(Duration::from_secs(60));
 
         task.tick();
 

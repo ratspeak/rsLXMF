@@ -7438,7 +7438,7 @@ mod tests {
         let hash = message.message_id();
         mgr.start_backchannel_delivery(message, dest).unwrap();
         let command = cmd_rx.try_recv().unwrap();
-        let original = Instant::now() - Duration::from_secs(400);
+        let original = ago_or_skip!(Duration::from_secs(400));
         // A healthy slow transfer is older than the legacy 360s cap but has
         // a real finite owner deadline. An unrelated Link cannot claim it.
         assert!(!mgr.observe_backchannel_resource_wait(
@@ -7465,15 +7465,18 @@ mod tests {
             mgr.message_timeout_window(hash),
             Some((original, Duration::from_secs(980)))
         );
+        let Some(before_original) = original.checked_sub(Duration::from_secs(1)) else {
+            return;
+        };
         assert!(!mgr.observe_backchannel_resource_wait(
             link_id,
             resource_hash,
-            original - Duration::from_secs(1),
+            before_original,
             Duration::MAX
         ));
         // A late observation gets only the remainder of the fixed envelope,
         // never another timeout from observation time.
-        let expired = Instant::now() - Duration::from_secs(200);
+        let expired = ago_or_skip!(Duration::from_secs(200));
         assert!(mgr.observe_backchannel_resource_wait(
             link_id,
             resource_hash,
@@ -7666,7 +7669,7 @@ mod tests {
         assert!(!mgr.abandon_backchannel_packet(old_link, [0xFF; 32]));
         assert_eq!(mgr.cancelled_backchannel_packets.len(), 256);
         for instant in mgr.cancelled_backchannel_packets.values_mut() {
-            *instant = Instant::now() - Duration::from_secs(121);
+            *instant = ago_or_skip!(Duration::from_secs(121));
         }
         mgr.prune_early_backchannel_settlement();
         assert!(mgr.cancelled_backchannel_packets.is_empty());
@@ -7718,7 +7721,7 @@ mod tests {
                             start.requested_at = Instant::now() - Duration::from_secs(11);
                         }
                         for delivery in mgr.pending_backchannel_deliveries.values_mut() {
-                            delivery.started_at = Instant::now() - Duration::from_secs(400);
+                            delivery.started_at = ago_or_skip!(Duration::from_secs(400));
                         }
                         assert_eq!(mgr.tick().len(), 1);
                     }
@@ -10374,7 +10377,7 @@ mod tests {
             let _advertisement = next_outbound(&mut rx);
             let request = {
                 let delivery = mgr.pending.get_mut(&link_id).unwrap();
-                let old = Instant::now() - Duration::from_secs(900);
+                let old = ago_or_skip!(Duration::from_secs(900));
                 delivery.link.keepalive.last_inbound = old;
                 delivery.link.keepalive.last_proof = Some(old);
                 delivery.link.keepalive.activated_at = Some(old);
@@ -10462,7 +10465,7 @@ mod tests {
         {
             let delivery = mgr.pending.get_mut(&link_id).unwrap();
             assert_eq!(delivery.state, DeliveryState::Transferring);
-            delivery.started_at = Instant::now() - Duration::from_secs(600);
+            delivery.started_at = ago_or_skip!(Duration::from_secs(600));
             delivery.timeout = Duration::ZERO;
         }
 
