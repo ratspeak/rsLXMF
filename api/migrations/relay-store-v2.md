@@ -10,7 +10,8 @@ relay storage and must never be copied into it.
 
 A new store can initialize automatically. An existing legacy directory requires
 explicit offline migration. An incomplete migration, invalid committed record,
-unsupported filesystem, or unavailable storage prevents hosting. Daemons fail
+or unavailable storage prevents hosting. Network shares and RAM disks are
+accepted with a logged warning because they cannot guarantee crash safety. Daemons fail
 startup when required relay storage is unavailable. Applications retain the
 user's hosting preference but show hosting as unavailable until recovery succeeds.
 There is no automatic in-memory fallback for a durable host. Startup checks each
