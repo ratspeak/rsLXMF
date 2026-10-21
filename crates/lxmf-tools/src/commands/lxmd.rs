@@ -22,7 +22,8 @@ use lxmf_core::admission::{
 };
 use lxmf_core::admission_store::FileAdmissionStore;
 use lxmf_core::constants::{
-    DELIVERY_RETRY_WAIT, DeliveryMethod, MAX_DELIVERY_ATTEMPTS, PATH_REQUEST_WAIT,
+    DELIVERY_RETRY_WAIT, DeliveryMethod, MAX_DELIVERY_ATTEMPTS, NODE_ANNOUNCE_DELAY,
+    PATH_REQUEST_WAIT,
 };
 use lxmf_core::delivery_ratchet::{DELIVERY_APP_NAME, DeliveryAnnounceKind, DeliveryRatchetState};
 use lxmf_core::inbound_resource::{
@@ -1689,6 +1690,11 @@ struct LxmdRunner {
     announce_subscriptions: Vec<AnnounceSubscription>,
     last_peer_announce: f64,
     last_node_announce: f64,
+    /// Due times of triggered node announces. Like Python's
+    /// `announce_propagation_node()`, each goes out `NODE_ANNOUNCE_DELAY` after
+    /// its trigger, so a node never bursts all of its destinations at once.
+    node_announces_due: VecDeque<f64>,
+    startup_node_announce_pending: bool,
     last_propagation_check: f64,
     last_crypto_save: f64,
     checkpoint_task: Option<DaemonCheckpointTask>,
@@ -2428,6 +2434,8 @@ impl LxmdRunner {
             announce_subscriptions: Vec::new(),
             last_peer_announce: 0.0,
             last_node_announce: 0.0,
+            node_announces_due: VecDeque::new(),
+            startup_node_announce_pending: false,
             last_propagation_check: 0.0,
             last_crypto_save: now,
             checkpoint_task: None,
@@ -2649,6 +2657,7 @@ impl LxmdRunner {
             .map_err(|e| format!("Failed to send announce: {e}"))
     }
 
+    #[cfg(test)]
     async fn send_propagation_announce(&mut self) -> Result<(), String> {
         let raw = self.create_propagation_announce_packet()?;
         self.transport_tx
@@ -2662,19 +2671,6 @@ impl LxmdRunner {
             .map_err(|e| format!("Failed to send propagation announce: {e}"))
     }
 
-    async fn send_control_announce(&mut self) -> Result<(), String> {
-        let raw = create_control_announce_packet(&self.identity, self.control_dest_hash)?;
-        self.transport_tx
-            .send(TransportMessage::Outbound(
-                rns_transport::messages::OutboundRequest {
-                    raw: Bytes::from(raw),
-                    destination_hash: self.control_dest_hash,
-                },
-            ))
-            .await
-            .map_err(|e| format!("Failed to send control announce: {e}"))
-    }
-
     fn should_announce_control(&self) -> bool {
         if !self.config.propagation_enabled {
             return false;
@@ -2682,6 +2678,63 @@ impl LxmdRunner {
         let mut allowed = HashSet::from([self.identity.hash]);
         allowed.extend(self.router.allowed_control.iter().copied());
         allowed.len() > 1
+    }
+
+    fn schedule_node_announce(&mut self, now: f64) {
+        const MAX_PENDING: usize = 8;
+        if self.node_announces_due.len() < MAX_PENDING {
+            self.node_announces_due
+                .push_back(now + NODE_ANNOUNCE_DELAY as f64);
+        }
+    }
+
+    /// Stage the propagation and control announces once the earliest scheduled
+    /// one is due; announces due together go out once.
+    fn stage_due_node_announce(&mut self, now: f64) {
+        if !self
+            .node_announces_due
+            .front()
+            .is_some_and(|due| *due <= now)
+        {
+            return;
+        }
+        let Ok(raw) = self.create_propagation_announce_packet() else {
+            return;
+        };
+        let dest = self.propagation_dest_hash;
+        let node_staged = self.queue_runtime_transport(
+            TransportMessage::Outbound(rns_transport::messages::OutboundRequest {
+                raw: Bytes::from(raw),
+                destination_hash: dest,
+            }),
+            "propagation announce",
+        );
+        let mut control_staged = true;
+        if self.should_announce_control()
+            && let Ok(raw) = create_control_announce_packet(&self.identity, self.control_dest_hash)
+        {
+            control_staged = self.queue_runtime_transport(
+                TransportMessage::Outbound(rns_transport::messages::OutboundRequest {
+                    raw: Bytes::from(raw),
+                    destination_hash: self.control_dest_hash,
+                }),
+                "control announce",
+            );
+        }
+        if node_staged && control_staged {
+            while self
+                .node_announces_due
+                .front()
+                .is_some_and(|due| *due <= now)
+            {
+                self.node_announces_due.pop_front();
+            }
+            if std::mem::take(&mut self.startup_node_announce_pending) {
+                tracing::info!("Startup propagation announce sent");
+            } else {
+                tracing::debug!("propagation node announce staged");
+            }
+        }
     }
 
     fn drain_control_commands(&mut self) {
@@ -3556,34 +3609,11 @@ impl LxmdRunner {
         if self.config.propagation_enabled
             && let Some(interval) = self.config.node_announce_interval
             && now - self.last_node_announce > interval as f64
-            && let Ok(raw) = self.create_propagation_announce_packet()
         {
-            let dest = self.propagation_dest_hash;
-            let node_staged = self.queue_runtime_transport(
-                TransportMessage::Outbound(rns_transport::messages::OutboundRequest {
-                    raw: Bytes::from(raw),
-                    destination_hash: dest,
-                }),
-                "periodic propagation announce",
-            );
-            let mut control_staged = true;
-            if self.should_announce_control()
-                && let Ok(raw) =
-                    create_control_announce_packet(&self.identity, self.control_dest_hash)
-            {
-                control_staged = self.queue_runtime_transport(
-                    TransportMessage::Outbound(rns_transport::messages::OutboundRequest {
-                        raw: Bytes::from(raw),
-                        destination_hash: self.control_dest_hash,
-                    }),
-                    "periodic control announce",
-                );
-            }
-            if node_staged && control_staged {
-                self.last_node_announce = now;
-                tracing::debug!("periodic propagation node announce staged");
-            }
+            self.last_node_announce = now;
+            self.schedule_node_announce(now);
         }
+        self.stage_due_node_announce(now);
 
         if let Some(task) = self.prop_maintenance_task.as_mut() {
             match task.result.try_recv() {
@@ -5988,7 +6018,6 @@ pub(crate) async fn main() {
                     match runner.send_announce().await {
                         Ok(()) => {
                             tracing::info!("Startup announce sent (interface online)");
-                            runner.last_peer_announce = now_f64();
                             announced = true;
                         }
                         Err(e) => tracing::warn!("Failed to send startup announce: {e}"),
@@ -6012,27 +6041,21 @@ pub(crate) async fn main() {
         } else if !announced {
             tracing::warn!("No online interface detected after 30s, announcing anyway");
             let _ = runner.send_announce().await;
-            runner.last_peer_announce = now_f64();
         }
     }
 
+    // As in Python's deferred start jobs, both announce clocks start here even
+    // when nothing announced at start.
+    let announce_clock_start = now_f64();
+    runner.last_peer_announce = announce_clock_start;
+    runner.last_node_announce = announce_clock_start;
     if !shutdown.is_triggered()
         && daemon_config.node_announce_at_start
         && daemon_config.propagation_enabled
     {
-        match runner.send_propagation_announce().await {
-            Ok(()) => {
-                tracing::info!("Startup propagation announce sent");
-                if runner.should_announce_control() {
-                    match runner.send_control_announce().await {
-                        Ok(()) => tracing::info!("Startup control announce sent"),
-                        Err(e) => tracing::warn!("Failed to send startup control announce: {e}"),
-                    }
-                }
-                runner.last_node_announce = now_f64();
-            }
-            Err(e) => tracing::warn!("Failed to send startup propagation announce: {e}"),
-        }
+        runner.schedule_node_announce(announce_clock_start);
+        runner.startup_node_announce_pending = true;
+        tracing::info!("Startup propagation announce scheduled in {NODE_ANNOUNCE_DELAY}s");
     }
 
     if let Some(ref cmd) = daemon_config.on_inbound_command {
@@ -7119,6 +7142,55 @@ mod tests {
         let (header, announce) = unpack_announce(&raw);
         assert!(!header.flags.context_flag);
         assert_eq!(announce.ratchet, None);
+    }
+
+    #[tokio::test]
+    async fn node_announces_follow_their_trigger_by_node_announce_delay() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp = std::env::temp_dir().join(format!(
+            "lxmd-node-announce-delay-{}-{unique}",
+            std::process::id()
+        ));
+        let (tx, mut rx) = mpsc::channel(64);
+        initialize_storage_namespace(&temp).unwrap();
+        let mut runner = LxmdRunner::new(DaemonConfig::default(), &temp, tx, None).unwrap();
+        // Announce scheduling needs no propagation runtime, only its config.
+        runner.config.propagation_enabled = true;
+        runner.config.node_announce_interval = Some(60);
+        runner.router.allowed_control.push([0x55; 16]);
+        let mut staged = || {
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .filter_map(|message| match message {
+                    TransportMessage::Outbound(request) => Some(request.destination_hash),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        staged();
+        let (node, control) = (runner.propagation_dest_hash, runner.control_dest_hash);
+        let delay = NODE_ANNOUNCE_DELAY as f64;
+
+        // Triggers due together are announced once, never before the delay.
+        runner.schedule_node_announce(1_000.0);
+        runner.schedule_node_announce(1_000.5);
+        runner.stage_due_node_announce(1_000.0 + delay - 0.1);
+        assert!(staged().is_empty());
+        runner.stage_due_node_announce(1_000.5 + delay);
+        assert_eq!(staged(), vec![node, control]);
+        runner.stage_due_node_announce(1_000.5 + 2.0 * delay);
+        assert!(staged().is_empty());
+
+        // An elapsed periodic interval schedules the announce rather than sending it.
+        runner.last_node_announce = now_f64() - 61.0;
+        runner.tick();
+        assert!(!staged().contains(&node));
+        assert_eq!(runner.node_announces_due.len(), 1);
+
+        drop(runner);
+        let _ = std::fs::remove_dir_all(&temp);
     }
 
     #[test]
