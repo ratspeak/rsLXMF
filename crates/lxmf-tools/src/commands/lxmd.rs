@@ -1617,6 +1617,8 @@ struct LxmdRunner {
     delivery_ratchets: DeliveryRatchetState,
     received_ratchets: HashMap<String, ReceivedRatchet>,
     known_identities: HashMap<String, [u8; 64]>,
+    /// Identities asked of Transport's validated announce cache.
+    identity_recalls: HashMap<[u8; 16], oneshot::Receiver<TransportQueryResponse>>,
     route_hops: HashMap<[u8; 16], u8>,
     /// Transport blackhole table snapshot, refreshed per tick. Used to drop
     /// inbound LXMs from blackholed identities (LXMRouter.py:1739-1741).
@@ -1729,7 +1731,131 @@ impl LxmdRunner {
             }
         }
         self.announce_subscriptions = subscriptions;
+        self.learn_validated_identities().await;
         Ok(())
+    }
+
+    /// Learn the LXMF identities Transport validated before these
+    /// subscriptions existed; later ones arrive as announce events. Python's
+    /// LXMF recalls them from `RNS.Identity` (Transport.py:2172).
+    async fn learn_validated_identities(&mut self) {
+        let (response_tx, response_rx) = oneshot::channel();
+        let query = TransportMessage::Rpc {
+            query: TransportQuery::GetRecentAnnounces,
+            response_tx,
+        };
+        if self.transport_tx.send(query).await.is_err() {
+            return;
+        }
+        let Ok(Ok(TransportQueryResponse::Announces(announces))) =
+            tokio::time::timeout(Duration::from_secs(5), response_rx).await
+        else {
+            tracing::warn!("Transport did not list its validated announces");
+            return;
+        };
+        let lxmf_aspects = [
+            rns_identity::name_hash::name_hash(DELIVERY_APP_NAME),
+            rns_identity::name_hash::name_hash("lxmf.propagation"),
+        ];
+        for announce in announces {
+            if let Some(public_key) = announce.public_key
+                && lxmf_aspects.contains(&announce.name_hash)
+            {
+                self.learn_identity(
+                    &announce.dest_hash,
+                    public_key,
+                    announce.ratchet,
+                    Some(announce.timestamp),
+                );
+            }
+        }
+    }
+
+    /// Ask Transport for an identity this daemon lacks, as Python's LXMF
+    /// calls `RNS.Identity.recall` wherever it needs one.
+    fn recall_identity(&mut self, destination_hash: [u8; 16]) {
+        if self
+            .known_identities
+            .contains_key(&hex::encode(destination_hash))
+            || self.identity_recalls.contains_key(&destination_hash)
+        {
+            return;
+        }
+        let (response_tx, response_rx) = oneshot::channel();
+        if self
+            .transport_tx
+            .try_send(TransportMessage::Rpc {
+                query: TransportQuery::RecallDestination {
+                    dest: destination_hash,
+                },
+                response_tx,
+            })
+            .is_ok()
+        {
+            self.identity_recalls.insert(destination_hash, response_rx);
+        }
+    }
+
+    fn drain_identity_recalls(&mut self) {
+        let mut answered = Vec::new();
+        for (destination_hash, response) in &mut self.identity_recalls {
+            match response.try_recv() {
+                Ok(TransportQueryResponse::RecalledDestination(recalled)) => {
+                    answered.push((*destination_hash, recalled));
+                }
+                Err(oneshot::error::TryRecvError::Empty) => {}
+                _ => answered.push((*destination_hash, None)),
+            }
+        }
+        for (destination_hash, recalled) in answered {
+            self.identity_recalls.remove(&destination_hash);
+            if let Some(recalled) = recalled {
+                self.learn_identity(
+                    &destination_hash,
+                    recalled.public_key,
+                    recalled.ratchet,
+                    Some(recalled.timestamp),
+                );
+            }
+        }
+    }
+
+    /// Record an announced identity key and ratchet, persisting only a
+    /// changed ratchet (Python `Identity._remember_ratchet`), off the daemon
+    /// loop. Identity keys stay on the periodic and shutdown saves.
+    fn learn_identity(
+        &mut self,
+        destination_hash: &[u8; 16],
+        public_key: [u8; 64],
+        ratchet: Option<[u8; 32]>,
+        received_at: Option<f64>,
+    ) {
+        let dest_hex = hex::encode(destination_hash);
+        if self.known_identities.get(&dest_hex) != Some(&public_key) {
+            self.known_identities.insert(dest_hex.clone(), public_key);
+            tracing::debug!(dest = %dest_hex, "learned identity key from announce");
+        }
+        if let Some(ratchet_key) = ratchet
+            && self
+                .received_ratchets
+                .get(&dest_hex)
+                .is_none_or(|rr| rr.ratchet_pub != ratchet_key)
+        {
+            let rr = received_at.map_or_else(
+                || ReceivedRatchet::new(ratchet_key),
+                |at| ReceivedRatchet::new_at(ratchet_key, at),
+            );
+            self.received_ratchets.insert(dest_hex.clone(), rr);
+            tracing::debug!(dest = %dest_hex, "learned ratchet from announce");
+            let path = self
+                .received_ratchets_dir
+                .join(format!("{dest_hex}.ratchet"));
+            tokio::task::spawn_blocking(move || {
+                if let Err(e) = rr.save_durable(&path) {
+                    tracing::warn!("Failed to persist received ratchet: {e}");
+                }
+            });
+        }
     }
 
     async fn close_announce_subscriptions(&mut self) {
@@ -2381,6 +2507,7 @@ impl LxmdRunner {
             delivery_ratchets,
             received_ratchets,
             known_identities,
+            identity_recalls: HashMap::new(),
             route_hops: HashMap::new(),
             blackholed_identities: HashSet::new(),
             link_delivery: None,
@@ -2877,6 +3004,7 @@ impl LxmdRunner {
         for peer_hash in pending {
             let Some(peer_identity_hash) = recall_identity_hash(&self.known_identities, &peer_hash)
             else {
+                self.recall_identity(peer_hash);
                 tracing::debug!(
                     peer = %hex::encode(peer_hash),
                     "peer sync postponed until its identity is known"
@@ -3459,6 +3587,7 @@ impl LxmdRunner {
         self.retry_due_opportunistic_deliveries(now);
 
         self.drain_control_commands();
+        self.drain_identity_recalls();
         self.drain_peering_key_results();
         self.queue_due_peer_syncs();
         self.drive_pending_peer_syncs();
@@ -3537,6 +3666,7 @@ impl LxmdRunner {
             .map(|(store, node)| store.durable_haves(self.identity.hash, node, now as u64))
             .unwrap_or_default();
         let retain_synced_on_node = self.router.retain_node_lxms();
+        let mut unknown_propagation_node = None;
         if let Some(ref mut client) = self.propagation_client {
             client.replace_durable_haves(locally_delivered_ids);
             client.set_retain_synced_on_node(retain_synced_on_node);
@@ -3562,6 +3692,7 @@ impl LxmdRunner {
                         now,
                     )
                 {
+                    unknown_propagation_node = Some(node);
                     tracing::debug!(
                         node = %hex::encode(node),
                         "propagation node identity unknown; requesting path before download"
@@ -3576,6 +3707,9 @@ impl LxmdRunner {
                     | lxmf_core::propagation_client::PropagationClientState::Failed
             );
             propagation_status = Some(status);
+        }
+        if let Some(node) = unknown_propagation_node {
+            self.recall_identity(node);
         }
         if let Some(status) = propagation_status {
             self.router.update_propagation_transfer_status(status);
@@ -3876,32 +4010,8 @@ impl LxmdRunner {
                     );
                 }
             }
-            if let Some(pub_key) = event.public_key
-                && self.known_identities.get(&dest_hex) != Some(&pub_key)
-            {
-                self.known_identities.insert(dest_hex.clone(), pub_key);
-                tracing::debug!(dest = %dest_hex, "learned identity key from announce");
-            }
-            // Python Identity._remember_ratchet: persist only the single
-            // changed ratchet, off the daemon loop. Identity keys and the
-            // ring stay on the periodic/shutdown saves.
-            if let Some(ratchet_key) = event.ratchet
-                && self
-                    .received_ratchets
-                    .get(&dest_hex)
-                    .is_none_or(|rr| rr.ratchet_pub != ratchet_key)
-            {
-                let rr = ReceivedRatchet::new(ratchet_key);
-                self.received_ratchets.insert(dest_hex.clone(), rr);
-                tracing::debug!(dest = %dest_hex, "learned ratchet from announce");
-                let path = self
-                    .received_ratchets_dir
-                    .join(format!("{dest_hex}.ratchet"));
-                tokio::task::spawn_blocking(move || {
-                    if let Err(e) = rr.save_durable(&path) {
-                        tracing::warn!("Failed to persist received ratchet: {e}");
-                    }
-                });
+            if let Some(public_key) = event.public_key {
+                self.learn_identity(&event.destination_hash, public_key, event.ratchet, None);
             }
         }
         seen
@@ -5042,6 +5152,7 @@ impl LxmdRunner {
 
                 match plan {
                     DirectDeliveryPlan::RequestPath { drop_existing } => {
+                        self.recall_identity(dest_hash);
                         queue_path_request(
                             &self.transport_tx,
                             dest_hash,
@@ -5209,6 +5320,7 @@ impl LxmdRunner {
                         error = %err,
                         "destination key unknown, re-queuing"
                     );
+                    self.recall_identity(dest_hash);
                     requeue_after_path_request(
                         &mut self.router,
                         &self.transport_tx,
@@ -6461,6 +6573,102 @@ pub(crate) async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A transport that validated `announce` before any daemon subscribed.
+    async fn transport_that_heard(
+        announce: &[u8],
+    ) -> (mpsc::Sender<TransportMessage>, mpsc::Receiver<Bytes>) {
+        let (actor, tx) = rns_transport::actor::TransportActor::new();
+        tokio::spawn(actor.run());
+        let (driver_tx, driver_rx) = mpsc::channel(64);
+        let entry = rns_transport::messages::InterfaceEntry::new(
+            "heard".into(),
+            rns_transport::constants::InterfaceMode::Full,
+            rns_transport::constants::InterfaceDirection::bidirectional(),
+            10_000_000,
+            500,
+            driver_tx,
+        );
+        let owner = entry.owner.clone();
+        tx.send(TransportMessage::RegisterInterface { id: 1, entry })
+            .await
+            .unwrap();
+        tx.send(TransportMessage::InterfaceEvent {
+            interface_id: 1,
+            owner,
+            message: Box::new(TransportMessage::Inbound(
+                rns_transport::messages::InboundPacket {
+                    raw: Bytes::copy_from_slice(announce),
+                    interface_id: 1,
+                    rssi: None,
+                    snr: None,
+                    q: None,
+                },
+            )),
+        })
+        .await
+        .unwrap();
+        (tx, driver_rx)
+    }
+
+    fn propagation_node_announce(node: &Identity) -> (Vec<u8>, String) {
+        let mut destination = Destination::new(
+            Some(node),
+            rns_identity::destination::Direction::In,
+            rns_identity::destination::DestType::Single,
+            "lxmf.propagation",
+        )
+        .unwrap();
+        let raw = destination
+            .announce_packet(node, None, None, false, None, now_f64())
+            .unwrap();
+        (raw, hex::encode(destination.hash))
+    }
+
+    /// Python's LXMF recalls identities that Transport validated before the
+    /// router registered its handlers (Transport.py:2172, Identity.recall).
+    #[tokio::test]
+    async fn identities_validated_before_the_daemon_subscribed_are_learned() {
+        let node = Identity::new();
+        let (announce, node_hex) = propagation_node_announce(&node);
+        let (tx, _driver) = transport_that_heard(&announce).await;
+        let temp = tempfile::tempdir().unwrap();
+        initialize_storage_namespace(temp.path()).unwrap();
+        let mut runner = LxmdRunner::new(DaemonConfig::default(), temp.path(), tx, None).unwrap();
+        assert!(!runner.known_identities.contains_key(&node_hex));
+
+        runner.learn_validated_identities().await;
+
+        assert_eq!(
+            runner.known_identities.get(&node_hex),
+            Some(&node.get_public_key())
+        );
+    }
+
+    /// A propagation node the daemon never heard announced is recalled from
+    /// Transport before the download, as Python's LXMF does
+    /// (LXMRouter.request_messages_from_propagation_node, Identity.recall).
+    #[tokio::test]
+    async fn a_missing_propagation_node_identity_is_recalled_from_transport() {
+        let node = Identity::new();
+        let (announce, node_hex) = propagation_node_announce(&node);
+        let (tx, _driver) = transport_that_heard(&announce).await;
+        let temp = tempfile::tempdir().unwrap();
+        initialize_storage_namespace(temp.path()).unwrap();
+        let config = DaemonConfig {
+            outbound_propagation_node: Some(node_hex.clone()),
+            ..DaemonConfig::default()
+        };
+        let mut runner = LxmdRunner::new(config, temp.path(), tx, None).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !runner.known_identities.contains_key(&node_hex) {
+            assert!(Instant::now() < deadline, "the node's identity is recalled");
+            runner.tick();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(runner.known_identities[&node_hex], node.get_public_key());
+    }
 
     #[tokio::test]
     async fn storage_namespace_fresh_restart_and_missing_parent_are_checked() {

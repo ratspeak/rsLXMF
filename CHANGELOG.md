@@ -5,6 +5,7 @@
 - Start a propagation node without rereading and flushing every stored message, so restarts with large stores no longer delay announces and hosting. Each message is still verified when it is served.
 - Space `lxmd` announces like Python lxmd: the propagation and control announces follow their trigger by 20 seconds instead of going out together with the delivery announce, so Python transport nodes no longer hold the control announce after a restart. A node set not to announce at start now waits a full interval before its first periodic announce.
 - Fall back from opportunistic to direct delivery whenever a message's content does not fit one encrypted packet, over 287 bytes, as in Python LXMF 1.2.0.
+- `lxmd` learns the identities Reticulum validated before it subscribed to announces, and asks Reticulum for a missing identity before a propagation download, a delivery or a peer sync, as Python LXMF recalls them.
 
 ## 1.4.0 - 2026-10-12
 
