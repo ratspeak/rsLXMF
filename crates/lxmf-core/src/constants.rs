@@ -152,6 +152,10 @@ pub const STRUCT_OVERHEAD: usize = 8;
 /// 2 * dest(16) + sig(64) + timestamp(8) + struct(8) = 112.
 pub const LXMF_OVERHEAD: usize =
     2 * DESTINATION_LENGTH + SIGNATURE_LENGTH + TIMESTAMP_SIZE + STRUCT_OVERHEAD;
+/// Largest content an opportunistic message carries in one encrypted packet;
+/// the packet's destination supplies the destination hash. 383 - 112 + 16 = 287.
+pub const ENCRYPTED_PACKET_MAX_CONTENT: usize =
+    rns_wire::constants::SINGLE_PACKET_ENCRYPTED_MDU - LXMF_OVERHEAD + DESTINATION_LENGTH;
 pub const PAPER_MDU: usize = 2210;
 
 pub const TICKET_EXPIRY: u64 = 21 * 24 * 60 * 60;
@@ -290,6 +294,12 @@ mod tests {
     #[test]
     fn test_lxmf_overhead() {
         assert_eq!(LXMF_OVERHEAD, 112);
+    }
+
+    /// LXMF 1.2.0 `ENCRYPTED_PACKET_MAX_CONTENT` (LXMessage.py:64-79, 3fc60af).
+    #[test]
+    fn encrypted_packet_max_content_is_lxmf_1_2_0s() {
+        assert_eq!(ENCRYPTED_PACKET_MAX_CONTENT, 287);
     }
 
     #[test]

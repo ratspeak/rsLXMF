@@ -576,9 +576,7 @@ impl LxmRouter {
             let content_size = packed
                 .len()
                 .saturating_sub(TIMESTAMP_SIZE + STRUCT_OVERHEAD);
-            // Approximates ENCRYPTED_PACKET_MAX_CONTENT for default RNS parameters.
-            let max_content = 295;
-            if content_size > max_content {
+            if content_size > ENCRYPTED_PACKET_MAX_CONTENT {
                 message.method = DeliveryMethod::Direct;
             }
         }
@@ -3485,6 +3483,36 @@ mod tests {
         router.try_send(msg).unwrap();
         assert_eq!(router.pending_outbound.len(), 1);
         assert_eq!(router.pending_outbound[0].state, MessageState::Outbound);
+    }
+
+    /// LXMF 1.2.0 keeps a message opportunistic only while its content fits
+    /// one encrypted packet, 287 bytes (LXMessage.py:64-79, :402-406).
+    #[test]
+    fn opportunistic_content_over_one_packet_falls_back_to_direct() {
+        let mut router = LxmRouter::new(RouterConfig::default());
+        for (content_size, method) in [
+            (287, DeliveryMethod::Opportunistic),
+            (288, DeliveryMethod::Direct),
+        ] {
+            let message = crate::message::test_message(
+                [0xAA; 16],
+                [0xBB; 16],
+                "",
+                &"x".repeat(content_size),
+                DeliveryMethod::Opportunistic,
+            );
+            let packed = message.pack_payload().unwrap();
+            assert_eq!(
+                packed.len() - TIMESTAMP_SIZE - STRUCT_OVERHEAD,
+                content_size
+            );
+            router.try_send(message).unwrap();
+            assert_eq!(
+                router.pending_outbound.last().unwrap().method,
+                method,
+                "content of {content_size} bytes"
+            );
+        }
     }
 
     #[test]

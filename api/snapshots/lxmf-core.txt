@@ -196,6 +196,7 @@ pub const lxmf_core::constants::DELIVERY_LIMIT: usize
 pub const lxmf_core::constants::DELIVERY_RETRY_WAIT: u64
 pub const lxmf_core::constants::DESTINATION_LENGTH: usize
 pub const lxmf_core::constants::DUPLICATE_SIGNAL: &str
+pub const lxmf_core::constants::ENCRYPTED_PACKET_MAX_CONTENT: usize
 pub const lxmf_core::constants::FASTEST_N_RANDOM_POOL: usize
 pub const lxmf_core::constants::FIELD_AUDIO: u8
 pub const lxmf_core::constants::FIELD_COMMANDS: u8
