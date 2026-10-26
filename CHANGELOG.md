@@ -7,6 +7,7 @@
 - Fall back from opportunistic to direct delivery whenever a message's content does not fit one encrypted packet, over 287 bytes, as in Python LXMF 1.2.0.
 - `lxmd` learns the identities Reticulum validated before it subscribed to announces, and asks Reticulum for a missing identity before a propagation download, a delivery or a peer sync, as Python LXMF recalls them.
 - Store a signed message so its delivery can resume after a restart under the same id. A message that is already queued is no longer queued twice.
+- Generate deferred stamps in the order messages were sent, as Python LXMF does, so a reply no longer overtakes the message it answers.
 
 ## 1.4.0 - 2026-10-12
 

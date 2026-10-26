@@ -4,7 +4,7 @@
 //! all mutable state.
 
 use crate::now_f64;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 
 use bytes::Bytes;
@@ -320,6 +320,9 @@ pub struct LxmRouter {
     pub pending_outbound: Vec<LxMessage>,
     /// Messages awaiting deferred stamp generation, keyed by message hash.
     pub pending_deferred_stamps: HashMap<[u8; 32], SignedLxMessage>,
+    /// Order in which `defer_stamp` queued the deferred messages, so stamps
+    /// are generated first in, first out.
+    deferred_stamp_order: VecDeque<[u8; 32]>,
     /// Captured at construction so deferred-stamp PoW can spawn onto the
     /// blocking pool even when the caller is itself on a `spawn_blocking`
     /// thread, where `Handle::try_current()` fails. Without it the tick grinds
@@ -432,6 +435,7 @@ impl LxmRouter {
             config,
             pending_outbound: Vec::new(),
             pending_deferred_stamps: HashMap::new(),
+            deferred_stamp_order: VecDeque::new(),
             runtime_handle: tokio::runtime::Handle::try_current().ok(),
             active_deferred_stamp: None,
             allowed: Vec::new(),
@@ -703,10 +707,28 @@ impl LxmRouter {
         ))
     }
 
+    /// Queue a message for stamp generation, after those already deferred.
+    /// Replacing a queued message keeps its place.
     pub fn defer_stamp(&mut self, mut message: SignedLxMessage) {
         message.state = MessageState::Outbound;
-        self.pending_deferred_stamps
-            .insert(message.message_id(), message);
+        let id = message.message_id();
+        if self.pending_deferred_stamps.insert(id, message).is_none() {
+            self.deferred_stamp_order.retain(|queued| *queued != id);
+            self.deferred_stamp_order.push_back(id);
+        }
+    }
+
+    /// The oldest deferred message, as Python's insertion-ordered dict yields
+    /// it (LXMRouter.py:2655-2662).
+    fn next_deferred_stamp(&mut self) -> Option<[u8; 32]> {
+        while let Some(id) = self.deferred_stamp_order.front() {
+            if self.pending_deferred_stamps.contains_key(id) {
+                return Some(*id);
+            }
+            self.deferred_stamp_order.pop_front();
+        }
+        // Entries placed directly in the public map have no recorded order.
+        self.pending_deferred_stamps.keys().next().copied()
     }
 
     pub fn process_deferred_stamps(&mut self) {
@@ -714,9 +736,10 @@ impl LxmRouter {
         if self.active_deferred_stamp.is_some() {
             return;
         }
-        let Some((&message_hash, message)) = self.pending_deferred_stamps.iter().next() else {
+        let Some(message_hash) = self.next_deferred_stamp() else {
             return;
         };
+        let message = &self.pending_deferred_stamps[&message_hash];
         let cost = message.stamp_cost().unwrap_or(0);
         if cost == 0 || message.outbound_ticket().is_some() {
             if let Some(message) = self.pending_deferred_stamps.remove(&message_hash) {
@@ -4808,5 +4831,31 @@ mod tests {
             let _ = router.submit_signed(restored);
         }
         assert_eq!(router.pending_outbound.len(), 1);
+    }
+
+    /// Python's deferred-stamp dict keeps insertion order (LXMRouter.py:2655-2662).
+    #[test]
+    fn deferred_stamps_are_generated_in_submission_order() {
+        let (identity, source) = resumable_sender();
+        let key = identity.get_signing_key().unwrap();
+        let mut router = LxmRouter::new(RouterConfig::default());
+        let mut submitted = Vec::new();
+        for n in 0..12 {
+            let mut draft = resumable_draft(source, &format!("deferred {n}"));
+            draft.stamp_cost = Some(1);
+            let signed = draft.sign(&key).unwrap();
+            submitted.push(signed.message_id());
+            router.submit_signed(signed).unwrap();
+        }
+        assert!(router.cancel_outbound(&submitted.remove(3)));
+        while !router.pending_deferred_stamps.is_empty() {
+            router.process_deferred_stamps();
+        }
+        let stamped: Vec<_> = router
+            .pending_outbound
+            .iter()
+            .map(|message| message.message_id())
+            .collect();
+        assert_eq!(stamped, submitted);
     }
 }
