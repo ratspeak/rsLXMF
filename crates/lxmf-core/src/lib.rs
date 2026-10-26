@@ -93,7 +93,8 @@ pub mod message_api {
     pub use crate::message::{
         AudioField, EncodedFieldValue, FieldId, FieldMapKey, FieldValue, FieldValueRef, Fields,
         LxMessage, LxMessageDraft, MessageDecodeLimits, MessageError, MessageMetadata,
-        OwnedVerifiedLxMessage, RecipientStamp, SignedLxMessage, UniqueFieldMap, VerifiedLxMessage,
+        OwnedVerifiedLxMessage, RecipientStamp, ResumableLxMessage, SignedLxMessage,
+        UniqueFieldMap, VerifiedLxMessage,
     };
     pub use crate::types::{DestinationHash, IdentityHash, MessageId};
 }

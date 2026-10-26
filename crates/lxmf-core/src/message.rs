@@ -16,11 +16,13 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 mod draft;
 mod field;
+mod resumable;
 pub use draft::{LxMessageDraft, SignedLxMessage};
 use field::FieldIndex;
 pub use field::{
     EncodedFieldValue, FieldId, FieldMapKey, FieldValue, FieldValueRef, Fields, UniqueFieldMap,
 };
+pub use resumable::ResumableLxMessage;
 
 /// Lossy projection with a single exact-sized allocation. Standard UTF-8
 /// replacement semantics are preserved, but geometric String growth cannot
@@ -1486,6 +1488,8 @@ pub enum MessageError {
     InvalidSignature,
     #[error("public key does not bind claimed source")]
     SourceMismatch,
+    #[error("message is already queued")]
+    AlreadyQueued,
 
     #[error("message too short: {0} bytes")]
     TooShort(usize),

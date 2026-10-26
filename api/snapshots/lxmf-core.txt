@@ -732,6 +732,7 @@ pub fn lxmf_core::message::FieldValue::serialize<S: serde_core::ser::Serializer>
 impl<'de> serde_core::de::Deserialize<'de> for lxmf_core::message::FieldValue
 pub fn lxmf_core::message::FieldValue::deserialize<D: serde_core::de::Deserializer<'de>>(D) -> core::result::Result<Self, <D as serde_core::de::Deserializer>::Error>
 pub enum lxmf_core::message::MessageError
+pub lxmf_core::message::MessageError::AlreadyQueued
 pub lxmf_core::message::MessageError::DuplicateField
 pub lxmf_core::message::MessageError::HistoricalHashMismatch
 pub lxmf_core::message::MessageError::InvalidByte
@@ -941,6 +942,12 @@ pub lxmf_core::message::MessagePayload::title: alloc::string::String
 pub struct lxmf_core::message::OwnedVerifiedLxMessage
 impl lxmf_core::message::OwnedVerifiedLxMessage
 pub fn lxmf_core::message::OwnedVerifiedLxMessage::as_verified(&self) -> lxmf_core::message::VerifiedLxMessage<'_>
+pub struct lxmf_core::message::ResumableLxMessage
+impl lxmf_core::message::ResumableLxMessage
+pub fn lxmf_core::message::ResumableLxMessage::as_bytes(&self) -> &[u8]
+pub fn lxmf_core::message::ResumableLxMessage::from_bytes(impl core::convert::Into<bytes::bytes::Bytes>) -> core::result::Result<Self, lxmf_core::message::MessageError>
+impl core::fmt::Debug for lxmf_core::message::ResumableLxMessage
+pub fn lxmf_core::message::ResumableLxMessage::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct lxmf_core::message::SignedLxMessage
 impl lxmf_core::message::SignedLxMessage
 pub fn lxmf_core::message::SignedLxMessage::content_bytes(&self) -> &[u8]
@@ -958,6 +965,7 @@ pub fn lxmf_core::message::SignedLxMessage::stamp_cost(&self) -> core::option::O
 pub fn lxmf_core::message::SignedLxMessage::timestamp(&self) -> f64
 pub fn lxmf_core::message::SignedLxMessage::title_bytes(&self) -> &[u8]
 pub fn lxmf_core::message::SignedLxMessage::title_text(&self) -> alloc::borrow::Cow<'_, str>
+pub fn lxmf_core::message::SignedLxMessage::to_resumable(&self) -> lxmf_core::message::ResumableLxMessage
 impl core::ops::deref::Deref for lxmf_core::message::SignedLxMessage
 pub type lxmf_core::message::SignedLxMessage::Target = lxmf_core::message::MessageMetadata
 pub fn lxmf_core::message::SignedLxMessage::deref(&self) -> &Self::Target
@@ -998,6 +1006,7 @@ pub fn lxmf_core::message::FieldValue::serialize<S: serde_core::ser::Serializer>
 impl<'de> serde_core::de::Deserialize<'de> for lxmf_core::message::FieldValue
 pub fn lxmf_core::message::FieldValue::deserialize<D: serde_core::de::Deserializer<'de>>(D) -> core::result::Result<Self, <D as serde_core::de::Deserializer>::Error>
 pub enum lxmf_core::message_api::MessageError
+pub lxmf_core::message_api::MessageError::AlreadyQueued
 pub lxmf_core::message_api::MessageError::DuplicateField
 pub lxmf_core::message_api::MessageError::HistoricalHashMismatch
 pub lxmf_core::message_api::MessageError::InvalidByte
@@ -1208,6 +1217,12 @@ pub fn lxmf_core::message::MessageMetadata::default() -> Self
 pub struct lxmf_core::message_api::OwnedVerifiedLxMessage
 impl lxmf_core::message::OwnedVerifiedLxMessage
 pub fn lxmf_core::message::OwnedVerifiedLxMessage::as_verified(&self) -> lxmf_core::message::VerifiedLxMessage<'_>
+pub struct lxmf_core::message_api::ResumableLxMessage
+impl lxmf_core::message::ResumableLxMessage
+pub fn lxmf_core::message::ResumableLxMessage::as_bytes(&self) -> &[u8]
+pub fn lxmf_core::message::ResumableLxMessage::from_bytes(impl core::convert::Into<bytes::bytes::Bytes>) -> core::result::Result<Self, lxmf_core::message::MessageError>
+impl core::fmt::Debug for lxmf_core::message::ResumableLxMessage
+pub fn lxmf_core::message::ResumableLxMessage::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct lxmf_core::message_api::SignedLxMessage
 impl lxmf_core::message::SignedLxMessage
 pub fn lxmf_core::message::SignedLxMessage::content_bytes(&self) -> &[u8]
@@ -1225,6 +1240,7 @@ pub fn lxmf_core::message::SignedLxMessage::stamp_cost(&self) -> core::option::O
 pub fn lxmf_core::message::SignedLxMessage::timestamp(&self) -> f64
 pub fn lxmf_core::message::SignedLxMessage::title_bytes(&self) -> &[u8]
 pub fn lxmf_core::message::SignedLxMessage::title_text(&self) -> alloc::borrow::Cow<'_, str>
+pub fn lxmf_core::message::SignedLxMessage::to_resumable(&self) -> lxmf_core::message::ResumableLxMessage
 impl core::ops::deref::Deref for lxmf_core::message::SignedLxMessage
 pub type lxmf_core::message::SignedLxMessage::Target = lxmf_core::message::MessageMetadata
 pub fn lxmf_core::message::SignedLxMessage::deref(&self) -> &Self::Target
@@ -1974,6 +1990,7 @@ pub fn lxmf_core::router::LxmRouter::remember_ticket(&mut self, [u8; 16], [u8; 1
 pub fn lxmf_core::router::LxmRouter::remove_peer(&mut self, &[u8; 16])
 pub fn lxmf_core::router::LxmRouter::requires_authentication(&self) -> bool
 pub fn lxmf_core::router::LxmRouter::reserve_inbound(&mut self, &lxmf_core::message::LxMessage) -> core::option::Option<lxmf_core::router::InboundReservation>
+pub fn lxmf_core::router::LxmRouter::restore_signed(&self, &lxmf_core::message::ResumableLxMessage, &[u8; 64], lxmf_core::constants::DeliveryMethod) -> core::result::Result<lxmf_core::message::SignedLxMessage, lxmf_core::message::MessageError>
 pub fn lxmf_core::router::LxmRouter::retain_node_lxms(&self) -> bool
 pub fn lxmf_core::router::LxmRouter::rotate_peers(&mut self)
 pub fn lxmf_core::router::LxmRouter::run_jobs_tick(&mut self)

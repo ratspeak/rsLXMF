@@ -24,8 +24,8 @@
       "tier": "candidate-stable",
       "compatibility": "reviewed-snapshot",
       "snapshot": "api/snapshots/lxmf-core.txt",
-      "itemCount": 2209,
-      "sha256": "3983790769c9ae44c1b2665cbf894720b39fa03635575a04b3d0f19e412de83e"
+      "itemCount": 2226,
+      "sha256": "67e48ebcad7cdc46b04dd04ec2f38e153bf55f119c6b0ccb914d442ccd67fcdc"
     },
     {
       "name": "lxmf-tools",

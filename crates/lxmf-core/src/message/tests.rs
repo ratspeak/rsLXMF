@@ -731,3 +731,117 @@ fn bounded_propagation_wrapper_rejects_forged_counts_and_lengths_before_allocati
     trailing.push(0);
     assert!(LxMessage::unpack_propagation_wrapper_bounded(&trailing, trailing.len()).is_err());
 }
+
+fn resumable_identity() -> rns_identity::identity::Identity {
+    let mut key = [0x11; 64];
+    key[32..].fill(0x22);
+    rns_identity::identity::Identity::from_private_key(&key).unwrap()
+}
+
+fn resumable_signed(
+    identity: &rns_identity::identity::Identity,
+    cost: Option<u8>,
+) -> SignedLxMessage {
+    let source = rns_identity::destination::Destination::hash_from_name_and_identity(
+        "lxmf.delivery",
+        Some(&identity.hash),
+    );
+    let mut draft = LxMessageDraft::new(
+        [0x5a; 16],
+        source,
+        "Resume",
+        "Hello",
+        DeliveryMethod::Direct,
+    )
+    .unwrap();
+    draft.set_timestamp(1_700_000_000.).unwrap();
+    draft.stamp_cost = cost;
+    draft.sign(&identity.get_signing_key().unwrap()).unwrap()
+}
+
+#[test]
+fn resumable_form_bytes_are_pinned() {
+    let signed = resumable_signed(&resumable_identity(), Some(8));
+    let stored = signed.to_resumable();
+    let bytes = stored.as_bytes().to_vec();
+    let wire = signed.finalize(None).unwrap().wire_bytes().to_vec();
+    assert_eq!(bytes[..96], wire[..96], "the signed header leads");
+    assert_eq!(bytes[96..100], [0xc1, b'L', b'X', b'R']);
+    assert_eq!(bytes[100], 1, "version");
+    assert_eq!(bytes[101..103], [1, 8], "stamp-cost floor");
+    assert_eq!(bytes[103], 0, "no recipient stamp yet");
+    assert_eq!(bytes[104..108], [0; 4], "no propagation envelope yet");
+    let digest_at = bytes.len() - 16;
+    assert_eq!(
+        bytes[108..digest_at],
+        wire[96..],
+        "the signed payload follows"
+    );
+    assert_eq!(bytes[digest_at..], sha256(&bytes[..digest_at])[..16]);
+    // Source hash and signature checked against Python RNS 1.5.5.
+    assert_eq!(
+        hex::encode(&bytes),
+        concat!(
+            "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+            "58ead48e0227a546df7a9712ea53572c",
+            "cbdadee740fb728eef746f5e23c3bc3121fcaea60eaff41eb4d011d4ae64eb8f",
+            "8a900be403ca81baac788cf29bd9d64cab486ff0c3923571f11e4a21b4c34005",
+            "c14c5852",
+            "01",
+            "0108",
+            "00",
+            "00000000",
+            "94cb41d954fc40000000c406526573756d65c40548656c6c6f80",
+            "370fdcdb14f43dd52931349474302403",
+        )
+    );
+}
+
+#[test]
+fn resumable_form_is_not_a_wire_message() {
+    for _ in 0..64 {
+        let identity = rns_identity::identity::Identity::new();
+        let stored = resumable_signed(&identity, None).to_resumable();
+        assert!(LxMessage::unpack(stored.as_bytes()).is_err());
+        assert!(
+            LxMessage::unpack_owned(
+                Bytes::copy_from_slice(stored.as_bytes()),
+                MessageDecodeLimits::default()
+            )
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn resumable_form_round_trips_and_rejects_damage() {
+    let stored = resumable_signed(&resumable_identity(), Some(8)).to_resumable();
+    let bytes = stored.as_bytes().to_vec();
+    assert_eq!(
+        ResumableLxMessage::from_bytes(bytes.clone()).unwrap(),
+        stored
+    );
+    for at in 0..bytes.len() {
+        let mut damaged = bytes.clone();
+        damaged[at] ^= 0x01;
+        assert!(
+            ResumableLxMessage::from_bytes(damaged).is_err(),
+            "flipped byte {at} accepted"
+        );
+        assert!(ResumableLxMessage::from_bytes(bytes[..at].to_vec()).is_err());
+    }
+    let redigest = |mut bytes: Vec<u8>| {
+        let at = bytes.len() - 16;
+        let digest = sha256(&bytes[..at]);
+        bytes[at..].copy_from_slice(&digest[..16]);
+        bytes
+    };
+    for (at, value) in [(100, 2), (101, 2), (103, 7), (108, 0x95)] {
+        let mut unknown = bytes.clone();
+        unknown[at] = value;
+        assert!(
+            ResumableLxMessage::from_bytes(redigest(unknown)).is_err(),
+            "byte {at} = {value:#x} accepted"
+        );
+    }
+}

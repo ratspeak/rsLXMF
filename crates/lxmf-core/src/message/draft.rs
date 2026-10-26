@@ -315,6 +315,22 @@ impl LxMessageDraft {
     }
 }
 impl SignedLxMessage {
+    pub(crate) fn restored(
+        message: LxMessage,
+        outbound_ticket: Option<[u8; 16]>,
+        stamp_cost: Option<u8>,
+    ) -> Self {
+        Self {
+            message,
+            outbound_ticket,
+            stamp_cost,
+        }
+    }
+    /// Store this message so its delivery can resume after a restart, under
+    /// the same id. The stored form keeps the signing stamp cost as a floor.
+    pub fn to_resumable(&self) -> ResumableLxMessage {
+        ResumableLxMessage::new(&self.message.wire, self.stamp_cost)
+    }
     pub fn timestamp(&self) -> f64 {
         self.message.timestamp()
     }

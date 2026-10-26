@@ -16,7 +16,8 @@ use crate::inbound_resource::{
     InboundResourceTracker,
 };
 use crate::message::{
-    LxMessage, LxMessageDraft, MessageError, RecipientStamp, SignedLxMessage, VerifiedLxMessage,
+    LxMessage, LxMessageDraft, MessageError, MessageMetadata, RecipientStamp, ResumableLxMessage,
+    SignedLxMessage, VerifiedLxMessage,
 };
 use crate::peer::{LxmPeer, OutboundOfferPolicy};
 use crate::propagation::PropagationStore;
@@ -643,7 +644,16 @@ impl LxmRouter {
 
     /// Signatures freeze the body before recipient work; only finalized messages
     /// enter outbound queues. Deferred completion can never mutate another body.
+    ///
+    /// A message whose id is already queued, awaiting either its stamp or
+    /// delivery, is refused with [`MessageError::AlreadyQueued`].
     pub fn submit_signed(&mut self, message: SignedLxMessage) -> Result<(), MessageError> {
+        let id = message.message_id();
+        if self.pending_deferred_stamps.contains_key(&id)
+            || self.pending_outbound.iter().any(|m| m.message_id() == id)
+        {
+            return Err(MessageError::AlreadyQueued);
+        }
         if message.method == DeliveryMethod::Propagated && self.outbound_propagation_node.is_none()
         {
             return Err(MessageError::PackFailed(
@@ -660,6 +670,37 @@ impl LxmRouter {
         let stamp = message.generate_recipient_stamp()?;
         self.try_send(message.finalize(stamp)?)
             .map_err(|e| MessageError::PackFailed(e.to_string()))
+    }
+
+    /// Restore a stored message for another delivery under the same id.
+    ///
+    /// `source_public_key` is the active identity's: the message must verify
+    /// as sent by it. The outbound ticket is the current one, and the stamp
+    /// cost is the larger of the cost the message was signed under and the
+    /// destination's current cost. Finish the message as for a fresh send,
+    /// then pass it to [`Self::submit_signed`].
+    pub fn restore_signed(
+        &self,
+        stored: &ResumableLxMessage,
+        source_public_key: &[u8; 64],
+        method: DeliveryMethod,
+    ) -> Result<SignedLxMessage, MessageError> {
+        let mut message = stored.unverified_message()?;
+        message.verify(source_public_key)?;
+        message.metadata = MessageMetadata {
+            state: MessageState::Outbound,
+            method,
+            ..MessageMetadata::default()
+        };
+        let destination = message.destination_hash();
+        let outbound_ticket = self.get_outbound_ticket(&destination);
+        let current_cost = self.get_stamp_cost(&destination).filter(|cost| *cost > 0);
+        let stamp_cost = stored.stamp_cost_floor().max(current_cost);
+        Ok(SignedLxMessage::restored(
+            message,
+            outbound_ticket,
+            stamp_cost,
+        ))
     }
 
     pub fn defer_stamp(&mut self, mut message: SignedLxMessage) {
@@ -4590,5 +4631,182 @@ mod tests {
             MessageState::Outbound,
             "core tick without a Direct adapter must not claim link sending started"
         );
+    }
+
+    fn resumable_sender() -> (rns_identity::identity::Identity, [u8; 16]) {
+        let identity = rns_identity::identity::Identity::new();
+        let source = rns_identity::destination::Destination::hash_from_name_and_identity(
+            "lxmf.delivery",
+            Some(&identity.hash),
+        );
+        (identity, source)
+    }
+
+    fn resumable_draft(source: [u8; 16], content: &str) -> LxMessageDraft {
+        LxMessageDraft::new(
+            [0xA7; 16],
+            source,
+            "resume",
+            content,
+            DeliveryMethod::Direct,
+        )
+        .unwrap()
+    }
+
+    fn stored_form(
+        router: &mut LxmRouter,
+        identity: &rns_identity::identity::Identity,
+        draft: &mut LxMessageDraft,
+    ) -> crate::message::ResumableLxMessage {
+        router.prepare_outbound(draft).unwrap();
+        let signed = draft
+            .clone()
+            .sign(&identity.get_signing_key().unwrap())
+            .unwrap();
+        let stored = signed.to_resumable();
+        crate::message::ResumableLxMessage::from_bytes(stored.as_bytes().to_vec()).unwrap()
+    }
+
+    #[test]
+    fn restored_message_keeps_its_id_and_signed_wire() {
+        let (identity, source) = resumable_sender();
+        let mut router = LxmRouter::new(RouterConfig::default());
+        let mut draft = resumable_draft(source, "same bytes");
+        router.prepare_outbound(&mut draft).unwrap();
+        let signed = draft.sign(&identity.get_signing_key().unwrap()).unwrap();
+        let stored = signed.to_resumable();
+        let original = signed.finalize(None).unwrap();
+
+        // Only the public key is needed to restore and finish the message.
+        let public_key = identity.get_public_key();
+        let restarted = LxmRouter::new(RouterConfig::default());
+        let restored = restarted
+            .restore_signed(&stored, &public_key, DeliveryMethod::Opportunistic)
+            .unwrap();
+        assert_eq!(restored.message_id(), original.message_id());
+        assert_eq!(restored.method, DeliveryMethod::Opportunistic);
+        assert_eq!(restored.state, MessageState::Outbound);
+        assert!(!restored.incoming);
+        let finished = restored.finalize(None).unwrap();
+        assert_eq!(finished.wire_bytes(), original.wire_bytes());
+        assert!(finished.verify(&public_key).is_ok());
+    }
+
+    #[test]
+    fn restore_refuses_another_identity_and_a_bad_signature() {
+        let (identity, source) = resumable_sender();
+        let mut router = LxmRouter::new(RouterConfig::default());
+        let stored = stored_form(&mut router, &identity, &mut resumable_draft(source, "x"));
+
+        let other = rns_identity::identity::Identity::new();
+        assert!(matches!(
+            router.restore_signed(&stored, &other.get_public_key(), DeliveryMethod::Direct),
+            Err(MessageError::SourceMismatch)
+        ));
+
+        let mut forged = stored.as_bytes().to_vec();
+        forged[40] ^= 0x01;
+        let at = forged.len() - 16;
+        let digest = rns_crypto::sha::sha256(&forged[..at]);
+        forged[at..].copy_from_slice(&digest[..16]);
+        let forged = crate::message::ResumableLxMessage::from_bytes(forged).unwrap();
+        assert!(matches!(
+            router.restore_signed(&forged, &identity.get_public_key(), DeliveryMethod::Direct),
+            Err(MessageError::InvalidSignature)
+        ));
+    }
+
+    #[test]
+    fn restore_refreshes_the_ticket_and_keeps_the_signing_cost_as_a_floor() {
+        let (identity, source) = resumable_sender();
+        let destination = [0xA7; 16];
+        let mut sender = LxmRouter::new(RouterConfig::default());
+        sender.remember_ticket(destination, [0x42; 16], now_f64() + 60.0);
+        sender.set_stamp_cost(destination, 8);
+        let mut draft = resumable_draft(source, "ticketed");
+        sender.prepare_outbound(&mut draft).unwrap();
+        assert!(draft.outbound_ticket.is_some());
+        let stored = draft
+            .sign(&identity.get_signing_key().unwrap())
+            .unwrap()
+            .to_resumable();
+        let public_key = identity.get_public_key();
+
+        // After a restart the ticket has expired and the cost entry is gone:
+        // the message proves work at the cost it was signed under.
+        let mut restarted = LxmRouter::new(RouterConfig::default());
+        restarted.remember_ticket(destination, [0x42; 16], now_f64() - 1.0);
+        let restored = restarted
+            .restore_signed(&stored, &public_key, DeliveryMethod::Direct)
+            .unwrap();
+        assert_eq!(restored.outbound_ticket(), None);
+        assert_eq!(restored.stamp_cost(), Some(8));
+        let id = restored.message_id();
+        restarted.submit_signed(restored).unwrap();
+        assert!(restarted.pending_deferred_stamps.contains_key(&id));
+
+        restarted.set_stamp_cost(destination, 12);
+        let raised = restarted
+            .restore_signed(&stored, &public_key, DeliveryMethod::Direct)
+            .unwrap();
+        assert_eq!(raised.stamp_cost(), Some(12));
+        restarted.set_stamp_cost(destination, 4);
+        let lowered = restarted
+            .restore_signed(&stored, &public_key, DeliveryMethod::Direct)
+            .unwrap();
+        assert_eq!(lowered.stamp_cost(), Some(8));
+
+        restarted.remember_ticket(destination, [0x43; 16], now_f64() + 60.0);
+        let ticketed = restarted
+            .restore_signed(&stored, &public_key, DeliveryMethod::Direct)
+            .unwrap();
+        assert_eq!(ticketed.outbound_ticket(), Some([0x43; 16]));
+    }
+
+    #[test]
+    fn submit_signed_refuses_a_message_already_queued() {
+        let (identity, source) = resumable_sender();
+        let key = identity.get_signing_key().unwrap();
+        let mut router = LxmRouter::new(RouterConfig::default());
+        let draft = resumable_draft(source, "once");
+        router
+            .submit_signed(draft.clone().sign(&key).unwrap())
+            .unwrap();
+        assert!(matches!(
+            router.submit_signed(draft.sign(&key).unwrap()),
+            Err(MessageError::AlreadyQueued)
+        ));
+        assert_eq!(router.pending_outbound.len(), 1);
+
+        let mut stamped = resumable_draft(source, "stamped once");
+        stamped.stamp_cost = Some(8);
+        router
+            .submit_signed(stamped.clone().sign(&key).unwrap())
+            .unwrap();
+        assert!(matches!(
+            router.submit_signed(stamped.sign(&key).unwrap()),
+            Err(MessageError::AlreadyQueued)
+        ));
+        assert_eq!(router.pending_deferred_stamps.len(), 1);
+        assert_eq!(router.pending_outbound.len(), 1);
+    }
+
+    #[test]
+    fn restoring_one_message_twice_queues_it_once() {
+        let (identity, source) = resumable_sender();
+        let mut router = LxmRouter::new(RouterConfig::default());
+        let stored = stored_form(
+            &mut router,
+            &identity,
+            &mut resumable_draft(source, "twice"),
+        );
+        let public_key = identity.get_public_key();
+        for _ in 0..2 {
+            let restored = router
+                .restore_signed(&stored, &public_key, DeliveryMethod::Direct)
+                .unwrap();
+            let _ = router.submit_signed(restored);
+        }
+        assert_eq!(router.pending_outbound.len(), 1);
     }
 }
