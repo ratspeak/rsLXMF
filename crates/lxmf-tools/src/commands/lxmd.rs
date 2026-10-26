@@ -1619,6 +1619,9 @@ struct LxmdRunner {
     known_identities: HashMap<String, [u8; 64]>,
     /// Identities asked of Transport's validated announce cache.
     identity_recalls: HashMap<[u8; 16], oneshot::Receiver<TransportQueryResponse>>,
+    /// Reaches the shared instance when attached to one.
+    control_plane: Option<ReticulumHandle>,
+    retain_task: Option<tokio::task::JoinHandle<()>>,
     route_hops: HashMap<[u8; 16], u8>,
     /// Transport blackhole table snapshot, refreshed per tick. Used to drop
     /// inbound LXMs from blackholed identities (LXMRouter.py:1739-1741).
@@ -1818,6 +1821,40 @@ impl LxmdRunner {
                 );
             }
         }
+    }
+
+    /// Retain delivered destinations in Reticulum, through the shared
+    /// instance when attached to one, as Python's router does
+    /// (LXMRouter.py:2761, Reticulum.py:1449-1461).
+    fn forward_destination_retains(&mut self) {
+        let Some(control_plane) = self.control_plane.clone() else {
+            return;
+        };
+        if self
+            .retain_task
+            .as_ref()
+            .is_some_and(|task| !task.is_finished())
+        {
+            return;
+        }
+        let retains = self.router.take_destination_retains();
+        if retains.is_empty() {
+            return;
+        }
+        self.retain_task = Some(tokio::spawn(async move {
+            for dest in retains {
+                if control_plane
+                    .query_control(TransportQuery::RetainDestination { dest })
+                    .await
+                    .is_none()
+                {
+                    tracing::debug!(
+                        dest = %hex::encode(dest),
+                        "Reticulum did not retain a delivered destination"
+                    );
+                }
+            }
+        }));
     }
 
     /// Record an announced identity key and ratchet, persisting only a
@@ -2508,6 +2545,8 @@ impl LxmdRunner {
             received_ratchets,
             known_identities,
             identity_recalls: HashMap::new(),
+            control_plane: None,
+            retain_task: None,
             route_hops: HashMap::new(),
             blackholed_identities: HashSet::new(),
             link_delivery: None,
@@ -3585,6 +3624,7 @@ impl LxmdRunner {
 
         self.drain_destination_delivery_proofs();
         self.retry_due_opportunistic_deliveries(now);
+        self.forward_destination_retains();
 
         self.drain_control_commands();
         self.drain_identity_recalls();
@@ -6043,6 +6083,7 @@ pub(crate) async fn main() {
             std::process::exit(1);
         }
     };
+    runner.control_plane = Some(rns_handle.clone());
     if let Err(error) = runner.install_announce_subscriptions(&rns_handle).await {
         if shutdown.is_triggered() {
             tracing::info!("Startup announce cancelled by shutdown");
@@ -6574,12 +6615,12 @@ pub(crate) async fn main() {
 mod tests {
     use super::*;
 
-    /// A transport that validated `announce` before any daemon subscribed.
-    async fn transport_that_heard(
+    /// Feed `announce` to `transport` as heard on a new interface `id`.
+    async fn hear(
+        transport: &mpsc::Sender<TransportMessage>,
+        id: u64,
         announce: &[u8],
-    ) -> (mpsc::Sender<TransportMessage>, mpsc::Receiver<Bytes>) {
-        let (actor, tx) = rns_transport::actor::TransportActor::new();
-        tokio::spawn(actor.run());
+    ) -> mpsc::Receiver<Bytes> {
         let (driver_tx, driver_rx) = mpsc::channel(64);
         let entry = rns_transport::messages::InterfaceEntry::new(
             "heard".into(),
@@ -6590,39 +6631,138 @@ mod tests {
             driver_tx,
         );
         let owner = entry.owner.clone();
-        tx.send(TransportMessage::RegisterInterface { id: 1, entry })
+        transport
+            .send(TransportMessage::RegisterInterface { id, entry })
             .await
             .unwrap();
-        tx.send(TransportMessage::InterfaceEvent {
-            interface_id: 1,
-            owner,
-            message: Box::new(TransportMessage::Inbound(
-                rns_transport::messages::InboundPacket {
-                    raw: Bytes::copy_from_slice(announce),
-                    interface_id: 1,
-                    rssi: None,
-                    snr: None,
-                    q: None,
-                },
-            )),
-        })
-        .await
-        .unwrap();
+        transport
+            .send(TransportMessage::InterfaceEvent {
+                interface_id: id,
+                owner,
+                message: Box::new(TransportMessage::Inbound(
+                    rns_transport::messages::InboundPacket {
+                        raw: Bytes::copy_from_slice(announce),
+                        interface_id: id,
+                        rssi: None,
+                        snr: None,
+                        q: None,
+                    },
+                )),
+            })
+            .await
+            .unwrap();
+        driver_rx
+    }
+
+    /// A transport that validated `announce` before any daemon subscribed.
+    async fn transport_that_heard(
+        announce: &[u8],
+    ) -> (mpsc::Sender<TransportMessage>, mpsc::Receiver<Bytes>) {
+        let (actor, tx) = rns_transport::actor::TransportActor::new();
+        tokio::spawn(actor.run());
+        let driver_rx = hear(&tx, 1, announce).await;
         (tx, driver_rx)
     }
 
-    fn propagation_node_announce(node: &Identity) -> (Vec<u8>, String) {
+    fn lxmf_announce(
+        identity: &Identity,
+        aspect: &str,
+        app_data: Option<&[u8]>,
+    ) -> (Vec<u8>, String) {
         let mut destination = Destination::new(
-            Some(node),
+            Some(identity),
             rns_identity::destination::Direction::In,
             rns_identity::destination::DestType::Single,
-            "lxmf.propagation",
+            aspect,
         )
         .unwrap();
         let raw = destination
-            .announce_packet(node, None, None, false, None, now_f64())
+            .announce_packet(identity, app_data, None, false, None, now_f64())
             .unwrap();
         (raw, hex::encode(destination.hash))
+    }
+
+    fn propagation_node_announce(node: &Identity) -> (Vec<u8>, String) {
+        lxmf_announce(node, "lxmf.propagation", None)
+    }
+
+    /// A standalone Reticulum with no interfaces, whose control plane is its
+    /// own transport.
+    async fn standalone_reticulum(dir: &Path) -> (ReticulumHandle, ShutdownSignal) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join("config"),
+            "[reticulum]\nshare_instance = No\nenable_transport = No\n\
+             respond_to_probes = No\npanic_on_interface_error = No\n\
+             discover_interfaces = No\n\n[interfaces]\n",
+        )
+        .unwrap();
+        let shutdown = ShutdownSignal::new();
+        let handle = rns_runtime::reticulum::init(
+            Some(dir.to_str().unwrap()),
+            None,
+            shutdown.clone(),
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        )
+        .await
+        .unwrap();
+        (handle, shutdown)
+    }
+
+    /// Python's router retains a destination's announce data once a message
+    /// to it is delivered (LXMRouter.py:2761), on the shared instance when
+    /// attached to one (Reticulum.py:1449-1461).
+    #[tokio::test]
+    async fn delivered_destinations_are_retained_through_the_control_plane() {
+        let temp = tempfile::tempdir().unwrap();
+        let (reticulum, shutdown) = standalone_reticulum(&temp.path().join("rns")).await;
+        let recipient = Identity::new();
+        let (announce, recipient_hex) = lxmf_announce(&recipient, DELIVERY_APP_NAME, None);
+        let _driver = hear(&reticulum.transport_tx, 9001, &announce).await;
+        let recipient_hash: [u8; 16] = hex::decode(&recipient_hex).unwrap().try_into().unwrap();
+        let lxmf_dir = temp.path().join("lxmf");
+        initialize_storage_namespace(&lxmf_dir).unwrap();
+        let mut runner = LxmdRunner::new(
+            DaemonConfig::default(),
+            &lxmf_dir,
+            reticulum.transport_tx.clone(),
+            None,
+        )
+        .unwrap();
+        runner.control_plane = Some(reticulum.clone());
+        let delivered = LxMessageDraft::new(
+            recipient_hash,
+            runner.lxmf_dest_hash,
+            "",
+            "delivered",
+            DeliveryMethod::Opportunistic,
+        )
+        .unwrap()
+        .sign(&runner.identity.get_signing_key().unwrap())
+        .unwrap()
+        .finalize(None)
+        .unwrap();
+        runner.router.complete_outbound_message(delivered);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            runner.tick();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let retained = match reticulum
+                .query_transport(TransportQuery::GetRecentAnnounces)
+                .await
+            {
+                Some(TransportQueryResponse::Announces(announces)) => announces
+                    .iter()
+                    .any(|entry| entry.dest_hash == recipient_hash && entry.retained),
+                _ => false,
+            };
+            if retained {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the recipient is retained");
+        }
+        shutdown.trigger();
     }
 
     /// Python's LXMF recalls identities that Transport validated before the

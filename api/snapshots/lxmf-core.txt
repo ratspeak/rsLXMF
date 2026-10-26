@@ -2013,6 +2013,7 @@ pub fn lxmf_core::router::LxmRouter::stats(&self) -> lxmf_core::router::RouterSt
 pub fn lxmf_core::router::LxmRouter::submit_signed(&mut self, lxmf_core::message::SignedLxMessage) -> core::result::Result<(), lxmf_core::message::MessageError>
 pub fn lxmf_core::router::LxmRouter::sync_peer_policies_for_store(&self, u64) -> alloc::vec::Vec<lxmf_core::peer::OutboundOfferPolicy>
 pub fn lxmf_core::router::LxmRouter::sync_peers(&mut self) -> alloc::vec::Vec<[u8; 16]>
+pub fn lxmf_core::router::LxmRouter::take_destination_retains(&mut self) -> alloc::vec::Vec<[u8; 16]>
 pub fn lxmf_core::router::LxmRouter::throttle_peer(&mut self, [u8; 16])
 pub fn lxmf_core::router::LxmRouter::tick(&mut self)
 pub fn lxmf_core::router::LxmRouter::tick_with_encryptor<F>(&mut self, F) where F: core::ops::function::FnMut([u8; 16], &[u8]) -> core::result::Result<alloc::vec::Vec<u8>, lxmf_core::message::MessageError>

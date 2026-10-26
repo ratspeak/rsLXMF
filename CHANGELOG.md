@@ -8,6 +8,7 @@
 - `lxmd` learns the identities Reticulum validated before it subscribed to announces, and asks Reticulum for a missing identity before a propagation download, a delivery or a peer sync, as Python LXMF recalls them.
 - Store a signed message so its delivery can resume after a restart under the same id. A message that is already queued is no longer queued twice.
 - Generate deferred stamps in the order messages were sent, as Python LXMF does, so a reply no longer overtakes the message it answers.
+- Keep a destination's identity in Reticulum once a message to it is delivered, as Python LXMF does. `lxmd` asks the shared instance when attached to one.
 
 ## 1.4.0 - 2026-10-12
 

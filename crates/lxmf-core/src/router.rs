@@ -365,7 +365,12 @@ pub struct LxmRouter {
     inbound_resource_tracker: InboundResourceTracker,
     inbound_reservations: HashMap<[u8; 32], u64>,
     next_inbound_reservation: u64,
+    /// Destinations of delivered messages not yet taken by the embedder.
+    destination_retains: VecDeque<[u8; 16]>,
 }
+
+/// Delivered destinations a router holds for the embedder to retain.
+const MAX_PENDING_RETAINS: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DirectOutboundHandling {
@@ -464,6 +469,7 @@ impl LxmRouter {
             inbound_resource_tracker: InboundResourceTracker::default(),
             inbound_reservations: HashMap::new(),
             next_inbound_reservation: 0,
+            destination_retains: VecDeque::new(),
         }
     }
 
@@ -1030,7 +1036,25 @@ impl LxmRouter {
             self.ticket_store
                 .mark_ticket_delivered(msg.destination_hash(), now_f64());
         }
+        let destination = msg.destination_hash();
+        if !self.destination_retains.contains(&destination) {
+            if self.destination_retains.len() == MAX_PENDING_RETAINS {
+                self.destination_retains.pop_front();
+            }
+            self.destination_retains.push_back(destination);
+        }
         msg.mark_delivered();
+    }
+
+    /// Destinations that received a delivered message since the last call.
+    ///
+    /// Python's router retains each one's announce data in Reticulum so its
+    /// identity outlives its path (LXMRouter.py:2761). Send each as
+    /// `TransportQuery::RetainDestination` through the control plane, which
+    /// forwards to a shared instance. At most the newest 256 are kept between
+    /// calls.
+    pub fn take_destination_retains(&mut self) -> Vec<[u8; 16]> {
+        self.destination_retains.drain(..).collect()
     }
 
     /// Mark a pending outbound message failed and remove it from the outbound
@@ -4857,5 +4881,53 @@ mod tests {
             .map(|message| message.message_id())
             .collect();
         assert_eq!(stamped, submitted);
+    }
+
+    fn delivered_to(destination: [u8; 16], content: &str) -> LxMessage {
+        crate::message::test_message(
+            destination,
+            [0xB0; 16],
+            "retain",
+            content,
+            DeliveryMethod::Direct,
+        )
+    }
+
+    /// Python retains a destination's announce data once a message to it is
+    /// delivered (LXMRouter.py:2761).
+    #[test]
+    fn delivered_messages_ask_to_retain_their_destination() {
+        let mut router = LxmRouter::new(RouterConfig::default());
+        let direct = delivered_to([0xD1; 16], "direct");
+        let direct_id = direct.message_id();
+        router.try_send(direct).unwrap();
+        let failed = delivered_to([0xD3; 16], "failed");
+        let failed_id = failed.message_id();
+        router.try_send(failed).unwrap();
+
+        assert!(router.mark_outbound_delivered(&direct_id));
+        router.complete_outbound_message(delivered_to([0xD2; 16], "opportunistic"));
+        router.complete_outbound_message(delivered_to([0xD1; 16], "again"));
+        assert!(router.mark_outbound_failed(&failed_id));
+
+        assert_eq!(
+            router.take_destination_retains(),
+            vec![[0xD1; 16], [0xD2; 16]]
+        );
+        assert!(router.take_destination_retains().is_empty());
+    }
+
+    #[test]
+    fn untaken_retains_keep_only_the_newest_destinations() {
+        let mut router = LxmRouter::new(RouterConfig::default());
+        for n in 0..300u16 {
+            let mut destination = [0; 16];
+            destination[..2].copy_from_slice(&n.to_be_bytes());
+            router.complete_outbound_message(delivered_to(destination, "bounded"));
+        }
+        let retains = router.take_destination_retains();
+        assert_eq!(retains.len(), 256);
+        assert_eq!(retains[0][..2], 44u16.to_be_bytes());
+        assert_eq!(retains[255][..2], 299u16.to_be_bytes());
     }
 }
