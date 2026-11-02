@@ -57,7 +57,11 @@ pub struct DeliveryRatchetState {
 }
 
 impl DeliveryRatchetState {
-    /// Load verified state, preserving any invalid existing files in place.
+    /// Load canonical or legacy Rust state, preserving rejected files in place.
+    /// Canonical signatures cover the packed key list. Accepted legacy signatures
+    /// cover only the current public key, not retained old keys; canonical rewrite
+    /// is best-effort and does not establish their historical authenticity.
+    /// A failed rewrite does not prevent use of the accepted legacy ring.
     ///
     /// A missing ring is generated and persisted before it becomes live. A
     /// ring that cannot be stored leaves delivery available but unratcheted.

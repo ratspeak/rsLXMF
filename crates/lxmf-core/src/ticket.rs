@@ -47,7 +47,9 @@ impl Ticket {
         Ok(encoded)
     }
 
-    /// Decode a signed inbound Python-compatible ticket field.
+    /// Decode a Python-compatible ticket field with a finite future expiry and
+    /// a 16-byte token. The caller must authenticate the containing message and
+    /// bind `destination_hash` to its sender before storing the learned ticket.
     pub fn decode_field(destination_hash: [u8; 16], encoded: &[u8], now: f64) -> Option<Self> {
         let mut cursor = std::io::Cursor::new(encoded);
         let value = rmpv::decode::read_value(&mut cursor).ok()?;

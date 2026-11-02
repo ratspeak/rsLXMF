@@ -1,4 +1,4 @@
-//! LXMF daemon configuration and runner.
+//! LXMF daemon configuration and inbound-hook helpers.
 //!
 //! Python reference: LXMF/Utilities/lxmd.py.
 
@@ -11,9 +11,8 @@ use rns_runtime::config::{Config, ConfigSection};
 
 /// Normalized view of Python `lxmd.apply_config()` behavior.
 ///
-/// This intentionally mirrors Python's active_configuration keys and units.
-/// It is kept separate from [`DaemonConfig`] while the daemon still has legacy
-/// Rust fields and storage layout.
+/// Values retain Python's configuration units before conversion into
+/// [`DaemonConfig`], including decimal KB/MB and announce intervals in seconds.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PythonLxmdConfig {
     pub display_name: String,
@@ -190,7 +189,7 @@ pub struct DaemonConfig {
     pub enforce_stamps: bool,
     pub message_storage_limit: Option<usize>,
     pub from_static_only: bool,
-    /// Max accepted inbound delivery transfer size in KB. Python reference:
+    /// Max accepted inbound delivery transfer size in decimal KB. Python reference:
     /// `delivery_transfer_max_accepted_size` in `lxmd.py`.
     pub delivery_transfer_max_accepted_size: f64,
 }
@@ -407,8 +406,9 @@ pub fn execute_on_inbound(command: &str, message_path: &str) -> std::io::Result<
     execute_on_inbound_with_event(command, message_path, "")
 }
 
-/// Durable propagation outbox events may replay after a crash. Hooks can use
-/// this stable identifier for their own idempotency boundary.
+/// Execute an inbound hook with `event_id` in the `LXMF_EVENT_ID` environment
+/// variable when the identifier is nonempty. Durable propagation outbox events
+/// may replay after a crash; the hook can use the identifier to deduplicate them.
 pub fn execute_on_inbound_with_event(
     command: &str,
     message_path: &str,
@@ -523,9 +523,9 @@ fn split_command_line(command: &str) -> std::io::Result<Vec<String>> {
     Ok(parts)
 }
 
-/// Persist a received message before invoking the configured hook. Keeping
-/// both operations in one blocking job prevents the hook from racing the
-/// atomic file write and keeps process execution off the async daemon loop.
+/// Persist a received message, then invoke the configured hook after the write
+/// succeeds. This function blocks; async callers must run it on a blocking
+/// worker. A hook error is returned after the message has already been saved.
 pub fn persist_inbound_and_execute(
     message_path: &std::path::Path,
     packed: &[u8],

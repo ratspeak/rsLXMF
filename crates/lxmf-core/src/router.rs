@@ -1,7 +1,9 @@
-//! LXMF Router: message delivery engine and propagation node.
+//! LXMF routing policy, delivery queues and propagation bookkeeping.
 //!
-//! Python reference: LXMF/LXMRouter.py. Actor pattern — a single tokio task owns
-//! all mutable state.
+//! The embedding application owns and drives [`LxmRouter`]. It must connect
+//! transport delivery, durable admission and peer-sync workers; the router does
+//! not spawn an actor loop or host a propagation node by itself. Python's
+//! `LXMRouter` is the corresponding protocol reference.
 
 use crate::now_f64;
 use std::collections::{HashMap, VecDeque};
@@ -26,15 +28,17 @@ use crate::stamper;
 use crate::ticket::{Ticket, TicketStore};
 use crate::types::PropagationTransientId;
 
-/// Outstanding actor-owned admission. Only this router can match its nonce.
+/// Outstanding inbound admission reservation. Return it to the same router
+/// instance that issued it; its counter is not unique across router instances.
 #[derive(Debug)]
 pub struct InboundReservation {
     message_id: [u8; 32],
     nonce: u64,
 }
 
-/// Durable barrier for router-minted reply tickets. Signing the marked draft
-/// fails until this exact intent has committed its immutable ticket snapshot.
+/// Persistence barrier for a router-minted reply ticket. Signing the marked
+/// draft remains blocked until this intent establishes that the required ticket
+/// is durable, either in its snapshot or a newer committed ticket snapshot.
 pub struct OutboundTicketIntent {
     barrier: Option<std::sync::Arc<()>>,
     snapshot: Option<crate::persist::TicketPersistenceSnapshot>,
@@ -63,8 +67,8 @@ impl OutboundTicketIntent {
 
 /// Router configuration.
 ///
-/// Core fields are stable for downstream compatibility; additional Python
-/// `LXMRouter.__init__` knobs live in [`RouterConfigExt`] behind the `ext` field.
+/// Additional settings live in [`RouterConfigExt`] behind the `ext` field.
+/// Embedders must pass relevant policy to their transport and propagation owners.
 #[derive(Debug, Clone)]
 pub struct RouterConfig {
     pub propagation_enabled: bool,
@@ -81,7 +85,7 @@ pub struct RouterConfig {
 
 /// Extended router configuration.
 ///
-/// Additional `LXMRouter.__init__` fields; all have sensible defaults.
+/// Additional routing, admission and propagation settings with a [`Default`] implementation.
 #[derive(Debug, Clone)]
 pub struct RouterConfigExt {
     pub autopeer_maxdepth: usize,
@@ -89,13 +93,14 @@ pub struct RouterConfigExt {
     pub peering_cost: u8,
     pub max_peering_cost: u8,
     pub processing_outbound: bool,
-    /// Maximum outbound messages to process per tick (`None` = unlimited).
+    /// Maximum messages advanced per outbound-processing call (`None` = no count limit).
     pub processing_limit: Option<usize>,
     pub retain_synced_on_node: bool,
     pub auth_required: bool,
     /// Generate outbound message PoW stamps through the router deferred-stamp queue.
     pub defer_stamp_generation: bool,
-    /// Propagation storage cap in bytes (`None` = unlimited).
+    /// Size-culling target for the router's in-memory propagation index, in bytes.
+    /// `None` disables size-based culling; this is not an insertion or disk quota.
     pub message_storage_limit: Option<usize>,
     /// Name advertised in propagation announce metadata.
     pub name: Option<String>,
@@ -235,12 +240,9 @@ pub enum DirectDeliveryPlan {
     Fail,
 }
 
-/// Apply upstream LXMF Direct delivery attempt/path/link policy to one message.
-///
-/// This is a policy primitive for embedders that still own transport adapters.
-/// It mutates the same attempt/progress fields Python mutates in
-/// `LXMRouter.process_outbound`, but leaves actual path requests and Link
-/// creation to the caller.
+/// Plan a Direct delivery from the caller's identity, route and Link snapshot.
+/// Mutates attempt, timing, progress and message state; the caller performs
+/// path requests and Link operations and reports their outcomes.
 pub fn plan_direct_delivery(
     message: &mut LxMessage,
     input: DirectDeliveryPlanInput,
@@ -314,7 +316,7 @@ pub fn plan_direct_delivery(
     }
 }
 
-/// LXMF router — owns all mutable state under the actor pattern.
+/// Router-owned policy and queues. The embedding application serializes access and drives it.
 pub struct LxmRouter {
     pub config: RouterConfig,
     pub pending_outbound: Vec<LxMessage>,
@@ -323,13 +325,13 @@ pub struct LxmRouter {
     /// Order in which `defer_stamp` queued the deferred messages, so stamps
     /// are generated first in, first out.
     deferred_stamp_order: VecDeque<[u8; 32]>,
-    /// Captured at construction so deferred-stamp PoW can spawn onto the
-    /// blocking pool even when the caller is itself on a `spawn_blocking`
-    /// thread, where `Handle::try_current()` fails. Without it the tick grinds
-    /// stamps inline while holding the manager lock (observed 53 s stall).
+    /// Fallback runtime for deferred stamp workers, captured at construction.
+    /// The current runtime is preferred. If neither is available, stamp search
+    /// runs synchronously in the calling thread.
     pub runtime_handle: Option<tokio::runtime::Handle>,
     pub active_deferred_stamp: Option<DeferredStampJob>,
-    /// Identities allowed for delivery. An empty list means "all allowed".
+    /// Allow-list consulted by [`Self::is_allowed`]. Empty admits identities not blocked;
+    /// authentication policy must be enforced separately by the embedding adapter.
     pub allowed: Vec<[u8; 16]>,
     pub blocked: Vec<[u8; 16]>,
     pub allowed_control: Vec<[u8; 16]>,
@@ -342,7 +344,8 @@ pub struct LxmRouter {
     pub outbound_stamp_costs: HashMap<[u8; 16], StampCostEntry>,
     pub ticket_store: TicketStore,
     ticket_intent_in_flight: std::sync::Weak<()>,
-    /// Identity hash → priority level.
+    /// Destination hash → recorded priority level. The propagation index uses
+    /// membership to apply its fixed priority weight; it does not use the level.
     pub prioritized: HashMap<[u8; 16], u8>,
     pub delivery_callback: Option<DeliveryCallback>,
     pub transport_tx: Option<mpsc::Sender<rns_transport::messages::TransportMessage>>,
@@ -405,8 +408,8 @@ pub struct StampCostEntry {
 
 /// Owned, coherent snapshot of the router state written by [`LxmRouter::save_state`].
 ///
-/// Creating the snapshot only clones in-memory state. The caller can therefore
-/// release any lock that protects the router before calling [`Self::save_state`],
+/// Capturing this snapshot clones in-memory state and assigns a ticket revision.
+/// The caller can release any router lock before calling [`Self::save_state`],
 /// keeping filesystem I/O out of the router's critical section.
 #[derive(Debug, Clone)]
 pub struct RouterStateSnapshot {
@@ -421,7 +424,8 @@ impl RouterStateSnapshot {
     /// Persist this owned snapshot using the router's MessagePack layout.
     ///
     /// Each file is written atomically via rename, matching
-    /// [`LxmRouter::save_state`].
+    /// [`LxmRouter::save_state`]. The group is not one transaction: an error can
+    /// follow successful writes to earlier files. Serialize snapshot writes.
     pub fn save_state(&self, state_dir: &std::path::Path) -> std::io::Result<()> {
         use crate::persist;
 
@@ -503,14 +507,14 @@ impl LxmRouter {
 
     /// Number of active ordinary inbound delivery Resources.
     ///
-    /// Python reference: `LXMRouter.inbound_count` — LXMRouter.py:466.
+    /// Python reference: `LXMRouter.inbound_count`.
     pub fn inbound_count(&self) -> usize {
         self.inbound_resource_tracker.inbound_count()
     }
 
     /// Owned handles for all active ordinary inbound delivery Resources.
     ///
-    /// Python reference: `LXMRouter.inbound_resources` — LXMRouter.py:474.
+    /// Python reference: `LXMRouter.inbound_resources`.
     pub fn inbound_resources(&self) -> Vec<InboundResourceHandle> {
         self.inbound_resource_tracker.inbound_resources()
     }
@@ -527,7 +531,7 @@ impl LxmRouter {
 
     /// Queue cancellation for one unique active logical Resource.
     ///
-    /// Python reference: `LXMRouter.cancel_inbound` — LXMRouter.py:484.
+    /// Python reference: `LXMRouter.cancel_inbound`.
     pub fn cancel_inbound(&self, resource_id: &[u8; 32]) -> bool {
         self.inbound_resource_tracker.cancel_inbound(resource_id)
     }
@@ -538,8 +542,8 @@ impl LxmRouter {
     }
 
     /// Queue cancellation for a stable snapshot of all active Resources.
-    ///
-    /// Python reference: `LXMRouter.cancel_all_inbound` — LXMRouter.py:505.
+    /// Returns the number of requests accepted by the adapter queue, not the
+    /// number of completed cancellations.
     pub fn cancel_all_inbound(&self) -> usize {
         self.inbound_resource_tracker.cancel_all_inbound()
     }
@@ -565,10 +569,10 @@ impl LxmRouter {
 
     /// Queue a message for outbound delivery and report immediate routing errors.
     ///
-    /// Mirrors Python LXMF 0.9.8's explicit `IOError` when a caller attempts
-    /// `PROPAGATED` delivery without configuring an outbound propagation node.
-    /// The legacy [`send`](Self::send) wrapper preserves older Rust call-sites
-    /// while still marking the message failed and firing its callback.
+    /// Propagated delivery requires an outbound propagation node; otherwise the
+    /// returned error owns the message after its failure callback has fired.
+    /// This low-level method does not verify signatures or reject duplicate IDs.
+    /// Use [`Self::submit_signed`] for signed-message preparation and duplicate checks.
     pub fn try_send(&mut self, mut message: LxMessage) -> Result<(), SendError> {
         if message.method == DeliveryMethod::Propagated && self.outbound_propagation_node.is_none()
         {
@@ -602,8 +606,9 @@ impl LxmRouter {
     /// Learned outbound tickets do not change signed fields and can be
     /// attached at any time. A requested reply ticket is a signed LXMF field,
     /// so it must be inserted before signing. The method is deliberately
-    /// signer-agnostic: callers may subsequently use either `sign` or
-    /// `sign_with` without exposing private key material to the router.
+    /// signer-agnostic. When the returned intent requires persistence, call
+    /// [`OutboundTicketIntent::persist`] with this draft before `sign` or
+    /// `sign_with`; signing remains blocked until that barrier is released.
     pub fn prepare_outbound(
         &mut self,
         message: &mut LxMessageDraft,
@@ -684,11 +689,10 @@ impl LxmRouter {
 
     /// Restore a stored message for another delivery under the same id.
     ///
-    /// `source_public_key` is the active identity's: the message must verify
-    /// as sent by it. The outbound ticket is the current one, and the stamp
-    /// cost is the larger of the cost the message was signed under and the
-    /// destination's current cost. Finish the message as for a fresh send,
-    /// then pass it to [`Self::submit_signed`].
+    /// The caller supplies the active identity's public key; the message must
+    /// verify against it. Uses the current outbound ticket and the larger of
+    /// the stored stamp-cost floor and the destination's current cost. Pass the
+    /// returned signed message to [`Self::submit_signed`] for recipient work and queuing.
     pub fn restore_signed(
         &self,
         stored: &ResumableLxMessage,
@@ -860,7 +864,8 @@ impl LxmRouter {
         self.blocked.retain(|h| h != identity_hash);
     }
 
-    /// An empty allow-list means "everyone not blocked is allowed".
+    /// An empty allow-list admits every identity not blocked. This helper does
+    /// not consult [`Self::requires_authentication`] or verify an identity proof.
     pub fn is_allowed(&self, identity_hash: &[u8; 16]) -> bool {
         if !self.blocked.contains(identity_hash) {
             self.allowed.is_empty() || self.allowed.contains(identity_hash)
@@ -873,47 +878,47 @@ impl LxmRouter {
         self.allowed_control.contains(identity_hash)
     }
 
-    /// Whether delivery requires an entry in the allow-list.
-    ///
-    /// Python reference: `LXMRouter.requires_authentication` — LXMRouter.py:415-417.
+    /// Configured authentication requirement for the embedding delivery adapter.
+    /// This getter does not enforce access; [`Self::is_allowed`] is a separate check.
     pub fn requires_authentication(&self) -> bool {
         self.config.ext.auth_required
     }
 
-    /// Toggle whether delivery requires an entry in the allow-list.
-    ///
-    /// Python reference: `LXMRouter.set_authentication` — LXMRouter.py:409-413.
+    /// Set the authentication requirement consumed by the embedding adapter.
+    /// This does not change [`Self::is_allowed`] or validate incoming messages itself.
     pub fn set_authentication(&mut self, required: bool) {
         self.config.ext.auth_required = required;
     }
 
-    /// Whether the node keeps synchronized messages in its propagation store.
+    /// Retention preference passed to [`crate::propagation_client::PropagationClient`].
+    /// The current client retains previously known haves when enabled; newly
+    /// downloaded messages accepted through admission are still purged.
     pub fn retain_node_lxms(&self) -> bool {
         self.config.ext.retain_synced_on_node
     }
 
-    /// Toggle whether the node keeps synchronized messages in its propagation store.
-    ///
-    /// Python reference: `LXMRouter.set_retain_node_lxms` — LXMRouter.py:419-420.
+    /// Set the retention preference for the embedding propagation client.
+    /// The adapter must copy it to the client. See [`Self::retain_node_lxms`]
+    /// for the current known-haves-only scope.
     pub fn set_retain_node_lxms(&mut self, retain: bool) {
         self.config.ext.retain_synced_on_node = retain;
     }
 
-    /// Propagation storage cap in bytes (`None` = unlimited).
+    /// Size-culling target for the router's propagation index, in bytes.
+    /// `None` disables size-based culling.
     pub fn message_storage_limit(&self) -> Option<usize> {
         self.config.ext.message_storage_limit
     }
 
-    /// Set the propagation storage cap in bytes (`None` = unlimited).
-    ///
-    /// Python reference: `LXMRouter.set_message_storage_limit` — LXMRouter.py:423-424.
+    /// Set the propagation index's size-culling target in bytes. `None` disables
+    /// size-based culling; the setter does not cull immediately or impose a disk quota.
+    /// Culling runs through [`Self::cull_propagation`] or enabled periodic jobs.
     pub fn set_message_storage_limit(&mut self, limit: Option<usize>) {
         self.config.ext.message_storage_limit = limit;
     }
 
-    /// Current on-disk-equivalent size of the propagation store, in bytes.
-    ///
-    /// Python reference: `LXMRouter.message_storage_size` — LXMRouter.py:437-441.
+    /// Byte count recorded by the router's in-memory propagation index.
+    /// This does not inspect files or a separately hosted [`crate::propagation_node::PropagationNode`].
     pub fn message_storage_size(&self) -> usize {
         self.propagation_store.total_size()
     }
@@ -923,7 +928,9 @@ impl LxmRouter {
     /// The returned token can be shared with a peer that should bypass stamp PoW when sending
     /// to this router. Default expiry is [`TICKET_EXPIRY`] seconds.
     ///
-    /// Python reference: `LXMRouter.generate_ticket` — LXMRouter.py:1094-1108.
+    /// This low-level helper always generates a token, without renewal/interval
+    /// reuse or persistence. Persist ticket state before advertising the token;
+    /// [`Self::prepare_outbound`] supplies the normal reply-ticket barrier.
     pub fn generate_ticket(
         &mut self,
         destination_hash: [u8; 16],
@@ -940,15 +947,15 @@ impl LxmRouter {
 
     /// Record an externally-provided outbound ticket so the router can use it when sending.
     ///
-    /// Python reference: `LXMRouter.remember_ticket` — LXMRouter.py:1110-1113.
+    /// Python reference: `LXMRouter.remember_ticket`.
     pub fn remember_ticket(&mut self, destination_hash: [u8; 16], token: [u8; 16], expires: f64) {
         self.ticket_store
             .remember_outbound(Ticket::new(token, destination_hash, expires));
     }
 
-    /// Returns the token of the first valid ticket for `destination_hash`.
+    /// Return the currently stored valid outbound ticket for `destination_hash`.
     ///
-    /// Python reference: `LXMRouter.get_outbound_ticket` — LXMRouter.py:1058-1064.
+    /// Python reference: `LXMRouter.get_outbound_ticket`.
     pub fn get_outbound_ticket(&self, destination_hash: &[u8; 16]) -> Option<[u8; 16]> {
         let now = now_f64();
         self.ticket_store
@@ -958,7 +965,7 @@ impl LxmRouter {
 
     /// Returns the expiry (Unix epoch seconds) of the valid ticket for `destination_hash`.
     ///
-    /// Python reference: `LXMRouter.get_outbound_ticket_expiry` — LXMRouter.py:1125-1131.
+    /// Python reference: `LXMRouter.get_outbound_ticket_expiry`.
     pub fn get_outbound_ticket_expiry(&self, destination_hash: &[u8; 16]) -> Option<f64> {
         let now = now_f64();
         self.ticket_store
@@ -966,19 +973,16 @@ impl LxmRouter {
             .map(|t| t.expires)
     }
 
-    /// Snapshot of all stored tickets (including expired / used entries).
-    ///
-    /// Python reference: `LXMRouter.get_inbound_tickets` — LXMRouter.py:1133-1136.
+    /// Borrow all locally issued inbound tickets, across destinations. Expired
+    /// entries remain visible until culled. This does not include learned outbound tickets.
     pub fn get_inbound_tickets(&self) -> &[Ticket] {
         self.ticket_store.inbound()
     }
 
-    /// Cancel an outbound message before it is sent.
-    ///
-    /// Removes the message from `pending_outbound` (or `pending_deferred_stamps`) if it is still
-    /// in a cancellable state. Returns `true` if the message was found and cancelled.
-    ///
-    /// Python reference: `LXMRouter.cancel_outbound` — LXMRouter.py:474-487.
+    /// Remove a matching message from the router's outbound or deferred-stamp queue.
+    /// Returns `true` when found, regardless of its prior state. A matching active
+    /// stamp worker receives a cooperative cancellation request. The embedding
+    /// runtime must separately cancel any Link/Resource work it already owns.
     pub fn cancel_outbound(&mut self, message_hash: &[u8; 32]) -> bool {
         if let Some(pos) = self
             .pending_outbound
@@ -1051,8 +1055,8 @@ impl LxmRouter {
     /// Python's router retains each one's announce data in Reticulum so its
     /// identity outlives its path (LXMRouter.py:2761). Send each as
     /// `TransportQuery::RetainDestination` through the control plane, which
-    /// forwards to a shared instance. At most the newest 256 are kept between
-    /// calls.
+    /// forwards to a shared instance. Up to 256 distinct destinations are kept
+    /// in insertion order; a repeat delivery does not refresh an existing entry's position.
     pub fn take_destination_retains(&mut self) -> Vec<[u8; 16]> {
         self.destination_retains.drain(..).collect()
     }
@@ -1107,9 +1111,10 @@ impl LxmRouter {
         true
     }
 
-    /// Get the outbound-delivery progress (0.0..=1.0) for a pending message.
+    /// Get the recorded progress for a queued or deferred message. The value is
+    /// returned unchanged; caller-written metadata is not clamped here.
     ///
-    /// Python reference: `LXMRouter.get_outbound_progress` — LXMRouter.py:489-495.
+    /// Python reference: `LXMRouter.get_outbound_progress`.
     pub fn get_outbound_progress(&self, message_hash: &[u8; 32]) -> Option<f64> {
         self.pending_outbound
             .iter()
@@ -1124,42 +1129,37 @@ impl LxmRouter {
 
     /// Get the cached required stamp cost for a destination (delivery).
     ///
-    /// Returns `None` if no announce has advertised a cost for this destination.
-    ///
-    /// Python reference: `LXMRouter.get_outbound_lxm_stamp_cost` — LXMRouter.py:1138-1147.
+    /// Returns the cached entry unchanged, without an expiry check. Use
+    /// [`Self::get_stamp_cost`] to exclude expired entries. Unlike Python's
+    /// same-named message-ID lookup, this API takes a destination hash.
     pub fn get_outbound_lxm_stamp_cost(&self, destination_hash: &[u8; 16]) -> Option<u8> {
         self.outbound_stamp_costs
             .get(destination_hash)
             .map(|e| e.cost)
     }
 
-    /// Get the propagation stamp cost for a message queued for propagation-node delivery.
-    ///
-    /// Returns the per-message `stamp_cost` recorded on the pending message when it was enqueued.
-    ///
-    /// Python reference: `LXMRouter.get_outbound_lxm_propagation_stamp_cost` — LXMRouter.py:1149-1156.
+    /// Return the recipient stamp cost recorded on a deferred message.
+    /// Despite this method's name, it reads only `pending_deferred_stamps` and
+    /// does not return the separate propagation-node admission stamp target.
     pub fn get_outbound_lxm_propagation_stamp_cost(&self, message_hash: &[u8; 32]) -> Option<u8> {
         self.pending_deferred_stamps
             .get(message_hash)
             .and_then(|m| m.stamp_cost())
     }
 
-    /// Return whether a message or propagation transient ID has already been
-    /// delivered locally.
-    ///
-    /// Python reference: `LXMRouter.has_message` — LXMRouter.py:1667-1669.
+    /// Check the local-delivery dedupe cache for a message or transient ID.
+    /// Durable discard/deletion decisions can also populate it; presence does
+    /// not prove a message file exists. This lookup does not check expiry.
     pub fn has_message(&self, transient_id: &PropagationTransientId) -> bool {
         self.propagation_store.is_locally_delivered(transient_id)
     }
 
-    /// Atomically admit one already-decoded inbound message and invoke the
-    /// router callback at most once.
-    ///
-    /// Both ordinary packet/Resource delivery and propagation download must
-    /// use this actor-owned gate before any application-visible side effect.
-    /// A propagation message may carry a ciphertext-derived `transient_id`
-    /// distinct from its signed message hash; both identifiers are retained
-    /// so a later delivery through another representation is still deduped.
+    /// Mark a message ID delivered in memory and invoke the registered callback.
+    /// With `allow_duplicate = false`, an ID already in the local-delivery cache
+    /// returns `false`; with `true`, repeated calls may invoke the callback again.
+    /// This compatibility helper does not verify the message, persist local
+    /// effects or record a distinct ciphertext transient ID. Use the reservation
+    /// and durable-receipt commit path for application admission.
     pub fn deliver_inbound(&mut self, message: &LxMessage, allow_duplicate: bool) -> bool {
         let message_id = message.message_id();
         if !allow_duplicate && self.propagation_store.is_locally_delivered(&message_id) {
@@ -1172,8 +1172,10 @@ impl LxmRouter {
         true
     }
 
-    /// Reserve before local disk/DB work; no ticket learning, dedupe publication
-    /// or callback occurs until commit. An aborted write leaves retries possible.
+    /// Reserve a message ID before local disk/DB work. An existing reservation
+    /// for that ID returns `None`; this does not check the delivered cache or
+    /// authenticate the message. No ticket learning, dedupe publication or callback
+    /// occurs here. Return the reservation to this instance to abort or commit it.
     pub fn reserve_inbound(&mut self, message: &LxMessage) -> Option<InboundReservation> {
         let message_id = message.message_id();
         if self.inbound_reservations.contains_key(&message_id) {
@@ -1191,6 +1193,12 @@ impl LxmRouter {
         }
     }
 
+    /// Complete a matching reservation after the adapter has obtained a durable
+    /// receipt. Records both message and transient IDs; learns a ticket only from
+    /// a matching verified message with a committed/duplicate disposition.
+    /// Returns whether the new-commit delivery path ran; `false` also covers
+    /// duplicates, discards and mismatched reservations. The caller establishes
+    /// identity/node scope and durable effects before invoking this method.
     pub fn commit_inbound(
         &mut self,
         reservation: InboundReservation,
@@ -1249,6 +1257,10 @@ impl LxmRouter {
         true
     }
 
+    /// Decode/decrypt a paper URI and pass it to [`Self::deliver_inbound`] without
+    /// signature verification or durable persistence. The returned message is
+    /// unverified, and a registered callback may already have run. For verified
+    /// durable admission, decode separately and use the reservation/commit path.
     pub fn ingest_lxm_uri<F>(
         &mut self,
         uri: &str,
@@ -1262,9 +1274,11 @@ impl LxmRouter {
         Ok(message)
     }
 
-    /// Register a router-wide callback fired on every inbound message delivery.
+    /// Replace the router-wide callback used by inbound delivery/commit helpers.
+    /// It runs synchronously in the calling thread; duplicate/discard behavior
+    /// depends on the helper used.
     ///
-    /// Python reference: `LXMRouter.register_delivery_callback` — LXMRouter.py:358-359.
+    /// Python reference: `LXMRouter.register_delivery_callback`.
     pub fn register_delivery_callback<F>(&mut self, callback: F)
     where
         F: Fn(&LxMessage) + Send + 'static,
@@ -1273,9 +1287,9 @@ impl LxmRouter {
     }
 
     /// Load persisted runtime state (stamp costs, tickets, dedup sets) from
-    /// `state_dir`. Missing files are treated as empty state. Dedup-cache
-    /// timestamps are restored as persisted so age-based expiry survives
-    /// restarts.
+    /// `state_dir`. Missing files are treated as empty state; other load errors
+    /// propagate after any earlier fields have already been replaced. Dedup-cache
+    /// timestamps are restored so age-based expiry survives restarts.
     pub fn load_state(&mut self, state_dir: &std::path::Path) -> std::io::Result<()> {
         use crate::persist;
         self.outbound_stamp_costs = persist::load_stamp_costs(state_dir)?;
@@ -1323,8 +1337,9 @@ impl LxmRouter {
         }
     }
 
-    /// Persist runtime state to `state_dir` using MessagePack. Safe to call
-    /// periodically; each file is written atomically via rename.
+    /// Persist runtime state to `state_dir` using MessagePack. Each file is
+    /// replaced atomically; the set is not a single transaction. Serialize writes
+    /// so an older snapshot cannot overwrite newer state.
     pub fn save_state(&self, state_dir: &std::path::Path) -> std::io::Result<()> {
         self.state_snapshot().save_state(state_dir)
     }
@@ -1351,9 +1366,10 @@ impl LxmRouter {
     }
 
     /// Return authoritative policies for peers that have not processed the
-    /// current propagation-store generation. This is an O(peers) scheduler
-    /// query; exact message eligibility is intentionally deferred to the
-    /// sync task's off-loop offer preparation.
+    /// current propagation-store generation. Prefers eligible alive peers; if
+    /// none are alive, returns eligible unresponsive peers. Snapshots clone peer
+    /// policy/handled-ID state and are sorted by peer hash. Exact message
+    /// eligibility is checked during offer preparation.
     ///
     /// The method does not mutate peer state, allowing a single shared sync
     /// task to accept one policy before the daemon marks that peer started.
@@ -1385,10 +1401,11 @@ impl LxmRouter {
         true
     }
 
-    /// Add a peer from announce data.
-    ///
-    /// The peer is added only when autopeer is enabled, the router is below
-    /// `max_peers`, and the announce hop count is within `autopeer_maxdepth`.
+    /// Add or refresh a peer from announce data. New peers count toward
+    /// `max_peers`; static peers bypass autopeer and hop-depth gates.
+    /// Other peers require autopeer enabled and, when hops are known, an allowed
+    /// depth. Excess peering cost is refused and can remove an existing peer on
+    /// a non-stale policy announce. The caller supplies authenticated, finite data.
     pub fn autopeer(&mut self, candidate: AutopeerCandidate) -> bool {
         let AutopeerCandidate {
             destination_hash,
@@ -1540,9 +1557,9 @@ impl LxmRouter {
 
     /// Mark pending propagated messages due after the configured propagation node announces.
     ///
-    /// Mirrors LXMF 0.9.8's propagation announce handler. The announce app_data
-    /// must be a valid propagation-node announce before any retry backoff is
-    /// cleared.
+    /// Requires the configured destination and app data accepted by
+    /// [`crate::handlers::parse_pn_announce_data`] before clearing retry backoff.
+    /// The caller verifies the announce's identity and authenticity.
     pub fn trigger_outbound_for_propagation_node_announce(
         &mut self,
         destination_hash: [u8; 16],
@@ -1576,7 +1593,8 @@ impl LxmRouter {
         self.config.max_peers = max;
     }
 
-    /// Propagation storage limit in kilobytes.
+    /// Set the advertised per-transfer propagation limit in decimal kB.
+    /// This does not set total storage capacity or update a separate node owner.
     pub fn set_propagation_limit(&mut self, limit_kb: usize) {
         self.config.propagation_limit_kb = limit_kb;
     }
@@ -1588,7 +1606,7 @@ impl LxmRouter {
 
     /// Build propagation-node announce app_data (msgpack).
     ///
-    /// Python reference: LXMRouter.get_propagation_node_app_data — LXMRouter.py:306-318.
+    /// Python reference: LXMRouter.get_propagation_node_app_data.
     pub fn get_propagation_node_app_data(&self) -> Vec<u8> {
         use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1634,9 +1652,9 @@ impl LxmRouter {
 
     /// Validate a stamp, accepting a matching ticket hash as a bypass.
     ///
-    /// A ticket is matched by comparing the first 16 bytes of
-    /// `SHA-256(ticket.token || message_id)` against the stamp prefix;
-    /// otherwise falls back to PoW validation.
+    /// A ticket matches only when the complete stamp equals the 16-byte
+    /// truncated hash of `ticket.token || message_id`. A nonmatching stamp must
+    /// be exactly 32 bytes for PoW validation; a matching prefix alone is no ticket bypass.
     pub fn validate_stamp_with_tickets(
         &self,
         message_id: &[u8; 32],
@@ -1677,7 +1695,9 @@ impl LxmRouter {
         }
     }
 
-    /// Summarise propagation-node state for a control status request.
+    /// Summarise router-held propagation configuration, index and peer counters.
+    /// Returns `None` when propagation is disabled. This does not query a separate
+    /// live node or filesystem; the embedding runtime supplies those totals.
     ///
     /// Python reference: LXMRouter.compile_stats.
     pub fn control_status(&self) -> Option<NodeStats> {
@@ -1794,11 +1814,10 @@ impl LxmRouter {
         }
     }
 
-    /// Drain pending outbound messages into [`OutboundAction`]s.
-    ///
-    /// A delivery that later fails externally (e.g. unknown destination key)
-    /// should be re-queued via [`send`][Self::send] with `delivery_attempts`
-    /// incremented.
+    /// Move eligible outbound messages into [`OutboundAction`]s, subject to
+    /// retry times and the per-call processing limit. Other messages remain queued.
+    /// The caller owns emitted deliveries, including proof tracking and retries;
+    /// requeue retryable failures through [`Self::try_send`] after updating attempts.
     #[tracing::instrument(
         level = "debug",
         name = "router.process_outbound",
@@ -1930,12 +1949,9 @@ impl LxmRouter {
         actions
     }
 
-    /// Process outbound messages while keeping Direct deliveries in the router
-    /// queue until LinkDeliveryManager reports a terminal result.
-    ///
-    /// This mirrors Python's `LXMRouter.process_outbound` ownership model for
-    /// Direct messages while preserving [`Self::process_outbound`] for older
-    /// embedders that still take ownership of Direct messages themselves.
+    /// Plan Direct deliveries while retaining their originals in the router queue.
+    /// The caller executes plans, reports terminal Link results to the router and
+    /// handles non-Direct actions. This method does not poll a Link manager itself.
     pub fn process_outbound_with_direct<F>(&mut self, mut direct_input: F) -> Vec<OutboundAction>
     where
         F: FnMut(&LxMessage, f64) -> DirectDeliveryPlanInput,
@@ -2096,10 +2112,11 @@ impl LxmRouter {
         }
     }
 
-    /// Send single-packet opportunistic actions via the configured transport.
-    ///
-    /// Direct and Propagated actions require a Reticulum link and are handled by
-    /// `LinkDeliveryManager` / propagation helpers in the embedding runtime.
+    /// Compatibility executor without a destination encryptor. With transport
+    /// configured, Opportunistic actions fail encryption and are requeued.
+    /// Direct/Propagated actions are consumed without delivery; without transport,
+    /// all supplied actions are discarded. Handle delivery actions in the embedder
+    /// or use [`Self::execute_actions_with_encryptor`] for Opportunistic work.
     pub fn execute_actions(&mut self, actions: Vec<OutboundAction>) {
         self.execute_actions_with_encryptor(actions, |dest_hash, _plaintext| {
             Err(MessageError::PackFailed(format!(
@@ -2115,6 +2132,12 @@ impl LxmRouter {
     /// Python encrypts Opportunistic LXMF packet payloads with the recipient
     /// destination identity before handing bytes to Reticulum. Core cannot
     /// infer destination keys, so embeddings must provide the encryptor.
+    ///
+    /// This consumes the action list. Direct/Propagated actions are discarded,
+    /// and without a configured transport all actions are discarded. Dispatch
+    /// those methods separately before calling. Successful packet enqueueing does
+    /// not retain a message for delivery-proof tracking; the embedding runtime
+    /// must own that lifecycle when delivery confirmation is required.
     pub fn execute_actions_with_encryptor<F>(
         &mut self,
         actions: Vec<OutboundAction>,
@@ -2204,7 +2227,10 @@ impl LxmRouter {
         }
     }
 
-    /// Advance one scheduler tick: drain outbound, then run periodic jobs.
+    /// Advance deferred stamps and periodic jobs using the compatibility executor.
+    /// Direct messages stay queued; Propagated actions are consumed without delivery,
+    /// and Opportunistic work lacks destination encryption. This is not a complete
+    /// delivery driver; use explicit action processing in an embedding runtime.
     pub fn tick(&mut self) {
         self.processing_count += 1;
 
@@ -2217,8 +2243,9 @@ impl LxmRouter {
         self.run_periodic_jobs();
     }
 
-    /// Advance one scheduler tick using caller-supplied destination encryption
-    /// for Opportunistic packet actions.
+    /// Advance stamps, Opportunistic actions and periodic jobs with destination
+    /// encryption. Direct messages stay queued; Propagated actions are consumed
+    /// without delivery. For other methods or proof tracking, drive actions explicitly.
     pub fn tick_with_encryptor<F>(&mut self, encrypt_fn: F)
     where
         F: FnMut([u8; 16], &[u8]) -> Result<Vec<u8>, MessageError>,
@@ -2234,13 +2261,11 @@ impl LxmRouter {
         self.run_periodic_jobs();
     }
 
-    /// Drive the periodic job machinery for embedders that process outbound
-    /// themselves via `process_outbound_with_direct` instead of calling
-    /// [`Self::tick`]. Without this the jobloop counters never advance and
-    /// transient-cache cleaning, store culls, and peer rotation never run.
-    /// Time-gated to Python's `PROCESSING_INTERVAL` so callers may invoke it
-    /// every loop pass regardless of their tick rate (lxmd: 4 s, Ratspeak:
-    /// 500 ms) without skewing the jobloop cadences.
+    /// Drive periodic jobs when the embedder processes outbound actions itself.
+    /// Advances the job counter at most once per `0.9 * PROCESSING_INTERVAL`
+    /// wall-clock seconds; missed intervals are not replayed. Jobs clean transient
+    /// caches/throttles and, when propagation is enabled, cull the router index
+    /// and rotate peers. This does not drive outbound work or a separate node store.
     pub fn run_jobs_tick(&mut self) {
         let now = now_f64();
         if now - self.last_jobs_tick < PROCESSING_INTERVAL as f64 * 0.9 {
@@ -2306,7 +2331,8 @@ pub enum OutboundAction {
         message: LxMessage,
         prop_hash: [u8; 16],
     },
-    /// Small enough for single-packet delivery.
+    /// Opportunistic packet action. Final encryption and packet-size admission
+    /// remain the executor's responsibility.
     DeliverOpportunistic {
         message: LxMessage,
         dest_hash: [u8; 16],

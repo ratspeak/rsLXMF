@@ -326,8 +326,9 @@ impl SignedLxMessage {
             stamp_cost,
         }
     }
-    /// Store this message so its delivery can resume after a restart, under
-    /// the same id. The stored form keeps the signing stamp cost as a floor.
+    /// Create a representation the caller can persist to resume delivery after
+    /// a restart under the same ID. It retains the signing stamp cost as a floor;
+    /// this method performs no file or database write.
     pub fn to_resumable(&self) -> ResumableLxMessage {
         ResumableLxMessage::new(&self.message.wire, self.stamp_cost)
     }
@@ -373,6 +374,8 @@ impl SignedLxMessage {
         self.outbound_ticket
     }
     /// Compute the optional recipient stamp without changing the signed body.
+    /// Runs synchronously; proof of work uses [`crate::stamper::generate_stamp`]
+    /// and its attempt budget.
     pub fn generate_recipient_stamp(&self) -> Result<Option<RecipientStamp>, MessageError> {
         if let Some(ticket) = self.outbound_ticket {
             let mut material = [0u8; 48];

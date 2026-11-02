@@ -1,5 +1,8 @@
 //! File adapter for lxmd's durable download receipts and hook outbox.
 //! The original ciphertext TID is journaled before publishing decrypted bytes.
+//! Keep exclusive ownership of the journal and body paths while the store is
+//! open; its mutex coordinates clones of one store, not independent open calls
+//! or external file writers.
 use crate::admission::*;
 use bytes::Bytes;
 use rns_identity::persistence::{
@@ -109,6 +112,11 @@ impl FileAdmissionStore {
         })
     }
 
+    /// Prepare a persistence operation for an already authenticated message and
+    /// caller-selected disposition. The scope must retain the original ciphertext
+    /// TID; this method recomputes only the received plaintext wire hash.
+    /// Neither preparation nor commit authenticates the sender. Preparation writes
+    /// no files; commit performs persistence.
     pub fn prepare(
         &self,
         mut record: AdmissionRecord,
@@ -125,8 +133,10 @@ impl FileAdmissionStore {
         }
     }
 
-    /// Durable visible receipts remain while their referenced message exists;
-    /// invisible policy/TID accelerators expire after the local90-day policy.
+    /// Return live receipts from committed or recovered state for this identity/node.
+    /// Visible receipts have no time expiry; invisible policy/TID receipts expire
+    /// after 90 days. This query does not re-read archive files. Use the store's
+    /// deletion API to revoke visible receipts when deleting a message.
     pub fn haves(&self, identity: [u8; 16], node: [u8; 16], now: u64) -> Vec<Vec<u8>> {
         let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         inner

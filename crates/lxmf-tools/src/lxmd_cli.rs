@@ -79,11 +79,12 @@ pub struct Args {
     #[arg(long)]
     pub exampleconfig: bool,
 
-    /// Run as a system service (no interactive output).
+    /// Default to warning-level logging for service use; -v/-q override this.
+    /// The process remains in the foreground.
     #[arg(short = 's', long)]
     pub service: bool,
 
-    /// Display local node status and exit.
+    /// Query node status over Reticulum and exit (use `--remote` for another node).
     #[arg(long)]
     pub status: bool,
 
@@ -107,7 +108,7 @@ pub struct Args {
     #[arg(short = 'r', long, value_name = "DEST_HASH")]
     pub remote: Option<String>,
 
-    /// Identity path used for remote query operations.
+    /// Identity path used for local or remote control queries.
     #[arg(long, value_name = "PATH")]
     pub identity: Option<PathBuf>,
 
@@ -115,22 +116,24 @@ pub struct Args {
     #[arg(long, num_args = 1..=2, value_names = ["DEST_HASH", "CONTENT"])]
     pub send: Option<Vec<String>>,
 
-    /// Read outgoing --send content from a UTF-8 file instead of argv.
+    /// Read outgoing `--send` content from a UTF-8 file instead of argv.
     #[arg(long, value_name = "PATH")]
     pub send_file: Option<PathBuf>,
 
-    /// Delivery method for --send.
+    /// Delivery method for `--send`.
     #[arg(long, value_enum, default_value_t = SendMethod::Opportunistic)]
     pub send_method: SendMethod,
 
-    /// Link/resource completion timeout for --send.
+    /// Nominal wait in seconds for each `--send` completion phase. Each poll
+    /// includes a one-second sleep; discovery and work between polls add time.
     #[arg(long, default_value_t = 90)]
     pub send_timeout_secs: u64,
 
-    /// Attach custom LXMF fields to the outgoing --send message. Accepts a
-    /// JSON object mapping field-id -> base64(value). Example:
-    ///   --send-fields-json '{"1":"aGVsbG8=","42":"AAECA/8="}'
-    /// Only meaningful alongside --send.
+    /// Attach binary LXMF fields to `--send`. Accepts a JSON object mapping
+    /// decimal field IDs (0–255) to base64-encoded bytes. Example:
+    /// `--send-fields-json '{"200":"aGVsbG8=","201":"AAECA/8="}'`.
+    /// Choose IDs agreed with the receiving application. This option does not
+    /// construct native structured MessagePack fields. Only used with `--send`.
     #[arg(long, value_name = "JSON")]
     pub send_fields_json: Option<String>,
 }
@@ -203,7 +206,8 @@ autopeer_maxdepth = 6
 # Let configured static peers bypass sequential validation and inbound limits.
 # static_peers_bypass_sequential = yes
 
-# Maximum concurrent inbound propagation sync transfers.
+# Threshold for new inbound propagation sync offers. Already accepted offers
+# and static-peer bypass can exceed this value.
 # max_inbound_syncs = 3
 
 # message_storage_limit = 500
@@ -253,9 +257,9 @@ loglevel = 4
 }
 
 /// Parse a plaintext destination-hash list: one 16-byte hex value per line.
-/// Missing files return empty. Like Python `lxmd.py`, this accepts only raw
-/// 32-byte hex lines; comments and inline comments are ignored only because
-/// their raw line length is not exactly 32 bytes.
+/// Read errors return an empty list. Each line must contain exactly 32 ASCII
+/// hexadecimal characters; a trailing CR is allowed for CRLF files. Whitespace
+/// and comments are not stripped, so lines containing them are skipped.
 ///
 /// Python reference: `lxmd.py` reads `ignored` / `allowed` from the config dir.
 pub fn load_hash_list(path: &Path) -> Vec<[u8; 16]> {

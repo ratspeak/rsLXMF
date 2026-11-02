@@ -1,9 +1,11 @@
 # Rust API
 
-Application code that constructs or inspects LXMF messages should use
-`lxmf_core::message_api`. It re-exports the existing message, status, and
-identifier types without wrapping or replacing them. The original
-module-qualified paths remain supported.
+This guide describes the 1.4.0 source API, not the published standalone
+1.3.0 daemon. Application code should use `lxmf_core::message_api`, which
+re-exports the message types without wrappers. The equivalent module-qualified
+paths remain available. The [1.4 migration guide](migrations/1.4.md) explains
+the source-breaking change from mutable messages to drafts, signed messages
+and immutable finalized messages.
 
 The compiled `lxmf-core` `message` example demonstrates message construction,
 signing, packing, and unpacking through this path.
@@ -20,10 +22,10 @@ provisional module-qualified APIs.
 `lxmf-tools` supports the `lxmd-rs` binary and is not a public library
 integration target.
 
-The message facade changes no wire fields, signatures, serialization,
-delivery methods, proofs, persistence, or runtime behavior. Later reductions
-to the broader module tree require a reviewed API diff, downstream migration,
-and an explicit version decision.
+Choosing the facade instead of the equivalent module-qualified path does not
+change behavior. Upgrading from 1.3 to 1.4 does change message and persistence
+APIs; follow the migration guide. Further reductions to the broader module tree
+require a reviewed API diff, downstream migration and an explicit version decision.
 
 ## Delivery-owner integration
 

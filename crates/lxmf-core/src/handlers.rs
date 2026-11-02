@@ -1,7 +1,8 @@
 //! Announce handlers for `lxmf.delivery` and `lxmf.propagation` destinations, plus the
 //! propagation-node control endpoint dispatcher.
 //!
-//! Python reference: LXMF/Handlers.py, LXMF.py:172-198, LXMRouter.py:306-318, LXMRouter.py:985-1000.
+//! Related Python code: LXMF/Handlers.py, the announce helpers in LXMF.py,
+//! and the request handlers in LXMRouter.py.
 
 use std::collections::HashMap;
 
@@ -55,18 +56,19 @@ pub enum CompressionSupport {
 /// `[false, timebase, node_state, transfer_limit_kb, sync_limit_kb,
 /// [stamp_cost, stamp_flex, peering_cost], metadata]`.
 ///
-/// Python reference: LXMRouter.py:306-318.
+/// Python reference: `LXMRouter.get_propagation_node_app_data`.
 #[derive(Debug, Clone)]
 pub struct PropagationNodeAnnounceData {
-    /// Legacy LXMF PN-support flag, always false.
+    /// Compatibility field. The constructor/parser set it to false, and the
+    /// encoder always writes false regardless of this field.
     pub legacy: bool,
     /// Node timebase as Unix seconds.
     pub timebase: i64,
     /// True when the node is actively serving propagation.
     pub node_state: bool,
-    /// Per-transfer limit in kilobytes.
+    /// Per-transfer limit in decimal kilobytes (1 kB = 1000 bytes).
     pub transfer_limit: u64,
-    /// Per-sync limit in kilobytes.
+    /// Per-sync limit in decimal kilobytes (1 kB = 1000 bytes).
     pub sync_limit: u64,
     pub stamp_cost: u8,
     pub stamp_flex: u8,
@@ -111,7 +113,7 @@ impl PropagationNodeAnnounceData {
 
 /// Encode propagation-node announce `app_data` as msgpack.
 ///
-/// Python reference: LXMRouter.py:306-318.
+/// Python reference: `LXMRouter.get_propagation_node_app_data`.
 pub fn get_propagation_node_app_data(data: &PropagationNodeAnnounceData) -> Vec<u8> {
     use rmpv::Value;
 
@@ -142,13 +144,16 @@ pub fn get_propagation_node_app_data(data: &PropagationNodeAnnounceData) -> Vec<
     crate::encode_value(&announce_data)
 }
 
-/// Parse propagation-node announce data. Returns `None` if the data is
-/// malformed (not msgpack, not an array, fewer than 7 elements, or any
-/// element of the wrong type) — same rejection criteria as Python's
-/// `pn_announce_data_is_valid` at `LXMF.py:172-198`. The validator and
-/// the parser used to be two separate functions; the validator was
-/// dropped because it duplicated this function's checks and every
-/// in-tree caller called both back-to-back.
+/// Parse a propagation-node announce array with at least seven elements.
+///
+/// Requires a boolean state, numeric timebase, nonnegative finite limits/costs,
+/// a cost array with at least three values, and a metadata map. Rust casts apply; costs must
+/// fit in `u8` after conversion. The legacy slot is ignored. Only metadata with
+/// `u8` keys and binary values is retained. Extra array elements and trailing
+/// MessagePack bytes are not rejected.
+///
+/// This parser does not authenticate the announce or enforce timebase freshness.
+/// Its coercion and filtering rules differ from Python `pn_announce_data_is_valid`.
 pub fn parse_pn_announce_data(data: &[u8]) -> Option<PropagationNodeAnnounceData> {
     fn nonnegative_u64(value: &rmpv::Value) -> Option<u64> {
         value
@@ -211,7 +216,7 @@ pub fn parse_pn_announce_data(data: &[u8]) -> Option<PropagationNodeAnnounceData
 
 /// Extract stamp cost from propagation-node announce data.
 ///
-/// Python reference: `pn_stamp_cost_from_app_data` — LXMF.py:163-170.
+/// Uses [`parse_pn_announce_data`] and its numeric conversion rules.
 pub fn pn_stamp_cost_from_app_data(data: &[u8]) -> Option<u8> {
     parse_pn_announce_data(data).map(|p| p.stamp_cost)
 }
@@ -222,7 +227,8 @@ pub fn pn_stamp_cost_from_app_data(data: &[u8]) -> Option<u8> {
 ///
 /// `stamp_cost` must be in `1..=254`; out-of-range or `None` values are encoded as nil.
 ///
-/// Python reference: `get_announce_app_data` — LXMRouter.py:985-1001 (1.0.1).
+/// Names are sanitized and limited to [`MAX_ADVERTISED_NAME_CHARS`] characters.
+/// Python reference: `LXMRouter.get_announce_app_data`.
 pub fn get_announce_app_data(display_name: Option<&str>, stamp_cost: Option<u8>) -> Vec<u8> {
     use rmpv::Value;
 
@@ -246,8 +252,10 @@ pub fn get_announce_app_data(display_name: Option<&str>, stamp_cost: Option<u8>)
 
 /// Parse delivery-announce `app_data`, returning `(display_name, stamp_cost)`.
 ///
-/// Accepts both Python LXMF <=0.9.8's 2-element form and the 3-element
-/// feature-list form emitted from 1.0.1 (and extended peers).
+/// Requires an array with at least two elements; later elements are ignored.
+/// A binary UTF-8 name is sanitized and bounded. Unsigned stamp costs are cast
+/// to `u8`, retaining the low byte; this does not apply the encoder's `1..=254`
+/// filter. Original raw-text announce names are not parsed by this helper.
 pub fn parse_announce_app_data(data: &[u8]) -> Option<(Option<String>, Option<u8>)> {
     let value: rmpv::Value = rmpv::decode::read_value(&mut &data[..]).ok()?;
     let arr = value.as_array()?;
@@ -268,14 +276,14 @@ pub fn parse_announce_app_data(data: &[u8]) -> Option<(Option<String>, Option<u8
 
 /// Extract just the display name from delivery-announce `app_data`.
 ///
-/// Python reference: `display_name_from_app_data` — LXMF.py:131-143.
+/// Uses [`parse_announce_app_data`], including its name sanitization and array-only format.
 pub fn display_name_from_app_data(data: &[u8]) -> Option<String> {
     parse_announce_app_data(data).and_then(|(name, _)| name)
 }
 
 /// Extract just the stamp cost from delivery-announce `app_data`.
 ///
-/// Python reference: `stamp_cost_from_app_data` — LXMF.py:145-152.
+/// Uses [`parse_announce_app_data`], including its unsigned-to-`u8` cast.
 pub fn stamp_cost_from_app_data(data: &[u8]) -> Option<u8> {
     parse_announce_app_data(data).and_then(|(_, cost)| cost)
 }
@@ -285,7 +293,7 @@ pub fn stamp_cost_from_app_data(data: &[u8]) -> Option<u8> {
 /// Legacy 2-element app_data, malformed data, and missing feature lists are
 /// treated as unknown. A present feature list is authoritative.
 ///
-/// Python reference: `compression_support_from_app_data` — LXMF.py:154-164.
+/// Related Python helper: `compression_support_from_app_data`.
 pub fn compression_support_state_from_app_data(data: &[u8]) -> CompressionSupport {
     let Ok(value) = rmpv::decode::read_value(&mut &data[..]) else {
         return CompressionSupport::Unknown;
@@ -312,20 +320,18 @@ pub fn compression_support_state_from_app_data(data: &[u8]) -> CompressionSuppor
 
 /// Check whether a peer advertises `SF_COMPRESSION` support in its delivery-announce `app_data`.
 ///
-/// Fail-open like Python: legacy 2-element app_data, malformed data, and
-/// non-list feature entries all count as supported; only an explicit feature
-/// list that omits `SF_COMPRESSION` disables compression.
-///
-/// Python reference: `compression_support_from_app_data` — LXMF.py:154-164.
+/// Returns true for Supported or Unknown, including empty/malformed input and
+/// missing or non-list feature metadata. Only a present feature list without
+/// `SF_COMPRESSION` returns false. This boolean default differs from Python
+/// helper cases that return `None` or raise a decode error.
 pub fn compression_support_from_app_data(data: &[u8]) -> bool {
     compression_support_state_from_app_data(data) != CompressionSupport::Unsupported
 }
 
 /// Extract the advertised name from propagation-node announce data.
 ///
-/// Reads the [`PN_META_NAME`] metadata entry and decodes it as UTF-8.
-///
-/// Python reference: `pn_name_from_app_data` — LXMF.py:172-181.
+/// Reads binary [`PN_META_NAME`] metadata, decodes UTF-8, then sanitizes and
+/// bounds the name. Returns `None` if parsing fails or the result is empty.
 pub fn pn_name_from_app_data(data: &[u8]) -> Option<String> {
     let parsed = parse_pn_announce_data(data)?;
     let name_bytes = parsed.metadata.get(&crate::constants::PN_META_NAME)?;
@@ -374,21 +380,24 @@ pub enum ControlResult {
 
 /// Propagation-node request handler.
 ///
-/// Owns the access-control state and dispatches the three request paths (`/pn/get/stats`,
-/// `/offer`, `/get`) to [`crate::propagation_node::PropagationNode`]. Python reference:
-/// LXMRouter.py:650-657.
+/// Provides handlers for `/pn/get/stats`, `/offer`, `/get`, `/pn/peer/sync` and
+/// `/pn/peer/unpeer`. The embedder must supply identities already verified by
+/// the Link; these methods accept identity hashes and do not authenticate them.
+/// Sync/unpeer handlers authorize a request; the caller performs those actions.
 pub struct PropagationRequestHandler {
     pub local_identity_hash: [u8; 16],
     pub control_allowed: Vec<[u8; 16]>,
-    /// When true, only peers in [`static_peers`](Self::static_peers) may submit offers.
+    /// When true, offers require the supplied remote identity hash to be in
+    /// [`static_peers`](Self::static_peers). This helper uses identity hashes.
     pub from_static_only: bool,
     pub static_peers: std::collections::HashSet<[u8; 16]>,
-    /// Throttled peers mapped to their expiry Unix timestamp.
+    /// Supplied remote identity hashes mapped to throttle-expiry Unix timestamps.
     pub throttled_peers: HashMap<[u8; 16], f64>,
 }
 
 impl PropagationRequestHandler {
-    /// Create a handler seeded with the local identity hash, which is always control-allowed.
+    /// Create a handler with the local identity hash in its initial control allowlist.
+    /// The allowlist remains mutable, including removal of that identity.
     pub fn new(identity_hash: [u8; 16]) -> Self {
         Self {
             local_identity_hash: identity_hash,
@@ -399,9 +408,9 @@ impl PropagationRequestHandler {
         }
     }
 
-    /// Handle a `/pn/get/stats` request: validates identity and access, then returns msgpack stats.
+    /// Return MessagePack stats when the supplied verified identity is control-allowed.
     ///
-    /// Python reference: `LXMRouter.stats_get_request` — LXMRouter.py:819-822.
+    /// Related Python handler: `LXMRouter.stats_get_request`.
     pub fn handle_stats_request(
         &self,
         remote_identity_hash: Option<&[u8; 16]>,
@@ -423,9 +432,10 @@ impl PropagationRequestHandler {
 
     /// Handle an `/offer` request from a syncing peer.
     ///
-    /// Validates identity, throttle status, access, and peering key, then delegates to
-    /// [`crate::propagation_node::PropagationNode::handle_offer_request`]. Python reference:
-    /// `LXMRouter.offer_request` — LXMRouter.py:2139-2189.
+    /// Build identity-presence, throttle and static-access context, then delegate
+    /// decoding and peering-key checks to
+    /// [`crate::propagation_node::PropagationNode::handle_offer_request`].
+    /// Supply an already verified remote identity; this helper does not verify it.
     pub fn handle_offer_request(
         &self,
         remote_identity_hash: Option<&[u8; 16]>,
@@ -469,7 +479,9 @@ impl PropagationRequestHandler {
     /// [`GetRequestAction::ServeFiles`](crate::propagation_node::GetRequestAction::ServeFiles)
     /// plan — the embedder resolves it after releasing the node lock.
     ///
-    /// Python reference: `LXMRouter.message_get_request` — LXMRouter.py:1425-1499.
+    /// The caller must derive `client_dest_hash` from the verified remote identity
+    /// and enforce its access policy. This helper checks only that an identity
+    /// was supplied; it does not bind the two arguments.
     pub fn handle_message_get_request(
         &self,
         remote_identity_hash: Option<&[u8; 16]>,
@@ -494,7 +506,7 @@ impl PropagationRequestHandler {
     /// Handle a `/pn/peer/sync` request. Returns msgpack `true` on success; the caller performs
     /// the actual sync trigger.
     ///
-    /// Python reference: `LXMRouter.peer_sync_request` — LXMRouter.py:824-834.
+    /// Related Python handler: `LXMRouter.peer_sync_request`.
     pub fn handle_peer_sync_request(
         &self,
         remote_identity_hash: Option<&[u8; 16]>,
@@ -527,7 +539,7 @@ impl PropagationRequestHandler {
     /// Handle a `/pn/peer/unpeer` request. Returns msgpack `true` on success; the caller performs
     /// the actual peer removal.
     ///
-    /// Python reference: `LXMRouter.peer_unpeer_request` — LXMRouter.py:836-846.
+    /// Related Python handler: `LXMRouter.peer_unpeer_request`.
     pub fn handle_peer_unpeer_request(
         &self,
         remote_identity_hash: Option<&[u8; 16]>,
@@ -564,7 +576,7 @@ impl PropagationRequestHandler {
 
     /// Throttle `peer_hash` for `duration_secs` starting now.
     ///
-    /// Python reference: `LXMRouter.propagation_resource_concluded` — LXMRouter.py:2277-2278.
+    /// Related Python handler: `LXMRouter.propagation_resource_concluded`.
     pub fn throttle_peer(&mut self, peer_hash: [u8; 16], duration_secs: f64) {
         let expiry = now_f64() + duration_secs;
         self.throttled_peers.insert(peer_hash, expiry);

@@ -1,8 +1,10 @@
 use super::*;
 use std::process::{Command, Stdio};
 
-/// Holds the same OS lock as every v2 host. Legacy binaries ignore this lock;
-/// the mandatory supervisor assertion and known-process probe address that gap.
+/// Hold the OS lock shared with current v2 hosts during offline migration.
+/// Legacy binaries ignore it. The desktop constructor also requires the caller
+/// to stop supervisors and checks known processes; the iOS/Android constructors
+/// use restricted app-container checks and require the caller to join its writers.
 pub struct OfflineMigrationGuard {
     pub(super) legacy: PathBuf,
     pub(super) _lock: File,

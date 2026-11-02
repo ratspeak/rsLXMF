@@ -7,9 +7,11 @@ pub const MAX_ADVERTISED_NAME_CHARS: usize = 128;
 
 /// Normalize and bound an untrusted display name.
 ///
-/// The result is NFKC-normalized, contains no control or presentation-control
-/// codepoints, collapses all Unicode whitespace to one ASCII space, and is
-/// truncated by Unicode scalar values rather than UTF-8 bytes.
+/// Applies NFKC normalization and filters control characters, bidi controls,
+/// private-use characters, selected zero-width characters, variation selectors,
+/// and broad emoji/symbol ranges. Tabs and newlines are removed. Remaining
+/// whitespace collapses to one ASCII space, with no leading or trailing space.
+/// The length limit counts Unicode scalar values, not UTF-8 bytes.
 pub fn sanitize_name(input: &str, max_chars: usize) -> String {
     let mut output = sanitize_name_pass(input, max_chars);
     let rounds = output.nfkd().count().saturating_add(2);

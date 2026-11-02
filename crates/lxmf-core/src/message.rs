@@ -450,7 +450,7 @@ impl LxMessage {
     }
     /// Update [`auto_compress`](MessageMetadata::auto_compress) based on a peer's cached announce app_data.
     ///
-    /// Matches Python `LXMessage.determine_compression_support` — LXMessage.py:510-513.
+    /// Follows Python `LXMessage.determine_compression_support`.
     /// Fail-open: no cached app_data and legacy peers without a feature list
     /// default to compression enabled; only an explicit feature list omitting
     /// `SF_COMPRESSION` disables it.
@@ -460,9 +460,8 @@ impl LxMessage {
             .unwrap_or(true);
     }
 
-    /// Register a callback fired when this message transitions to `Delivered`.
-    ///
-    /// Python reference: `LXMessage.register_delivery_callback` — LXMessage.py:264-265.
+    /// Set the callback used by [`Self::notify_delivered`] and
+    /// [`Self::mark_delivered`], replacing any previous delivery callback.
     pub fn register_delivery_callback<F>(&mut self, callback: F)
     where
         F: Fn(&LxMessage) + Send + Sync + 'static,
@@ -470,9 +469,8 @@ impl LxMessage {
         self.callbacks.on_delivered = Some(Arc::new(callback));
     }
 
-    /// Register a callback fired when this message transitions to `Failed`.
-    ///
-    /// Python reference: `LXMessage.register_failed_callback` — LXMessage.py:267-268.
+    /// Set the callback used by [`Self::notify_failed`] and
+    /// [`Self::mark_failed`], replacing any previous failure callback.
     pub fn register_failed_callback<F>(&mut self, callback: F)
     where
         F: Fn(&LxMessage) + Send + Sync + 'static,
@@ -480,14 +478,16 @@ impl LxMessage {
         self.callbacks.on_failed = Some(Arc::new(callback));
     }
 
-    /// Fire the registered delivery callback, if any. Idempotent on repeated calls.
+    /// Invoke the delivery callback, if registered. Every call invokes it again;
+    /// the caller must prevent duplicate notifications when required.
     pub fn notify_delivered(&self) {
         if let Some(ref cb) = self.callbacks.on_delivered {
             cb(self);
         }
     }
 
-    /// Fire the registered failure callback, if any. Idempotent on repeated calls.
+    /// Invoke the failure callback, if registered. Every call invokes it again;
+    /// the caller must prevent duplicate notifications when required.
     pub fn notify_failed(&self) {
         if let Some(ref cb) = self.callbacks.on_failed {
             cb(self);
@@ -495,7 +495,8 @@ impl LxMessage {
     }
 
     /// Decode the first native LXMF file attachment while borrowing its bytes
-    /// from this message. Only the small filename is allocated.
+    /// from this message. The filename is copied into a string; it has no
+    /// separate length limit beyond the enclosing message's decode limits.
     pub fn first_file_attachment(&self) -> Result<Option<(String, &[u8])>, MessageError> {
         let Some(field) = self.fields().get(FIELD_FILE_ATTACHMENTS) else {
             return Ok(None);
@@ -515,7 +516,8 @@ impl LxMessage {
     }
 
     /// Decode the native LXMF image field while borrowing its image bytes
-    /// from this message. Only the short format string is allocated.
+    /// from this message. The format string is copied; it has no separate
+    /// length limit beyond the enclosing message's decode limits.
     pub fn image_attachment(&self) -> Result<Option<(String, &[u8])>, MessageError> {
         let Some(field) = self.fields().get(FIELD_IMAGE) else {
             return Ok(None);
@@ -576,8 +578,10 @@ impl LxMessage {
     }
 
     /// Unpack a propagation wrapper `msgpack([timestamp, [lxmf_data, ...]])`, where each entry is
-    /// `dest_hash(16) + encrypted_data + ?propagation_stamp`. The caller must decrypt and then
-    /// call [`Self::unpack`] on the decrypted bytes.
+    /// `dest_hash(16) + encrypted_data + ?propagation_stamp`. The caller removes any
+    /// propagation stamp, decrypts the ciphertext after the destination hash,
+    /// then prepends that destination hash before calling [`Self::unpack`].
+    /// Use a bounded wrapper parser for network ingress.
     ///
     /// Python reference: `LXMRouter.lxmf_propagation` / `propagation_resource_concluded`.
     pub fn unpack_propagation_wrapper(data: &[u8]) -> Result<(f64, Vec<Vec<u8>>), MessageError> {
@@ -586,9 +590,9 @@ impl LxMessage {
         Ok(wrapper)
     }
 
-    /// Smallest possible valid propagation entry: anything at or below
-    /// `LXMF_OVERHEAD + STAMP_SIZE` cannot carry a message (Python
-    /// `LXStamper.validate_pn_stamp` rejects it before building a workblock).
+    /// Minimum entry length accepted by the bounded propagation-wrapper parser.
+    /// Matches Python `LXStamper.validate_pn_stamp`'s rejection of entries at or
+    /// below `LXMF_OVERHEAD + STAMP_SIZE` before workblock construction.
     pub const MIN_PROPAGATION_ENTRY_SIZE: usize =
         crate::constants::LXMF_OVERHEAD + crate::constants::STAMP_SIZE + 1;
 
@@ -662,8 +666,7 @@ impl LxMessage {
 
     /// Mark transmission as in progress.
     ///
-    /// Python reference: LXMessage.py:479, 499 — DIRECT and PROPAGATED messages enter SENDING
-    /// when transmission begins.
+    /// Sets the local state to [`MessageState::Sending`]; performs no network I/O.
     pub fn mark_sending(&mut self) {
         self.state = MessageState::Sending;
     }
@@ -678,7 +681,8 @@ impl LxMessage {
     /// before emitting paper/QR content. The caller supplies that identity encryption closure,
     /// keeping this crate independent from any concrete identity store.
     ///
-    /// Python reference: LXMessage.py:443-455 and LXMessage.py:687-705.
+    /// Requires [`DeliveryMethod::Paper`] and a destination-plus-ciphertext
+    /// payload no larger than [`PAPER_MDU`].
     pub fn to_paper_uri<F>(&self, encrypt_fn: F) -> Result<String, MessageError>
     where
         F: FnOnce(&[u8]) -> Result<Vec<u8>, MessageError>,
@@ -727,10 +731,11 @@ impl LxMessage {
         Ok((destination_hash, bytes[DESTINATION_LENGTH..].to_vec()))
     }
 
-    /// Decode an upstream-compatible encrypted `lxm://` paper URI.
+    /// Decode an encrypted `lxm://` paper URI.
     ///
-    /// The caller supplies the local destination identity decryption closure. On success the
-    /// decrypted wire message is unpacked exactly like Python's `ingest_lxm_uri` path.
+    /// The caller supplies destination-identity decryption. This method restores
+    /// the destination prefix, parses the message, and marks its representation
+    /// as Paper. Authenticate the sender separately with [`Self::verify`].
     pub fn from_paper_uri<F>(uri: &str, decrypt_fn: F) -> Result<Self, MessageError>
     where
         F: FnOnce(&[u8]) -> Result<Vec<u8>, MessageError>,
@@ -746,7 +751,7 @@ impl LxMessage {
         Ok(message)
     }
 
-    /// Alias for [`Self::to_paper_uri`]; returns `None` if packing or encryption fails.
+    /// Alias for [`Self::to_paper_uri`]; returns `None` on any error.
     pub fn as_uri<F>(&self, encrypt_fn: F) -> Option<String>
     where
         F: FnOnce(&[u8]) -> Result<Vec<u8>, MessageError>,
@@ -754,7 +759,7 @@ impl LxMessage {
         self.to_paper_uri(encrypt_fn).ok()
     }
 
-    /// Alias for [`Self::from_paper_uri`]. Python reference: LXMessage.py:685-731.
+    /// Alias for [`Self::from_paper_uri`].
     pub fn from_uri<F>(uri: &str, decrypt_fn: F) -> Result<Self, MessageError>
     where
         F: FnOnce(&[u8]) -> Result<Vec<u8>, MessageError>,
@@ -764,8 +769,11 @@ impl LxMessage {
 
     /// Pack the message into a container for file storage.
     ///
-    /// Layout is a msgpack map `{state: u8, lxmf_bytes: bin, transport_encrypted: bool,
-    /// transport_encryption: str?, method: u8}`.
+    /// Writes a five-element MessagePack array in this order:
+    /// `[state, lxmf_bytes, transport_encrypted, transport_encryption, method]`.
+    /// `lxmf_bytes` is binary and `transport_encryption` is a string or nil.
+    /// Python's `packed_container` writes a named-field map; its file reader
+    /// does not accept this Rust array layout.
     pub fn pack_container(&self) -> Result<Vec<u8>, MessageError> {
         let container = MessageContainerRef {
             state: self.state as u8,
@@ -777,7 +785,8 @@ impl LxMessage {
         rmp_serde::to_vec(&container).map_err(|e| MessageError::PackFailed(e.to_string()))
     }
 
-    /// Unpack a message from a container (Python parity: `unpack_from_file` in LXMessage.py).
+    /// Decode a container array or a map with matching field names, then parse
+    /// its LXMF wire image. This does not verify the sender's signature.
     pub fn unpack_container(data: &[u8]) -> Result<Self, MessageError> {
         if data.len() > MessageDecodeLimits::default().max_wire_bytes + 65_536 {
             return Err(MessageError::UnpackFailed(
@@ -818,12 +827,10 @@ impl LxMessage {
 
     /// Write the message to `directory_path`, named by the message hash.
     ///
-    /// Writes are atomic (unique tmp file + fsync + rename) so concurrent
-    /// readers never observe a partial file — Python `write_to_directory`,
-    /// LXMessage.py:674-696 (1.0.1). Python additionally serializes the write
-    /// under a per-message persist lock; in Rust concurrent persists of one
-    /// message are already exclusive-borrow serialized or hit unique tmp
-    /// files, with the rename as the atomic last-writer-wins step.
+    /// Writes [`Self::pack_container`] through the platform durability boundary
+    /// in [`crate::persist::write_file_atomic`]. Publication errors, including
+    /// uncertain commits, propagate to the caller. The message type does not
+    /// serialize concurrent calls; callers needing write ordering must provide it.
     pub fn write_to_directory(&self, directory_path: &str) -> Result<String, MessageError> {
         let hash = self.message_id();
         let file_name = rns_crypto::hex_encode(&hash);
@@ -836,7 +843,8 @@ impl LxMessage {
         Ok(file_path)
     }
 
-    /// Read a message from a container file (Python parity: `unpack_from_file`).
+    /// Read a bounded container file. A 64-character hexadecimal filename must
+    /// match the parsed message ID. Sender authentication remains a separate step.
     pub fn read_from_file(file_path: &str) -> Result<Self, MessageError> {
         use std::io::Read;
         let file = std::fs::File::open(file_path)

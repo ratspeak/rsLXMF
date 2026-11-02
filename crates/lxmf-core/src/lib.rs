@@ -4,20 +4,20 @@
 //!
 //! This crate implements the LXMF wire model and is the core LXMF building
 //! block for `lxmf-tools` (the `lxmd-rs` daemon) and embedding applications.
-//! Its Reticulum dependency is `rns-transport` from rsReticulum; LXMF sits one
-//! layer above the Reticulum stack.
+//! It uses rsReticulum for transport, links, identities and Resources; LXMF
+//! sits one layer above the Reticulum stack.
 //!
 //! # Module map
 //!
 //! | Module                | What it does                                       |
 //! | --------------------- | -------------------------------------------------- |
-//! | [`message`]           | Message object: fields, packing, stamp, encryption |
+//! | [`message`]           | Message types, packing, verification and encryption hooks |
 //! | [`delivery_ratchet`]  | Durable delivery-announce ratchet transaction      |
 //! | [`inbound_resource`]  | Public inbound Resource tracking/cancellation      |
 //! | [`presentation`]      | Safe bounded presentation of untrusted names       |
-//! | [`router`]            | Actor-driven routing and delivery state machine    |
+//! | [`router`]            | Caller-driven routing and delivery state machine    |
 //! | [`peer`]              | Propagation-peer state and sync bookkeeping        |
-//! | [`propagation`]       | On-disk store-and-forward message pool             |
+//! | [`propagation`]       | In-memory propagation message index and selection             |
 //! | [`propagation_node`]  | Propagation-node role logic                        |
 //! | [`propagation_client`]| Client side of propagation sync                    |
 //! | [`propagation_sync`]  | Wire-level peer sync exchange                      |
@@ -25,9 +25,16 @@
 //! | [`discovery_stamper`] | [`DiscoveryStamper`] impl for on-network discovery |
 //! | [`sync`]              | Shared peer-to-peer sync primitives                |
 //! | [`link_delivery`]     | Reticulum-link-based delivery path                 |
-//! | [`handlers`]          | Callback trait surface for delivery events         |
-//! | [`ticket`]            | Small typed identifier for propagation workflows   |
+//! | [`handlers`]          | Announce parsing and propagation control handlers         |
+//! | [`ticket`]            | Directional tickets for bypassing recipient stamp work   |
 //! | [`persist`]           | MessagePack-based on-disk state                    |
+//! | [`admission`]         | Durable inbox admission and receipt state         |
+//! | [`admission_store`]   | Admission-store interface and file-backed adapter |
+//! | [`propagation_admission`] | Inbound propagation offer and transfer states |
+//! | [`propagation_offer`] | Propagation-offer evaluation outcomes             |
+//! | [`propagation_send`]  | Outbound propagation payload preparation          |
+//! | [`propagation_store_v2`] | Durable propagation store and recovery          |
+//! | [`types`]             | Message, destination and identity hash aliases    |
 //! | [`constants`]         | Wire constants: STATE, METHOD, field IDs, etc.     |
 //!
 //! See also `crates/lxmf-tools/` for the `lxmd-rs` binary, and `rsReticulum`

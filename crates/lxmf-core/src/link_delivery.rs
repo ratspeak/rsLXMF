@@ -1,9 +1,11 @@
-//! Link-based LXMF message delivery (Python's Direct delivery mode).
+//! Caller-driven LXMF delivery over Reticulum Links.
 //!
-//! Establishes a link to the recipient, identifies the sender, and transfers the message either
-//! as a single encrypted link packet or as a Resource over the link. Enables larger-than-MDU
-//! messages via resource segmentation, delivery confirmation via link-level proofs, and sender
-//! identity verification via link identification.
+//! Sends a message as an encrypted Link packet or as segmented Resources and
+//! tracks Link-level proofs. Reusable Direct Links identify the sender after a
+//! successful delivery when local identity keys are configured. One-shot packed
+//! deliveries, used for propagation deposits, identify before sending when those
+//! keys are available. Link proofs confirm transport receipt, not application
+//! validation or durable storage at the recipient.
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
@@ -57,23 +59,21 @@ const LINK_PACKET_DISPATCH_TIMEOUT: Duration = LINK_ENDPOINT_ADMISSION_TIMEOUT_M
 
 /// Authority-derived first-hop timing for an outbound Link.
 ///
-/// Python Reticulum computes an initiator's establishment deadline as the
-/// first-hop timeout plus six seconds for every hop to the destination. The
-/// first-hop timeout is one full Reticulum MTU at the next-hop interface's
-/// bitrate, plus the same six-second baseline. When no authoritative bitrate
-/// is available, Reticulum falls back to the baseline alone.
+/// The initiator's establishment timeout is the first-hop timeout plus six
+/// seconds times `max(hops, 1)`. With the canonical 500-byte MTU, first-hop
+/// serialization time is `500 * 8 / bitrate` seconds plus a six-second baseline,
+/// as in Python Reticulum. An unknown or zero bitrate uses the baseline alone.
 ///
-/// Keeping this input independent of interface type is intentional: BLE,
-/// serial, TCP and every future adapter use the same Link timing rule. It does
-/// not pause or reset the protocol clock when an interface goes offline.
+/// This input is independent of interface type. An interface going offline
+/// does not pause or reset the establishment clock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LinkEstablishmentTiming {
     first_hop_timeout: Duration,
 }
 
 impl LinkEstablishmentTiming {
-    /// Construct timing from an already-authoritative Reticulum first-hop
-    /// timeout (for example `ReticulumHandle::first_hop_timeout`).
+    /// Store an authoritative Reticulum first-hop timeout without validation
+    /// (for example, a value from `ReticulumHandle::first_hop_timeout`).
     pub const fn from_first_hop_timeout(first_hop_timeout: Duration) -> Self {
         Self { first_hop_timeout }
     }
@@ -84,14 +84,13 @@ impl LinkEstablishmentTiming {
         Self::from_first_hop_bitrate_and_mtu(bitrate, rns_wire::constants::MTU as u32)
     }
 
-    /// Derive first-hop timing from the effective next-hop bitrate and an
-    /// already-normalised Reticulum protocol MTU.
+    /// Derive timing as six seconds plus `min(normalised_mtu, 500) * 8 / bitrate`.
+    /// A zero bitrate contributes no serialization time.
     ///
-    /// Callers normally want [`Self::from_first_hop_bitrate`], which uses the
-    /// canonical 500-byte Reticulum MTU exactly like Python Reticulum and the
-    /// trusted rsReticulum runtime. `normalised_mtu` exists for callers that
-    /// already have an authoritative *protocol* MTU. It must never be a BLE
-    /// ATT MTU, an RNode serial chunk size, or a raw hardware-interface MTU.
+    /// Normally use [`Self::from_first_hop_bitrate`] for the canonical 500-byte
+    /// Reticulum MTU used by Python Reticulum and the rsReticulum runtime.
+    /// `normalised_mtu` must be a protocol MTU, not a BLE ATT MTU, RNode serial
+    /// chunk size, or raw hardware-interface MTU.
     pub fn from_first_hop_bitrate_and_mtu(bitrate: u64, normalised_mtu: u32) -> Self {
         let serialization_secs = if bitrate == 0 {
             0.0
@@ -360,7 +359,8 @@ pub struct PendingDelivery {
     pub link: Link,
     pub state: DeliveryState,
     pub started_at: Instant,
-    /// Resource transfer, populated after the link establishes.
+    /// Current Resource transfer when the payload requires one; single-packet
+    /// and idle deliveries have no Resource transfer.
     pub transfer: Option<OutboundTransfer>,
     /// Sequential Reticulum Resource plan for payloads larger than one
     /// efficient resource. Segment 1 is stored in `transfer`; later segments
@@ -375,8 +375,10 @@ pub struct PendingDelivery {
     link_request_result: Option<
         oneshot::Receiver<Result<(), rns_transport::link_messages::LinkRequestDispatchError>>,
     >,
-    /// Ordinary Link-packet proof window, installed when the packet is
-    /// locally admitted. Resource transfers use their own progress watchdog.
+    /// Current Link-packet admission or proof wait. Exact driver receipts
+    /// replace the staging window with the proof window after admission;
+    /// legacy queued acknowledgements include an admission allowance.
+    /// Resource transfers use their own progress watchdog.
     pub timeout: Duration,
     pub msg_hash: Option<[u8; 32]>,
     pub failure_reason: Option<String>,
@@ -390,8 +392,8 @@ pub struct PendingDelivery {
     /// Keep successful Direct links open for additional messages. Propagation
     /// deposits currently keep the old one-shot behavior.
     pub reusable: bool,
-    /// Upstream identifies the initiator after the first successful Direct
-    /// delivery, making the link usable as a peer backchannel.
+    /// Whether local Link identification was staged after a successful Direct
+    /// delivery. Requires configured identity keys; it is not a peer acknowledgement.
     pub backchannel_identified: bool,
     queued: VecDeque<QueuedDelivery>,
     /// Resources arriving in the reverse direction on this initiator-owned
@@ -575,7 +577,9 @@ pub struct DirectLinkStartReport {
     pub in_flight_deliveries: usize,
 }
 
-/// A proof-tracked send over an already-authenticated inbound delivery Link.
+/// Adapter receipt identifying a proof-tracked send over an authenticated
+/// inbound Link. The embedding runtime must establish that authentication;
+/// this publicly constructible value is not itself a proof of delivery.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackchannelSendReceipt {
     Packet {
@@ -632,9 +636,9 @@ impl fmt::Display for BackchannelSendError {
 
 impl std::error::Error for BackchannelSendError {}
 
-/// Whether a link-delivery failure should be treated like upstream LXMF's
-/// closed/pending Link path, where the message remains eligible for Direct
-/// rediscovery instead of being terminally failed.
+/// Classify known local link-delivery failure strings as eligible for Direct
+/// rediscovery. This matches the intended closed/pending-Link retry policy;
+/// it is an explicit string whitelist, not a classifier for arbitrary peer errors.
 pub fn is_retryable_link_delivery_failure(reason: &str) -> bool {
     // Only concrete local endpoint terminal outcomes, not malformed packet,
     // role mismatch or arbitrary peer rejection text, trigger rediscovery.
@@ -1058,10 +1062,11 @@ impl LinkDeliveryManager {
         self.backchannel_cancellation_aware = false;
     }
 
-    /// Install an adapter that fences closed receipt publication and retains
-    /// exact cleanup ownership. New starts close/drain their receipt immediately
+    /// Install an adapter whose caller contract fences closed receipt publication
+    /// and retains exact cleanup ownership. New starts close/drain their receipt
     /// on user cancellation; existing starts retain their captured policy.
-    /// Legacy adapters must continue using `set_backchannel_sender` instead.
+    /// This setter records that contract without verifying the adapter. Legacy
+    /// adapters must use [`Self::set_backchannel_sender`].
     pub fn set_cancellation_aware_backchannel_sender(
         &mut self,
         tx: mpsc::Sender<BackchannelSendCommand>,
@@ -1109,8 +1114,9 @@ impl LinkDeliveryManager {
         self.inbound_resource_completion_handler = Some(Arc::new(handler));
     }
 
-    /// Register an inbound authenticated Link as a reusable backchannel for a
-    /// remote LXMF delivery destination.
+    /// Cache a reusable inbound Link for a remote LXMF delivery destination.
+    /// The caller must already have authenticated the Link identity and verified
+    /// its binding to `dest_hash`; this method only records the mapping.
     pub fn register_backchannel(&mut self, dest_hash: [u8; 16], link_id: [u8; 16]) {
         self.backchannel_links.insert(dest_hash, link_id);
         tracing::info!(
@@ -1151,8 +1157,9 @@ impl LinkDeliveryManager {
         result
     }
 
-    /// Remove cached backchannel state for a closed Link and fail any
-    /// in-flight backchannel sends that were using it.
+    /// Remove a closed Link from the backchannel cache and fail its installed sends.
+    /// Pending starts with an early settlement or cancellation remain until their
+    /// exact receipt can be reconciled; closure does not discard that ownership.
     pub fn fail_backchannel_link(
         &mut self,
         link_id: [u8; 16],
@@ -1304,10 +1311,11 @@ impl LinkDeliveryManager {
         self.start_direct_delivery(message, dest_hash, hops, timing)
     }
 
-    /// Start a link delivery with an already-packed payload.
+    /// Start a one-shot Link delivery with a caller-supplied packed payload.
     ///
-    /// This is used for LXMF propagation deposits, whose link payload is the
-    /// propagation wrapper rather than the regular signed LXMF representation.
+    /// Propagation deposits use their propagation wrapper here rather than the
+    /// regular signed LXMF representation. This method does not validate that
+    /// wrapper or its correspondence to the supplied message metadata.
     pub fn start_packed_delivery(
         &mut self,
         message: LxMessage,
@@ -2044,10 +2052,12 @@ impl LinkDeliveryManager {
         }
     }
 
-    /// Drain inbound transport events and dispatch by packet context.
+    /// Process up to 32 inbound destination events and pending local acknowledgements.
     ///
-    /// Call before [`Self::tick`] each cycle. Routes `LRPROOF`, `ResourceHmu`, `ResourceReq`,
-    /// and `ResourcePrf` contexts to their handlers.
+    /// Call before [`Self::tick`] each cycle and continue polling when more input
+    /// is ready. Routes Link establishment, packets, Resources, proofs and lifecycle
+    /// events. `known_identities` must contain trusted destination-to-public-key
+    /// bindings for establishment-proof validation.
     pub fn drain_events(&mut self, known_identities: &HashMap<String, [u8; 64]>) {
         self.poll_link_requests();
         self.poll_endpoint_control();
@@ -2266,8 +2276,9 @@ impl LinkDeliveryManager {
         }
     }
 
-    /// Validate an inbound `LRPROOF`, complete the handshake, and transition to
-    /// [`DeliveryState::Identifying`].
+    /// Validate `LRPROOF` and stage endpoint binding and RTT acknowledgement.
+    /// `true` means that plan was accepted. The binding acknowledgement must be
+    /// processed and RTT send staged before entering [`DeliveryState::Identifying`].
     pub fn handle_link_proof(
         &mut self,
         link_id: &[u8; 16],
@@ -3688,11 +3699,11 @@ impl LinkDeliveryManager {
         }
     }
 
-    /// Handle an inbound `RESOURCE_REQ` (receiver's `request_next`).
+    /// Handle a decrypted, authenticated `RESOURCE_REQ` from the receiver.
     ///
-    /// The request returns a list of parts the receiver still needs; dispatch the resulting
-    /// `SendPart` actions immediately rather than waiting for the next [`Self::tick`], since
-    /// the receiver may time out and retry first.
+    /// This method immediately dispatches the requested parts rather than waiting
+    /// for [`Self::tick`]. Direct callers must authenticate and decrypt the request;
+    /// [`Self::drain_events`] performs that step for routed transport events.
     pub fn handle_request(&mut self, link_id: &[u8; 16], request_data: &[u8]) {
         let event = {
             let Some(delivery) = self.pending.get_mut(link_id) else {
@@ -3766,7 +3777,9 @@ impl LinkDeliveryManager {
         }
     }
 
-    /// Apply an inbound resource proof; returns `true` when the proof was accepted.
+    /// Validate a Resource proof; `true` means the current segment's proof was
+    /// accepted. A split Resource may then advance to another segment, so this is
+    /// not necessarily whole-message completion.
     pub fn handle_resource_proof(&mut self, link_id: &[u8; 16], proof_data: &[u8]) -> bool {
         let mut event = None;
         let accepted = if let Some(delivery) = self.pending.get_mut(link_id) {
@@ -3828,7 +3841,9 @@ impl LinkDeliveryManager {
         accepted
     }
 
-    /// Apply an inbound receiver-cancel/reject for the current outbound resource.
+    /// Apply a decrypted, authenticated receiver-cancel body for the current
+    /// outbound Resource. Matches its first 32 bytes against the Resource hash;
+    /// this method does not authenticate raw input. The next tick reports rejection.
     pub fn handle_resource_reject(&mut self, link_id: &[u8; 16], reject_data: &[u8]) -> bool {
         if reject_data.len() < 32 {
             return false;
@@ -3912,6 +3927,10 @@ impl LinkDeliveryManager {
         false
     }
 
+    /// Record a packet proof already verified by the authenticated Link owner.
+    /// This method accepts only identifiers and performs no cryptographic check.
+    /// Returns a completion result for an installed send. Otherwise, records an
+    /// early observation only when a start is pending on that Link.
     pub fn handle_backchannel_packet_proof(
         &mut self,
         link_id: [u8; 16],
@@ -3920,11 +3939,12 @@ impl LinkDeliveryManager {
         self.complete_backchannel_delivery(BackchannelProofKey::Packet(link_id, packet_hash))
     }
 
-    /// Mirror the exact bounded packet wait observed by the authenticated Link
-    /// owner. `awaiting_admission` separates local staging from the RTT proof
-    /// window installed after endpoint acceptance. Call before or after its send receipt;
-    /// delayed observations retain the original start instant. Unowned,
-    /// cancelled and completed sends cannot be installed by this method.
+    /// Mirror a packet wait supplied by the authenticated Link owner.
+    /// `awaiting_admission` separates local staging from the RTT proof window
+    /// installed after endpoint acceptance. Call before or after the send receipt;
+    /// delayed observations retain the supplied start instant. Requires an installed
+    /// send or a pending start on that Link; its receipt later confirms the exact hash.
+    /// The caller must supply a valid bounded window; its duration is not clamped.
     pub fn observe_backchannel_packet_wait(
         &mut self,
         link_id: [u8; 16],
@@ -3972,14 +3992,14 @@ impl LinkDeliveryManager {
         )
     }
 
-    /// Mirror an exact bounded Resource wait from its protocol owner. The
-    /// owner must drive advertisement/window/proof exhaustion and report
-    /// terminal results. Only real protocol progress/retry may update this
-    /// window; keepalives or generic UI progress must not extend it. This
-    /// replaces the finite legacy adapter fallback for this exact send only.
-    /// A bounded 180-second observation grace follows the original deadline to
-    /// tolerate asynchronous accounting delivery; terminal results still settle
-    /// immediately and duplicate observations do not restart that envelope.
+    /// Mirror a Resource wait supplied by its authenticated protocol owner.
+    /// The caller must supply a valid bounded window, drive protocol exhaustion,
+    /// and report terminal results; this method does not clamp the duration.
+    /// Only real protocol progress or retry may update the window, not keepalives
+    /// or generic UI progress. This replaces the legacy fallback for this send.
+    /// A 180-second observation grace follows the supplied deadline. Terminal
+    /// results still settle immediately; repeating an identical observation does
+    /// not restart the window.
     pub fn observe_backchannel_resource_wait(
         &mut self,
         link_id: [u8; 16],
@@ -4036,6 +4056,10 @@ impl LinkDeliveryManager {
         true
     }
 
+    /// Record a Resource proof already verified by the authenticated Link owner.
+    /// This method accepts only identifiers and performs no cryptographic check.
+    /// Returns a completion result for an installed send. Otherwise, records an
+    /// early observation only when a start is pending on that Link.
     pub fn handle_backchannel_resource_proof(
         &mut self,
         link_id: [u8; 16],
@@ -4667,15 +4691,14 @@ impl LinkDeliveryManager {
             .collect()
     }
 
-    /// Return the finite delivery-owner envelope currently owning this message.
+    /// Return the recorded delivery-owner wait for this message, when available.
     ///
-    /// Queued messages have no independent clock. Packet waits start at local
-    /// admission; Resource waits belong to the progress engine, not total
-    /// message age. Observed backchannel bounds preserve the external owner's
-    /// original instant, with a 180-second accounting observation grace for
-    /// externally owned Resources only. Direct Resource and packet protocol
-    /// clocks are unchanged. Legacy adapters without observations retain the
-    /// finite fallback, never an unlimited exemption from an orphan watchdog.
+    /// Messages queued behind another delivery on a reusable Direct Link have no
+    /// independent clock. Packet waits cover local staging and then proof receipt;
+    /// Resource waits belong to the progress engine, not total message age. Backchannel observations preserve the external owner's
+    /// supplied instant and duration, adding 180 seconds of accounting grace only
+    /// for Resources. Without an observation, legacy backchannels use the finite
+    /// fallback. Callers supplying observations are responsible for valid bounds.
     pub fn message_timeout_window(&self, msg_hash: [u8; 32]) -> Option<(Instant, Duration)> {
         for delivery in self.pending.values() {
             if delivery.msg_hash != Some(msg_hash) {

@@ -91,8 +91,10 @@ fn validate(
 }
 
 /// Import exact positively attested archive entries under the same offline
-/// guard. Every entry is checked before the first write, then rechecked at its
-/// publication boundary. Partial IO completion is restart-safe and idempotent.
+/// guard. Existing deletion journals are reconciled first. All selected entries
+/// are checked before any imported object is published, then rechecked at each
+/// publication boundary. Retrying after partial completion retains already
+/// committed entries and imports only those still absent.
 pub fn import_trusted_recovery_manifest(
     guard: &OfflineMigrationGuard,
     path: &Path,

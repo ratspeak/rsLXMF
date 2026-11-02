@@ -1,13 +1,17 @@
-//! Propagation sync background task.
+//! Outbound propagation-peer sync, driven by the caller through
+//! [`PropagationSyncTask::drain_events`] and [`PropagationSyncTask::tick`].
 //!
-//! Outbound sync to a configured propagation node using the Link
-//! REQUEST/RESPONSE pattern. Python reference: LXMPeer.py:381-386.
+//! The `/offer` exchange follows Python `LXMPeer.sync()` and `offer_response()`:
+//! 1. Establish a Link and send identification when local identity material is configured.
+//! 2. Send `/offer` with `[peering_key, transient_ids]`.
+//! 3. Read the response and intersect requested IDs with this attempt's offer.
+//! 4. Transfer available requested messages as a Resource, splitting large payloads.
+//! 5. Expose handled-ID updates and a terminal result for the caller to persist.
 //!
-//! Flow:
-//! 1. Establish a link to the node.
-//! 2. Send link.request("/offer", [peering_key, transient_ids]).
-//! 3. Receive a Response packet (context 0x0A) with OfferResponse.
-//! 4. Transfer requested messages as a Resource.
+//! Use an authoritative peer-policy snapshot for production sync. Policy-based
+//! offer preparation and message reads use blocking workers when a Tokio runtime
+//! is available; without one, they run synchronously. Compatibility offer
+//! preparation is always synchronous. This type does not spawn its own polling loop.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -62,11 +66,12 @@ pub struct PeerSyncTerminalResult {
     /// Store generation used by successful offer preparation. Failures leave
     /// this unset so unchanged-store work remains retryable after backoff.
     pub offer_generation: Option<u64>,
-    /// True only when no cumulative-limit or vanished-file work remains for
-    /// this generation.
+    /// With an authoritative policy, a completed attempt sets this only when
+    /// no cumulative-limit or vanished-file work remains for the generation.
+    /// The compatibility path without a policy assumes the offer exhausted it;
+    /// it does not track work excluded by its offer limit.
     pub generation_exhausted: bool,
-    /// Peer accounting deltas matching Python `LXMPeer.offer_response()` and
-    /// `resource_concluded()` semantics.
+    /// Number of IDs offered in a completed attempt; zero on failure.
     pub offered: u64,
     pub outgoing: u64,
     pub tx_bytes: u64,
@@ -232,7 +237,9 @@ impl PropagationSyncTask {
         }
     }
 
-    /// Create a sync task with disk-backed propagation storage.
+    /// Create a sync task with v2 propagation storage and its retained hosting lock.
+    /// Path resolution, startup errors and migration prerequisites are those of
+    /// [`PropagationNode::with_storage`].
     pub fn with_storage(
         transport_tx: mpsc::Sender<TransportMessage>,
         dest_hash: [u8; 16],
@@ -358,11 +365,10 @@ impl PropagationSyncTask {
         self.node_dest_hash = Some(dest_hash);
     }
 
-    /// Force an immediate sync attempt with `dest_hash`.
-    ///
-    /// Python `LXMPeer.sync()` is called directly by lxmd control requests;
-    /// this public shim preserves that behavior without waiting for the
-    /// periodic sync interval.
+    /// Start an attempt without waiting for the periodic interval. Returns
+    /// `false` when busy, while a terminal result awaits collection, or if Link
+    /// setup cannot be staged. This compatibility entry point clears the
+    /// authoritative policy; use [`Self::request_sync_now_with_policy`] when available.
     pub fn request_sync_now(&mut self, dest_hash: [u8; 16]) -> bool {
         if self.state != SyncTaskState::Idle || self.terminal_result.is_some() {
             return false;
@@ -376,7 +382,9 @@ impl PropagationSyncTask {
         true
     }
 
-    /// Force an immediate sync using an authoritative peer-policy snapshot.
+    /// Start an attempt with an authoritative peer-policy snapshot, bypassing
+    /// the periodic interval. Returns `false` when busy, while a terminal result
+    /// awaits collection, or if Link setup cannot be staged.
     pub fn request_sync_now_with_policy(&mut self, policy: OutboundOfferPolicy) -> bool {
         if self.state != SyncTaskState::Idle || self.terminal_result.is_some() {
             return false;
@@ -399,9 +407,9 @@ impl PropagationSyncTask {
         self.identity_key = Some(identity_key);
     }
 
-    /// Drain peer-handled updates discovered during offer negotiation or
-    /// proven Resource transfer. The daemon merges these into its authoritative
-    /// `LxmPeer` and persists that peer.
+    /// Drain handled IDs from policy filtering, offer negotiation and proven
+    /// Resource transfer. The caller must merge these into its authoritative
+    /// `LxmPeer` and persist it; draining alone performs no write.
     pub fn take_handled_updates(&mut self) -> Vec<PropagationTransientId> {
         std::mem::take(&mut self.handled_updates)
     }
@@ -410,9 +418,11 @@ impl PropagationSyncTask {
         self.terminal_result.take()
     }
 
-    /// Cancel all active and pending work for one peer. Dropping the bounded
-    /// worker receivers makes late preparation results inert, and clearing
-    /// handled deltas prevents an explicit unpeer from recreating persistence.
+    /// Discard this task's active and pending work for a matching peer, remove
+    /// its session and return to idle. Already running blocking workers may
+    /// finish their I/O, but dropped result receivers prevent installing their
+    /// results. Handled deltas are cleared so this task cannot restore them
+    /// after an explicit unpeer. Returns `false` if neither node nor policy matches.
     pub fn cancel_peer_sync(&mut self, peer_hash: &[u8; 16]) -> bool {
         let matches_active = self.node_dest_hash.as_ref() == Some(peer_hash);
         let matches_policy = self

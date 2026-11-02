@@ -1,5 +1,9 @@
 # Relay store migration
 
+This guide applies to the 1.4 source API and daemon. Build the matching
+source before using these commands; the standalone 1.3.0 binary does not
+provide this migration.
+
 Relay nodes now admit only validated opaque propagation data to a durable store.
 A packet proof follows complete validation and acknowledged durable admission.
 Resource completion still means transport completion; it does not certify the
@@ -20,7 +24,7 @@ whole message bodies; every read verifies the full body, and a body that fails
 is not served.
 
 Stop every process that can write the store, including service supervisors and
-scheduled restarts. Then run the candidate daemon against the correct config:
+scheduled restarts. Then run the 1.4 source-built daemon against the correct config:
 
 ```sh
 lxmd-rs --config /path/to/config --migrate-propagation-store --relay-writers-stopped

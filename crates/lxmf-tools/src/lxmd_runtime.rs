@@ -1,7 +1,7 @@
-//! Pure `lxmd` runtime helpers extracted from the binary.
+//! `lxmd` path selection, control-command preflight, and status formatting.
 //!
-//! This module keeps daemon path handling and other pure helpers out of the
-//! binary so CLI behavior can be tested directly.
+//! Path selection reads environment variables and checks the filesystem;
+//! these helpers do not start the daemon runtime.
 
 use std::path::{Path, PathBuf};
 

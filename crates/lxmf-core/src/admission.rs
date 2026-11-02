@@ -46,8 +46,10 @@ pub struct AdmissionRecord {
     pub committed_at: u64,
 }
 
-/// Verified local purge authority with its finite policy lifetime. Adapters
-/// supply these only after checking the referenced durable effect.
+/// Local purge authority with an optional expiry. Policy-discard and user-deleted
+/// receipts expire after [`POLICY_RECEIPT_LIFETIME`]; committed/duplicate receipts
+/// have no time expiry. Adapters must check the referenced durable effect before
+/// supplying this value; constructing it does not perform that verification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DurableHave {
     pub transient_id: [u8; 32],
@@ -84,8 +86,9 @@ pub enum AdmissionError {
 /// Trusted persistence adapter boundary. Implementations must atomically commit
 /// the receipt with the message/effect, or reference a previously durable effect.
 /// In particular, returning a record after a failed/uncertain filesystem or SQL
-/// commit violates this contract. SQLite implementations use the dedicated FULL
-/// connection; file implementations use the intent/body/commit journal.
+/// commit violates this contract. SQL adapters must establish their transaction
+/// and durability guarantees. [`crate::admission_store::FileAdmissionStore`]
+/// uses an intent/body/commit journal.
 pub trait DurableAdmissionBackend {
     fn commit(self) -> Result<AdmissionRecord, AdmissionError>;
 }
@@ -320,8 +323,9 @@ pub(crate) struct AdmissionResolution {
     pub outcome: DownloadAdmissionOutcome,
 }
 
-/// Single-use, generation-bound authority. Dropping it reports a retryable
-/// failure; cancelling its client generation cannot cancel a blocking commit.
+/// Single-use, generation-bound authority. Dropping an unresolved token attempts
+/// to send a Cancelled rejection to its consumer. Cancelling the client generation
+/// cannot cancel a blocking commit.
 pub struct DownloadAdmissionToken {
     scope: AdmissionScope,
     generation: u64,
@@ -355,11 +359,19 @@ impl DownloadAdmissionToken {
     pub fn scope(&self) -> AdmissionScope {
         self.scope
     }
-    /// Check immediately after durable commit before publishing current-generation effects.
-    /// Cancellation cannot stop an in-flight commit or release its memory lease.
+    /// Read whether this token still belongs to the current client generation.
+    ///
+    /// This is a snapshot, not a lock: the generation can change immediately.
+    /// Check after durable commit and use the adapter's lifecycle gate around
+    /// current-generation UI effects. Cancellation cannot stop an in-flight
+    /// commit or release its memory lease.
     pub fn is_current(&self) -> bool {
         self.current_generation.load(Ordering::Acquire) == self.generation
     }
+    /// Enqueue one outcome for this token's scope and current generation.
+    /// Success reports enqueueing, not remote deletion or an atomic lifecycle
+    /// transition; the consumer rechecks the generation before applying it.
+    /// A mismatched scope, revoked generation or closed consumer returns an error.
     pub fn resolve(mut self, outcome: DownloadAdmissionOutcome) -> Result<(), AdmissionError> {
         if let DownloadAdmissionOutcome::Accepted(receipt) = &outcome
             && receipt.record.scope != self.scope

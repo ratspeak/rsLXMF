@@ -23,9 +23,9 @@ use crate::constants::PN_STAMP_THROTTLE;
 
 const PROPAGATION_DESTINATION_NAME: &str = "lxmf.propagation";
 
-/// Default maximum number of concurrently transferring or validating syncs.
+/// Default active-sync threshold used when admitting new offers.
 pub const PN_DEFAULT_MAX_INBOUND_SYNCS: usize = 3;
-/// Smallest accepted configured inbound-sync limit.
+/// Lower bound applied to the configured inbound-sync threshold.
 pub const PN_MIN_MAX_INBOUND_SYNCS: usize = 1;
 /// Duration applied after a known peer submits an invalid-stamp batch.
 pub const PN_INVALID_STAMP_THROTTLE: Duration = Duration::from_secs(PN_STAMP_THROTTLE);
@@ -40,7 +40,9 @@ pub struct PnInboundAdmissionConfig {
     /// The LXMF default is `false`, so a configured static peer bypasses both
     /// admission gates.
     pub static_sequential: bool,
-    /// Maximum concurrent Resources in `Transferring` or `Validating` state.
+    /// Reject new non-bypassing offers when this many records are Transferring
+    /// or Validating. Values below one are clamped to one. Accepted offers do
+    /// not reserve slots, and starting them does not recheck this threshold.
     pub max_inbound_syncs: usize,
     /// Accept propagation offers only from configured static peers.
     pub from_static_only: bool,
@@ -286,7 +288,8 @@ impl PnInboundAdmission {
     ///
     /// A successful preflight creates no admission record. The returned
     /// candidate binds the link and peer values that the caller must use for
-    /// external key validation.
+    /// external key validation. The caller must supply the remote identity
+    /// verified on that Link; this coordinator receives hashes, not identity proofs.
     pub fn preflight_offer(
         &mut self,
         link_id: [u8; 16],
@@ -461,6 +464,7 @@ impl PnInboundAdmission {
     }
 
     /// Transition an accepted offer when its inbound Resource starts.
+    /// This checks the previous state but does not rerun offer admission gates.
     pub fn resource_started(&mut self, link_id: &[u8; 16]) -> Result<(), PnTransitionError> {
         self.transition(
             link_id,
@@ -480,7 +484,7 @@ impl PnInboundAdmission {
         )
     }
 
-    /// Conclude stamp validation and release all active accounting.
+    /// Conclude stamp validation and release this link's active accounting.
     ///
     /// Only [`PnValidationResult::InvalidStamp`] installs a throttle, and a
     /// throttle is possible only for a known peer retained in a valid record.

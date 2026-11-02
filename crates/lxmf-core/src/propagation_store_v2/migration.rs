@@ -177,8 +177,10 @@ fn verify_inventory(root: &Path, j: &MigrationJournal) -> io::Result<()> {
     }
     Ok(())
 }
-/// Startup only initializes a truly absent store. An incomplete journal or
-/// historical directory requires the explicit offline recovery path.
+/// Initialize a truly absent store or validate a completed v2 store. An
+/// incomplete journal or historical directory requires explicit offline migration.
+/// The temporary store lock is released before this returns the path; this
+/// function does not grant a hosting lease.
 pub fn open_store(legacy: &Path) -> io::Result<PathBuf> {
     Ok(open_locked_store(legacy)?.0)
 }
@@ -230,8 +232,10 @@ fn verify_published(j: &MigrationJournal) -> io::Result<()> {
     durable_reconcile(&j.v2.join("FORMAT"), FORMAT).map_err(err)?;
     Ok(())
 }
-/// The guard binds both path and verified writer exclusion. Neither a retry nor
-/// operator approval promotes any legacy object without independent provenance.
+/// Migrate the canonical path protected by the guard. Keep the constructor's
+/// writer-exclusion conditions in force throughout this call. Legacy objects
+/// remain quarantined; a retry or operator approval does not establish ingress
+/// provenance for them.
 pub fn migrate_store_offline(guard: &OfflineMigrationGuard) -> io::Result<MigrationReport> {
     migrate(&guard.legacy, None)
 }

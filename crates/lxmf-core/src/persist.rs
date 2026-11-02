@@ -1,14 +1,18 @@
-//! Persistent router state — matches Python `<storagepath>/lxmf/` layout.
+//! Router state files in a caller-supplied directory.
 //!
 //! Files:
-//! * `outbound_stamp_costs` — `HashMap<dest_hash, StampCostEntry>`
+//! * `outbound_stamp_costs` — destination stamp costs and observation times
 //! * `available_tickets` — versioned directional ticket state
-//! * `local_deliveries` — `HashMap<transient_id, timestamp>`
-//! * `locally_processed` — `HashMap<transient_id, timestamp>`
+//! * `local_deliveries` — delivered transient IDs and timestamps
+//! * `locally_processed` — processed transient IDs and timestamps
+//! * `node_stats` — propagation-node counters
+//! * `propagation_suppression_v1` — bounded download suppression records
+//! * `propagation_node_policies_v1` — recorded propagation-node policies
 //!
-//! All four files are MessagePack-encoded via `rmp-serde`. Missing files are
-//! treated as "no prior state" and do not raise errors — a fresh daemon is a
-//! valid state.
+//! These files use the Rust types' MessagePack representations; matching Python
+//! filenames does not establish interchangeable contents. Missing files yield
+//! empty/default state. Other I/O, malformed-data and capacity errors propagate
+//! to the caller.
 
 use std::collections::HashMap;
 use std::fs;

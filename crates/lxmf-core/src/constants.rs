@@ -173,7 +173,7 @@ pub const PATH_REQUEST_WAIT: u64 = 7;
 pub const MAX_PATHLESS_TRIES: u32 = 1;
 /// Maximum link inactivity before teardown (seconds).
 pub const LINK_MAX_INACTIVITY: u64 = 10 * 60;
-/// Maximum propagation link inactivity (seconds).
+/// Python propagation-link inactivity limit, in seconds; retained as a reference value.
 pub const P_LINK_MAX_INACTIVITY: u64 = 3 * 60;
 pub const MESSAGE_EXPIRY: u64 = 30 * 24 * 60 * 60;
 pub const STAMP_COST_EXPIRY: u64 = 45 * 24 * 60 * 60;
@@ -196,7 +196,7 @@ pub const PN_STAMP_THROTTLE: u64 = 180;
 
 pub const AUTOPEER: bool = true;
 pub const AUTOPEER_MAXDEPTH: usize = 4;
-/// When selecting peers for sync, pick from the N fastest.
+/// Size of the fastest-peer pool considered alongside unknown-speed peers.
 pub const FASTEST_N_RANDOM_POOL: usize = 2;
 /// Percentage of max_peers kept as headroom for rotation.
 pub const ROTATION_HEADROOM_PCT: usize = 10;
@@ -213,12 +213,12 @@ pub const DUPLICATE_SIGNAL: &str = "lxmf_duplicate";
 
 pub const OFFER_REQUEST_PATH: &str = "/offer";
 pub const MESSAGE_GET_PATH: &str = "/get";
-/// Maximum time a peer can be unreachable before removal (14 days).
+/// Age since last contact after which `mark_unreachable` marks a peer not alive (14 days).
 pub const MAX_UNREACHABLE: u64 = 14 * 24 * 60 * 60;
 /// Sync backoff step per consecutive failure (12 minutes).
 pub const SYNC_BACKOFF_STEP: u64 = 12 * 60;
 pub const PATH_REQUEST_GRACE: f64 = 7.5;
-/// Maximum time a peer can be stale before rotation (14 days).
+/// Age since last contact used by the peer staleness check (14 days).
 pub const PEER_STALE_TIME: u64 = 14 * 24 * 60 * 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -263,22 +263,23 @@ pub const STAMP_WORKBLOCK_EXPAND_ROUNDS_PN: usize = 1000;
 pub const STAMP_WORKBLOCK_EXPAND_ROUNDS_PEERING: usize = 25;
 /// SHA-256 output length.
 pub const STAMP_SIZE: usize = 32;
-/// Minimum batch size before using parallel validation pool.
+/// Python propagation-validation pool threshold, retained as a reference constant.
 pub const PN_VALIDATION_POOL_MIN_SIZE: usize = 256;
 
-/// Interval (in ticks) for processing outbound messages.
+/// Python outbound-processing cadence in ticks; retained as a reference constant.
 pub const JOB_OUTBOUND_INTERVAL: u64 = 1;
-/// Interval (in ticks) for processing deferred stamps.
+/// Python deferred-stamp cadence in ticks; retained as a reference constant.
 pub const JOB_STAMPS_INTERVAL: u64 = 1;
-/// Interval (in ticks) for cleaning inactive links.
+/// Python inactive-link cleanup cadence in ticks; retained as a reference constant.
 pub const JOB_LINKS_INTERVAL: u64 = 1;
 /// Interval (in ticks) for cleaning transient ID caches.
 pub const JOB_TRANSIENT_INTERVAL: u64 = 60;
 /// Interval (in ticks) for cleaning the message store.
 pub const JOB_STORE_INTERVAL: u64 = 120;
-/// Interval (in ticks) for syncing peers.
+/// Tick interval for cleaning throttled-peer entries, named for Python
+/// peer-sync cadence. Peer synchronization is driven by the embedding runtime.
 pub const JOB_PEERSYNC_INTERVAL: u64 = 6;
-/// Interval (in ticks) for ingesting peer distribution queues.
+/// Python peer-distribution ingestion cadence in ticks; retained as a reference constant.
 pub const JOB_PEERINGEST_INTERVAL: u64 = 6;
 /// 56 * JOB_PEERINGEST_INTERVAL.
 pub const JOB_ROTATE_INTERVAL: u64 = 56 * 6;

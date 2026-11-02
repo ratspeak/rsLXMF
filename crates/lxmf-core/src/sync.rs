@@ -1,7 +1,9 @@
-//! LXMF Propagation Sync Protocol -- Offer/Get between peers.
+//! Propagation offer/response values and local sync-session bookkeeping.
+//!
+//! The network task in [`crate::propagation_sync`] follows this exchange:
 //!
 //! 1. Peer A opens a Link to Peer B.
-//! 2. A sends Offer { transient_ids }.
+//! 2. A sends `/offer` with `[peering_key, transient_ids]`.
 //! 3. B responds with one of:
 //!    - `true`: peer wants ALL offered messages.
 //!    - `false`: peer already has everything.
@@ -9,7 +11,11 @@
 //!    - integer error code: 0xF0 NoIdentity, 0xF1 NoAccess, 0xF3 InvalidKey,
 //!      0xF4 InvalidData, 0xF5 InvalidStamp, 0xF6 Throttled.
 //! 4. A sends requested messages via Resource transfer.
-//! 5. B stores and sends proof.
+//! 5. Resource proof reports transport completion; application admission is a
+//!    separate responsibility.
+//!
+//! [`SyncGet`] and [`SyncSession`] are local helpers. They do not implement the
+//! authenticated `/offer` admission policy in [`crate::propagation_admission`].
 //!
 //! Python reference: LXMPeer.py (offer_response).
 
@@ -23,10 +29,13 @@ use crate::types::PropagationTransientId;
 pub const SYNC_MSG_OFFER: u16 = 0x0001;
 pub const SYNC_MSG_GET: u16 = 0x0002;
 
-/// Offer message: "I have these messages".
+/// Local offer data: a peering stamp and the transient IDs available for sync.
 ///
-/// Python wire: `[peering_key, unhandled_ids]`. `peering_key` is the raw stamp
-/// bytes (Python `self.peering_key[0]`), required by the receiver for access control.
+/// The `/offer` request uses `[peering_key, unhandled_ids]` with a MessagePack
+/// binary key and binary IDs. This type's `MessageBase::pack` uses the default
+/// Serde representation, which encodes its byte vectors as integer arrays.
+/// [`crate::propagation_sync`] constructs the required binary wire values
+/// explicitly when sending the request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncOffer {
     pub peering_key: Vec<u8>,
@@ -66,7 +75,8 @@ impl MessageBase for SyncOffer {
     }
 }
 
-/// Get message: "Send me these messages".
+/// Local wanted-ID list used by [`SyncSession`]. This wrapper is not the
+/// `/offer` wire response; use [`OfferResponse`] for that response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncGet {
     pub wanted_ids: Vec<Vec<u8>>,
@@ -103,7 +113,7 @@ impl MessageBase for SyncGet {
     }
 }
 
-/// Parsed offer response from a propagation node. Python: LXMPeer.py:396-439.
+/// Parsed offer response from a propagation node. See Python `LXMPeer.offer_response`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum OfferResponse {
     WantAll,
@@ -231,7 +241,8 @@ impl SyncSession {
         }
     }
 
-    /// Process a received offer; returns a SyncGet for IDs we don't have.
+    /// Select 32-byte IDs absent from the local store and enter Receiving state.
+    /// This helper does not validate the peering key or enforce admission policy.
     pub fn process_offer(&mut self, offer: &SyncOffer, our_store: &PropagationStore) -> SyncGet {
         let wanted: Vec<Vec<u8>> = offer
             .transient_ids

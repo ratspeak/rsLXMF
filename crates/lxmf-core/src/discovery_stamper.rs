@@ -2,15 +2,15 @@
 //!
 //! # Layering
 //!
-//! Python `RNS/Discovery.py:41` imports `LXMF.LXStamper` directly; the
-//! discovery subsystem cannot work without LXMF installed. Rust keeps
+//! Python `RNS.Discovery.InterfaceAnnouncer` loads `LXMF.LXStamper` when
+//! initialized, requiring LXMF for on-network discovery. Rust keeps
 //! Reticulum below LXMF, so `rns-transport` depends on a trait object and
 //! the concrete implementation lives here.
 //!
 //! # Workblock: Python parity
 //!
 //! Python discovery uses `LXStamper.stamp_workblock(infohash, expand_rounds=20)`
-//! (RNS/Discovery.py:220), where `stamp_workblock` is the
+//! in `InterfaceAnnouncer`, where `stamp_workblock` is the
 //! HKDF-expanded construction: one HKDF expand per round, each round
 //! producing 256 bytes, total `expand_rounds * 256` bytes.
 //! [`crate::stamper::stamp_workblock`] is the same construction.
@@ -26,14 +26,10 @@ use crate::stamper::{stamp_valid, stamp_value, stamp_workblock};
 /// interface, so this path has to stay cheap enough for periodic announces.
 pub const DISCOVERY_WORKBLOCK_EXPAND_ROUNDS: usize = 20;
 
-/// Upper bound on the random-stamp search before we give up on a given
-/// tick. If the cap is hit, the announcer skips this cycle and tries again
-/// rather than pinning a blocking worker indefinitely.
-///
-/// Python has no equivalent cap (it blocks until success); we cap so
-/// `spawn_blocking` threads cannot be stuck forever if the user
-/// misconfigures `discover_interfaces_required_value` to something
-/// unreasonable.
+/// Default attempt budget for one discovery stamp search. Exhaustion returns
+/// `None`, allowing the announcer to skip this preparation attempt and retry.
+/// The budget limits attempts, not elapsed time. The requested generation cost
+/// comes from the per-interface announce configuration.
 pub const DISCOVERY_MAX_ITERATIONS: u64 = 5_000_000;
 
 /// PoW stamper for on-network discovery announces. Thin wrapper around
@@ -50,8 +46,9 @@ pub struct LxmfDiscoveryStamper {
 }
 
 impl LxmfDiscoveryStamper {
-    /// Build a stamper with a custom iteration cap. Most callers want
-    /// [`LxmfDiscoveryStamper::default`].
+    /// Build a stamper with a custom iteration cap. Zero selects
+    /// [`DISCOVERY_MAX_ITERATIONS`], as does [`LxmfDiscoveryStamper::default`].
+    /// This differs from [`generate_discovery_stamp`], where zero allows no attempts.
     pub fn with_max_iterations(max_iterations: u64) -> Self {
         Self { max_iterations }
     }
@@ -107,10 +104,10 @@ impl DiscoveryStamper for LxmfDiscoveryStamper {
     }
 }
 
-/// Validation helper: synchronous wrapper mirroring
-/// [`crate::stamper::generate_stamp_limited`] but using the HKDF
-/// workblock construction. Public so interop tests and downstream validation
-/// can exercise discovery stamping without a transport runtime.
+/// Synchronous discovery stamp search with 20 HKDF workblock rounds and an
+/// explicit attempt limit. Uses the same construction as
+/// [`crate::stamper::generate_stamp_limited`], without a transport runtime.
+/// For nonzero cost, a zero iteration limit returns `None`.
 pub fn generate_discovery_stamp(
     infohash: &[u8; 32],
     target_value: u8,

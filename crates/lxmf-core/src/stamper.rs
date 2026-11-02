@@ -8,8 +8,10 @@
 //! workblock. Only the expand-round count differs per kind (see
 //! `STAMP_WORKBLOCK_EXPAND_ROUNDS{,_PN,_PEERING}` in constants.rs).
 //!
-//! Validity check: `SHA-256(workblock || stamp)` must have >= `cost` leading
-//! zero bits. Matches Python's `int.from_bytes(result) <= (1 << (256-cost))`.
+//! Rust validation requires at least `cost` leading zero bits in
+//! `SHA-256(workblock || stamp)`. Python uses an inclusive numeric threshold,
+//! `result <= 1 << (256 - cost)`; the exact equality boundary differs for
+//! nonzero cost.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -80,11 +82,10 @@ pub fn stamp_valid(stamp: &[u8; 32], cost: u8, workblock: &[u8]) -> bool {
     stamp_value(workblock, stamp) >= cost as u32
 }
 
-/// Give-up bound for stamp searches: 64× the expected `2^cost` work, so the
-/// failure probability for an honest cost is ~e^-64 while a hostile cost can
-/// no longer pin a thread forever. Costs ≥ 58 (cap would overflow u64) are
-/// unsatisfiable on real hardware and fail immediately. Python has no cap and
-/// blocks until success — deliberate divergence, see fix-registry.
+/// Attempt budget for [`generate_stamp`] and [`generate_stamp_cancellable`]:
+/// `64 * 2^cost`. Returns `None` for costs at least 58 because the budget would
+/// overflow `u64`. This limits attempts, not elapsed time. Deferred stamp
+/// workers use explicit cancellation and do not use this budget.
 pub fn stamp_iteration_cap(cost: u8) -> Option<u64> {
     if cost >= 58 {
         return None;
@@ -94,13 +95,15 @@ pub fn stamp_iteration_cap(cost: u8) -> Option<u64> {
 
 /// Single-threaded brute-force stamp search. Bounded by
 /// [`stamp_iteration_cap`]; returns `None` when the cap is exhausted or the
-/// cost is unsatisfiable.
+/// requested cost has no supported iteration budget.
 pub fn generate_stamp(material: &[u8], cost: u8, expand_rounds: usize) -> Option<([u8; 32], u32)> {
     generate_stamp_cancellable(material, cost, expand_rounds, &AtomicBool::new(false))
 }
 
-/// Synchronous bounded worker entry. Cancellation revokes work without claiming
-/// that an async task abort stopped this closure or released its byte owners.
+/// Synchronous search with the [`stamp_iteration_cap`] attempt budget.
+/// Checks cancellation before workblock construction and every 1,000 attempts;
+/// workblock construction itself is not interrupted. Run on a blocking worker
+/// when called from async code.
 pub fn generate_stamp_cancellable(
     material: &[u8],
     cost: u8,
@@ -179,7 +182,7 @@ pub fn validate_stamp(
     stamp_valid(stamp, cost, &workblock)
 }
 
-/// Python reference: LXStamper.py:48-51 (`validate_peering_key`).
+/// Python reference: `LXStamper.validate_peering_key`.
 ///
 /// `peering_id` = self_identity_hash || remote_identity_hash (32 bytes typical).
 /// Uses `STAMP_WORKBLOCK_EXPAND_ROUNDS_PEERING` for workblock generation.
@@ -191,7 +194,7 @@ pub fn validate_peering_key(peering_id: &[u8], peering_key: &[u8; 32], target_co
     stamp_valid(peering_key, target_cost, &workblock)
 }
 
-/// Python reference: LXStamper.py:53-65 (`validate_pn_stamp`).
+/// Python reference: `LXStamper.validate_pn_stamp`.
 ///
 /// `transient_data = lxm_data || stamp` where stamp is the last 32 bytes.
 /// Uses `STAMP_WORKBLOCK_EXPAND_ROUNDS_PN` for workblock generation.
@@ -222,7 +225,9 @@ pub fn validate_pn_stamp(transient_data: &[u8], target_cost: u8) -> Option<Propa
     Some((transient_id, lxm_data.to_vec(), value, stamp))
 }
 
-/// Cancellation handle for a deferred PoW task.
+/// Cooperative cancellation handle for a deferred PoW task.
+/// Call `cancel()` to request cancellation; dropping this handle or the result
+/// receiver does not stop the worker.
 #[derive(Clone)]
 pub struct DeferredStampHandle {
     cancel: Arc<AtomicBool>,
@@ -247,6 +252,11 @@ pub enum DeferredStampResult {
 /// Spawn a deferred stamp-generation task on a blocking worker.
 ///
 /// Returns a cancellation handle and a oneshot receiver for the result.
+/// The search has no iteration cap; see [`spawn_deferred_stamp_on`] for its
+/// cancellation contract.
+///
+/// # Panics
+/// Panics when called outside a Tokio runtime.
 #[tracing::instrument(
     level = "debug",
     name = "stamper.compute",
@@ -269,8 +279,13 @@ pub fn spawn_deferred_stamp(
     spawn_deferred_stamp_on(&handle, message_id, cost, expand_rounds)
 }
 
-/// Handle-explicit variant: callable from `spawn_blocking` threads (no
-/// implicit runtime context) — the manager tick runs there.
+/// Spawn on an explicit runtime handle, without requiring a current runtime
+/// context on the calling thread.
+///
+/// After workblock construction, a nonzero-cost search checks cancellation
+/// between batches of 1,000 attempts and runs until success or cancellation.
+/// It does not apply [`stamp_iteration_cap`]. Keep the cancellation handle and
+/// call `cancel()` when abandoning the result.
 pub fn spawn_deferred_stamp_on(
     runtime: &tokio::runtime::Handle,
     message_id: [u8; 32],

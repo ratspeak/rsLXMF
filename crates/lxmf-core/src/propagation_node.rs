@@ -1,9 +1,10 @@
-//! Store-and-forward propagation node with optional disk persistence.
+//! Propagation-node storage admission, peer offer selection and client GET plans.
 //!
-//! Mirrors propagation node management in Python LXMRouter.py. Provides
-//! message acceptance with size/duplicate checks, sync offer generation with
-//! per-peer filtering, peer persistence (save/load with handled message sets),
-//! and expired message culling with orphaned file cleanup.
+//! Durable network deposits require a disk-backed v2 store. The node reserves
+//! admission under its owner lock, publishes opaque bytes and provenance on a
+//! blocking worker, then commits in-memory accounting. Expiry and quota culling
+//! retire indexed entries; unindexed legacy or orphan files are not promoted or
+//! removed by ordinary maintenance.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -18,15 +19,20 @@ use crate::types::PropagationTransientId;
 
 #[derive(Debug, Clone)]
 pub struct PropagationNodeConfig {
+    /// Stored-byte admission threshold. One new message may cross it: admission
+    /// checks current stored plus reserved bytes. Run maintenance to cull excess.
+    /// This is not a hard maximum for the resulting stored byte count.
     pub max_storage: usize,
     pub max_message_age: u64,
     /// Messages below this effective stamp value are rejected. Python derives
     /// this from `propagation_stamp_cost - propagation_stamp_cost_flexibility`.
     pub min_stamp_cost: u8,
     pub peering_cost: u8,
+    /// Maximum newly admitted image size in bytes, including the 32-byte PN stamp.
     pub max_message_size: usize,
-    /// Maximum encoded inbound `/offer` request size. This follows the
-    /// node's advertised propagation sync budget.
+    /// Maximum encoded inbound `/offer` request size in bytes. The default
+    /// uses [`SYNC_LIMIT`] in decimal kilobytes; the caller must keep this
+    /// setting aligned with its advertised sync budget.
     pub max_offer_size: usize,
 }
 
@@ -126,10 +132,10 @@ fn get_ids(input: Option<&[u8]>) -> impl Iterator<Item = PropagationTransientId>
     })
 }
 
-/// Outcome of [`PropagationNode::handle_get_request`]. Phases 1/3 (and
-/// malformed input) are answered from the store alone; phase 2 returns a
-/// read plan so the embedder performs blocking file I/O after releasing
-/// the node lock.
+/// Immediate GET response or deferred file-work plan. Listing and malformed
+/// requests can return bytes directly. Requests with wants or haves produce
+/// a plan for durable retirements and reads, including purge-only requests.
+/// Resolve that plan after releasing the node lock.
 #[derive(Debug)]
 pub enum GetRequestAction {
     Respond(Vec<u8>),
@@ -137,21 +143,22 @@ pub enum GetRequestAction {
 }
 
 impl GetRequestAction {
-    /// Resolve to response bytes, performing any planned file reads inline.
+    /// Resolve to response bytes, performing planned retirements and reads inline.
     /// Blocking; do not call while holding a shared node lock.
     pub fn into_response(self) -> Vec<u8> {
         self.into_response_with_served_count().0
     }
 
-    /// Resolve the response and report how many messages were actually read
-    /// and admitted by the client's transfer limit. This lets the daemon keep
-    /// Python-compatible served-message accounting without repeating I/O.
+    /// Perform deferred retirements/reads and return the response with its
+    /// served-message count. Only successfully read messages that fit the
+    /// client/local limits count. This method blocks when file work is planned.
     pub fn into_response_with_served_count(self) -> (Vec<u8>, u64) {
         self.into_response_with_served_count_bounded(rns_protocol::resource::MAX_RESOURCE_SIZE)
     }
 
-    /// Resolve on a blocking worker with its previously reserved local response
-    /// allowance. Complete messages are skipped when they cannot fit.
+    /// Perform deferred retirements/reads using a previously reserved local
+    /// response allowance. The caller runs this on a blocking worker; this
+    /// method does not spawn one. Complete messages are skipped if they cannot fit.
     pub fn into_response_with_served_count_bounded(self, maximum: usize) -> (Vec<u8>, u64) {
         match self {
             GetRequestAction::Respond(bytes) if bytes.len() <= maximum => (bytes, 0),
@@ -161,8 +168,9 @@ impl GetRequestAction {
     }
 }
 
-/// Phase-2 read plan: wants resolved and ownership-gated under the node
-/// lock; [`GetServePlan::serve`] does the file reads outside it.
+/// GET plan containing ownership-filtered wants and haves.
+/// [`Self::serve`] performs durable haves retirement before reading wants,
+/// outside the node lock. A purge-only request has no reads.
 #[derive(Debug)]
 pub struct GetServePlan {
     reads: Vec<PlannedRead>,
@@ -179,11 +187,12 @@ struct PlannedRead {
 }
 
 impl GetServePlan {
-    /// Read planned files and encode the phase-2 response. Mirrors Python
-    /// LXMRouter.message_get_request limit accounting (LXMRouter.py:1477-1494):
-    /// 24-byte base + 16 bytes per message, full stored size counted,
-    /// over-limit entries skipped (not a transfer abort), stamps stripped
-    /// for client download. Unreadable files are skipped.
+    /// Retire planned haves, then read wants and encode the response. A retirement
+    /// error returns MessagePack nil. Client-limit accounting follows Python
+    /// `LXMRouter.message_get_request`: a 24-byte base plus each full stored size
+    /// and 16 bytes per message. Over-limit or unreadable entries are skipped;
+    /// stored propagation stamps are stripped for client download. Local encoded
+    /// response capacity is checked separately. This method blocks.
     pub fn serve(&self) -> Vec<u8> {
         self.serve_with_count().0
     }
@@ -362,6 +371,7 @@ pub struct PlannedMessageRead {
 
 /// Blocking reads for a plan from [`PropagationNode::plan_message_reads`];
 /// call without holding the node lock. Missing/unreadable files are skipped.
+/// Returned images retain their stored propagation stamps.
 pub fn read_planned_messages(
     plan: &[PlannedMessageRead],
 ) -> Vec<(PropagationTransientId, Vec<u8>)> {
@@ -664,7 +674,8 @@ pub struct PropagationNode {
 }
 
 impl PropagationNode {
-    /// In-memory node (no disk persistence).
+    /// In-memory bookkeeping node. It cannot acknowledge durable network deposits;
+    /// use [`Self::with_storage`] for hosted propagation storage.
     pub fn new(config: PropagationNodeConfig, dest_hash: [u8; 16]) -> Self {
         Self {
             config,
@@ -732,7 +743,10 @@ impl PropagationNode {
         self.offer_generation = self.offer_generation.saturating_add(1);
     }
 
-    /// Disk-backed node. Loads existing messages from `storage_path` on startup.
+    /// Open a disk-backed v2 store, retain its hosting lock, and load indexed entries.
+    /// `storage_path` identifies the legacy/base path; its parent must exist.
+    /// Historical stores or incomplete migrations require explicit offline
+    /// migration rather than automatic promotion of existing files.
     pub fn with_storage(
         config: PropagationNodeConfig,
         dest_hash: [u8; 16],
@@ -807,7 +821,9 @@ impl PropagationNode {
         })
     }
 
-    /// Release a reservation after a failed blocking write.
+    /// Release failed-write accounting after its owning plan has been dropped.
+    /// Supply the plan's original transient ID and size. A still-live reservation
+    /// owner prevents release.
     pub fn abort_store_write(&mut self, transient_id: &PropagationTransientId, size: usize) {
         if self
             .pending_admissions
@@ -876,12 +892,13 @@ impl PropagationNode {
         }
     }
 
-    /// Store a validated propagated LXMF blob with its propagation-node stamp.
+    /// Validate and reserve a new opaque propagation image plus its 32-byte stamp.
+    /// Checks the measured stamp value against `stamp_value` and node policy;
+    /// this method does not persist the returned plan.
     ///
-    /// Canonical propagation-node storage mirrors upstream Python: keep
-    /// `lxmf_data || stamp` on disk so peer sync can forward proof-carrying
-    /// data. Client `/get` strips the final 32-byte stamp before returning
-    /// messages to recipients.
+    /// Stored images retain `lxmf_data || stamp` for peer sync. Client `/get`
+    /// strips that stamp. Duplicates return `None`; use [`Self::plan_opaque_admission`]
+    /// when the caller needs pending/committed duplicate outcomes.
     pub fn plan_accept_stamped_propagated_blob(
         &mut self,
         lxmf_data: &[u8],
@@ -904,8 +921,11 @@ impl PropagationNode {
             _ => None,
         }
     }
-    /// Preferred network admission API. Same-TID exact-image duplicates share
-    /// the original completion and never perform a second disk write.
+    /// Plan a durable network admission or observe an existing one. Pending
+    /// same-TID duplicates must have identical complete bytes and share the
+    /// original completion. A committed TID retains its first stored image and
+    /// returns a separate durability/provenance check; it is not overwritten.
+    /// Volatile nodes reject this operation.
     pub fn plan_opaque_admission(
         &mut self,
         blob: ValidatedOpaquePropagationBlob,
@@ -1109,7 +1129,9 @@ impl PropagationNode {
         }
     }
 
-    /// Returns only messages the peer has not already received.
+    /// Return indexed IDs absent from the caller's handled set. This compatibility
+    /// helper does not apply stamp/transfer policy or pending-retirement filtering;
+    /// use [`Self::prepare_sync_offer_with_policy`] for a peer-policy offer.
     pub fn create_offer_filtered(
         &self,
         handled: &HashSet<PropagationTransientId>,
@@ -1198,9 +1220,9 @@ impl PropagationNode {
         }
     }
 
-    /// Inverse-offer pattern: the peer lists what it has; we return the IDs
-    /// we hold that the peer does not. Python reference:
-    /// LXMRouter.offer_request_received().
+    /// Local inverse-set helper: return indexed IDs absent from `offered_ids`.
+    /// This is not the network `/offer` handler and performs no peer admission
+    /// or pending-retirement filtering.
     pub fn offer_request(
         &mut self,
         _peer_hash: [u8; 16],
@@ -1238,8 +1260,8 @@ impl PropagationNode {
         crate::encode_value(&value)
     }
 
-    /// Handle a Link REQUEST at the `/offer` path. Python reference:
-    /// LXMRouter.offer_request() (LXMRouter.py:2139-2189).
+    /// Handle a Link REQUEST at the `/offer` path. Related Python handler:
+    /// `LXMRouter.offer_request`.
     ///
     /// `request_data` is msgpack `[peering_key, [transient_id_1, ...]]`.
     /// Transitional compatibility wrapper for callers that still compute the
@@ -1314,16 +1336,17 @@ impl PropagationNode {
         )
     }
 
-    /// Handle a Link REQUEST at the `/get` path for client download. Python
-    /// reference: LXMRouter.message_get_request() (LXMRouter.py:1425-1499).
+    /// Plan a Link REQUEST at `/get` for an already authenticated client. The
+    /// caller binds `client_dest_hash` to that identity and enforces access policy.
+    /// Related Python handler: `LXMRouter.message_get_request`.
     ///
     /// Wire format is msgpack `[wants, haves]` or `[wants, haves, delivery_limit]`:
     /// - Phase 1 (list): `[None, None]` -> available transient IDs for the client,
     ///   smallest message first (Python sorts by file size ascending).
-    /// - Phase 2 (get):  `[[wants...], [haves...]]` -> haves are purged first
-    ///   (Python order), then wants resolve to a [`GetServePlan`] whose file
-    ///   reads the embedder performs without holding the node lock.
-    /// - Phase 3 (purge): `[None, [received_ids...]]` -> delete from store.
+    /// - Phase 2 (get): `[[wants...], [haves...]]` -> a [`GetServePlan`] retires
+    ///   haves before reading wants when resolved on the blocking worker.
+    /// - Phase 3 (purge): `[None, [received_ids...]]` -> the same deferred plan
+    ///   with retirements and no reads. Planning itself performs no file I/O.
     pub fn handle_get_request(
         &mut self,
         request_data: &[u8],
@@ -1442,7 +1465,9 @@ impl PropagationNode {
 
     /// Resolve requested transient IDs into store-file read plans (no I/O).
     /// Perform the reads via [`read_planned_messages`] after releasing the
-    /// node lock. Returns an empty vec when there is no disk storage.
+    /// node lock. Returns an empty vec when there is no disk storage. The caller
+    /// must enforce any destination or offered-ID restrictions before using this
+    /// helper; it selects existing eligible IDs without those authorization checks.
     pub fn plan_message_reads(
         &self,
         requested_ids: &[PropagationTransientId],
@@ -1466,9 +1491,9 @@ impl PropagationNode {
             .collect()
     }
 
-    /// Fetch raw packed message data for each requested transient ID. Python
-    /// reference: LXMRouter.message_get_request_received(). Blocking
-    /// convenience over [`Self::plan_message_reads`] — prefer the staged pair
+    /// Fetch full stored opaque images, including propagation stamps, for the
+    /// supplied IDs. Blocking convenience over [`Self::plan_message_reads`],
+    /// with the same caller authorization responsibility. Prefer the staged pair
     /// when the node sits behind a shared lock.
     pub fn message_get_request(
         &self,
@@ -1477,9 +1502,10 @@ impl PropagationNode {
         read_planned_messages(&self.plan_message_reads(requested_ids))
     }
 
-    /// Produce a `SyncOffer` listing message IDs the peer has not yet handled.
-    /// The caller sends it over an established link. Python reference:
-    /// LXMRouter.sync_request_received().
+    /// Blocking compatibility wrapper: load the peer policy from disk, falling
+    /// back to [`OutboundOfferPolicy::unrestricted`] if unavailable, then prepare
+    /// an offer. Prefer an authoritative live policy snapshot. The returned
+    /// [`SyncOffer`] is local data; the network task encodes the binary `/offer` wire form.
     pub fn prepare_sync_offer(&mut self, peer_hash: [u8; 16]) -> SyncOffer {
         let policy = self
             .load_peer(&peer_hash)
@@ -1552,11 +1578,15 @@ impl PropagationNode {
 
     /// Prepare one offer from an authoritative peer-policy snapshot.
     ///
-    /// Selection mirrors `LXMPeer.sync`: only existing, unhandled messages
-    /// meeting the peer's stamp and transfer limits are eligible. Candidates
-    /// are ordered by ascending store weight before the cumulative sync cap is
-    /// applied. The chosen IDs are retained in the session so a subsequent
-    /// response cannot request data outside this offer.
+    /// Select eligible unhandled messages by ascending weight, filtering stamp
+    /// and per-message limits before the cumulative sync cap, as in Python
+    /// `LXMPeer.sync`. The session retains the chosen IDs; the network task uses
+    /// them to validate responses. [`Self::process_sync_get`] does not perform
+    /// that membership check.
+    ///
+    /// This compatibility wrapper performs blocking peer-file reads and may
+    /// persist terminal handled-ID updates. The network task stages this work
+    /// outside the node lock.
     pub fn prepare_sync_offer_with_policy(&mut self, policy: &OutboundOfferPolicy) -> SyncOffer {
         loop {
             let snapshot = self.snapshot_sync_offer_preparation(policy);
@@ -1582,8 +1612,9 @@ impl PropagationNode {
         }
     }
 
-    /// Compare a peer's `SyncOffer` against our store and return a `SyncGet`
-    /// listing IDs we want. Python reference: LXMRouter.offer_request_received().
+    /// Local compatibility helper: select offered 32-byte IDs absent from the
+    /// index and replace this peer's session. It does not validate a peering key
+    /// or apply the network offer-admission policy.
     pub fn process_sync_offer(&mut self, peer_hash: [u8; 16], offer: &SyncOffer) -> SyncGet {
         // process_offer needs &self.store; compute the get before mutating sync_sessions.
         let mut tmp_session = SyncSession::new(peer_hash);
@@ -1592,9 +1623,10 @@ impl PropagationNode {
         result
     }
 
-    /// Return the packed message data for each ID in `get`. The caller
-    /// transfers each blob as a Resource over the link. Python reference:
-    /// LXMRouter.message_get_request_received().
+    /// Blocking compatibility helper returning full stored images for the valid
+    /// 32-byte IDs in `get`. This does not restrict requests to a previous offer;
+    /// the caller must validate that membership. The network task in
+    /// [`crate::propagation_sync`] filters responses and constructs the batch wire format.
     pub fn process_sync_get(&mut self, peer_hash: [u8; 16], get: &SyncGet) -> Vec<Vec<u8>> {
         if let Some(session) = self.sync_sessions.get_mut(&peer_hash) {
             session.process_get(get);
@@ -1623,11 +1655,10 @@ impl PropagationNode {
             .collect()
     }
 
-    /// Record a successful transfer for a peer. Loads the peer, adds the
-    /// transient ID to its handled set, saves it, and records the transfer in
-    /// the sync session. Python reference:
-    /// LXMRouter.propagation_resource_concluded() (LXMRouter.py:2271) --
-    /// `peer.queue_handled_message(transient_id)`.
+    /// Best-effort blocking bookkeeping for a successful peer transfer. If the
+    /// peer loads, add the ID and attempt to save; save errors are ignored.
+    /// An existing session's transfer counter increments independently. Use
+    /// [`Self::persist_peer_handled`] when the caller needs persistence errors.
     pub fn mark_peer_handled(
         &mut self,
         peer_hash: &[u8; 16],
@@ -1643,8 +1674,9 @@ impl PropagationNode {
         }
     }
 
-    /// Merge peer-handled observations into persisted state using the same
-    /// authoritative policy that produced the offer.
+    /// Merge peer-handled observations using the authoritative offer policy and
+    /// persist the result, returning write errors. This blocks on peer-file I/O.
+    /// A volatile node returns success without writing a peer file.
     pub fn persist_peer_handled(
         &self,
         policy: &OutboundOfferPolicy,

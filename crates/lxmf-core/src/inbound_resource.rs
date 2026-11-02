@@ -62,7 +62,8 @@ impl From<InboundResourceConclusion> for InboundResourceStatus {
     }
 }
 
-/// Owned, non-sensitive snapshot of one inbound transfer.
+/// Owned snapshot containing link/Resource IDs, sizes, progress and status.
+/// It contains no transferred payload bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InboundResourceSnapshot {
     pub key: InboundResourceKey,
@@ -133,10 +134,12 @@ impl InboundResourceHandle {
         self.snapshot_rx.borrow().clone()
     }
 
-    /// Wait for the next lifecycle/progress update.
+    /// Wait for an unseen lifecycle/progress state. Intermediate updates may
+    /// be coalesced by the watch channel.
     ///
-    /// Returns `None` after the terminal snapshot has been published and the
-    /// actor owner has dropped its sender.
+    /// Returns `None` once the sender is gone and its latest value has been seen.
+    /// Dropping the tracker can close the channel without publishing a terminal
+    /// state; terminal states require the corresponding lifecycle event.
     pub async fn changed(&mut self) -> Option<InboundResourceSnapshot> {
         if self.snapshot_rx.changed().await.is_err() {
             return None;
@@ -166,9 +169,10 @@ struct ActiveInboundResource {
 
 /// Single-owner active Resource registry.
 ///
-/// Terminal records are removed immediately, so the registry is bounded by
-/// concurrent transfers. Previously returned handles retain the final owned
-/// snapshot without keeping actor state alive.
+/// Concluded and LinkClosed events remove records immediately. The embedder
+/// must forward those events to keep the registry limited to active transfers;
+/// the tracker has no independent entry cap or timeout. Previously returned
+/// handles retain their latest snapshot without keeping tracker state alive.
 #[derive(Default)]
 pub struct InboundResourceTracker {
     active: HashMap<InboundResourceKey, ActiveInboundResource>,
@@ -203,8 +207,8 @@ impl InboundResourceTracker {
 
     /// Return the active Resource matching `resource_id`.
     ///
-    /// A cryptographic ID collision across two Links fails closed instead of
-    /// choosing the wrong cancellation authority.
+    /// If the same Resource ID is active on more than one Link, returns `None`.
+    /// Use [`Self::inbound_resource_exact`] with the full key to disambiguate.
     pub fn inbound_resource(&self, resource_id: &[u8; 32]) -> Option<InboundResourceHandle> {
         let mut matches = self
             .active
@@ -237,7 +241,8 @@ impl InboundResourceTracker {
     /// Queue cancellation for a stable snapshot of every active Resource.
     ///
     /// The returned count is the number accepted by the bounded command
-    /// channel, matching Python's count-oriented `cancel_all_inbound` API.
+    /// channel, not the number of completed cancellations. Closure is reported
+    /// by subsequent lifecycle events.
     pub fn cancel_all_inbound(&self) -> usize {
         self.inbound_resources()
             .into_iter()

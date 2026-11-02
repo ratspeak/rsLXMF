@@ -1,16 +1,24 @@
-//! Client-side propagation node download protocol.
+//! Client-side propagation node downloads, driven by the caller through
+//! [`PropagationClient::drain_events`] and [`PropagationClient::tick`].
 //!
-//! Python reference: LXMRouter.py:484-587.
+//! The `/get` wire exchange corresponds to Python
+//! `LXMRouter.request_messages_from_propagation_node()`.
 //!
-//! Protocol flow:
-//! 1. Establish link to the propagation node destination.
-//! 2. Identify on the link (LinkIdentify).
-//! 3. Request `/get` with `[None, None]` -- server returns available transient IDs.
-//! 4. Client sorts into wants/haves.
-//! 5. Purge known haves, then request bounded wants chunks with a per-transfer limit.
-//! 6. Server returns `[lxmf_data_1, lxmf_data_2, ...]`.
-//! 7. Client processes received messages.
-//! 8. `/get` with `[None, received_ids]` purges each downloaded batch before the next chunk.
+//! 1. Establish a Link and identify with the configured public/signing key pair.
+//!    Without that pair, no identification is sent; an authenticating node rejects the request.
+//! 2. Request `/get` with `[None, None]` to list available transient IDs.
+//! 3. Separate caller-installed durable haves from eligible wants. Purge those
+//!    haves unless retention is enabled, then request bounded wants chunks.
+//! 4. Validate the returned ciphertext IDs, membership, count and byte budget.
+//!    Pass downloaded payloads and admission tokens to the application's durable adapter.
+//! 5. Await local admission decisions. Only accepted durable receipts authorize
+//!    purging newly downloaded IDs; rejected items remain available for retry.
+//! 6. Purge accepted IDs before requesting the next chunk. The retention option
+//!    applies to previously known haves, not these newly accepted downloads.
+//!
+//! Suppression records delay new wants but never authorize remote deletion.
+//! Persist suppression changes and acknowledge their current revision before
+//! further wants can proceed.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{
@@ -57,9 +65,9 @@ pub enum PropagationClientState {
     Receiving,
     /// `/get` with `[None, received_ids]` sent.
     PurgeRequested,
-    /// Download bytes await a durable local application decision.
+    /// Waiting for local admission decisions or a durable suppression checkpoint.
     AwaitingAdmission,
-    /// At least one item was retained remotely for retry/revalidation.
+    /// At least one downloaded item lacked durable local acceptance in this cycle.
     Partial,
     Complete,
     Failed,
@@ -333,21 +341,31 @@ impl PropagationClient {
         self.outbound_propagation_node = Some(dest_hash);
     }
 
-    /// KB per transfer.
+    /// Set the requested server response budget in decimal kB (1000 bytes).
+    /// The value is sent unchanged in `/get`; supply a finite positive number.
+    /// Local Resource and admission byte limits still apply independently.
     pub fn set_delivery_limit(&mut self, limit_kb: f64) {
         self.delivery_limit = Some(limit_kb);
     }
 
+    /// Trust this ID as a durable local have, with no expiry. It may authorize
+    /// remote purge on the next download cycle unless retention is enabled.
+    /// The caller must establish the durable local effect; this method does not verify it.
     pub fn add_local_message(&mut self, transient_id: PropagationTransientId) {
         self.local_message_expiry.remove(transient_id.as_slice());
         self.local_messages.insert(transient_id.to_vec());
     }
 
+    /// Trust a caller-supplied transient ID as a durable local have with no expiry.
+    /// This has the same purge authority as [`Self::add_local_message`]; it does
+    /// not check the ID length or verify a durable local effect.
     pub fn add_local_message_id(&mut self, transient_id: Vec<u8>) {
         self.local_message_expiry.remove(&transient_id);
         self.local_messages.insert(transient_id);
     }
 
+    /// Replace all local haves and clear their expiry times. Every supplied ID
+    /// is trusted as durable purge authority; lengths and local effects are not checked.
     pub fn replace_local_message_ids<I>(&mut self, transient_ids: I)
     where
         I: IntoIterator<Item = Vec<u8>>,
@@ -356,6 +374,9 @@ impl PropagationClient {
         self.local_message_expiry.clear();
     }
 
+    /// Replace local purge authority from the durable adapter, preserving expiry
+    /// times and pruning expired haves. This trusts the supplied records; it does
+    /// not revalidate stored files or commit new local effects.
     pub fn replace_durable_haves(
         &mut self,
         haves: impl IntoIterator<Item = crate::admission::DurableHave>,
@@ -398,6 +419,9 @@ impl PropagationClient {
         }
     }
 
+    /// Keep previously known local haves on the node during subsequent selection.
+    /// Newly downloaded messages accepted through admission are still purged;
+    /// this flag does not provide retention for those messages.
     pub fn set_retain_synced_on_node(&mut self, retain: bool) {
         self.retain_synced_on_node = retain;
     }
@@ -477,7 +501,9 @@ impl PropagationClient {
     pub fn suppression_revision(&self) -> u64 {
         self.suppression_revision
     }
-    /// A slow checkpoint must never reinstall an older ledger over new state.
+    /// Acknowledge a completed durable checkpoint only if its revision is still
+    /// current. Returns `false` after intervening changes; otherwise clears the
+    /// dirty/failure flags without replacing the ledger. The caller performs the write.
     pub fn acknowledge_suppression_persistence(&mut self, revision: u64) -> bool {
         if revision != self.suppression_revision {
             return false;
@@ -493,8 +519,9 @@ impl PropagationClient {
     pub fn take_suppression_updates(&mut self) -> Vec<SuppressionRecord> {
         std::mem::take(&mut self.suppression_updates)
     }
-    /// The adapter must report a failed durable suppression update. Automatic
-    /// new wants pause until persisted state is installed after recovery.
+    /// Report a failed durable suppression update and pause new wants. Resume
+    /// after durably checkpointing and acknowledging the current revision, or
+    /// installing persisted state after recovery.
     pub fn suppression_persistence_failed(&mut self) {
         self.suppression_persist_failed = true;
     }
@@ -534,8 +561,10 @@ impl PropagationClient {
         self.start_download_with_limit(None)
     }
 
-    /// Start a propagation download, limiting newly requested messages.
-    /// `None` and zero mirror Python's `PR_ALL_MESSAGES`.
+    /// Start a propagation download, limiting newly requested messages across
+    /// the whole cycle. `None` and zero select all eligible messages, as with
+    /// Python's `PR_ALL_MESSAGES`. Returns `false` while active, without a node,
+    /// with queued downloads, or while suppression persistence blocks a restart.
     /// Move live downloads into the durable adapter before restarting. Failure
     /// or cancellation drops the client-owned queue and revokes its tokens;
     /// already moved payload/worker owners retain their memory leases.
@@ -649,7 +678,9 @@ impl PropagationClient {
         true
     }
 
-    /// Cancel an active request and return to the idle state.
+    /// Revoke current admissions, drop client-owned downloads and return to idle.
+    /// External payload/worker owners retain their memory leases. Link cleanup
+    /// is queued; this call does not wait for network teardown to complete.
     pub fn cancel_download(&mut self) {
         self.cleanup();
         self.status = PropagationTransferStatus::default();

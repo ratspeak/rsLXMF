@@ -10,7 +10,7 @@ use crate::constants::DESTINATION_LENGTH;
 /// Reticulum destination hash, as carried in LXMF wire messages.
 pub type DestinationHash = [u8; DESTINATION_LENGTH];
 
-/// Reticulum identity hash, used for peer and ticket identity binding.
+/// Reticulum identity hash. Ticket stores use delivery destination hashes instead.
 pub type IdentityHash = [u8; DESTINATION_LENGTH];
 
 /// Canonical LXMF message id / SHA-256 digest.

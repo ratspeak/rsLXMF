@@ -1,6 +1,7 @@
-//! Store-and-forward message storage for LXMF propagation nodes.
+//! In-memory propagation-entry accounting, deduplication caches and distribution queue.
 //!
-//! Mirrors propagation entry management in Python LXMRouter.py.
+//! The owning router or node handles durable files and admission. Weight-based
+//! culling uses the formula from Python `LXMRouter.get_weight`.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -17,7 +18,7 @@ pub struct PropagationEntry {
     pub stamp_value: u8,
     pub size: usize,
     pub collected: bool,
-    /// Stored file contains `lxmf_data || propagation_stamp`.
+    /// When true, the stored file contains `lxmf_data || propagation_stamp`.
     ///
     /// Client download strips the stamp; peer sync keeps it.
     pub stamped: bool,
@@ -73,7 +74,11 @@ impl PropagationEntry {
 
     /// Accepts canonical 64-hex transient IDs in both the 3-component format
     /// and the older 2-component `{transient_id}_{timestamp}` form (stamp_value
-    /// defaults to 0). Pre-fix 32-hex transient IDs are rejected.
+    /// defaults to 0). Shortened 32-hex transient IDs are rejected.
+    ///
+    /// # Panics
+    /// Non-ASCII input can panic when sliced at hexadecimal byte-pair offsets.
+    /// Validate that untrusted filenames are ASCII before calling.
     pub fn parse_filename(filename: &str) -> Option<(PropagationTransientId, f64, u8)> {
         let parts: Vec<&str> = filename.split('_').collect();
         match parts.len() {
@@ -93,7 +98,8 @@ impl PropagationEntry {
     }
 }
 
-/// Owned by the router actor; no shared access.
+/// In-memory index and accounting state. Mutations require exclusive access;
+/// the owner handles synchronization, durable storage and admission policy.
 #[derive(Debug, Default)]
 pub struct PropagationStore {
     entries: HashMap<PropagationTransientId, PropagationEntry>,
@@ -106,7 +112,8 @@ pub struct PropagationStore {
     /// Prioritised destinations receive a 0.1x weight multiplier during culling.
     prioritised_destinations: HashSet<[u8; 16]>,
     peer_distribution_queue: VecDeque<(PropagationTransientId, Option<[u8; 16]>)>,
-    /// `None` disables the byte-size cap.
+    /// Optional byte-limit setting. This type does not enforce it automatically;
+    /// the owner must call culling with its chosen limit.
     pub storage_limit: Option<usize>,
 }
 
@@ -116,6 +123,10 @@ impl PropagationStore {
     }
 
     /// Returns `false` if the destination is in the ignored list.
+    ///
+    /// The caller must exclude an existing transient ID before inserting.
+    /// Replacing one adds the new size without subtracting the previous size.
+    /// This method performs no persistence, stamp validation or size-limit check.
     pub fn insert(&mut self, entry: PropagationEntry) -> bool {
         if self.ignored_destinations.contains(&entry.destination_hash) {
             return false;
@@ -178,11 +189,12 @@ impl PropagationStore {
         }
     }
 
-    /// Cull messages by weighted score until total size is within `limit_bytes`.
+    /// Remove indexed entries by weighted score until accounted size is within
+    /// `limit_bytes`, assuming each transient ID was inserted only once.
     ///
-    /// Score = priority_weight * age_weight * size. Evicts highest-weight first
-    /// (oldest + largest + non-prioritised). Matches Python
-    /// `clean_message_store()` in LXMRouter.py.
+    /// Score = priority_weight * age_weight * size. Highest scores go first,
+    /// using Python `LXMRouter.get_weight`'s formula. This updates the in-memory
+    /// index and byte count; it does not delete message files.
     pub fn cull_by_weight(&mut self, limit_bytes: usize) {
         if self.total_size <= limit_bytes {
             return;
@@ -299,7 +311,7 @@ impl PropagationStore {
     }
 
     /// Age out dedup-cache entries older than `MESSAGE_EXPIRY * 6` (Python
-    /// `LXMRouter.clean_transient_id_caches`, LXMRouter.py:956). Retention is
+    /// `LXMRouter.clean_transient_id_caches`). Retention is
     /// purely age-based: entries must outlive their store membership so a
     /// culled-and-reoffered message is still recognised as already handled.
     pub fn clean_transient_caches(&mut self, now: f64) {

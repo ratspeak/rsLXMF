@@ -27,8 +27,10 @@ pub struct PreparedNode {
     pub policy: AdvertisedNodePolicy,
 }
 
-/// Identity and policy freshness are required; the recipient itself may be
-/// offline. Only a missing recipient key warrants recipient path discovery.
+/// Check the node identity, node path, advertised policy and recipient key.
+/// Policy must be younger than [`NODE_METADATA_MAX_AGE`] and have a finite,
+/// nonnegative transfer limit. The recipient may be offline: only its key is
+/// needed. This function reports missing inputs; it performs no path discovery.
 pub fn propagation_readiness(
     node: [u8; 16],
     node_identity_known: bool,
@@ -58,8 +60,9 @@ pub fn propagation_readiness(
     Ok(PreparedNode { node, policy })
 }
 
-/// One send-owned encryption result. Retrying changes only the outer timestamp
-/// and (when required cost rises) the PN stamp, never ciphertext or transient ID.
+/// One send-owned encryption result. Retrying changes the outer timestamp and,
+/// if the saved stamp no longer meets the node's cost, regenerates the PN stamp.
+/// Ciphertext and transient ID stay fixed.
 #[derive(Debug, Clone)]
 pub struct PropagationEnvelope {
     message: LxMessage,
@@ -155,7 +158,9 @@ impl PropagationEnvelope {
         self.message.wire_bytes() == message.wire_bytes()
             && &self.encryption_binding == encryption_binding
     }
-    /// Call immediately before dispatch with refreshed advertised policy.
+    /// Pack immediately before dispatch using policy checked by
+    /// [`propagation_readiness`]. This does not refresh the policy or send data.
+    /// It may synchronously regenerate the PN stamp if more work is required.
     pub fn pack_for(
         &mut self,
         node: PreparedNode,

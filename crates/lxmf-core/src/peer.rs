@@ -164,11 +164,12 @@ pub struct LxmPeer {
     pub stamp_cost_flexibility: Option<u8>,
     /// Peering cost used for outbound peering-key generation.
     pub peering_cost: u8,
-    /// Generated peering key `(stamp, value)`. `None` until [`LxmPeer::generate_peering_key`] succeeds.
+    /// Cached peering stamp and work value, generated or restored from storage.
+    /// Use [`Self::peering_key_ready`] to check it against the current cost.
     pub peering_key: Option<([u8; 32], u32)>,
-    /// Per-transfer propagation limit in KB.
+    /// Per-transfer propagation limit in decimal kilobytes (1 kB = 1000 bytes).
     pub propagation_transfer_limit: Option<f64>,
-    /// Per-sync propagation limit in KB.
+    /// Per-sync propagation limit in decimal kilobytes (1 kB = 1000 bytes).
     pub propagation_sync_limit: Option<f64>,
     pub currently_transferring_messages: Option<Vec<PropagationTransientId>>,
     pub link_alive: bool,
@@ -290,10 +291,13 @@ impl LxmPeer {
         peer
     }
 
-    /// Refresh announce-derived policy only when `timebase` is newer.
+    /// Refresh policy when the supplied `timebase` is newer. The caller must
+    /// keep both supplied and stored timebases finite; this method does not
+    /// validate them, and NaN bypasses the ordering guard.
     ///
-    /// Returns `true` when the peer was updated. Runtime counters, handled
-    /// messages and static-peer status remain owned by the existing peer.
+    /// Returns `true` when updated. Handled messages and static-peer status are
+    /// retained. Calling `heard()` updates liveness/last-heard and resets the
+    /// unreachable count and sync backoff; the next sync attempt is reset to zero.
     #[allow(clippy::too_many_arguments)]
     pub fn refresh_from_announce(
         &mut self,
@@ -316,7 +320,9 @@ impl LxmPeer {
         )
     }
 
-    /// Refresh announce-derived policy and bounded metadata only when newer.
+    /// Refresh policy and bounded metadata with the ordering and liveness
+    /// behavior of [`Self::refresh_from_announce`]. Both supplied and stored
+    /// timebases must be finite; this method does not reject NaN.
     #[allow(clippy::too_many_arguments)]
     pub fn refresh_from_announce_with_metadata(
         &mut self,
@@ -548,13 +554,15 @@ impl LxmPeer {
         self.sync_backoff
     }
 
-    /// Peers unseen for [`PEER_STALE_TIME`] are stale and should be rotated to the back of the queue.
+    /// Whether more than [`PEER_STALE_TIME`] seconds have elapsed since last heard.
+    /// This check does not rotate or remove the peer.
     pub fn is_stale(&self) -> bool {
         let now = now_f64();
         now - self.last_heard > PEER_STALE_TIME as f64
     }
 
-    /// Whether the peering key has been generated and meets [`Self::peering_cost`].
+    /// Whether a cached key's recorded work value meets [`Self::peering_cost`].
+    /// This trusts the stored/public value; it does not revalidate the key.
     pub fn peering_key_ready(&self) -> bool {
         if let Some((_, value)) = self.peering_key {
             value >= self.peering_cost as u32
@@ -563,7 +571,8 @@ impl LxmPeer {
         }
     }
 
-    /// Peering-key value (leading zero bits), if generated.
+    /// Cached peering-key work value (leading zero bits), if present.
+    /// Restored or caller-supplied values are returned without recomputation.
     pub fn peering_key_value(&self) -> Option<u32> {
         self.peering_key.map(|(_, value)| value)
     }
@@ -573,7 +582,12 @@ impl LxmPeer {
     /// Key material is `peer_identity_hash || our_identity_hash` (16 + 16 bytes), run through the
     /// stamp PoW system with [`STAMP_WORKBLOCK_EXPAND_ROUNDS_PEERING`] expand rounds.
     ///
-    /// Python reference: `LXMPeer.generate_peering_key` — LXMPeer.py:242-265.
+    /// Returns immediately when a key is already cached; it does not revalidate
+    /// that key against a changed cost. Use [`Self::peering_key_ready`] for that
+    /// check. Otherwise runs synchronous proof of work with
+    /// [`crate::stamper::generate_stamp`]'s attempt budget.
+    ///
+    /// Python reference: `LXMPeer.generate_peering_key`.
     pub fn generate_peering_key(
         &mut self,
         peer_identity_hash: &[u8; 16],
@@ -625,7 +639,7 @@ impl LxmPeer {
     /// `next_sync_attempt` so sync can proceed immediately, updates `last_heard`, and marks the
     /// peer alive.
     ///
-    /// Python reference: LXMPeer.py:530-538.
+    /// This updates local peer state; it does not identify the link or start a sync.
     pub fn link_established(&mut self, _link_id: [u8; 16], establishment_rate: Option<f64>) {
         if let Some(rate) = establishment_rate {
             self.link_establishment_rate = rate;
@@ -637,12 +651,10 @@ impl LxmPeer {
         self.link_alive = true;
     }
 
-    /// Link-closed callback: clears the link and transitions to [`PeerState::Idle`].
+    /// Clear the link-alive flag and transition to [`PeerState::Idle`].
     ///
-    /// If the peer was mid-sync, the in-flight transfer list is cleared so backoff logic
-    /// treats it as a sync failure.
-    ///
-    /// Python reference: LXMPeer.py:540-542.
+    /// If the previous state was active, clear the in-flight transfer list.
+    /// This callback does not itself increment backoff or mark the peer unreachable.
     pub fn link_closed(&mut self) {
         let was_active = self.state != PeerState::Idle;
         self.link_alive = false;
@@ -694,11 +706,13 @@ impl From<&LxmPeer> for OutboundOfferPolicy {
     }
 }
 
-/// Select the best peer to sync with from a set of candidates.
+/// Return the input index of an idle peer with unhandled messages.
 ///
-/// Mirrors Python `sync_peers()`: draw from the fastest [`FASTEST_N_RANDOM_POOL`] alive peers,
-/// mix in unknown-speed peers, and fall back to unresponsive peers that have passed their sync
-/// backoff.
+/// Alive peers take priority: sort them by descending transfer rate and choose
+/// the first. This selection is deterministic; adding unknown-speed peers to
+/// the candidate pool does not randomize the choice as Python `sync_peers()` does.
+/// If no alive peer qualifies, choose the first unresponsive peer whose backoff
+/// has elapsed. Backoff is not checked in the alive-peer branch.
 pub fn select_sync_peer(peers: &[&LxmPeer]) -> Option<usize> {
     if peers.is_empty() {
         return None;

@@ -13,7 +13,10 @@ use crate::types::PropagationTransientId;
 /// A binary 32-byte transient ID requires at least 34 MessagePack bytes.
 const ENCODED_TRANSIENT_ID_MIN_BYTES: usize = 34;
 
-/// A peering-key-validated offer and the subset not present in local storage.
+/// Offer outcome and the subset absent from local storage. The variants are
+/// publicly constructible, so this value alone is not proof of authentication
+/// or admission. Obtain it through [`crate::propagation_node::PropagationNode::evaluate_offer_request`]
+/// after preflight, then commit it to that same admission candidate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PnOfferEvaluation {
     HaveAll,
