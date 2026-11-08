@@ -4,7 +4,7 @@
 
 **Rust LXMF messaging and propagation for Reticulum.**
 
-[![License: AGPL-3.0-or-later](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue.svg)](LICENSE)
+[![License: Reticulum License](https://img.shields.io/badge/license-Reticulum%20License-blue.svg)](LICENSE)
 [![Rust 1.89+](https://img.shields.io/badge/rust-1.89%2B-orange.svg)](https://www.rust-lang.org)
 [![Compatibility floor: LXMF 1.0.1](https://img.shields.io/badge/compatibility%20floor-LXMF%201.0.1-success.svg)](https://github.com/markqvist/LXMF)
 [![Supplementary release reference: LXMF 1.1.0](https://img.shields.io/badge/supplementary%20release%20reference-LXMF%201.1.0-blue.svg)](https://github.com/markqvist/LXMF)
@@ -19,7 +19,11 @@
 
 ---
 
-rsLXMF is a Rust implementation of LXMF, the Reticulum messaging layer. This is not a fork of LXMF, this is LXMF written in a different language focused on staying interoperable. This is not a source of truth implementation, do not use it as such.
+rsLXMF is a Rust port of [LXMF](https://github.com/markqvist/LXMF), the
+Reticulum messaging layer, from the reference implementation by Mark Qvist. It
+was written from the reference source, not from a specification, and tracks the
+reference's wire behavior release by release. The Python reference
+implementation remains the source of truth. See [License](#license).
 
 Commands are intentionally namespaced for Rust with the Rust-specific `lxmd-rs` command, so rsLXMF can live beside other
 LXMF daemons on `PATH` without worry.
@@ -369,4 +373,12 @@ PRs are closed for now until I have time to catch up on everything. I'm tired.
 
 ## License
 
-GNU Affero General Public License v3.0 or later. See [LICENSE](LICENSE).
+rsLXMF is licensed under the [Reticulum License](LICENSE), the license of the
+reference implementation it is ported from. Copyright (c) 2020-2026 Mark Qvist,
+unless otherwise noted; additions and modifications Copyright (c) 2026 Ratspeak
+LLC.
+
+The license is permissive with two conditions: no use in systems built to
+purposefully harm people, and no use in or contribution to AI or language-model
+training. The copyright and permission notice must stay in every copy.
+[LICENSE](LICENSE) is the binding text.
