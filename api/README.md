@@ -1,7 +1,7 @@
 # Rust API
 
-This guide describes the 1.4.0 source API, not the published standalone
-1.3.0 daemon. Application code should use `lxmf_core::message_api`, which
+This guide describes the 1.4.0 API, published as v1.4.0, not the 1.3.0
+daemon. Application code should use `lxmf_core::message_api`, which
 re-exports the message types without wrappers. The equivalent module-qualified
 paths remain available. The [1.4 migration guide](migrations/1.4.md) explains
 the source-breaking change from mutable messages to drafts, signed messages

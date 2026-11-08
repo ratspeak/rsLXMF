@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 1.4.0 - 2026-11-08
+
 - Start a propagation node without rereading and flushing every stored message, so restarts with large stores no longer delay announces and hosting. Each message is still verified when it is served.
 - Space `lxmd` announces like Python lxmd: the propagation and control announces follow their trigger by 20 seconds instead of going out together with the delivery announce, so Python transport nodes no longer hold the control announce after a restart. A node set not to announce at start now waits a full interval before its first periodic announce.
 - Fall back from opportunistic to direct delivery whenever a message's content does not fit one encrypted packet, over 287 bytes, as in Python LXMF 1.2.0.
@@ -9,12 +11,6 @@
 - Store a signed message so its delivery can resume after a restart under the same id. A message that is already queued is no longer queued twice.
 - Generate deferred stamps in the order messages were sent, as Python LXMF does, so a reply no longer overtakes the message it answers.
 - Keep a destination's identity in Reticulum once a message to it is delivered, as Python LXMF does. `lxmd` asks the shared instance when attached to one.
-
-## 1.4.0 - 2026-10-12
-
-This section records the source-version transition. It is not a standalone
-1.4.0 binary release; the published standalone release remains 1.3.0.
-
 - Preserve each signed message exactly as received, including binary text and custom fields, and reject ambiguous field definitions.
 - Remove downloaded messages from a propagation node only after the receiving application confirms durable acceptance. Failed items remain available for retry.
 - Keep propagation messages encrypted in storage, quarantine untrusted legacy entries, and require storage recovery before a node becomes available.

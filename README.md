@@ -42,7 +42,7 @@ LXMF daemons on `PATH` without worry.
 
 ## Build It
 
-This guide describes the 1.4.0 source line at `b5c3365b5715f1f36f74963a9d2136238d956467`, used by Ratspeak 1.0.37 with rsReticulum 1.4.0. The published standalone daemon download is [v1.3.0](https://github.com/ratspeak/rsLXMF/releases/tag/v1.3.0); use [its README](https://github.com/ratspeak/rsLXMF/blob/v1.3.0/README.md) and bundled `--help` for that build. The 1.4 message and durable relay APIs require a coordinated source migration.
+This guide describes the 1.4.0 release, [v1.4.0](https://github.com/ratspeak/rsLXMF/releases/tag/v1.4.0), built with rsReticulum [v1.4.0](https://github.com/ratspeak/rsReticulum/releases/tag/v1.4.0); it is the source line Ratspeak builds from. For the 1.3.0 daemon, use [the v1.3.0 README](https://github.com/ratspeak/rsLXMF/blob/v1.3.0/README.md) and that build's `--help`. The 1.4 message and durable relay APIs require a coordinated source migration.
 
 The current development layout for rsLXMF requires
 rsReticulum as a sibling directory/repo next to it, such as:
@@ -58,8 +58,8 @@ mkdir ratspeak-src
 cd ratspeak-src
 git clone https://github.com/ratspeak/rsReticulum
 git clone https://github.com/ratspeak/rsLXMF
-git -C rsReticulum checkout --detach 5b38cae702a5b3984adf12a435f6d3012fcf90e1
-git -C rsLXMF checkout --detach b5c3365b5715f1f36f74963a9d2136238d956467
+git -C rsReticulum checkout --detach v1.4.0
+git -C rsLXMF checkout --detach v1.4.0
 cd rsLXMF
 ```
 
@@ -357,7 +357,7 @@ Most daemon and control flags are implemented: `--config`, `--rnsconfig`,
 Additional rsLXMF-only flags: `--send`, `--send-file`, `--send-method`,
 `--send-timeout-secs`, and `--send-fields-json`.
 
-The complete corpus and live matrix for standalone 1.3.0 use Python LXMF 1.0.1
+The complete corpus and live matrix for 1.3.0 and 1.4.0 use Python LXMF 1.0.1
 with Reticulum 1.4.2. A supplementary lane checks daemon, delivery,
 Resource/proof, and propagation behavior against exact LXMF 1.1.0 with the
 same Reticulum 1.4.2 source. Historical vectors retain their original

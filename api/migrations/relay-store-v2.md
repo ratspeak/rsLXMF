@@ -1,8 +1,7 @@
 # Relay store migration
 
-This guide applies to the 1.4 source API and daemon. Build the matching
-source before using these commands; the standalone 1.3.0 binary does not
-provide this migration.
+This guide applies to the 1.4 API and daemon, published as v1.4.0. The 1.3.0
+binary does not provide this migration.
 
 Relay nodes now admit only validated opaque propagation data to a durable store.
 A packet proof follows complete validation and acknowledged durable admission.
