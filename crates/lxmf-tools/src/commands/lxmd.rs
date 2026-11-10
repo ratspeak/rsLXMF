@@ -22,10 +22,12 @@ use lxmf_core::admission::{
 };
 use lxmf_core::admission_store::FileAdmissionStore;
 use lxmf_core::constants::{
-    DELIVERY_RETRY_WAIT, DeliveryMethod, MAX_DELIVERY_ATTEMPTS, NODE_ANNOUNCE_DELAY,
-    PATH_REQUEST_WAIT,
+    DELIVERY_LINK_COST, DELIVERY_RETRY_WAIT, DeliveryMethod, MAX_DELIVERY_ATTEMPTS,
+    NODE_ANNOUNCE_DELAY, PATH_REQUEST_WAIT, PROPAGATION_LINK_COST,
 };
-use lxmf_core::delivery_ratchet::{DELIVERY_APP_NAME, DeliveryAnnounceKind, DeliveryRatchetState};
+use lxmf_core::delivery_ratchet::{
+    DELIVERY_APP_NAME, DeliveryAnnounceKind, DeliveryRatchetError, DeliveryRatchetState,
+};
 use lxmf_core::inbound_resource::{
     InboundResourceCancelRequest, InboundResourceConclusion, InboundResourceEvent,
     InboundResourceKey,
@@ -61,8 +63,8 @@ use lxmf_tools::lxmd_runtime::{
     LxmdPaths, delivery_announce_app_data, preflight_control_command,
     propagation_announce_app_data, resolve_config_dirs,
 };
-use rns_identity::announce::AnnounceData;
-use rns_identity::destination::Destination;
+use rns_identity::announce::AnnounceStampExt;
+use rns_identity::destination::{DefaultAppData, Destination};
 use rns_identity::identity::Identity;
 use rns_identity::persistence::{
     durable_create_dir_all, durable_reconcile, durable_write, validate_durable_storage_directory,
@@ -70,12 +72,14 @@ use rns_identity::persistence::{
 use rns_identity::ratchet::{
     ReceivedRatchet, clean_received_ratchets_dir, purge_expired_ratchets_in_memory,
 };
+use rns_runtime::destination_stamper::{Admission, DestinationStamps, StampOutcome};
 use rns_runtime::lifecycle::ShutdownSignal;
 use rns_runtime::link_manager::{
     LinkManagerAccountingEvent, LinkManagerCommand, LinkResourceConclusion, LinkResourceDirection,
     LinkResourceEvent,
 };
 use rns_runtime::reticulum::{AnnounceSubscription, AnnounceSubscriptionError, ReticulumHandle};
+use rns_transport::link_messages::{AnnounceRequest, DestinationEvent};
 use rns_transport::messages::{TransportMessage, TransportQuery, TransportQueryResponse};
 
 use self::lxmd_pn::{
@@ -119,53 +123,6 @@ fn queue_control_command(
             "control command not queued: daemon runner stopped"
         );
         None
-    }
-}
-
-/// Synchronous LinkManager callbacks cannot await the bounded transport
-/// mailbox. Keep only the newest announce for each destination until the
-/// daemon actor can enqueue it. Repeated requests for the same destination
-/// are equivalent, so coalescing is lossless at the protocol-operation level
-/// while keeping memory bounded by the number of announce destinations.
-#[derive(Clone, Default)]
-struct AnnounceMailbox {
-    pending: Arc<Mutex<HashMap<[u8; 16], TransportMessage>>>,
-}
-
-impl AnnounceMailbox {
-    fn stage(&self, destination_hash: [u8; 16], message: TransportMessage) {
-        match self.pending.lock() {
-            Ok(mut pending) => {
-                if pending.insert(destination_hash, message).is_some() {
-                    tracing::debug!(
-                        destination = %hex::encode(destination_hash),
-                        "coalesced repeated required announce"
-                    );
-                }
-            }
-            Err(_) => tracing::error!(
-                destination = %hex::encode(destination_hash),
-                "required announce mailbox lock poisoned"
-            ),
-        }
-    }
-
-    fn take_pending(&self) -> Vec<([u8; 16], TransportMessage)> {
-        match self.pending.lock() {
-            Ok(mut pending) => pending.drain().collect(),
-            Err(_) => {
-                tracing::error!("required announce mailbox lock poisoned");
-                Vec::new()
-            }
-        }
-    }
-
-    #[cfg(test)]
-    fn pending_len(&self) -> usize {
-        self.pending
-            .lock()
-            .map(|pending| pending.len())
-            .unwrap_or_default()
     }
 }
 
@@ -1216,58 +1173,8 @@ fn backchannel_error_from_runtime(
     }
 }
 
-fn create_control_announce_packet(
-    identity: &Identity,
-    control_dest_hash: [u8; 16],
-) -> Result<Vec<u8>, String> {
-    let announce = AnnounceData::create(identity, CONTROL_APP_NAME, None, None)
-        .map_err(|e| format!("Failed to create control announce: {e}"))?;
-    let payload = announce.pack();
-
-    let flags = rns_wire::flags::PacketFlags {
-        header_type: rns_wire::flags::HeaderType::Header1,
-        context_flag: false,
-        transport_type: rns_wire::flags::TransportType::Broadcast,
-        destination_type: rns_wire::flags::DestinationType::Single,
-        packet_type: rns_wire::flags::PacketType::Announce,
-    };
-    let header = rns_wire::header::PacketHeader {
-        flags,
-        hops: 0,
-        transport_id: None,
-        destination_hash: control_dest_hash,
-        context: rns_wire::context::PacketContext::None,
-    };
-
-    let mut raw = header.pack();
-    raw.extend_from_slice(&payload);
-    Ok(raw)
-}
-
-fn send_control_announce_try(
-    mailbox: &AnnounceMailbox,
-    identity: &Identity,
-    control_dest_hash: [u8; 16],
-) {
-    match create_control_announce_packet(identity, control_dest_hash) {
-        Ok(raw) => {
-            mailbox.stage(
-                control_dest_hash,
-                TransportMessage::Outbound(rns_transport::messages::OutboundRequest {
-                    raw: Bytes::from(raw),
-                    destination_hash: control_dest_hash,
-                }),
-            );
-        }
-        Err(e) => tracing::warn!("{e}"),
-    }
-}
-
-fn create_propagation_announce_packet_for(
-    identity: &Identity,
-    propagation_dest_hash: [u8; 16],
-    config: &DaemonConfig,
-) -> Result<Vec<u8>, String> {
+/// `LXMRouter.get_propagation_node_app_data`, the propagation destination's default app data.
+fn propagation_node_app_data(config: &DaemonConfig) -> Vec<u8> {
     let mut pn_data = lxmf_core::handlers::PropagationNodeAnnounceData::new(
         config.propagation_enabled && !config.from_static_only,
         config.propagation_limit_kb as u64,
@@ -1279,36 +1186,28 @@ fn create_propagation_announce_packet_for(
     if let Some(ref name) = config.node_name {
         pn_data.set_name(name);
     }
-    let app_data = propagation_announce_app_data(&pn_data);
+    propagation_announce_app_data(&pn_data)
+}
 
-    let announce = AnnounceData::create(
-        identity,
-        "lxmf.propagation",
-        Some(app_data.as_slice()),
-        None,
-    )
-    .map_err(|e| format!("Failed to create propagation announce: {e}"))?;
-
-    let payload = announce.pack();
-
-    let flags = rns_wire::flags::PacketFlags {
-        header_type: rns_wire::flags::HeaderType::Header1,
-        context_flag: false,
-        transport_type: rns_wire::flags::TransportType::Broadcast,
-        destination_type: rns_wire::flags::DestinationType::Single,
-        packet_type: rns_wire::flags::PacketType::Announce,
-    };
-    let header = rns_wire::header::PacketHeader {
-        flags,
-        hops: 0,
-        transport_id: None,
-        destination_hash: propagation_dest_hash,
-        context: rns_wire::context::PacketContext::None,
-    };
-
-    let mut raw = header.pack();
-    raw.extend_from_slice(&payload);
-    Ok(raw)
+/// Delivery destination events reach the LinkManager; announce requests go to
+/// the daemon, which owns the delivery ratchets, app data and stamp.
+async fn forward_delivery_events(
+    mut events: mpsc::Receiver<DestinationEvent>,
+    link_tx: mpsc::Sender<DestinationEvent>,
+    announce_tx: mpsc::UnboundedSender<AnnounceRequest>,
+) {
+    while let Some(event) = events.recv().await {
+        match event {
+            DestinationEvent::AnnounceRequested(request) => {
+                let _ = announce_tx.send(request);
+            }
+            event => {
+                if link_tx.send(event).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
 }
 
 /// Soft cap on announce-learned identity keys. Python bounds its equivalent
@@ -1375,26 +1274,6 @@ fn prune_known_identities(
         }
     }
     before - known_identities.len()
-}
-
-fn send_propagation_announce_try(
-    mailbox: &AnnounceMailbox,
-    identity: &Identity,
-    propagation_dest_hash: [u8; 16],
-    config: &DaemonConfig,
-) {
-    match create_propagation_announce_packet_for(identity, propagation_dest_hash, config) {
-        Ok(raw) => {
-            mailbox.stage(
-                propagation_dest_hash,
-                TransportMessage::Outbound(rns_transport::messages::OutboundRequest {
-                    raw: Bytes::from(raw),
-                    destination_hash: propagation_dest_hash,
-                }),
-            );
-        }
-        Err(e) => tracing::warn!("{e}"),
-    }
 }
 
 /// Atomically reserve capacity for receipt tracking and packet dispatch.
@@ -1678,7 +1557,11 @@ struct LxmdRunner {
     endpoint_dispatch: Option<rns_transport::link_endpoint_dispatch::LinkEndpointDispatchHandle>,
     transport_tx: mpsc::Sender<TransportMessage>,
     pending_runtime_transport: VecDeque<TransportMessage>,
-    required_announces: AnnounceMailbox,
+    delivery_stamps: DestinationStamps<AnnounceRequest>,
+    delivery_announce_rx: mpsc::UnboundedReceiver<AnnounceRequest>,
+    /// Path responses refused because wall time has not advanced past the last announce.
+    coalesced_path_responses: VecDeque<AnnounceRequest>,
+    control_link_command_tx: Option<mpsc::Sender<rns_runtime::link_manager::LinkManagerCommand>>,
     lossless_queue_high_water: LosslessQueueHighWater,
     /// Plaintext application data decoded by the LinkManager.
     link_packet_rx: mpsc::UnboundedReceiver<(Vec<u8>, [u8; 16])>,
@@ -1994,6 +1877,11 @@ impl LxmdRunner {
             paths.ratchet_control_path.clone(),
             wall_now,
         )?;
+        let mut delivery_ratchets = delivery_ratchets;
+        rns_runtime::destination_stamper::load_stored_stamp(
+            delivery_ratchets.destination_mut(),
+            &identity,
+        );
 
         // Mirrors Python `Identity._clean_ratchets()`: sweep the directory at
         // startup so stale entries don't survive a restart.
@@ -2083,14 +1971,24 @@ impl LxmdRunner {
         let (destination_delivery_proof_tx, destination_delivery_proof_rx) =
             mpsc::unbounded_channel::<rns_runtime::link_manager::DestinationDeliveryProof>();
 
+        let (delivery_link_tx, delivery_link_rx) = mpsc::channel(256);
+        let (delivery_announce_tx, delivery_announce_rx) = mpsc::unbounded_channel();
+        tokio::spawn(forward_delivery_events(
+            delivery_rx,
+            delivery_link_tx,
+            delivery_announce_tx,
+        ));
         let signing_key = identity.get_signing_key();
         let mut link_mgr = rns_runtime::link_manager::LinkManager::with_destination(
             transport_tx.clone(),
-            delivery_rx,
+            delivery_link_rx,
             &identity,
             DELIVERY_APP_NAME,
             signing_key,
         );
+        if let Some(destination) = link_mgr.destination_mut() {
+            destination.set_link_cost(DELIVERY_LINK_COST);
+        }
         if let Some(handle) = &endpoint_dispatch {
             link_mgr.set_link_endpoint_dispatch_handle(handle.clone());
         }
@@ -2145,10 +2043,7 @@ impl LxmdRunner {
         // commands that the daemon has actually accepted, instead of silently
         // dropping `--sync`/`--unpeer` when a bounded queue is full.
         let (control_command_tx, control_command_rx) = mpsc::unbounded_channel::<ControlCommand>();
-        // LinkManager announce callbacks are synchronous. Coalesce repeated
-        // requests by destination until the daemon actor can preserve them
-        // into the bounded transport mailbox.
-        let required_announces = AnnounceMailbox::default();
+        let mut control_link_command_tx = None;
 
         let mut propagation_admission = None;
         let prop_get_workers = PnGetWorkers::default();
@@ -2373,21 +2268,13 @@ impl LxmdRunner {
                 }
             });
 
-            let prop_announce_mailbox = required_announces.clone();
-            let prop_announce_identity = identity
-                .get_private_key()
-                .and_then(|key| Identity::from_private_key(&*key).ok());
-            let prop_announce_config = config.clone();
-            prop_link_mgr.set_announce_handler(move || {
-                if let Some(ref identity) = prop_announce_identity {
-                    send_propagation_announce_try(
-                        &prop_announce_mailbox,
-                        identity,
-                        propagation_dest_hash,
-                        &prop_announce_config,
-                    );
-                }
-            });
+            if let Some(destination) = prop_link_mgr.destination_mut() {
+                destination.set_link_cost(PROPAGATION_LINK_COST);
+                let app_data_config = config.clone();
+                destination.set_default_app_data(DefaultAppData::Dynamic(Box::new(move || {
+                    Some(propagation_node_app_data(&app_data_config))
+                })));
+            }
 
             let (pn_link_command_tx, pn_link_command_rx) =
                 mpsc::channel::<rns_runtime::link_manager::LinkManagerCommand>(256);
@@ -2492,22 +2379,11 @@ impl LxmdRunner {
                 }
             });
 
-            let control_announce_mailbox = required_announces.clone();
-            let control_announce_identity = identity
-                .get_private_key()
-                .and_then(|key| Identity::from_private_key(&*key).ok());
-            control_link_mgr.set_announce_handler(move || {
-                if let Some(ref identity) = control_announce_identity {
-                    send_control_announce_try(
-                        &control_announce_mailbox,
-                        identity,
-                        control_dest_hash,
-                    );
-                }
-            });
-
+            let (control_tx, control_rx) =
+                mpsc::channel::<rns_runtime::link_manager::LinkManagerCommand>(8);
+            control_link_command_tx = Some(control_tx);
             tokio::spawn(async move {
-                control_link_mgr.run().await;
+                control_link_mgr.run_with_commands(control_rx).await;
             });
 
             tracing::info!("propagation sync server ready for offer/get requests");
@@ -2593,7 +2469,10 @@ impl LxmdRunner {
             endpoint_dispatch,
             transport_tx: transport_tx.clone(),
             pending_runtime_transport: VecDeque::new(),
-            required_announces,
+            delivery_stamps: DestinationStamps::new(),
+            delivery_announce_rx,
+            coalesced_path_responses: VecDeque::new(),
+            control_link_command_tx,
             lossless_queue_high_water: LosslessQueueHighWater::default(),
             link_packet_rx,
             delivery_accounting_rx,
@@ -2815,39 +2694,103 @@ impl LxmdRunner {
         }
     }
 
-    fn create_announce_packet(&mut self) -> Result<Vec<u8>, String> {
-        let app_data =
-            delivery_announce_app_data(self.config.display_name.as_deref(), self.config.stamp_cost);
+    fn create_announce_packet(
+        &mut self,
+        kind: DeliveryAnnounceKind<'_>,
+        stamp_ext: Option<&AnnounceStampExt>,
+    ) -> Result<Vec<u8>, DeliveryRatchetError> {
+        // Path responses carry the default app data, which LXMRouter.py:431-434 sets only with a display name.
+        let app_data = match (kind, self.config.display_name.as_deref()) {
+            (DeliveryAnnounceKind::PathResponse { .. }, None) => Vec::new(),
+            (_, name) => delivery_announce_app_data(name, self.config.stamp_cost),
+        };
         let now = now_f64();
-        self.delivery_ratchets
-            .create_announce(
-                &self.identity,
-                &app_data,
-                now as u64,
-                now,
-                DeliveryAnnounceKind::Broadcast,
-            )
-            .map_err(|error| error.to_string())
+        self.delivery_ratchets.create_announce(
+            &self.identity,
+            &app_data,
+            now as u64,
+            now,
+            kind,
+            stamp_ext,
+        )
     }
 
-    fn create_propagation_announce_packet(&mut self) -> Result<Vec<u8>, String> {
-        create_propagation_announce_packet_for(
+    /// `Destination.announce` for the delivery destination: parked while its
+    /// stamp is generated when the policy stamps destinations.
+    fn request_delivery_announce(&mut self, request: AnnounceRequest) -> Result<(), String> {
+        let path_response = request.path_response;
+        match self.delivery_stamps.admit(
+            self.delivery_ratchets.destination(),
             &self.identity,
-            self.propagation_dest_hash,
-            &self.config,
-        )
+            path_response,
+            request,
+        ) {
+            Admission::Ready(request, ext) => self.emit_delivery_announce(request, ext.as_ref()),
+            Admission::Queued => Ok(()),
+            Admission::Dropped(_) => Err("stamp queue full, announce dropped".to_string()),
+        }
+    }
+
+    fn on_delivery_stamp(&mut self, outcome: StampOutcome) {
+        let ready = self.delivery_stamps.complete(
+            self.delivery_ratchets.destination_mut(),
+            &self.identity,
+            outcome,
+        );
+        for (request, ext) in ready {
+            if let Err(error) = self.emit_delivery_announce(request, ext.as_ref()) {
+                tracing::warn!("failed to send delivery announce after stamp generation: {error}");
+            }
+        }
+    }
+
+    fn emit_delivery_announce(
+        &mut self,
+        request: AnnounceRequest,
+        stamp_ext: Option<&AnnounceStampExt>,
+    ) -> Result<(), String> {
+        let kind = if request.path_response {
+            DeliveryAnnounceKind::PathResponse {
+                tag: request.tag.as_deref(),
+            }
+        } else {
+            DeliveryAnnounceKind::Broadcast
+        };
+        let raw = match self.create_announce_packet(kind, stamp_ext) {
+            Ok(raw) => raw,
+            Err(DeliveryRatchetError::Coalesced) if request.path_response => {
+                if self.coalesced_path_responses.len() < 32 {
+                    self.coalesced_path_responses.push_back(request);
+                }
+                return Ok(());
+            }
+            Err(error) => return Err(error.to_string()),
+        };
+        let outbound = rns_transport::messages::OutboundRequest {
+            raw: Bytes::from(raw),
+            destination_hash: self.lxmf_dest_hash,
+        };
+        let message = match request.attached_interface {
+            Some(interface_id) => TransportMessage::OutboundAttached {
+                request: outbound,
+                interface_id,
+            },
+            None => TransportMessage::Outbound(outbound),
+        };
+        if self.queue_runtime_transport(message, "delivery announce") {
+            Ok(())
+        } else {
+            Err("transport channel closed".to_string())
+        }
     }
 
     #[cfg(test)]
     async fn send_propagation_announce(&mut self) -> Result<(), String> {
-        let raw = self.create_propagation_announce_packet()?;
-        self.transport_tx
-            .send(TransportMessage::Outbound(
-                rns_transport::messages::OutboundRequest {
-                    raw: Bytes::from(raw),
-                    destination_hash: self.propagation_dest_hash,
-                },
-            ))
+        let tx = self
+            .prop_link_command_tx
+            .as_ref()
+            .ok_or("propagation node is not running")?;
+        tx.send(LinkManagerCommand::Announce)
             .await
             .map_err(|e| format!("Failed to send propagation announce: {e}"))
     }
@@ -2894,21 +2837,17 @@ impl LxmdRunner {
     }
 
     fn stage_delivery_announce(&mut self, context: &'static str) -> bool {
-        let Ok(raw) = self.create_announce_packet() else {
-            return false;
-        };
-        let dest = self.lxmf_dest_hash;
-        let staged = self.queue_runtime_transport(
-            TransportMessage::Outbound(rns_transport::messages::OutboundRequest {
-                raw: Bytes::from(raw),
-                destination_hash: dest,
-            }),
-            context,
-        );
-        if staged {
-            tracing::debug!("{context} staged");
+        match self.request_delivery_announce(AnnounceRequest::normal(DELIVERY_APP_NAME.to_string()))
+        {
+            Ok(()) => {
+                tracing::debug!("{context} staged");
+                true
+            }
+            Err(error) => {
+                tracing::warn!("{context} failed: {error}");
+                false
+            }
         }
-        staged
     }
 
     /// Time until the earliest scheduled node announce that is not yet due;
@@ -2936,29 +2875,13 @@ impl LxmdRunner {
         {
             return;
         }
-        let Ok(raw) = self.create_propagation_announce_packet() else {
-            return;
+        let announce = |tx: &Option<mpsc::Sender<LinkManagerCommand>>| {
+            tx.as_ref()
+                .is_some_and(|tx| tx.try_send(LinkManagerCommand::Announce).is_ok())
         };
-        let dest = self.propagation_dest_hash;
-        let node_staged = self.queue_runtime_transport(
-            TransportMessage::Outbound(rns_transport::messages::OutboundRequest {
-                raw: Bytes::from(raw),
-                destination_hash: dest,
-            }),
-            "propagation announce",
-        );
-        let mut control_staged = true;
-        if self.should_announce_control()
-            && let Ok(raw) = create_control_announce_packet(&self.identity, self.control_dest_hash)
-        {
-            control_staged = self.queue_runtime_transport(
-                TransportMessage::Outbound(rns_transport::messages::OutboundRequest {
-                    raw: Bytes::from(raw),
-                    destination_hash: self.control_dest_hash,
-                }),
-                "control announce",
-            );
-        }
+        let node_staged = announce(&self.prop_link_command_tx);
+        let control_staged =
+            !self.should_announce_control() || announce(&self.control_link_command_tx);
         if node_staged && control_staged {
             while self
                 .node_announces_due
@@ -3684,11 +3607,9 @@ impl LxmdRunner {
             &mut self.lossless_queue_high_water.store_write_tasks,
         );
         self.observe_lossless_queue_depths();
-        for (destination_hash, message) in self.required_announces.take_pending() {
-            if let Err(message) =
-                self.queue_runtime_transport_recoverable(message, "required announce")
-            {
-                self.required_announces.stage(destination_hash, *message);
+        for request in std::mem::take(&mut self.coalesced_path_responses) {
+            if let Err(error) = self.request_delivery_announce(request) {
+                tracing::debug!("delivery path response not sent: {error}");
             }
         }
         self.flush_runtime_transport();
@@ -6499,6 +6420,14 @@ pub(crate) async fn main() {
             Some(raw) = runner.inbound_raw_rx.recv() => {
                 runner.handle_inbound_packet(&raw);
             }
+            Some(request) = runner.delivery_announce_rx.recv() => {
+                if let Err(error) = runner.request_delivery_announce(request) {
+                    tracing::debug!("delivery announce not sent: {error}");
+                }
+            }
+            outcome = runner.delivery_stamps.recv() => {
+                runner.on_delivery_stamp(outcome);
+            }
             Some((plaintext, _link_id)) = runner.link_packet_rx.recv() => {
                 runner.handle_link_delivered_data(&plaintext);
                 runner.drain_link_packets();
@@ -7283,32 +7212,6 @@ mod tests {
     }
 
     #[test]
-    fn announce_mailbox_coalesces_bursts_and_preserves_distinct_destinations() {
-        let mailbox = AnnounceMailbox::default();
-        let identity = Identity::new();
-        let control_hash = [0x31; 16];
-        let propagation_hash = [0x32; 16];
-        let config = DaemonConfig::default();
-
-        for _ in 0..64 {
-            send_control_announce_try(&mailbox, &identity, control_hash);
-            send_propagation_announce_try(&mailbox, &identity, propagation_hash, &config);
-        }
-
-        assert_eq!(mailbox.pending_len(), 2);
-        let destinations = mailbox
-            .take_pending()
-            .into_iter()
-            .map(|(hash, _)| hash)
-            .collect::<HashSet<_>>();
-        assert_eq!(
-            destinations,
-            HashSet::from([control_hash, propagation_hash])
-        );
-        assert_eq!(mailbox.pending_len(), 0);
-    }
-
-    #[test]
     fn lossless_queue_high_water_only_moves_forward() {
         let mut high_water = 0;
         observe_lossless_queue_depth("test", 7, &mut high_water);
@@ -7497,26 +7400,19 @@ mod tests {
         );
     }
 
-    fn unpack_announce(raw: &[u8]) -> (rns_wire::header::PacketHeader, AnnounceData) {
+    fn unpack_announce(
+        raw: &[u8],
+    ) -> (
+        rns_wire::header::PacketHeader,
+        rns_identity::announce::AnnounceData,
+    ) {
         let (header, header_len) = rns_wire::header::PacketHeader::unpack(raw).unwrap();
-        let announce = AnnounceData::unpack(&raw[header_len..], header.flags.context_flag).unwrap();
-        (header, announce)
-    }
-
-    #[test]
-    fn propagation_announce_is_never_ratcheted() {
-        let identity = Identity::new();
-        let destination =
-            Destination::hash_from_name_and_identity("lxmf.propagation", Some(&identity.hash));
-        let raw = create_propagation_announce_packet_for(
-            &identity,
-            destination,
-            &DaemonConfig::default(),
+        let announce = rns_identity::announce::AnnounceData::unpack(
+            &raw[header_len..],
+            header.flags.context_flag,
         )
         .unwrap();
-        let (header, announce) = unpack_announce(&raw);
-        assert!(!header.flags.context_flag);
-        assert_eq!(announce.ratchet, None);
+        (header, announce)
     }
 
     #[tokio::test]
@@ -7529,23 +7425,29 @@ mod tests {
             "lxmd-node-announce-delay-{}-{unique}",
             std::process::id()
         ));
-        let (tx, mut rx) = mpsc::channel(64);
+        let (tx, _rx) = mpsc::channel(64);
         initialize_storage_namespace(&temp).unwrap();
         let mut runner = LxmdRunner::new(DaemonConfig::default(), &temp, tx, None).unwrap();
-        // Announce scheduling needs no propagation runtime, only its config.
+        // Announce scheduling needs no propagation runtime, only its config
+        // and the two destinations' command channels.
         runner.config.propagation_enabled = true;
         runner.config.node_announce_interval = Some(60);
         runner.router.allowed_control.push([0x55; 16]);
-        let mut staged = || {
-            std::iter::from_fn(|| rx.try_recv().ok())
-                .filter_map(|message| match message {
-                    TransportMessage::Outbound(request) => Some(request.destination_hash),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-        };
-        staged();
+        let (node_tx, mut node_rx) = mpsc::channel(8);
+        let (control_tx, mut control_rx) = mpsc::channel(8);
+        runner.prop_link_command_tx = Some(node_tx);
+        runner.control_link_command_tx = Some(control_tx);
         let (node, control) = (runner.propagation_dest_hash, runner.control_dest_hash);
+        let mut staged = || {
+            let mut out = Vec::new();
+            while let Ok(LinkManagerCommand::Announce) = node_rx.try_recv() {
+                out.push(node);
+            }
+            while let Ok(LinkManagerCommand::Announce) = control_rx.try_recv() {
+                out.push(control);
+            }
+            out
+        };
         let delay = NODE_ANNOUNCE_DELAY as f64;
 
         // Triggers due together are announced once, never before the delay.
@@ -7614,7 +7516,9 @@ mod tests {
             };
             initialize_storage_namespace(&temp).unwrap();
             let mut runner = LxmdRunner::new(config, &temp, tx, None).expect("runner");
-            let raw = runner.create_announce_packet().expect("delivery announce");
+            let raw = runner
+                .create_announce_packet(DeliveryAnnounceKind::Broadcast, None)
+                .expect("delivery announce");
             let (_, announce) = unpack_announce(&raw);
             let (_, stamp_cost) = lxmf_core::handlers::parse_announce_app_data(
                 announce.app_data.as_deref().expect("delivery app data"),

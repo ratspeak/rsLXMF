@@ -189,6 +189,10 @@ pub const PROPAGATION_LIMIT: usize = 256;
 pub const DELIVERY_LIMIT: usize = 1000;
 /// PROPAGATION_LIMIT * 40, in KB.
 pub const SYNC_LIMIT: usize = 10240;
+/// Link-request stamp cost announced by delivery destinations (LXMRouter.py:53).
+pub const DELIVERY_LINK_COST: f64 = 3.25;
+/// Link-request stamp cost announced by propagation destinations (LXMRouter.py:54).
+pub const PROPAGATION_LINK_COST: f64 = 3.25;
 pub const PROPAGATION_COST_MIN: f64 = 13.0;
 pub const PROPAGATION_COST: f64 = 16.0;
 pub const PROPAGATION_COST_FLEX: f64 = 3.0;

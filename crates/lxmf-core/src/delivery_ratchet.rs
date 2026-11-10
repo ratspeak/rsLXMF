@@ -6,6 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
+use rns_identity::announce::AnnounceStampExt;
 use rns_identity::announce_state::RatchetControlState;
 use rns_identity::destination::{AnnounceTime, DestType, Destination, Direction};
 use rns_identity::identity::Identity;
@@ -74,7 +75,7 @@ impl DeliveryRatchetState {
         control_path: PathBuf,
         wall_now: u64,
     ) -> Result<Self, DeliveryRatchetError> {
-        let destination = Destination::new(
+        let mut destination = Destination::new(
             Some(identity),
             Direction::In,
             DestType::Single,
@@ -83,6 +84,7 @@ impl DeliveryRatchetState {
         if destination.hash != destination_hash {
             return Err(DeliveryRatchetError::DestinationMismatch);
         }
+        destination.set_link_cost(crate::constants::DELIVERY_LINK_COST);
 
         let ring_existed = ring_path.exists();
         let (mut ring, ring_file_trusted) = if ring_existed {
@@ -189,6 +191,15 @@ impl DeliveryRatchetState {
         self.destination.hash
     }
 
+    /// The delivery destination, holding its destination stamp and link cost.
+    pub fn destination(&self) -> &Destination {
+        &self.destination
+    }
+
+    pub fn destination_mut(&mut self) -> &mut Destination {
+        &mut self.destination
+    }
+
     pub fn ring(&self) -> &RatchetRing {
         &self.ring
     }
@@ -201,7 +212,8 @@ impl DeliveryRatchetState {
     ///
     /// `wall_now` supplies both rotation age and the 40-bit wire ordering
     /// value. `cache_now` is a separate local elapsed-time domain used only for
-    /// tagged path-response expiry.
+    /// tagged path-response expiry. `stamp_ext` is appended to the app data
+    /// when the stamp policy stamps destinations.
     pub fn create_announce(
         &mut self,
         identity: &Identity,
@@ -209,6 +221,7 @@ impl DeliveryRatchetState {
         wall_now: u64,
         cache_now: f64,
         kind: DeliveryAnnounceKind<'_>,
+        stamp_ext: Option<&AnnounceStampExt>,
     ) -> Result<Vec<u8>, DeliveryRatchetError> {
         if identity.hash != self.control.identity_hash() {
             return Err(DeliveryRatchetError::DestinationMismatch);
@@ -285,13 +298,14 @@ impl DeliveryRatchetState {
             DeliveryAnnounceKind::PathResponse { tag } => (true, tag),
         };
         self.destination
-            .announce_packet_at(
+            .announce_packet_with_ext_at(
                 identity,
                 Some(app_data),
                 ratchet_public.as_ref(),
                 path_response,
                 tag,
                 AnnounceTime::new(wire_now, announce_time.cache)?,
+                stamp_ext,
             )
             .map_err(DeliveryRatchetError::from)
     }
@@ -383,6 +397,7 @@ mod tests {
                 101,
                 101.0,
                 DeliveryAnnounceKind::Broadcast,
+                None,
             )
             .unwrap();
         let (header, announce) = unpack_announce(&raw);
@@ -396,6 +411,7 @@ mod tests {
                 101,
                 101.5,
                 DeliveryAnnounceKind::Broadcast,
+                None,
             ),
             Err(DeliveryRatchetError::Coalesced)
         ));
@@ -410,6 +426,7 @@ mod tests {
                 102,
                 102.0,
                 DeliveryAnnounceKind::Broadcast,
+                None,
             )
             .unwrap();
         assert_eq!(unpack_announce(&raw).1.ratchet, Some(initial_public));
@@ -422,6 +439,7 @@ mod tests {
                 rotate_at,
                 rotate_at as f64,
                 DeliveryAnnounceKind::Broadcast,
+                None,
             )
             .unwrap();
         let rotated_public = unpack_announce(&raw).1.ratchet.unwrap();
@@ -459,6 +477,7 @@ mod tests {
                 101,
                 101.0,
                 DeliveryAnnounceKind::Broadcast,
+                None,
             )
             .unwrap();
         let (header, announce) = unpack_announce(&raw);
@@ -483,6 +502,7 @@ mod tests {
                 101,
                 101.0,
                 DeliveryAnnounceKind::Broadcast,
+                None,
             )
             .unwrap();
         assert!(!unpack_announce(&raw).0.flags.context_flag);
@@ -501,6 +521,7 @@ mod tests {
                 101,
                 101.0,
                 DeliveryAnnounceKind::Broadcast,
+                None,
             )
             .unwrap();
         let live_public = state.ring.current_public_key();
@@ -515,6 +536,7 @@ mod tests {
                 rotate_at,
                 rotate_at as f64,
                 DeliveryAnnounceKind::Broadcast,
+                None,
             ),
             Err(DeliveryRatchetError::PersistControl { .. })
         ));
@@ -535,6 +557,7 @@ mod tests {
                 101,
                 101.0,
                 DeliveryAnnounceKind::PathResponse { tag: Some(tag) },
+                None,
             )
             .unwrap();
         let committed_wire = state.control.last_announce_wire();
@@ -546,6 +569,7 @@ mod tests {
                 101,
                 102.0,
                 DeliveryAnnounceKind::PathResponse { tag: Some(tag) },
+                None,
             )
             .unwrap();
         assert_eq!(
@@ -574,6 +598,7 @@ mod tests {
                 101,
                 f64::NAN,
                 DeliveryAnnounceKind::Broadcast,
+                None,
             ),
             Err(DeliveryRatchetError::Destination(_))
         ));
