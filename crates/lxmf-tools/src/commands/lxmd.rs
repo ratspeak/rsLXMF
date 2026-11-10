@@ -5967,6 +5967,13 @@ pub(crate) async fn main() {
 
     let transport_tx = rns_handle.transport_tx.clone();
 
+    if control_preflight.is_none() {
+        // LXMRouter.REQUIRED_DESTINATION_TYPES, registered as the router starts.
+        for destination_type in [DELIVERY_APP_NAME, "lxmf.propagation"] {
+            rns_handle.wants_destination_type(destination_type).await;
+        }
+    }
+
     if let Some(preflight) = control_preflight {
         let identity = match Identity::from_file(&preflight.identity_path) {
             Ok(identity) => identity,
@@ -6612,6 +6619,8 @@ pub(crate) async fn main() {
         }
     }
 
+    // Reticulum's exit handler deregisters this process's destination types.
+    rns_handle.unwants_all_destination_types().await;
     tracing::info!("LXMF Daemon stopped");
     if let Some(status) = one_shot_status {
         std::process::exit(status);
