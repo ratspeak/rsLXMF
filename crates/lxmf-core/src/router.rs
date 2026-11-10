@@ -6,7 +6,7 @@
 //! `LXMRouter` is the corresponding protocol reference.
 
 use crate::now_f64;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 
 use bytes::Bytes;
@@ -156,6 +156,23 @@ pub enum SendError {
         message: Box<LxMessage>,
         source: TicketPreparationError,
     },
+    /// Opportunistic content above the PLAIN single-packet limit; Python
+    /// raises here instead of falling back to a link.
+    ContentTooLarge {
+        message: Box<LxMessage>,
+        size: usize,
+        limit: usize,
+    },
+}
+
+/// Outcome of [`LxmRouter::ingest_lxm_uri`] for a URI that decoded and decrypted.
+#[derive(Debug)]
+pub enum PaperIngest {
+    /// Python's `signal_local_delivery`. The delivery callback ran unless the
+    /// source is ignored or the message id was already delivered.
+    Delivered(Box<LxMessage>),
+    /// Python's `signal_duplicate`: the paper bytes were already processed.
+    Duplicate,
 }
 
 impl SendError {
@@ -163,6 +180,7 @@ impl SendError {
         match self {
             Self::MissingOutboundPropagationNode(message) => message,
             Self::TicketPreparation { message, .. } => message,
+            Self::ContentTooLarge { message, .. } => message,
         }
     }
 }
@@ -174,6 +192,10 @@ impl fmt::Display for SendError {
                 "attempt to send propagated message with no outbound propagation node configured",
             ),
             Self::TicketPreparation { source, .. } => source.fmt(f),
+            Self::ContentTooLarge { size, limit, .. } => write!(
+                f,
+                "opportunistic content of length {size} exceeds the single-packet limit of {limit}"
+            ),
         }
     }
 }
@@ -336,6 +358,10 @@ pub struct LxmRouter {
     pub blocked: Vec<[u8; 16]>,
     pub allowed_control: Vec<[u8; 16]>,
     pub ignored: Vec<[u8; 16]>,
+    /// Outbound destinations of type PLAIN: unencrypted single packets.
+    plain_destinations: HashSet<[u8; 16]>,
+    /// Destinations whose latest announce lists features without `SF_COMPRESSION`.
+    compression_unsupported: HashSet<[u8; 16]>,
     pub peers: HashMap<[u8; 16], LxmPeer>,
     /// Peers that will never be rotated out.
     pub static_peers: Vec<[u8; 16]>,
@@ -452,6 +478,8 @@ impl LxmRouter {
             blocked: Vec::new(),
             allowed_control: Vec::new(),
             ignored: Vec::new(),
+            plain_destinations: HashSet::new(),
+            compression_unsupported: HashSet::new(),
             peers: HashMap::new(),
             static_peers: Vec::new(),
             propagation_store: PropagationStore::new(),
@@ -592,7 +620,17 @@ impl LxmRouter {
             let content_size = packed
                 .len()
                 .saturating_sub(TIMESTAMP_SIZE + STRUCT_OVERHEAD);
-            if content_size > ENCRYPTED_PACKET_MAX_CONTENT {
+            if self.is_plain_destination(&message.destination_hash()) {
+                if content_size > PLAIN_PACKET_MAX_CONTENT {
+                    return Err(SendError::ContentTooLarge {
+                        message: Box::new(message),
+                        size: content_size,
+                        limit: PLAIN_PACKET_MAX_CONTENT,
+                    });
+                }
+                message.transport_encrypted = false;
+                message.transport_encryption = Some("Unencrypted".to_string());
+            } else if content_size > ENCRYPTED_PACKET_MAX_CONTENT {
                 message.method = DeliveryMethod::Direct;
             }
         }
@@ -873,6 +911,38 @@ impl LxmRouter {
     pub fn unignore_destination(&mut self, dest_hash: &[u8; 16]) {
         self.ignored.retain(|h| h != dest_hash);
         self.propagation_store.unignore_destination(dest_hash);
+    }
+
+    /// Mark an outbound destination as PLAIN, as a Python `LXMessage` built
+    /// for an `RNS.Destination.PLAIN`: opportunistic messages to it go out as
+    /// unencrypted PLAIN packets of at most [`PLAIN_PACKET_MAX_CONTENT`].
+    pub fn register_plain_destination(&mut self, dest_hash: [u8; 16]) {
+        self.plain_destinations.insert(dest_hash);
+    }
+
+    pub fn deregister_plain_destination(&mut self, dest_hash: &[u8; 16]) {
+        self.plain_destinations.remove(dest_hash);
+    }
+
+    pub fn is_plain_destination(&self, dest_hash: &[u8; 16]) -> bool {
+        self.plain_destinations.contains(dest_hash)
+    }
+
+    /// Record a destination's latest announce app data for Python
+    /// `LXMessage.determine_compression_support`, which every send applies.
+    pub fn update_compression_support(&mut self, dest_hash: [u8; 16], app_data: Option<&[u8]>) {
+        if app_data.is_some_and(|data| {
+            !data.is_empty() && !crate::handlers::compression_support_from_app_data(data)
+        }) {
+            self.compression_unsupported.insert(dest_hash);
+        } else {
+            self.compression_unsupported.remove(&dest_hash);
+        }
+    }
+
+    /// Whether sends to `dest_hash` may compress, from its latest announce.
+    pub fn compression_supported(&self, dest_hash: &[u8; 16]) -> bool {
+        !self.compression_unsupported.contains(dest_hash)
     }
 
     pub fn prioritise(&mut self, identity_hash: [u8; 16], level: u8) {
@@ -1188,12 +1258,17 @@ impl LxmRouter {
     }
 
     /// Mark a message ID delivered in memory and invoke the registered callback.
-    /// With `allow_duplicate = false`, an ID already in the local-delivery cache
-    /// returns `false`; with `true`, repeated calls may invoke the callback again.
+    /// A message from an ignored source returns `false` and is not recorded
+    /// (Python `lxmf_delivery`). With `allow_duplicate = false`, an ID already
+    /// in the local-delivery cache returns `false`; with `true`, repeated calls
+    /// may invoke the callback again.
     /// This compatibility helper does not verify the message, persist local
     /// effects or record a distinct ciphertext transient ID. Use the reservation
     /// and durable-receipt commit path for application admission.
     pub fn deliver_inbound(&mut self, message: &LxMessage, allow_duplicate: bool) -> bool {
+        if self.ignored.contains(&message.source_hash()) {
+            return false;
+        }
         let message_id = message.message_id();
         if !allow_duplicate && self.propagation_store.is_locally_delivered(&message_id) {
             return false;
@@ -1290,21 +1365,48 @@ impl LxmRouter {
         true
     }
 
-    /// Decode/decrypt a paper URI and pass it to [`Self::deliver_inbound`] without
-    /// signature verification or durable persistence. The returned message is
-    /// unverified, and a registered callback may already have run. For verified
-    /// durable admission, decode separately and use the reservation/commit path.
+    /// Ingest a paper URI as Python `LXMRouter.ingest_lxm_uri`: the transient id
+    /// (full hash of the paper bytes) is claimed in the processed cache, then the
+    /// decrypted message goes to [`Self::deliver_inbound`] with method
+    /// Propagated and the transient id is recorded as delivered. A repeated
+    /// URI returns [`PaperIngest::Duplicate`] unless `allow_duplicate` is set.
+    /// No signature verification or stamp enforcement happens here, and the
+    /// returned message is unverified.
     pub fn ingest_lxm_uri<F>(
         &mut self,
         uri: &str,
+        allow_duplicate: bool,
         decrypt_fn: F,
-    ) -> Result<LxMessage, crate::message::MessageError>
+    ) -> Result<PaperIngest, MessageError>
     where
-        F: FnOnce(&[u8]) -> Result<Vec<u8>, crate::message::MessageError>,
+        F: FnOnce(&[u8]) -> Result<Vec<u8>, MessageError>,
     {
-        let message = LxMessage::from_paper_uri(uri, decrypt_fn)?;
-        self.deliver_inbound(&message, false);
-        Ok(message)
+        let (destination_hash, encrypted) = LxMessage::decode_paper_uri(uri)?;
+        let mut lxmf_data = Vec::with_capacity(DESTINATION_LENGTH + encrypted.len());
+        lxmf_data.extend_from_slice(&destination_hash);
+        lxmf_data.extend_from_slice(&encrypted);
+        let transient_id = rns_crypto::sha::full_hash(&lxmf_data);
+        if !allow_duplicate
+            && (self.propagation_store.contains(&transient_id)
+                || self.propagation_store.is_locally_processed(&transient_id))
+        {
+            return Ok(PaperIngest::Duplicate);
+        }
+        self.propagation_store.mark_locally_processed(transient_id);
+
+        let mut packed = destination_hash.to_vec();
+        packed.extend_from_slice(&decrypt_fn(&encrypted)?);
+        // Python records the transient id as delivered even when the decrypted
+        // bytes do not unpack (LXMRouter.py:2858-2864).
+        let unpacked = LxMessage::unpack(&packed);
+        self.propagation_store.mark_locally_delivered(transient_id);
+        let mut message = unpacked?;
+        message.method = DeliveryMethod::Propagated;
+        message.representation = DeliveryRepresentation::Paper;
+        message.transport_encrypted = true;
+        message.transport_encryption = Some(rns_identity::identity::CURVE.to_string());
+        self.deliver_inbound(&message, allow_duplicate);
+        Ok(PaperIngest::Delivered(Box::new(message)))
     }
 
     /// Replace the router-wide callback used by inbound delivery/commit helpers.
@@ -1599,7 +1701,7 @@ impl LxmRouter {
     /// Mark pending propagated messages due after the configured propagation node announces.
     ///
     /// Requires the configured destination and app data accepted by
-    /// [`crate::handlers::parse_pn_announce_data`] before clearing retry backoff.
+    /// [`crate::handlers::pn_announce_data_is_valid`] before clearing retry backoff.
     /// The caller verifies the announce's identity and authenticity.
     pub fn trigger_outbound_for_propagation_node_announce(
         &mut self,
@@ -1609,7 +1711,7 @@ impl LxmRouter {
         if self.outbound_propagation_node != Some(destination_hash) {
             return 0;
         }
-        if crate::handlers::parse_pn_announce_data(app_data).is_none() {
+        if !crate::handlers::pn_announce_data_is_valid(app_data) {
             return 0;
         }
 
@@ -1941,6 +2043,7 @@ impl LxmRouter {
                             let mut msg = self.pending_outbound.remove(i);
                             msg.mark_sending();
                             let dest_hash = msg.destination_hash();
+                            msg.auto_compress = self.compression_supported(&dest_hash);
                             actions.push(OutboundAction::DeliverDirect {
                                 message: msg,
                                 dest_hash,
@@ -1971,6 +2074,7 @@ impl LxmRouter {
                     msg.mark_sent();
                     msg.progress = 0.50;
                     let dest_hash = msg.destination_hash();
+                    msg.auto_compress = self.compression_supported(&dest_hash);
                     actions.push(OutboundAction::DeliverOpportunistic {
                         message: msg,
                         dest_hash,
@@ -2051,6 +2155,9 @@ impl LxmRouter {
                     if self.pending_outbound[i].state != MessageState::Sending {
                         self.pending_outbound[i].mark_sending();
                     }
+                    // Python LXMessage.send re-reads compression support on every send.
+                    let dest_hash = self.pending_outbound[i].destination_hash();
+                    self.pending_outbound[i].auto_compress = self.compression_supported(&dest_hash);
                     let plan = plan_direct_delivery(&mut self.pending_outbound[i], input, now);
                     match plan {
                         DirectDeliveryPlan::Fail => {
@@ -2121,6 +2228,7 @@ impl LxmRouter {
                     msg.mark_sent();
                     msg.progress = 0.50;
                     let dest_hash = msg.destination_hash();
+                    msg.auto_compress = self.compression_supported(&dest_hash);
                     actions.push(OutboundAction::DeliverOpportunistic {
                         message: msg,
                         dest_hash,
@@ -2193,9 +2301,15 @@ impl LxmRouter {
                     mut message,
                     dest_hash,
                 } => {
-                    match message
-                        .pack_opportunistic_encrypted(|plaintext| encrypt_fn(dest_hash, plaintext))
-                    {
+                    let plain = self.plain_destinations.contains(&dest_hash);
+                    let payload = if plain {
+                        Ok(message.wire_bytes()[DESTINATION_LENGTH..].to_vec())
+                    } else {
+                        message.pack_opportunistic_encrypted(|plaintext| {
+                            encrypt_fn(dest_hash, plaintext)
+                        })
+                    };
+                    match payload {
                         Ok(packet_payload) => {
                             // Python LXMessage.__as_packet strips the destination
                             // hash before encryption because the RNS packet
@@ -2204,7 +2318,11 @@ impl LxmRouter {
                                 header_type: rns_wire::flags::HeaderType::Header1,
                                 context_flag: false,
                                 transport_type: rns_wire::flags::TransportType::Broadcast,
-                                destination_type: rns_wire::flags::DestinationType::Single,
+                                destination_type: if plain {
+                                    rns_wire::flags::DestinationType::Plain
+                                } else {
+                                    rns_wire::flags::DestinationType::Single
+                                },
                                 packet_type: rns_wire::flags::PacketType::Data,
                             };
                             let header = rns_wire::header::PacketHeader {
@@ -3425,9 +3543,11 @@ mod tests {
             fired_clone.store(true, Ordering::Relaxed);
         });
 
-        let decoded = router
-            .ingest_lxm_uri(&uri, |ciphertext| Ok(ciphertext.to_vec()))
-            .unwrap();
+        let Ok(PaperIngest::Delivered(decoded)) =
+            router.ingest_lxm_uri(&uri, false, |ciphertext| Ok(ciphertext.to_vec()))
+        else {
+            panic!("paper URI not delivered");
+        };
         assert_eq!(decoded.title_text(), "paper");
         assert!(fired.load(Ordering::Relaxed));
     }
@@ -4359,6 +4479,64 @@ mod tests {
             rx.try_recv().is_err(),
             "execute_actions without an encryptor must not send raw opportunistic payloads"
         );
+    }
+
+    #[test]
+    fn propagation_node_announce_trigger_follows_python_validity() {
+        let mut router = LxmRouter::new(RouterConfig::default());
+        let node = [0xCC; 16];
+        router.set_outbound_propagation_node(Some(node));
+        router
+            .try_send(crate::message::test_message(
+                [0xAA; 16],
+                [0xBB; 16],
+                "Propagated",
+                "Content",
+                DeliveryMethod::Propagated,
+            ))
+            .unwrap();
+        // NaN slot-5 cost: pn_announce_data_is_valid accepts it, the typed parse does not.
+        let data = hex::decode(
+            "97c2ce6553f100c3cd0100cd280093cb7ff800000000000003128101c407706e206e616d65",
+        )
+        .unwrap();
+        assert!(crate::handlers::parse_pn_announce_data(&data).is_none());
+        assert_eq!(
+            router.trigger_outbound_for_propagation_node_announce(node, &data),
+            1
+        );
+    }
+
+    #[test]
+    fn compression_support_follows_latest_announce() {
+        let mut router = LxmRouter::new(RouterConfig::default());
+        let dest = [0xAB; 16];
+        assert!(router.compression_supported(&dest));
+        router.update_compression_support(dest, Some(&[0x93, 0xc4, 0x01, b'n', 0xc0, 0x90]));
+        assert!(!router.compression_supported(&dest));
+        router.update_compression_support(dest, Some(&[0x93, 0xc4, 0x01, b'n', 0x08, 0x91, 0x00]));
+        assert!(router.compression_supported(&dest));
+        router.update_compression_support(dest, Some(&[0x93, 0xc4, 0x01, b'n', 0xc0, 0x90]));
+        router
+            .try_send(crate::message::test_message(
+                dest,
+                [0xBB; 16],
+                "Direct",
+                "Content",
+                DeliveryMethod::Direct,
+            ))
+            .unwrap();
+        let actions = router.process_outbound_with_direct(|_, _| DirectDeliveryPlanInput {
+            identity_known: true,
+            route: Some(DirectRouteSnapshot::new(dest, 1)),
+            reusable_link: DirectReusableLinkState::None,
+        });
+        assert!(matches!(
+            actions.as_slice(),
+            [OutboundAction::PlanDirect { message, .. }] if !message.auto_compress
+        ));
+        router.update_compression_support(dest, None);
+        assert!(router.compression_supported(&dest));
     }
 
     #[test]

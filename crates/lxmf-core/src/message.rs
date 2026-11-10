@@ -734,6 +734,7 @@ impl LxMessage {
     /// The caller supplies destination-identity decryption. This method restores
     /// the destination prefix, parses the message, and marks its representation
     /// as Paper. Authenticate the sender separately with [`Self::verify`].
+    /// Router ingest with duplicate handling is `LxmRouter::ingest_lxm_uri`.
     pub fn from_paper_uri<F>(uri: &str, decrypt_fn: F) -> Result<Self, MessageError>
     where
         F: FnOnce(&[u8]) -> Result<Vec<u8>, MessageError>,

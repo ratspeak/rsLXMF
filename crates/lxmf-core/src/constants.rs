@@ -159,6 +159,10 @@ pub const LXMF_OVERHEAD: usize =
 /// the packet's destination supplies the destination hash. 383 - 112 + 16 = 287.
 pub const ENCRYPTED_PACKET_MAX_CONTENT: usize =
     rns_wire::constants::SINGLE_PACKET_ENCRYPTED_MDU - LXMF_OVERHEAD + DESTINATION_LENGTH;
+/// Largest content of an unencrypted single packet to a PLAIN destination.
+/// 464 - 112 + 16 = 368.
+pub const PLAIN_PACKET_MAX_CONTENT: usize =
+    rns_wire::constants::PLAIN_MDU - LXMF_OVERHEAD + DESTINATION_LENGTH;
 pub const PAPER_MDU: usize = 2210;
 
 pub const TICKET_EXPIRY: u64 = 21 * 24 * 60 * 60;

@@ -1800,6 +1800,8 @@ impl LxmdRunner {
         for (destination_hash, recalled) in answered {
             self.identity_recalls.remove(&destination_hash);
             if let Some(recalled) = recalled {
+                self.router
+                    .update_compression_support(destination_hash, recalled.app_data.as_deref());
                 self.learn_identity(
                     &destination_hash,
                     recalled.public_key,
@@ -3969,6 +3971,13 @@ impl LxmdRunner {
                         tracing::debug!(dest = %dest_hex, %error, "kept cached stamp cost");
                     }
                 }
+                self.router
+                    .update_compression_support(event.destination_hash, event.app_data.as_deref());
+                if !self.router.compression_supported(&event.destination_hash)
+                    && let Some(ref mut ld) = self.link_delivery
+                {
+                    ld.disable_pending_direct_compression(event.destination_hash);
+                }
                 let triggered = self
                     .router
                     .trigger_outbound_for_delivery_announce(event.destination_hash);
@@ -4095,6 +4104,11 @@ impl LxmdRunner {
                     stamp_cost = pn.stamp_cost,
                     "learned propagation-node stamp cost from announce"
                 );
+            }
+            // Python triggers on pn_announce_data_is_valid alone (Handlers.py:43-53).
+            if event.name_hash == propagation_name_hash
+                && let Some(data) = event.app_data.as_deref()
+            {
                 let triggered = self
                     .router
                     .trigger_outbound_for_propagation_node_announce(event.destination_hash, data);
@@ -5173,8 +5187,8 @@ impl LxmdRunner {
                             let hops = route_hops_for(&self.route_hops, prop_hash);
                             self.ensure_link_delivery();
                             if let Some(ref mut ld) = self.link_delivery
-                                && let Err(err) = ld
-                                    .start_packed_delivery(message, prop_hash, hops, packed, false)
+                                && let Err(err) =
+                                    ld.start_packed_delivery(message, prop_hash, hops, packed, true)
                             {
                                 let reason = err.error.to_string();
                                 tracing::warn!(
