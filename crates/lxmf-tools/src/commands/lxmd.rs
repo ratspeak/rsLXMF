@@ -53,7 +53,7 @@ use lxmf_tools::lxmd_cli::{
 };
 use lxmf_tools::lxmd_control::{
     CONTROL_APP_NAME, ControlCommandKind, ControlResponse, decode_control_response,
-    encode_control_success, encode_nil_response, encode_peer_error, encode_router_control_stats,
+    encode_control_success, encode_peer_error, encode_router_control_stats,
     exit_for_control_response, format_remote_status, print_control_link_error, query_control,
     resolve_remote_identity_hash,
 };
@@ -2452,7 +2452,8 @@ impl LxmdRunner {
 
                 if path_hash == stats_path_hash {
                     tracing::info!("control: handling stats request");
-                    Some(snapshot.stats_response.unwrap_or_else(encode_nil_response))
+                    // compile_stats returns None off a propagation node: no response.
+                    snapshot.stats_response
                 } else if path_hash == sync_path_hash {
                     tracing::info!("control: handling peer sync request");
                     if data.len() != 16 {

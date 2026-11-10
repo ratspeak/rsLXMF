@@ -147,10 +147,6 @@ pub fn encode_control_success() -> Vec<u8> {
     encode_value(&Value::Boolean(true))
 }
 
-pub fn encode_nil_response() -> Vec<u8> {
-    encode_value(&Value::Nil)
-}
-
 pub fn encode_router_control_stats(
     router: &LxmRouter,
     identity_hash: [u8; 16],
