@@ -96,7 +96,7 @@ fn help_lists_cli_surface_without_starting_runtime() {
 
 #[cfg(unix)]
 #[test]
-fn ctrl_c_exits_during_startup_announce_wait() {
+fn ctrl_c_exits_during_deferred_start() {
     let lxmf_dir = TestDir::new("lxmf-ctrlc");
     let rns_dir = TestDir::new("rns-ctrlc");
     fs::write(
@@ -173,11 +173,6 @@ discover_interfaces = No
     assert!(
         output.status.success(),
         "expected clean shutdown after Ctrl+C, got:\n{}",
-        combined_output(&output)
-    );
-    assert!(
-        combined_output(&output).contains("Startup announce cancelled by shutdown"),
-        "expected startup announce cancellation log, got:\n{}",
         combined_output(&output)
     );
 }

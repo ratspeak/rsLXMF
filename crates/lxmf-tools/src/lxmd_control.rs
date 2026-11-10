@@ -17,6 +17,8 @@ use rns_runtime::link_client::{LinkClient, LinkClientError};
 use rns_transport::messages::TransportMessage;
 use tokio::sync::mpsc;
 
+const PATHFINDER_M: i64 = rns_transport::constants::PATHFINDER_M as i64;
+
 pub const CONTROL_APP_NAME: &str = "lxmf.propagation.control";
 pub const PROPAGATION_APP_NAME: &str = "lxmf.propagation";
 
@@ -155,6 +157,7 @@ pub fn encode_router_control_stats(
     propagation_destination_hash: [u8; 16],
     node: Option<&PropagationNode>,
     now: f64,
+    hops_to: impl Fn(&[u8; 16]) -> u8,
 ) -> Vec<u8> {
     let message_count = node
         .map(PropagationNode::message_count)
@@ -192,7 +195,14 @@ pub fn encode_router_control_stats(
                 Value::from(peer.state as u64),
             ),
             (Value::String("alive".into()), Value::Boolean(peer.alive)),
-            (Value::String("name".into()), Value::Nil),
+            (
+                Value::String("name".into()),
+                peer.metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get(&lxmf_core::constants::PN_META_NAME))
+                    .and_then(|name| std::str::from_utf8(name).ok())
+                    .map_or(Value::Nil, Value::from),
+            ),
             (
                 Value::String("last_heard".into()),
                 Value::from(peer.last_heard as i64),
@@ -244,7 +254,7 @@ pub fn encode_router_control_stats(
             (Value::String("peering_key".into()), peering_key_value),
             (
                 Value::String("network_distance".into()),
-                Value::from(255_u64),
+                Value::from(hops_to(hash)),
             ),
             (Value::String("rx_bytes".into()), Value::from(peer.rx_bytes)),
             (Value::String("tx_bytes".into()), Value::from(peer.tx_bytes)),
@@ -582,8 +592,8 @@ pub fn format_remote_status(
                 "Unreachable"
             };
             let last_heard_age = (now - map_f64(peer, "last_heard").unwrap_or(0.0)).max(0.0);
-            let hops = map_i64(peer, "network_distance").unwrap_or(255);
-            let hops_text = if hops == 255 {
+            let hops = map_i64(peer, "network_distance").unwrap_or(PATHFINDER_M);
+            let hops_text = if hops == PATHFINDER_M {
                 "hops unknown".to_string()
             } else if hops == 1 {
                 "1 hop away".to_string()
@@ -1096,8 +1106,14 @@ mod tests {
         router.peers.insert(peer_hash, peer);
         router.static_peers.push(peer_hash);
 
-        let encoded =
-            encode_router_control_stats(&router, [0x11; 16], [0x22; 16], None, 1_700_003_600.0);
+        let encoded = encode_router_control_stats(
+            &router,
+            [0x11; 16],
+            [0x22; 16],
+            None,
+            1_700_003_600.0,
+            |_| rns_transport::constants::PATHFINDER_M,
+        );
         let stats = decode_value(&encoded);
         let keys = stats
             .as_map()

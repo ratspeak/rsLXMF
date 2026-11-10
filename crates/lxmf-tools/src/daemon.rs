@@ -486,11 +486,9 @@ pub fn create_router_with_transport(
     router
 }
 
-/// Execute an on_inbound hook.
-///
-/// Runs `Command::new(prog).arg(...)` with `message_path` as a separate
-/// argument rather than interpolating into a shell string, so untrusted path
-/// contents cannot inject shell metacharacters.
+/// Execute an on_inbound hook as Python lxmd does: the command and the quoted
+/// message path are split like `shlex.split(command + ' "' + path + '"')`, the
+/// output is discarded and the exit status is ignored.
 pub fn execute_on_inbound(command: &str, message_path: &str) -> std::io::Result<()> {
     execute_on_inbound_with_event(command, message_path, "")
 }
@@ -498,38 +496,33 @@ pub fn execute_on_inbound(command: &str, message_path: &str) -> std::io::Result<
 /// Execute an inbound hook with `event_id` in the `LXMF_EVENT_ID` environment
 /// variable when the identifier is nonempty. Durable propagation outbox events
 /// may replay after a crash; the hook can use the identifier to deduplicate them.
+/// Only a failure to run the command is an error.
 pub fn execute_on_inbound_with_event(
     command: &str,
     message_path: &str,
     event_id: &str,
 ) -> std::io::Result<()> {
-    use std::process::Command;
+    use std::process::{Command, Stdio};
 
-    let parts = split_command_line(command)?;
-    if parts.is_empty() {
+    // An empty command is falsy in Python and runs nothing.
+    if command.is_empty() {
         return Ok(());
     }
-
+    let parts = split_command_line(&format!("{command} \"{message_path}\""))?;
     let mut cmd = Command::new(&parts[0]);
-    for arg in &parts[1..] {
-        cmd.arg(arg);
-    }
-    cmd.arg(message_path);
+    cmd.args(&parts[1..])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     if !event_id.is_empty() {
         cmd.env("LXMF_EVENT_ID", event_id);
     }
-
-    let status = cmd.status()?;
-    if !status.success() {
-        return Err(std::io::Error::other(format!(
-            "on_inbound command exited with status: {status}"
-        )));
-    }
+    cmd.status()?;
     Ok(())
 }
 
-/// Parse the configured hook using the shell-like quoting supported by
-/// Python's `shlex.split()`, without invoking a shell.
+/// Split a command line as Python's POSIX `shlex.split()` does, without
+/// invoking a shell.
 fn split_command_line(command: &str) -> std::io::Result<Vec<String>> {
     use std::io::{Error, ErrorKind};
 
@@ -545,8 +538,18 @@ fn split_command_line(command: &str) -> std::io::Result<Vec<String>> {
     let mut quote = Quote::None;
     let mut escaped = false;
     let mut started = false;
+    let mut escaped_in_double = false;
 
     for ch in command.chars() {
+        // Inside double quotes a backslash escapes only `"` and `\`.
+        if escaped_in_double {
+            if ch != '"' && ch != '\\' {
+                current.push('\\');
+            }
+            current.push(ch);
+            escaped_in_double = false;
+            continue;
+        }
         if escaped {
             current.push(ch);
             escaped = false;
@@ -567,7 +570,7 @@ fn split_command_line(command: &str) -> std::io::Result<Vec<String>> {
                 if ch == '"' {
                     quote = Quote::None;
                 } else if ch == '\\' {
-                    escaped = true;
+                    escaped_in_double = true;
                 } else {
                     current.push(ch);
                 }
@@ -586,7 +589,7 @@ fn split_command_line(command: &str) -> std::io::Result<Vec<String>> {
                     escaped = true;
                     started = true;
                 }
-                c if c.is_whitespace() => {
+                ' ' | '\t' | '\r' | '\n' => {
                     if started {
                         parts.push(std::mem::take(&mut current));
                         started = false;
@@ -600,7 +603,7 @@ fn split_command_line(command: &str) -> std::io::Result<Vec<String>> {
         }
     }
 
-    if escaped || quote != Quote::None {
+    if escaped || escaped_in_double || quote != Quote::None {
         return Err(Error::new(
             ErrorKind::InvalidInput,
             "unterminated quote or escape in on_inbound command",

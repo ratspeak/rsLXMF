@@ -474,11 +474,13 @@ mod tests {
         );
         data.timebase = 1_700_000_000;
         data.set_name("Node");
+        data.version = Some("1.3.0".into());
 
+        // Upstream metadata order: 0xFE impl name, 0x00 version, then binary 0x01 name.
         assert_eq!(
             hex::encode(propagation_announce_app_data(&data)),
             concat!(
-                "98c2ce6553f100c3cd0100cd2800931103138101c4044e6f6465",
+                "98c2ce6553f100c3cd0100cd28009311031383ccfea46c786d6400a5312e332e3001c4044e6f6465",
                 "93cb4030400000000000cb4008000000000000cb4032800000000000"
             )
         );

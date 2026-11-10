@@ -54,7 +54,9 @@ pub enum CompressionSupport {
 /// Wire layout is an 8-element msgpack array:
 /// `[false, timebase, node_state, transfer_limit_kb, sync_limit_kb,
 /// [ceil(stamp_cost), ceil(stamp_flex), ceil(peering_cost)], metadata,
-/// [stamp_cost, stamp_flex, peering_cost]]`.
+/// [stamp_cost, stamp_flex, peering_cost]]`. The metadata map carries
+/// [`PN_META_IMPL_NAME`] and [`PN_META_VERSION`] as strings, then the binary
+/// entries of `metadata`.
 ///
 /// Python reference: `LXMRouter.get_propagation_node_app_data`.
 #[derive(Debug, Clone)]
@@ -74,6 +76,11 @@ pub struct PropagationNodeAnnounceData {
     pub stamp_cost: f64,
     pub stamp_flex: f64,
     pub peering_cost: f64,
+    /// [`PN_META_IMPL_NAME`] string; `new` sets `"lxmd"` as upstream does.
+    pub impl_name: Option<String>,
+    /// [`PN_META_VERSION`] string; `new` sets this crate's version.
+    pub version: Option<String>,
+    /// Binary metadata entries, such as [`PN_META_NAME`].
     pub metadata: HashMap<u8, Vec<u8>>,
 }
 
@@ -98,6 +105,8 @@ impl PropagationNodeAnnounceData {
             stamp_cost,
             stamp_flex,
             peering_cost,
+            impl_name: Some(PN_IMPL_NAME.to_string()),
+            version: Some(env!("CARGO_PKG_VERSION").to_string()),
             metadata: HashMap::new(),
         }
     }
@@ -124,8 +133,23 @@ pub fn get_propagation_node_app_data(data: &PropagationNodeAnnounceData) -> Vec<
 
     let metadata = {
         let mut map = Vec::new();
-        for (k, v) in &data.metadata {
-            map.push((Value::from(*k as u64), Value::Binary(v.clone())));
+        for (key, text) in [
+            (PN_META_IMPL_NAME, &data.impl_name),
+            (PN_META_VERSION, &data.version),
+        ] {
+            if let Some(text) = text {
+                map.push((Value::from(key), Value::from(text.as_str())));
+            }
+        }
+        let mut entries = data
+            .metadata
+            .iter()
+            .filter(|(k, _)| data.impl_name.is_none() || **k != PN_META_IMPL_NAME)
+            .filter(|(k, _)| data.version.is_none() || **k != PN_META_VERSION)
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|(k, _)| **k);
+        for (k, v) in entries {
+            map.push((Value::from(*k), Value::Binary(v.clone())));
         }
         Value::Map(map)
     };
@@ -393,8 +417,9 @@ pub fn pn_announce_data_is_valid(data: &[u8]) -> bool {
 /// Limits are extracted with `int()` as the Python announce handler does.
 /// Costs come from the fractional slot 7 when present, else from `int()` of
 /// slot 5, as the handler takes them. Limits below zero become zero; announces with a
-/// non-finite cost are refused. Only metadata with `u8` keys and binary values
-/// is retained.
+/// non-finite cost are refused. String [`PN_META_IMPL_NAME`] and
+/// [`PN_META_VERSION`] values fill `impl_name` and `version`; otherwise only
+/// metadata with `u8` keys and binary values is retained.
 pub fn parse_pn_announce_data(data: &[u8]) -> Option<PropagationNodeAnnounceData> {
     let value = valid_pn_announce(data)?;
     let int_at = |index: usize| python_int(&python_index(&value, index)?);
@@ -421,12 +446,22 @@ pub fn parse_pn_announce_data(data: &[u8]) -> Option<PropagationNodeAnnounceData
     let (stamp_cost, stamp_flex, peering_cost) = (cost(0)?, cost(1)?, cost(2)?);
 
     let mut metadata = HashMap::new();
+    let (mut impl_name, mut version) = (None, None);
     for (k, v) in python_index(&value, 6)?.as_map()? {
-        if let (Some(key), Some(val)) = (
-            k.as_u64().and_then(|number| number.try_into().ok()),
-            v.as_slice().map(|s| s.to_vec()),
-        ) {
-            metadata.insert(key, val);
+        let Some(key) = k.as_u64().and_then(|number| u8::try_from(number).ok()) else {
+            continue;
+        };
+        match (key, v) {
+            (PN_META_IMPL_NAME, rmpv::Value::String(text)) => {
+                impl_name = text.as_str().map(str::to_string)
+            }
+            (PN_META_VERSION, rmpv::Value::String(text)) => {
+                version = text.as_str().map(str::to_string)
+            }
+            (_, rmpv::Value::Binary(val)) => {
+                metadata.insert(key, val.clone());
+            }
+            _ => {}
         }
     }
 
@@ -439,6 +474,8 @@ pub fn parse_pn_announce_data(data: &[u8]) -> Option<PropagationNodeAnnounceData
         stamp_cost,
         stamp_flex,
         peering_cost,
+        impl_name,
+        version,
         metadata,
     })
 }

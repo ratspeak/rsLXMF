@@ -1656,22 +1656,18 @@ impl LxmRouter {
             .unwrap_or_default()
             .as_secs() as i64;
 
-        let mut metadata = std::collections::HashMap::new();
+        let mut data = crate::handlers::PropagationNodeAnnounceData::new(
+            self.config.propagation_enabled && !self.config.ext.from_static_only,
+            self.config.propagation_limit_kb as u64,
+            self.config.sync_limit_kb as u64,
+            self.config.propagation_stamp_cost,
+            self.config.propagation_stamp_flex,
+            self.config.ext.peering_cost,
+        );
+        data.timebase = now;
         if let Some(ref name) = self.config.ext.name {
-            metadata.insert(0u8, name.as_bytes().to_vec());
+            data.set_name(name);
         }
-
-        let data = crate::handlers::PropagationNodeAnnounceData {
-            legacy: false,
-            node_state: self.config.propagation_enabled && !self.config.ext.from_static_only,
-            timebase: now,
-            transfer_limit: self.config.propagation_limit_kb as u64,
-            sync_limit: self.config.sync_limit_kb as u64,
-            stamp_cost: self.config.propagation_stamp_cost,
-            stamp_flex: self.config.propagation_stamp_flex,
-            peering_cost: self.config.ext.peering_cost,
-            metadata,
-        };
 
         crate::handlers::get_propagation_node_app_data(&data)
     }

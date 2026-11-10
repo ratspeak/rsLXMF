@@ -105,14 +105,20 @@ enum ControlCommand {
     Unpeer([u8; 16]),
 }
 
+/// A command the stopped runner cannot act on gets no response, so the client
+/// times out instead of reading an unhandled code as success.
 fn queue_control_command(
     command_tx: &mpsc::UnboundedSender<ControlCommand>,
     command: ControlCommand,
-) -> Vec<u8> {
+) -> Option<Vec<u8>> {
     if command_tx.send(command).is_ok() {
-        encode_control_success()
+        Some(encode_control_success())
     } else {
-        encode_peer_error(lxmf_core::constants::PeerError::Timeout)
+        tracing::warn!(
+            ?command,
+            "control command not queued: daemon runner stopped"
+        );
+        None
     }
 }
 
@@ -1065,6 +1071,29 @@ fn link_failure_retryable(reason: &str) -> bool {
     is_retryable_link_delivery_failure(reason)
 }
 
+/// Python `lxmf_delivery()` receive state: the delivery method, and Curve25519
+/// transport encryption for SINGLE and LINK destinations (LXMRouter.py:2174,2218-2226).
+fn mark_received(msg: &mut LxMessage, method: DeliveryMethod) {
+    msg.method = method;
+    msg.transport_encrypted = true;
+    msg.transport_encryption = Some(rns_identity::identity::CURVE.to_string());
+}
+
+/// Write the stored propagated message as Python's `write_to_directory()` file,
+/// `<messages_dir>/<hex message hash>` holding `packed_container()`.
+fn write_propagated_container(
+    body: &std::path::Path,
+    messages_dir: &std::path::Path,
+) -> std::io::Result<PathBuf> {
+    let wire = std::fs::read(body)?;
+    let mut msg = LxMessage::unpack(&wire).map_err(std::io::Error::other)?;
+    mark_received(&mut msg, DeliveryMethod::Propagated);
+    let container = msg.pack_container().map_err(std::io::Error::other)?;
+    let path = messages_dir.join(hex::encode(msg.message_id()));
+    lxmf_core::persist::write_file_atomic(&path, &container)?;
+    Ok(path)
+}
+
 fn route_hops_for(route_hops: &HashMap<[u8; 16], u8>, dest_hash: [u8; 16]) -> u8 {
     route_hops.get(&dest_hash).copied().unwrap_or(1).max(1)
 }
@@ -1297,6 +1326,10 @@ const KNOWN_IDENTITIES_SOFT_CAP: usize = 10_000;
 /// Full path-table resync cadence for `route_hops`. Announce events keep the
 /// map fresh in between; this only re-baselines and prunes expired paths.
 const ROUTE_HOPS_REFRESH_SECS: f64 = 300.0;
+
+/// Python lxmd `DEFFERED_JOBS_DELAY` and `JOBS_INTERVAL`, in seconds.
+const DEFERRED_JOBS_DELAY: u64 = 10;
+const JOBS_INTERVAL: u64 = 5;
 
 /// Resolve a destination hash to its identity hash via the learned identity
 /// keys — the lxmd equivalent of `RNS.Identity.recall` (LXMessage.py:776).
@@ -2271,14 +2304,7 @@ impl LxmdRunner {
                                 .lock()
                                 .map(|state| propagation_client_allowed(&state, remote.as_ref()))
                                 .unwrap_or(false);
-                            if !allowed {
-                                (
-                                    Some(encode_peer_error(
-                                        lxmf_core::constants::PeerError::NoAccess,
-                                    )),
-                                    0,
-                                )
-                            } else if let Some(remote) = remote {
+                            if let Some(remote) = remote.filter(|_| allowed) {
                                 let client = Destination::hash_from_name_and_identity(
                                     DELIVERY_APP_NAME,
                                     Some(&remote),
@@ -2294,10 +2320,17 @@ impl LxmdRunner {
                                         action.into_response_with_served_count_bounded(limit);
                                     (Some(bytes), count)
                                 })
-                            } else {
+                            } else if remote.is_none() {
                                 (
                                     Some(encode_peer_error(
                                         lxmf_core::constants::PeerError::NoIdentity,
+                                    )),
+                                    0,
+                                )
+                            } else {
+                                (
+                                    Some(encode_peer_error(
+                                        lxmf_core::constants::PeerError::NoAccess,
                                     )),
                                     0,
                                 )
@@ -2417,13 +2450,10 @@ impl LxmdRunner {
                     .map(|state| state.clone())
                     .unwrap_or_default();
 
-                let Some(remote_hash) = remote_identity_hash else {
-                    return Some(encode_peer_error(
-                        lxmf_core::constants::PeerError::NoIdentity,
-                    ));
-                };
+                // RNS ALLOW_LIST handlers deny unidentified and unlisted peers without a response.
+                let remote_hash = remote_identity_hash?;
                 if !snapshot.allowed_control.contains(&remote_hash) {
-                    return Some(encode_peer_error(lxmf_core::constants::PeerError::NoAccess));
+                    return None;
                 }
 
                 if path_hash == stats_path_hash {
@@ -2441,10 +2471,7 @@ impl LxmdRunner {
                     if !snapshot.peer_hashes.contains(&peer_hash) {
                         return Some(encode_peer_error(lxmf_core::constants::PeerError::NotFound));
                     }
-                    Some(queue_control_command(
-                        &command_tx_for_handler,
-                        ControlCommand::Sync(peer_hash),
-                    ))
+                    queue_control_command(&command_tx_for_handler, ControlCommand::Sync(peer_hash))
                 } else if path_hash == unpeer_path_hash {
                     tracing::info!("control: handling unpeer request");
                     if data.len() != 16 {
@@ -2457,10 +2484,10 @@ impl LxmdRunner {
                     if !snapshot.peer_hashes.contains(&peer_hash) {
                         return Some(encode_peer_error(lxmf_core::constants::PeerError::NotFound));
                     }
-                    Some(queue_control_command(
+                    queue_control_command(
                         &command_tx_for_handler,
                         ControlCommand::Unpeer(peer_hash),
-                    ))
+                    )
                 } else {
                     tracing::debug!(
                         path = hex::encode(path_hash),
@@ -2771,6 +2798,12 @@ impl LxmdRunner {
                 self.propagation_dest_hash,
                 node_guard.as_deref(),
                 now_f64(),
+                |peer| {
+                    self.route_hops
+                        .get(peer)
+                        .copied()
+                        .unwrap_or(rns_transport::constants::PATHFINDER_M)
+                },
             ))
         } else {
             None
@@ -2810,19 +2843,6 @@ impl LxmdRunner {
         )
     }
 
-    async fn send_announce(&mut self) -> Result<(), String> {
-        let raw = self.create_announce_packet()?;
-        self.transport_tx
-            .send(TransportMessage::Outbound(
-                rns_transport::messages::OutboundRequest {
-                    raw: Bytes::from(raw),
-                    destination_hash: self.lxmf_dest_hash,
-                },
-            ))
-            .await
-            .map_err(|e| format!("Failed to send announce: {e}"))
-    }
-
     #[cfg(test)]
     async fn send_propagation_announce(&mut self) -> Result<(), String> {
         let raw = self.create_propagation_announce_packet()?;
@@ -2844,6 +2864,63 @@ impl LxmdRunner {
         let mut allowed = HashSet::from([self.identity.hash]);
         allowed.extend(self.router.allowed_control.iter().copied());
         allowed.len() > 1
+    }
+
+    /// Python lxmd `deferred_start_jobs()`: optional start-up announces, then
+    /// both periodic announce clocks start.
+    fn run_deferred_start_jobs(&mut self, announce_delivery: bool) {
+        let now = now_f64();
+        if announce_delivery {
+            self.stage_delivery_announce("start-up delivery announce");
+        }
+        if self.config.propagation_enabled && self.config.node_announce_at_start {
+            self.schedule_node_announce(now);
+        }
+        self.last_peer_announce = now;
+        self.last_node_announce = now;
+    }
+
+    /// Python lxmd `jobs()`, run every `JOBS_INTERVAL` after the deferred start.
+    fn announce_jobs(&mut self, now: f64) {
+        if let Some(interval) = self.config.announce_interval
+            && now > self.last_peer_announce + interval as f64
+            && self.stage_delivery_announce("periodic delivery announce")
+        {
+            self.last_peer_announce = now;
+        }
+        if self.config.propagation_enabled
+            && let Some(interval) = self.config.node_announce_interval
+            && now > self.last_node_announce + interval as f64
+        {
+            self.last_node_announce = now;
+            self.schedule_node_announce(now);
+        }
+        self.stage_due_node_announce(now);
+    }
+
+    fn stage_delivery_announce(&mut self, context: &'static str) -> bool {
+        let Ok(raw) = self.create_announce_packet() else {
+            return false;
+        };
+        let dest = self.lxmf_dest_hash;
+        let staged = self.queue_runtime_transport(
+            TransportMessage::Outbound(rns_transport::messages::OutboundRequest {
+                raw: Bytes::from(raw),
+                destination_hash: dest,
+            }),
+            context,
+        );
+        if staged {
+            tracing::debug!("{context} staged");
+        }
+        staged
+    }
+
+    /// Time until the earliest scheduled node announce that is not yet due;
+    /// an overdue one is retried by the processing tick.
+    fn next_node_announce_in(&self) -> Option<Duration> {
+        let wait = self.node_announces_due.front()? - now_f64();
+        (wait > 0.0).then(|| Duration::from_secs_f64(wait))
     }
 
     fn schedule_node_announce(&mut self, now: f64) {
@@ -3763,30 +3840,6 @@ impl LxmdRunner {
             client.acknowledge_transfer();
         }
 
-        if let Some(interval) = self.config.announce_interval
-            && now - self.last_peer_announce > interval as f64
-            && let Ok(raw) = self.create_announce_packet()
-        {
-            let dest = self.lxmf_dest_hash;
-            if self.queue_runtime_transport(
-                TransportMessage::Outbound(rns_transport::messages::OutboundRequest {
-                    raw: Bytes::from(raw),
-                    destination_hash: dest,
-                }),
-                "periodic delivery announce",
-            ) {
-                self.last_peer_announce = now;
-                tracing::debug!("periodic peer announce staged");
-            }
-        }
-
-        if self.config.propagation_enabled
-            && let Some(interval) = self.config.node_announce_interval
-            && now - self.last_node_announce > interval as f64
-        {
-            self.last_node_announce = now;
-            self.schedule_node_announce(now);
-        }
         self.stage_due_node_announce(now);
 
         if let Some(task) = self.prop_maintenance_task.as_mut() {
@@ -4291,7 +4344,7 @@ impl LxmdRunner {
                 {
                     return;
                 }
-                self.handle_inbound_message(msg);
+                self.handle_inbound_message(msg, DeliveryMethod::Direct);
             }
             Err(e) => {
                 tracing::debug!("link data not an LXMF message: {e}");
@@ -4685,6 +4738,9 @@ impl LxmdRunner {
                         &receipt,
                         verified.as_ref(),
                     );
+                    if receipt.record().disposition == DurableDisposition::Committed {
+                        self.store_propagated_container(result.message.clone());
+                    }
                     let _ = result
                         .token
                         .resolve(DownloadAdmissionOutcome::Accepted(receipt));
@@ -4705,6 +4761,23 @@ impl LxmdRunner {
             }
         }
         self.drive_download_queue();
+    }
+
+    /// Python delivers propagated messages through the same callback as direct
+    /// ones, so they land in the messages directory in the same format.
+    fn store_propagated_container(&mut self, mut msg: LxMessage) {
+        mark_received(&mut msg, DeliveryMethod::Propagated);
+        let path = self.messages_dir.join(hex::encode(msg.message_id()));
+        match msg.pack_container() {
+            Ok(container) => {
+                tokio::task::spawn_blocking(move || {
+                    if let Err(error) = lxmf_core::persist::write_file_atomic(&path, &container) {
+                        tracing::error!(%error, path = %path.display(), "failed to store propagated message");
+                    }
+                });
+            }
+            Err(error) => tracing::error!(%error, "failed to pack propagated message for storage"),
+        }
     }
 
     fn download_epochs(&self) -> AdmissionEpochs {
@@ -4833,12 +4906,15 @@ impl LxmdRunner {
             return;
         };
         let result_tx = self.hook_result_tx.clone();
-        self.hook_task = Some(tokio::task::spawn_blocking(move || {
-            match lxmf_tools::daemon::execute_on_inbound_with_event(
-                &command,
-                &path.to_string_lossy(),
-                &hex::encode(event),
-            ) {
+        let messages_dir = self.messages_dir.clone();
+        self.hook_task = Some(tokio::task::spawn_blocking(
+            move || match write_propagated_container(&path, &messages_dir).and_then(|written| {
+                lxmf_tools::daemon::execute_on_inbound_with_event(
+                    &command,
+                    &written.to_string_lossy(),
+                    &hex::encode(event),
+                )
+            }) {
                 Ok(()) => {
                     let success = match store.complete_hook(event) {
                         Ok(()) => true,
@@ -4853,8 +4929,8 @@ impl LxmdRunner {
                     tracing::warn!(%error,event=%hex::encode(event),"inbound hook failed; retained for retry");
                     let _ = result_tx.send(false);
                 }
-            }
-        }));
+            },
+        ));
     }
 
     fn handle_inbound_packet(&mut self, raw: &[u8]) {
@@ -4932,7 +5008,7 @@ impl LxmdRunner {
                     }
                 }
 
-                self.handle_inbound_message(msg);
+                self.handle_inbound_message(msg, DeliveryMethod::Opportunistic);
             }
             Err(e) => {
                 tracing::warn!("failed to unpack LXMF message: {e}");
@@ -5004,7 +5080,7 @@ impl LxmdRunner {
     }
 
     /// Write a received LXMF message to disk and invoke `on_inbound`.
-    fn handle_inbound_message(&mut self, msg: LxMessage) {
+    fn handle_inbound_message(&mut self, mut msg: LxMessage, method: DeliveryMethod) {
         // Direct/opportunistic admission has already checked the recipient's
         // policy. Ticket learning separately requires the source-bound proof;
         // deliver_inbound deliberately has no authentication authority. Learn
@@ -5026,13 +5102,14 @@ impl LxmdRunner {
         std::fs::create_dir_all(&messages_dir).ok();
 
         let msg_hash = hex::encode(msg.message_id());
-        let msg_path = messages_dir.join(format!("{msg_hash}.lxm"));
+        let msg_path = messages_dir.join(&msg_hash);
 
         // Pack synchronously (CPU-bound, no IO) and offload the disk write
         // to the blocking pool so a slow disk doesn't stall the lxmd runner
         // task between inbound messages. Atomic tmp+rename write so readers
-        // never see a partial file (LXMessage.py:674-696).
-        match msg.pack() {
+        // never see a partial file (LXMessage.py:696-712).
+        mark_received(&mut msg, method);
+        match msg.pack_container() {
             Ok(packed) => {
                 let write_path = msg_path.clone();
                 let on_inbound = self.config.on_inbound_command.clone();
@@ -6146,84 +6223,16 @@ pub(crate) async fn main() {
 
     tracing::info!("LXMF router initialized");
 
-    // Startup announce: wait until at least one interface is online, mirroring
-    // Python's deferred_start_jobs() pattern.
-    if daemon_config.announce_at_start {
-        tracing::info!("Waiting for interfaces to come online before announcing...");
-        let mut announced = false;
-        for _ in 0..30 {
-            if shutdown.is_triggered() {
-                break;
-            }
-            let poll_started = Instant::now();
-            let (otx, orx) = tokio::sync::oneshot::channel();
-            tokio::select! {
-                _ = shutdown.wait() => break,
-                result = runner.transport_tx.send(TransportMessage::Rpc {
-                    query: rns_transport::messages::TransportQuery::GetInterfaceStats,
-                    response_tx: otx,
-                }) => {
-                    if result.is_err() {
-                        break;
-                    }
-                }
-            }
-
-            let stats_result = tokio::select! {
-                _ = shutdown.wait() => break,
-                result = tokio::time::timeout(Duration::from_secs(1), orx) => result,
-            };
-            if let Ok(Ok(rns_transport::messages::TransportQueryResponse::InterfaceStats(stats))) =
-                stats_result
-            {
-                // `online` is the readiness signal. Requiring traffic bytes
-                // creates a circular startup gate on listening/server
-                // interfaces and can postpone the daemon loop (including
-                // accepted control commands) for the full 30 seconds.
-                let any_online = stats.iter().any(|stats| stats.online);
-                if any_online {
-                    match runner.send_announce().await {
-                        Ok(()) => {
-                            tracing::info!("Startup announce sent (interface online)");
-                            announced = true;
-                        }
-                        Err(e) => tracing::warn!("Failed to send startup announce: {e}"),
-                    }
-                    break;
-                }
-            }
-            // The control LinkManager is already live during this wait. Never
-            // acknowledge a command and then leave it dormant until startup
-            // announcement polling finishes.
-            runner.drain_control_commands();
-            let elapsed = poll_started.elapsed();
-            if elapsed < Duration::from_secs(1)
-                && sleep_or_shutdown(&shutdown, Duration::from_secs(1) - elapsed).await
-            {
-                break;
-            }
-        }
-        if shutdown.is_triggered() {
-            tracing::info!("Startup announce cancelled by shutdown");
-        } else if !announced {
-            tracing::warn!("No online interface detected after 30s, announcing anyway");
-            let _ = runner.send_announce().await;
-        }
-    }
-
-    // As in Python's deferred start jobs, both announce clocks start here even
-    // when nothing announced at start.
-    let announce_clock_start = now_f64();
-    runner.last_peer_announce = announce_clock_start;
-    runner.last_node_announce = announce_clock_start;
-    if !shutdown.is_triggered()
-        && daemon_config.node_announce_at_start
-        && daemon_config.propagation_enabled
-    {
-        runner.schedule_node_announce(announce_clock_start);
+    // Python's enable_propagation() always announces the node, independent of
+    // the deferred start jobs.
+    if daemon_config.propagation_enabled {
+        runner.schedule_node_announce(now_f64());
         runner.startup_node_announce_pending = true;
         tracing::info!("Startup propagation announce scheduled in {NODE_ANNOUNCE_DELAY}s");
     }
+    let deferred_start = tokio::time::sleep(Duration::from_secs(DEFERRED_JOBS_DELAY));
+    tokio::pin!(deferred_start);
+    let mut deferred_start_done = false;
 
     if let Some(ref cmd) = daemon_config.on_inbound_command {
         tracing::info!("On-inbound command: {}", cmd);
@@ -6232,6 +6241,9 @@ pub(crate) async fn main() {
     let mut one_shot_status = None;
     if let Some(send_args) = args.send.as_ref().filter(|_| !shutdown.is_triggered()) {
         one_shot_status = Some(1);
+        // A one-shot send runs the deferred start jobs before it sends.
+        deferred_start_done = true;
+        runner.run_deferred_start_jobs(daemon_config.announce_at_start);
         'one_shot: {
             let dest_hex = normalize_hash_hex(&send_args[0]);
             let content = match args.send_file.as_ref() {
@@ -6463,6 +6475,8 @@ pub(crate) async fn main() {
     // Event-driven for inbound, periodic for outbound and maintenance.
     let mut tick_timer = tokio::time::interval(Duration::from_secs(4));
     tick_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut jobs_timer = tokio::time::interval(Duration::from_secs(JOBS_INTERVAL));
+    jobs_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut propagation_sync_timer = tokio::time::interval(Duration::from_millis(25));
     propagation_sync_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -6470,6 +6484,18 @@ pub(crate) async fn main() {
             _ = shutdown.wait() => break,
             _ = propagation_sync_timer.tick() => {
                 runner.drive_propagation_sync();
+            }
+            _ = &mut deferred_start, if !deferred_start_done => {
+                deferred_start_done = true;
+                runner.run_deferred_start_jobs(daemon_config.announce_at_start);
+            }
+            _ = jobs_timer.tick(), if deferred_start_done => {
+                runner.announce_jobs(now_f64());
+            }
+            // Recreated on every loop pass, so it is a deadline rather than a delay.
+            _ = tokio::time::sleep(runner.next_node_announce_in().unwrap_or(Duration::from_secs(3600))),
+                if runner.next_node_announce_in().is_some() => {
+                runner.stage_due_node_announce(now_f64());
             }
             _ = tick_timer.tick() => {
                 runner.drain_announce_events();
@@ -6957,9 +6983,7 @@ mod tests {
             )))
         );
 
-        let archived = runner
-            .messages_dir
-            .join(format!("{}.lxm", hex::encode(message.message_id())));
+        let archived = runner.messages_dir.join(hex::encode(message.message_id()));
         tokio::time::timeout(Duration::from_secs(5), async {
             while !archived.exists() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -7376,7 +7400,7 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let peer_hash = [0x42; 16];
 
-        let response = queue_control_command(&tx, ControlCommand::Sync(peer_hash));
+        let response = queue_control_command(&tx, ControlCommand::Sync(peer_hash)).unwrap();
 
         assert!(matches!(
             decode_control_response(&response),
@@ -7389,16 +7413,11 @@ mod tests {
     }
 
     #[test]
-    fn control_command_reports_timeout_when_daemon_queue_is_closed() {
+    fn control_command_is_unanswered_when_daemon_queue_is_closed() {
         let (tx, rx) = mpsc::unbounded_channel();
         drop(rx);
 
-        let response = queue_control_command(&tx, ControlCommand::Sync([0x24; 16]));
-
-        assert!(matches!(
-            decode_control_response(&response),
-            ControlResponse::Error(lxmf_core::constants::PeerError::Timeout)
-        ));
+        assert!(queue_control_command(&tx, ControlCommand::Sync([0x24; 16])).is_none());
     }
 
     #[test]
@@ -7549,7 +7568,7 @@ mod tests {
 
         // An elapsed periodic interval schedules the announce rather than sending it.
         runner.last_node_announce = now_f64() - 61.0;
-        runner.tick();
+        runner.announce_jobs(now_f64());
         assert!(!staged().contains(&node));
         assert_eq!(runner.node_announces_due.len(), 1);
 

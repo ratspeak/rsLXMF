@@ -93,6 +93,9 @@ pub const PN_META_SYNC_STRATUM: u8 = 0x02;
 pub const PN_META_SYNC_THROTTLE: u8 = 0x03;
 pub const PN_META_AUTH_BAND: u8 = 0x04;
 pub const PN_META_UTIL_PRESSURE: u8 = 0x05;
+pub const PN_META_IMPL_NAME: u8 = 0xFE;
+/// Implementation name upstream advertises under [`PN_META_IMPL_NAME`].
+pub const PN_IMPL_NAME: &str = "lxmd";
 pub const PN_META_CUSTOM: u8 = 0xFF;
 
 pub const SF_COMPRESSION: u8 = 0x00;
