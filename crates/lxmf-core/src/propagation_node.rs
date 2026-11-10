@@ -414,6 +414,13 @@ impl ValidatedOpaquePropagationBlob {
     pub fn transient_id(&self) -> PropagationTransientId {
         self.transient_id
     }
+    /// Stored image length: message data plus the 32-byte stamp.
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
     pub fn stamp_value(&self) -> f64 {
         self.stamp_value
     }
@@ -551,6 +558,8 @@ pub(crate) struct PreparedSyncOffer {
     pub generation: u64,
     pub selected_ids: Vec<PropagationTransientId>,
     pub terminal_handled_ids: Vec<PropagationTransientId>,
+    /// Below the peer's stamp requirement: dropped from its unhandled set only.
+    pub dropped_unhandled_ids: Vec<PropagationTransientId>,
     pub generation_exhausted: bool,
 }
 
@@ -560,6 +569,7 @@ pub(crate) enum InstallPreparedSyncOffer {
         offer: SyncOffer,
         generation: u64,
         terminal_handled_ids: Vec<PropagationTransientId>,
+        dropped_unhandled_ids: Vec<PropagationTransientId>,
         generation_exhausted: bool,
     },
     Stale,
@@ -590,6 +600,9 @@ pub(crate) fn prepare_sync_offer_snapshot(
     }
 
     let mut candidates = snapshot.candidates;
+    if let Some(unhandled) = snapshot.policy.unhandled_messages.as_ref() {
+        candidates.retain(|candidate| unhandled.contains(&candidate.transient_id));
+    }
     candidates.sort_by(|left, right| {
         left.weight
             .total_cmp(&right.weight)
@@ -599,13 +612,14 @@ pub(crate) fn prepare_sync_offer_snapshot(
     let mut cumulative_size = INITIAL_STRUCTURE_OVERHEAD;
     let mut selected_ids = Vec::new();
     let mut terminal_handled_ids = Vec::new();
+    let mut dropped_unhandled_ids = Vec::new();
     let mut cumulative_deferred = false;
     for candidate in candidates {
         if handled_messages.contains(&candidate.transient_id) {
             continue;
         }
         if candidate.stamp_value < snapshot.policy.minimum_stamp_cost {
-            terminal_handled_ids.push(candidate.transient_id);
+            dropped_unhandled_ids.push(candidate.transient_id);
             continue;
         }
 
@@ -638,6 +652,7 @@ pub(crate) fn prepare_sync_offer_snapshot(
         generation: snapshot.generation,
         selected_ids,
         terminal_handled_ids,
+        dropped_unhandled_ids,
         generation_exhausted,
     }
 }
@@ -1150,20 +1165,15 @@ impl PropagationNode {
             .count()
     }
 
-    /// Count live store entries not yet handled by one peer. The daemon's
-    /// generation scheduler does not maintain `LxmPeer`'s legacy cached
-    /// unhandled counter, so control status must derive this from the same
-    /// authoritative store used to prepare offers.
+    /// Count a peer's queued messages that are still live in the store, as
+    /// Python derives `unhandled_message_count` from `propagation_entries`.
     pub fn unhandled_message_count(
         &self,
-        handled_messages: &HashSet<PropagationTransientId>,
+        unhandled_messages: &HashSet<PropagationTransientId>,
     ) -> usize {
-        self.store
-            .entries()
-            .filter(|entry| {
-                self.eligible(&entry.transient_id)
-                    && !handled_messages.contains(&entry.transient_id)
-            })
+        unhandled_messages
+            .iter()
+            .filter(|id| self.contains(id))
             .count()
     }
 
@@ -1572,6 +1582,7 @@ impl PropagationNode {
             offer,
             generation: prepared.generation,
             terminal_handled_ids: prepared.terminal_handled_ids,
+            dropped_unhandled_ids: prepared.dropped_unhandled_ids,
             generation_exhausted: prepared.generation_exhausted,
         }
     }
@@ -1595,13 +1606,18 @@ impl PropagationNode {
                 InstallPreparedSyncOffer::Installed {
                     offer,
                     terminal_handled_ids,
+                    dropped_unhandled_ids,
                     ..
                 } => {
                     // Compatibility wrapper: production uses the staged task
                     // path and exposes this delta to the daemon for off-loop
                     // persistence.
-                    if !terminal_handled_ids.is_empty()
-                        && let Err(error) = self.persist_peer_handled(policy, &terminal_handled_ids)
+                    if (!terminal_handled_ids.is_empty() || !dropped_unhandled_ids.is_empty())
+                        && let Err(error) = self.persist_peer_offer_dispositions(
+                            policy,
+                            &terminal_handled_ids,
+                            &dropped_unhandled_ids,
+                        )
                     {
                         tracing::warn!(%error, "failed to persist terminal offer dispositions");
                     }
@@ -1682,12 +1698,26 @@ impl PropagationNode {
         policy: &OutboundOfferPolicy,
         transient_ids: &[PropagationTransientId],
     ) -> std::io::Result<()> {
+        self.persist_peer_offer_dispositions(policy, transient_ids, &[])
+    }
+
+    /// Like [`Self::persist_peer_handled`], also dropping `dropped_ids` from
+    /// the peer's unhandled set without marking them handled.
+    pub fn persist_peer_offer_dispositions(
+        &self,
+        policy: &OutboundOfferPolicy,
+        handled_ids: &[PropagationTransientId],
+        dropped_ids: &[PropagationTransientId],
+    ) -> std::io::Result<()> {
         let mut peer = self
             .load_peer(&policy.peer_hash)
             .unwrap_or_else(|| policy.to_peer());
         policy.apply_to_peer(&mut peer);
-        for transient_id in transient_ids {
+        for transient_id in handled_ids {
             peer.add_handled_message(transient_id);
+        }
+        for transient_id in dropped_ids {
+            peer.remove_unhandled_message(transient_id);
         }
         self.save_peer(&peer)
     }
@@ -1704,8 +1734,21 @@ impl PropagationNode {
         let filename = format!("{}.peer", hex_encode(peer_hash));
         let path = dir.join(filename);
         let data = std::fs::read(&path).ok()?;
-        let mut peer = LxmPeer::from_bytes_with_handled(&data)?;
+        self.decode_peer(&data)
+    }
+
+    fn decode_peer(&self, data: &[u8]) -> Option<LxmPeer> {
+        let (mut peer, legacy) = LxmPeer::decode_stored(data)?;
         self.prune_handled_against_store(&mut peer);
+        if legacy {
+            // Older records offered every unhandled entry; keep that queue.
+            peer.unhandled_messages = self
+                .store
+                .entries()
+                .map(|entry| entry.transient_id)
+                .filter(|id| self.eligible(id) && !peer.handled_messages.contains(id))
+                .collect();
+        }
         Some(peer)
     }
 
@@ -1721,9 +1764,8 @@ impl PropagationNode {
                 let path = entry.path();
                 if path.extension().map(|e| e == "peer").unwrap_or(false)
                     && let Ok(data) = std::fs::read(&path)
-                    && let Some(mut peer) = LxmPeer::from_bytes_with_handled(&data)
+                    && let Some(peer) = self.decode_peer(&data)
                 {
-                    self.prune_handled_against_store(&mut peer);
                     peers.push(peer);
                 }
             }
@@ -1738,6 +1780,7 @@ impl PropagationNode {
     /// Files converge lazily: the next `mark_peer_handled` saves the pruned set.
     fn prune_handled_against_store(&self, peer: &mut LxmPeer) {
         peer.handled_messages.retain(|id| self.contains(id));
+        peer.unhandled_messages.retain(|id| self.contains(id));
     }
 }
 
@@ -2051,16 +2094,17 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn unhandled_count_is_derived_from_live_store_and_peer_handled_set() {
+    fn unhandled_count_covers_only_queued_ids_still_in_the_store() {
         let mut node = durable_test_node(PropagationNodeConfig::default(), [0xAA; 16]);
         let msg = make_signed_message([0xBB; 16], [0xCC; 16], "Test", "content");
         let transient_id = msg.transient_id.or(msg.hash).unwrap();
         assert!(node.accept_fixture(&msg));
 
-        let mut handled = HashSet::new();
-        assert_eq!(node.unhandled_message_count(&handled), 1);
-        handled.insert(transient_id);
-        assert_eq!(node.unhandled_message_count(&handled), 0);
+        let mut unhandled = HashSet::new();
+        assert_eq!(node.unhandled_message_count(&unhandled), 0);
+        unhandled.insert(transient_id);
+        unhandled.insert(tid(0x77));
+        assert_eq!(node.unhandled_message_count(&unhandled), 1);
     }
 
     #[test]
@@ -2174,7 +2218,7 @@ pub(crate) mod tests {
     #[test]
     fn prepared_offer_distinguishes_terminal_filters_from_cumulative_deferral() {
         let mut node = durable_test_node(PropagationNodeConfig::default(), [0xAA; 16]);
-        insert_offer_entry(&mut node, tid(0x01), 10, 9.0); // terminal low stamp
+        insert_offer_entry(&mut node, tid(0x01), 10, 9.0); // low stamp: dropped, not handled
         insert_offer_entry(&mut node, tid(0x02), 100, 20.0); // selected
         insert_offer_entry(&mut node, tid(0x03), 100, 20.0); // cumulative deferred
         insert_offer_entry(&mut node, tid(0x04), 1000, 20.0); // terminal oversize
@@ -2186,7 +2230,8 @@ pub(crate) mod tests {
         let prepared = prepare_sync_offer_snapshot(node.snapshot_sync_offer_preparation(&policy));
 
         assert_eq!(prepared.selected_ids, vec![tid(0x02)]);
-        assert_eq!(prepared.terminal_handled_ids, vec![tid(0x01), tid(0x04)]);
+        assert_eq!(prepared.terminal_handled_ids, vec![tid(0x04)]);
+        assert_eq!(prepared.dropped_unhandled_ids, vec![tid(0x01)]);
         assert!(
             !prepared.generation_exhausted,
             "cumulative-only skips must stay pending for another batch"

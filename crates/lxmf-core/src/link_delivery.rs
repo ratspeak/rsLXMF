@@ -19,6 +19,7 @@ use bytes::Bytes;
 use rns_crypto::ed25519::{Ed25519PrivateKey, Ed25519PublicKey};
 use rns_link::constants::ESTABLISHMENT_TIMEOUT_PER_HOP;
 use rns_link::link::{CloseReason, Link, LinkAction, LinkState};
+use rns_link::stamp::{LinkRequestStamper, LinkStampPolicy};
 use rns_protocol::resource::{
     InboundTransfer, LazyMultiSegmentOutbound, MAX_EFFICIENT_SIZE, MAX_RESOURCE_SIZE, MAX_SEGMENTS,
     MultiSegmentInbound, OutboundResource, OutboundTransfer, ResourceError, TransferAction,
@@ -534,6 +535,8 @@ pub enum LinkDeliveryStartError {
     InvalidTiming,
     TransportFull,
     TransportClosed,
+    /// The link request stamp could not be generated in time.
+    StampFailure,
 }
 
 impl fmt::Display for LinkDeliveryStartError {
@@ -542,6 +545,7 @@ impl fmt::Display for LinkDeliveryStartError {
             Self::InvalidTiming => f.write_str("invalid link establishment timing"),
             Self::TransportFull => f.write_str("transport full"),
             Self::TransportClosed => f.write_str("transport closed"),
+            Self::StampFailure => f.write_str("link request stamp generation failed"),
         }
     }
 }
@@ -935,6 +939,7 @@ pub struct LinkDeliveryManager {
     transport_ready: Option<TransportReady>,
     delivery_events: VecDeque<LxmfDeliveryEvent>,
     resource_counters: ResourceDispatchCounters,
+    link_stamper: LinkRequestStamper,
 }
 
 impl LinkDeliveryManager {
@@ -983,7 +988,14 @@ impl LinkDeliveryManager {
             transport_ready: None,
             delivery_events: VecDeque::new(),
             resource_counters: ResourceDispatchCounters::default(),
+            link_stamper: LinkRequestStamper::without_recall(LinkStampPolicy::default()),
         }
+    }
+
+    /// Stamp new link requests with this stamper's policy and announced costs.
+    /// The default stamps only when `always_stamp_lrs` is set.
+    pub fn set_link_request_stamper(&mut self, stamper: LinkRequestStamper) {
+        self.link_stamper = stamper;
     }
 
     /// Register the embedding task's waker for inbound delivery events and
@@ -1672,7 +1684,12 @@ impl LinkDeliveryManager {
         } = options;
         let msg_hash = Some(message.message_id());
         let packed_override_kind = packed_override.is_some();
-        let (mut link, request_data) = Link::new_initiator(dest_hash, hops);
+        let Ok((mut link, request_data)) = self.link_stamper.new_initiator(dest_hash, hops) else {
+            return Err(LinkDeliveryStartFailure {
+                error: LinkDeliveryStartError::StampFailure,
+                message: Box::new(message),
+            });
+        };
         if link
             .try_extend_establishment_timeout(timing.first_hop_timeout().as_secs_f64())
             .is_err()

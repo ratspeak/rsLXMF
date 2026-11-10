@@ -160,19 +160,6 @@ fn observe_lossless_queue_depth(queue: &'static str, depth: usize, high_water: &
     }
 }
 
-fn round_robin_peer_order(
-    mut peers: Vec<[u8; 16]>,
-    last_selected: Option<[u8; 16]>,
-) -> Vec<[u8; 16]> {
-    peers.sort_unstable();
-    if let (Some(last_selected), false) = (last_selected, peers.is_empty()) {
-        let next = peers.partition_point(|peer| *peer <= last_selected);
-        let peer_count = peers.len();
-        peers.rotate_left(next % peer_count);
-    }
-    peers
-}
-
 #[derive(Debug)]
 struct ValidatedPnEntry {
     lxmf_data: Vec<u8>,
@@ -195,6 +182,7 @@ struct PnPacketValidationWorkerResult {
     payload_owner: Bytes,
     malformed: bool,
     stored: bool,
+    accounted: Vec<([u8; 32], u64)>,
     committed: Vec<([u8; 32], u64)>,
     link_id: [u8; 16],
     #[cfg(test)]
@@ -296,12 +284,16 @@ enum PropagationStoreWriteOrigin {
 #[derive(Debug)]
 struct PropagationStoreCommitResult {
     origin: PropagationStoreWriteOrigin,
+    /// Every stamp-validated entry and its message size, duplicates included.
+    accounted: Vec<([u8; 32], u64)>,
+    /// Entries newly stored by this write.
     committed: Vec<([u8; 32], u64)>,
 }
 
 fn spawn_propagation_store_writes(
     node: Arc<Mutex<PropagationNode>>,
     plans: Vec<(PropagationStoreWritePlan, u64)>,
+    accounted: Vec<([u8; 32], u64)>,
     origin: PropagationStoreWriteOrigin,
     commit_tx: mpsc::UnboundedSender<PropagationStoreCommitResult>,
     operation: &'static str,
@@ -343,7 +335,11 @@ fn spawn_propagation_store_writes(
             "propagation store writes committed"
         );
         if commit_tx
-            .send(PropagationStoreCommitResult { origin, committed })
+            .send(PropagationStoreCommitResult {
+                origin,
+                accounted,
+                committed,
+            })
             .is_err()
         {
             tracing::debug!(operation, "propagation store commit receiver closed");
@@ -351,17 +347,33 @@ fn spawn_propagation_store_writes(
     }))
 }
 
+/// Python counts every validated entry before deduplication
+/// (`propagation_resource_concluded`, `propagation_packet`) and distributes
+/// only newly stored ones (`lxmf_propagation`).
 fn apply_propagation_store_commit(
     router: &mut LxmRouter,
     node: Option<&Arc<Mutex<PropagationNode>>>,
+    distribution: &mut Vec<([u8; 32], Option<[u8; 16]>)>,
     result: PropagationStoreCommitResult,
 ) {
-    if result.committed.is_empty() {
+    let from_peer = match result.origin {
+        PropagationStoreWriteOrigin::Peer(peer_hash) if router.peers.contains_key(&peer_hash) => {
+            Some(peer_hash)
+        }
+        _ => None,
+    };
+    distribution.extend(
+        result
+            .committed
+            .iter()
+            .map(|(transient_id, _)| (*transient_id, from_peer)),
+    );
+    if result.accounted.is_empty() {
         return;
     }
-    let committed_count = result.committed.len() as u64;
+    let committed_count = result.accounted.len() as u64;
     let committed_bytes = result
-        .committed
+        .accounted
         .iter()
         .map(|(_, bytes)| *bytes)
         .sum::<u64>();
@@ -372,7 +384,7 @@ fn apply_propagation_store_commit(
                 peer.incoming = peer.incoming.saturating_add(committed_count);
                 peer.rx_bytes = peer.rx_bytes.saturating_add(committed_bytes);
                 peer.heard();
-                for (transient_id, _) in result.committed {
+                for (transient_id, _) in result.accounted {
                     peer.add_handled_message(&transient_id);
                 }
                 if let Some(node) = node
@@ -620,6 +632,7 @@ fn validate_pn_packet_job(
         payload_owner: data.clone(),
         malformed: false,
         stored: false,
+        accounted: Vec::new(),
         committed: Vec::new(),
         entries: Vec::new(),
         timing: None,
@@ -673,6 +686,7 @@ fn execute_pn_packet_job(job: PnPacketValidationJob) -> PnPacketExecution {
         payload_owner: job.data.clone(),
         malformed: false,
         stored: false,
+        accounted: Vec::new(),
         committed: Vec::new(),
         #[cfg(test)]
         entries: Vec::new(),
@@ -704,6 +718,13 @@ fn execute_pn_packet_job(job: PnPacketValidationJob) -> PnPacketExecution {
     #[cfg(test)]
     let store_started = Instant::now();
     result.stored = true;
+    result.accounted = validated
+        .iter()
+        .map(|blob| {
+            let size = blob.len().saturating_sub(32) as u64;
+            (blob.transient_id(), size)
+        })
+        .collect();
     for blob in validated {
         let tid = blob.transient_id();
         let admission = job
@@ -1271,6 +1292,18 @@ const ROUTE_HOPS_REFRESH_SECS: f64 = 300.0;
 
 /// Python lxmd `DEFFERED_JOBS_DELAY` and `JOBS_INTERVAL`, in seconds.
 const DEFERRED_JOBS_DELAY: u64 = 10;
+/// Python `LXMRouter.JOB_STAMPCOST_INTERVAL`, in router job passes.
+const JOB_STAMPCOST_INTERVAL: u64 = 120;
+/// `RNS.Transport.await_path` timeouts Python `enable_propagation()` gives a
+/// loaded peer: 2.5 s, plus 5 s first for a static peer never heard.
+const PEER_LOAD_PATH_WAIT: f64 = 2.5;
+const PEER_LOAD_STATIC_PATH_WAIT: f64 = 7.5;
+
+#[derive(Debug)]
+struct PeerPathCheck {
+    response: Option<oneshot::Receiver<TransportQueryResponse>>,
+    grace_until: Option<f64>,
+}
 const JOBS_INTERVAL: u64 = 5;
 
 /// Resolve a destination hash to its identity hash via the learned identity
@@ -1597,7 +1630,21 @@ struct LxmdRunner {
     pending_backchannel_resource_cancellations:
         VecDeque<lxmf_core::link_delivery::BackchannelResourceCancelRequest>,
     last_delivery_failure: Option<String>,
-    propagation_sync: Option<lxmf_core::propagation_sync::PropagationSyncTask>,
+    /// Outbound peer syncs in progress, one per peer, as Python runs one
+    /// `LXMPeer` link per peer.
+    peer_syncs: HashMap<[u8; 16], lxmf_core::propagation_sync::PropagationSyncTask>,
+    /// Peers whose sync waits on a path check (Python `LXMPeer.sync()` path gate).
+    peer_path_checks: HashMap<[u8; 16], PeerPathCheck>,
+    /// Loaded peers whose identity must resolve within a path wait (seconds),
+    /// and the deadline once the wait has started.
+    peer_identity_deadlines: HashMap<[u8; 16], (f64, Option<f64>)>,
+    /// Unpeered remotes whose announce data is recalled for autopeering.
+    sync_autopeer_recalls: HashMap<[u8; 16], oneshot::Receiver<TransportQueryResponse>>,
+    peer_state_dirty: bool,
+    /// Python `peer_distribution_queue`: stored IDs and the peer they came from.
+    peer_distribution_queue: Vec<([u8; 32], Option<[u8; 16]>)>,
+    peer_jobs_count: u64,
+    last_peer_jobs: f64,
     propagation_client: Option<lxmf_core::propagation_client::PropagationClient>,
     propagation_node: Option<Arc<Mutex<PropagationNode>>>,
     propagation_admission: Option<Arc<Mutex<PnInboundRuntime>>>,
@@ -1647,8 +1694,6 @@ struct LxmdRunner {
     peering_key_result_rx: mpsc::Receiver<PeeringKeyWorkerResult>,
     peering_key_result_tx: mpsc::Sender<PeeringKeyWorkerResult>,
     peering_key_jobs: HashSet<[u8; 16]>,
-    pending_peer_syncs: HashSet<[u8; 16]>,
-    peer_sync_cursor: Option<[u8; 16]>,
     /// Non-link inbound packets; still encrypted, need destination-level decrypt.
     inbound_raw_rx: mpsc::Receiver<Vec<u8>>,
     announce_subscriptions: Vec<AnnounceSubscription>,
@@ -2122,9 +2167,10 @@ impl LxmdRunner {
                 prop_storage_path,
             )?));
             if let Ok(node) = pn.lock() {
+                // Python rebuilds every stored peer, without the max_peers cap.
                 for mut peer in node.load_peers() {
                     peer.is_static = static_peer_hashes.contains(&peer.destination_hash);
-                    let _ = router.add_peer(peer);
+                    router.peers.insert(peer.destination_hash, peer);
                 }
             }
 
@@ -2506,7 +2552,14 @@ impl LxmdRunner {
             backchannel_bridge_slots: Arc::new(tokio::sync::Semaphore::new(256)),
             pending_backchannel_resource_cancellations: VecDeque::new(),
             last_delivery_failure: None,
-            propagation_sync: None,
+            peer_syncs: HashMap::new(),
+            peer_path_checks: HashMap::new(),
+            peer_identity_deadlines: HashMap::new(),
+            sync_autopeer_recalls: HashMap::new(),
+            peer_state_dirty: false,
+            peer_distribution_queue: Vec::new(),
+            peer_jobs_count: 0,
+            last_peer_jobs: 0.0,
             propagation_client: None,
             propagation_node: None,
             propagation_admission,
@@ -2540,8 +2593,6 @@ impl LxmdRunner {
             peering_key_result_rx,
             peering_key_result_tx,
             peering_key_jobs: HashSet::new(),
-            pending_peer_syncs: HashSet::new(),
-            peer_sync_cursor: None,
             inbound_raw_rx,
             announce_subscriptions: Vec::new(),
             last_peer_announce: 0.0,
@@ -2560,19 +2611,22 @@ impl LxmdRunner {
         };
 
         if runner.config.propagation_enabled {
-            if let Some(ref pn) = propagation_node {
-                let mut sync = lxmf_core::propagation_sync::PropagationSyncTask::with_shared_node(
-                    transport_tx.clone(),
-                    pn.clone(),
+            if runner.identity.get_signing_key().is_none() {
+                tracing::error!(
+                    "local identity has no signing key; outbound peer sync cannot identify"
                 );
-                if let Some(signing_key) = runner.identity.get_signing_key() {
-                    sync.set_identity(runner.identity.get_public_key(), signing_key);
-                } else {
-                    tracing::error!(
-                        "local identity has no signing key; outbound peer sync cannot identify"
-                    );
+            }
+            // Python enable_propagation(): a loaded peer whose identity cannot be
+            // recalled after a short path wait is dropped.
+            for (hash, peer) in &runner.router.peers {
+                if !runner.known_identities.contains_key(&hex::encode(hash)) {
+                    let wait = if peer.is_static && peer.last_heard == 0.0 {
+                        PEER_LOAD_STATIC_PATH_WAIT
+                    } else {
+                        PEER_LOAD_PATH_WAIT
+                    };
+                    runner.peer_identity_deadlines.insert(*hash, (wait, None));
                 }
-                runner.propagation_sync = Some(sync);
             }
             runner.propagation_node = propagation_node;
 
@@ -2586,6 +2640,9 @@ impl LxmdRunner {
                 runner.identity.get_signing_key(),
             );
             client.set_delivery_limit(runner.config.delivery_transfer_max_accepted_size);
+            client.set_link_request_stamper(rns_runtime::link_stamp::blocking_stamper(
+                transport_tx.clone(),
+            ));
             if let Some(ref node_hex) = runner.config.outbound_propagation_node {
                 match hex::decode(node_hex) {
                     Ok(bytes) if bytes.len() == 16 => {
@@ -2674,6 +2731,10 @@ impl LxmdRunner {
                         .entry(hash)
                         .or_insert_with(|| lxmf_core::peer::LxmPeer::new(hash));
                     peer.is_static = true;
+                    // Python enable_propagation() asks for a never-heard static peer's path.
+                    if peer.last_heard == 0.0 && self.config.propagation_enabled {
+                        queue_path_request(&self.transport_tx, hash, false, "static peer");
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(hash = %configured, "ignoring invalid static peer hash: {e}")
@@ -2950,18 +3011,11 @@ impl LxmdRunner {
                     if !self.router.peers.contains_key(&peer_hash) {
                         continue;
                     }
-                    self.pending_peer_syncs.insert(peer_hash);
-                    if let Some(peer) = self.router.peers.get_mut(&peer_hash) {
-                        peer.next_sync_attempt = 0.0;
-                        peer.alive = true;
-                    }
                     tracing::info!(peer = %hex::encode(peer_hash), "control: queued peer sync");
+                    self.attempt_peer_sync(peer_hash, now_f64());
                 }
                 ControlCommand::Unpeer(peer_hash) => {
-                    self.pending_peer_syncs.remove(&peer_hash);
-                    if let Some(sync) = self.propagation_sync.as_mut() {
-                        sync.cancel_peer_sync(&peer_hash);
-                    }
+                    self.cancel_peer_sync(&peer_hash);
                     // Upstream control unpeer breaks the live peering without
                     // mutating the operator's configured static-peer set.
                     self.router.remove_peer(&peer_hash);
@@ -3019,7 +3073,6 @@ impl LxmdRunner {
                 // A bounded key search can fail for an excessive advertised
                 // cost. Put this policy generation into the normal peer
                 // backoff instead of spinning a fresh CPU job every tick.
-                self.pending_peer_syncs.remove(&result.peer_hash);
                 if let Some(peer) = self.router.peers.get_mut(&result.peer_hash) {
                     peer.next_sync_attempt =
                         now_f64() + lxmf_core::constants::SYNC_BACKOFF_STEP as f64;
@@ -3031,124 +3084,409 @@ impl LxmdRunner {
                 );
             }
             // A result for a different cost that no longer satisfies policy
-            // is ignored. The pending sync remains queued and dispatches a
-            // new job for the current target.
+            // is ignored; a later sync attempt dispatches a new job.
         }
     }
 
-    fn queue_due_peer_syncs(&mut self) {
-        if self.propagation_sync.is_none() {
+    /// The peer half of Python `LXMRouter.jobs()`, counted in 4 s passes.
+    fn run_peer_jobs(&mut self, now: f64) {
+        use lxmf_core::constants::{
+            JOB_PEERINGEST_INTERVAL, JOB_PEERSYNC_INTERVAL, PROCESSING_INTERVAL,
+        };
+        if now - self.last_peer_jobs < PROCESSING_INTERVAL as f64 * 0.9 {
             return;
         }
-        let Some(offer_generation) = self
-            .propagation_node
-            .as_ref()
-            .and_then(|node| node.lock().ok().map(|node| node.offer_generation()))
-        else {
+        self.last_peer_jobs = now;
+        self.peer_jobs_count += 1;
+        let propagation = self.propagation_node.is_some();
+        if propagation && self.peer_jobs_count.is_multiple_of(JOB_PEERINGEST_INTERVAL) {
+            self.flush_peer_distribution_queue();
+        }
+        if propagation && self.peer_jobs_count.is_multiple_of(JOB_PEERSYNC_INTERVAL) {
+            self.run_peer_sync_pass(now);
+        }
+        if self.peer_jobs_count.is_multiple_of(JOB_STAMPCOST_INTERVAL) {
+            self.router.cull_stamp_costs();
+        }
+    }
+
+    fn flush_peer_distribution_queue(&mut self) {
+        if self.peer_distribution_queue.is_empty() || self.router.peers.is_empty() {
+            return;
+        }
+        let entries = std::mem::take(&mut self.peer_distribution_queue);
+        self.router.flush_peer_distribution(&entries);
+        self.peer_state_dirty = true;
+    }
+
+    /// Python `LXMRouter.sync_peers()`, run every `JOB_PEERSYNC_INTERVAL` jobs.
+    fn run_peer_sync_pass(&mut self, now: f64) {
+        let Some(offer_generation) = self.propagation_node.as_ref().and_then(|node| {
+            node.lock().ok().map(|node| {
+                // Python derives each peer's unhandled set from the live store.
+                for peer in self.router.peers.values_mut() {
+                    peer.unhandled_messages.retain(|id| node.contains(id));
+                }
+                node.offer_generation()
+            })
+        }) else {
             return;
         };
-
-        for policy in self.router.sync_peer_policies_for_store(offer_generation) {
-            self.pending_peer_syncs.insert(policy.peer_hash);
+        let pass = self.router.sync_peers(now, offer_generation);
+        if let Some(peer_hash) = pass.selected {
+            self.attempt_peer_sync(peer_hash, now);
+        }
+        for peer_hash in pass.culled {
+            tracing::warn!(
+                peer = %hex::encode(peer_hash),
+                "removing peer due to excessive unreachability"
+            );
+            self.forget_peer(&peer_hash);
+        }
+        if std::mem::take(&mut self.peer_state_dirty) {
+            self.save_all_peers();
         }
     }
 
-    fn drive_pending_peer_syncs(&mut self) {
-        if self
-            .propagation_sync
-            .as_ref()
-            .is_none_or(|sync| sync.state != lxmf_core::propagation_sync::SyncTaskState::Idle)
+    fn save_all_peers(&self) {
+        let Some(node) = self.propagation_node.as_ref() else {
+            return;
+        };
+        let Ok(node) = node.lock() else {
+            return;
+        };
+        for peer in self.router.peers.values() {
+            if let Err(error) = node.save_peer(peer) {
+                tracing::warn!(
+                    peer = %hex::encode(peer.destination_hash),
+                    "failed to persist peer state: {error}"
+                );
+            }
+        }
+    }
+
+    /// Cancel sync work for a peer the router no longer holds and delete its
+    /// persisted state.
+    fn forget_peer(&mut self, peer_hash: &[u8; 16]) {
+        self.cancel_peer_sync(peer_hash);
+        if let Some(node) = self.propagation_node.as_ref()
+            && let Ok(mut node) = node.lock()
+            && let Err(error) = node.delete_peer(peer_hash)
+        {
+            tracing::warn!(
+                peer = %hex::encode(peer_hash),
+                "failed to remove persisted propagation peer: {error}"
+            );
+        }
+    }
+
+    fn cancel_peer_sync(&mut self, peer_hash: &[u8; 16]) -> bool {
+        self.peer_path_checks.remove(peer_hash);
+        match self.peer_syncs.remove(peer_hash) {
+            Some(mut sync) => {
+                sync.cancel_peer_sync(peer_hash);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Python `LXMPeer.sync()` up to its path check: postpone during backoff,
+    /// until stamp costs are known and until a peering key exists.
+    fn attempt_peer_sync(&mut self, peer_hash: [u8; 16], now: f64) {
+        if self.peer_syncs.contains_key(&peer_hash)
+            || self.peer_path_checks.contains_key(&peer_hash)
         {
             return;
         }
-
-        let mut pending = self.pending_peer_syncs.iter().copied().collect::<Vec<_>>();
-        // Match Python's preference for responsive peers. Peers that have
-        // exhausted their backoff stay queued as a fallback when no live peer
-        // is available.
-        if pending.iter().any(|peer_hash| {
-            self.router
-                .peers
-                .get(peer_hash)
-                .is_some_and(|peer| peer.alive)
-        }) {
-            pending.retain(|peer_hash| {
-                self.router
-                    .peers
-                    .get(peer_hash)
-                    .is_some_and(|peer| peer.alive)
-            });
+        let Some(peer) = self.router.peers.get_mut(&peer_hash) else {
+            return;
+        };
+        if peer.state != lxmf_core::constants::PeerState::Idle {
+            return;
         }
-        let pending = round_robin_peer_order(pending, self.peer_sync_cursor);
-        for peer_hash in pending {
-            let Some(peer_identity_hash) = recall_identity_hash(&self.known_identities, &peer_hash)
-            else {
-                self.recall_identity(peer_hash);
-                tracing::debug!(
-                    peer = %hex::encode(peer_hash),
-                    "peer sync postponed until its identity is known"
-                );
-                continue;
-            };
-            let policy = self.router.peers.get(&peer_hash).and_then(|peer| {
-                (peer.stamp_costs_known() && (peer.peering_cost == 0.0 || peer.peering_key_ready()))
-                    .then(|| OutboundOfferPolicy::from(peer))
-            });
-            if let Some(policy) = policy {
-                if let Some(sync) = self.propagation_sync.as_mut()
-                    && sync.request_sync_now_with_policy(policy)
-                {
-                    if let Some(peer) = self.router.peers.get_mut(&peer_hash) {
-                        peer.begin_sync();
-                    }
-                    self.pending_peer_syncs.remove(&peer_hash);
-                    self.peer_sync_cursor = Some(peer_hash);
-                }
-                return;
-            }
+        self.peer_state_dirty = true;
+        if !peer.sync_attempt(now) {
+            tracing::debug!(
+                peer = %hex::encode(peer_hash),
+                "postponing peer sync due to previous failures"
+            );
+            return;
+        }
+        if !peer.stamp_costs_known() {
+            tracing::debug!(
+                peer = %hex::encode(peer_hash),
+                "postponing peer sync since its required stamp costs are not yet known"
+            );
+            return;
+        }
+        if peer.peering_cost != 0.0 && !peer.peering_key_ready() {
+            tracing::debug!(
+                peer = %hex::encode(peer_hash),
+                "postponing peer sync since a peering key has not been generated yet"
+            );
+            self.spawn_peering_key_job(peer_hash);
+            return;
+        }
+        let (response_tx, response_rx) = oneshot::channel();
+        if self
+            .transport_tx
+            .try_send(TransportMessage::Rpc {
+                query: TransportQuery::HasPath { dest: peer_hash },
+                response_tx,
+            })
+            .is_ok()
+        {
+            self.peer_path_checks.insert(
+                peer_hash,
+                PeerPathCheck {
+                    response: Some(response_rx),
+                    grace_until: None,
+                },
+            );
+        }
+    }
 
-            if self
-                .router
-                .peers
-                .get(&peer_hash)
-                .is_some_and(|peer| !peer.stamp_costs_known())
-            {
-                tracing::debug!(
-                    peer = %hex::encode(peer_hash),
-                    "peer sync postponed until its stamp policy is known"
-                );
-                continue;
-            }
-
-            if self.peering_key_jobs.contains(&peer_hash) {
-                continue;
-            }
-            let Some(peer) = self.router.peers.get(&peer_hash) else {
-                self.pending_peer_syncs.remove(&peer_hash);
-                continue;
-            };
-
-            let peering_cost = peer.peering_cost;
-            let local_identity_hash = self.identity.hash;
-            let result_tx = self.peering_key_result_tx.clone();
-            self.peering_key_jobs.insert(peer_hash);
-            tokio::spawn(async move {
-                let result = tokio::task::spawn_blocking(move || {
-                    generate_peering_key_job(
-                        peer_hash,
-                        peering_cost,
-                        peer_identity_hash,
-                        local_identity_hash,
-                    )
-                })
-                .await
-                .unwrap_or(PeeringKeyWorkerResult {
+    fn spawn_peering_key_job(&mut self, peer_hash: [u8; 16]) {
+        if self.peering_key_jobs.contains(&peer_hash) {
+            return;
+        }
+        let Some(peer_identity_hash) = recall_identity_hash(&self.known_identities, &peer_hash)
+        else {
+            self.recall_identity(peer_hash);
+            return;
+        };
+        let Some(peer) = self.router.peers.get(&peer_hash) else {
+            return;
+        };
+        let peering_cost = peer.peering_cost;
+        let local_identity_hash = self.identity.hash;
+        let result_tx = self.peering_key_result_tx.clone();
+        self.peering_key_jobs.insert(peer_hash);
+        tokio::spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                generate_peering_key_job(
                     peer_hash,
                     peering_cost,
-                    peering_key: None,
-                });
-                let _ = result_tx.send(result).await;
+                    peer_identity_hash,
+                    local_identity_hash,
+                )
+            })
+            .await
+            .unwrap_or(PeeringKeyWorkerResult {
+                peer_hash,
+                peering_cost,
+                peering_key: None,
             });
+            let _ = result_tx.send(result).await;
+        });
+    }
+
+    /// Without a path, request one and wait `PATH_REQUEST_GRACE` before
+    /// checking again; a path still missing defers the sync (`LXMPeer.sync()`).
+    fn drive_peer_path_checks(&mut self, now: f64) {
+        let mut ready = Vec::new();
+        let mut failed = Vec::new();
+        for (peer_hash, check) in &mut self.peer_path_checks {
+            if let Some(response) = check.response.as_mut() {
+                let has_path = match response.try_recv() {
+                    Err(oneshot::error::TryRecvError::Empty) => continue,
+                    Ok(TransportQueryResponse::BoolResult(has_path)) => has_path,
+                    _ => false,
+                };
+                check.response = None;
+                if has_path {
+                    ready.push(*peer_hash);
+                } else if check.grace_until.is_some() {
+                    failed.push(*peer_hash);
+                } else {
+                    tracing::debug!(
+                        peer = %hex::encode(peer_hash),
+                        "no path to peer exists, requesting"
+                    );
+                    queue_path_request(&self.transport_tx, *peer_hash, false, "peer sync");
+                    check.grace_until = Some(now + lxmf_core::constants::PATH_REQUEST_GRACE);
+                }
+            } else if check.grace_until.is_some_and(|until| now >= until) {
+                let (response_tx, response_rx) = oneshot::channel();
+                if self
+                    .transport_tx
+                    .try_send(TransportMessage::Rpc {
+                        query: TransportQuery::HasPath { dest: *peer_hash },
+                        response_tx,
+                    })
+                    .is_ok()
+                {
+                    check.response = Some(response_rx);
+                } else {
+                    failed.push(*peer_hash);
+                }
+            }
+        }
+        for peer_hash in failed {
+            self.peer_path_checks.remove(&peer_hash);
+            if let Some(peer) = self.router.peers.get_mut(&peer_hash) {
+                peer.path_request_failed(now);
+                self.peer_state_dirty = true;
+                tracing::debug!(
+                    peer = %hex::encode(peer_hash),
+                    "path request was not answered, retrying peer sync later"
+                );
+            }
+        }
+        for peer_hash in ready {
+            self.peer_path_checks.remove(&peer_hash);
+            self.start_peer_sync(peer_hash);
+        }
+    }
+
+    /// The link half of Python `LXMPeer.sync()`, once a path exists.
+    fn start_peer_sync(&mut self, peer_hash: [u8; 16]) {
+        let Some(node) = self.propagation_node.clone() else {
+            return;
+        };
+        if recall_identity_hash(&self.known_identities, &peer_hash).is_none() {
+            self.recall_identity(peer_hash);
+            tracing::error!(
+                peer = %hex::encode(peer_hash),
+                "could not request sync to peer since its identity could not be recalled"
+            );
+            return;
+        }
+        let Some(peer) = self.router.peers.get_mut(&peer_hash) else {
+            return;
+        };
+        if peer.unhandled_message_count() == 0 {
+            tracing::debug!(
+                peer = %hex::encode(peer_hash),
+                "sync requested, but no unhandled messages exist for peer"
+            );
+            return;
+        }
+        let mut sync = lxmf_core::propagation_sync::PropagationSyncTask::with_shared_node(
+            self.transport_tx.clone(),
+            node,
+        );
+        sync.set_link_request_stamper(rns_runtime::link_stamp::blocking_stamper(
+            self.transport_tx.clone(),
+        ));
+        if let Some(signing_key) = self.identity.get_signing_key() {
+            sync.set_identity(self.identity.get_public_key(), signing_key);
+        }
+        if sync.request_sync_now_with_policy(OutboundOfferPolicy::from(&*peer)) {
+            peer.begin_sync();
+            self.peer_syncs.insert(peer_hash, sync);
+        }
+    }
+
+    /// Python `propagation_resource_concluded()` autopeers an identified,
+    /// unpeered remote from its recalled propagation node announce.
+    fn recall_sync_autopeer(&mut self, peer_hash: [u8; 16]) {
+        if !self.config.autopeer
+            || self.router.peers.contains_key(&peer_hash)
+            || self.sync_autopeer_recalls.contains_key(&peer_hash)
+        {
+            return;
+        }
+        let (response_tx, response_rx) = oneshot::channel();
+        if self
+            .transport_tx
+            .try_send(TransportMessage::Rpc {
+                query: TransportQuery::RecallDestination { dest: peer_hash },
+                response_tx,
+            })
+            .is_ok()
+        {
+            self.sync_autopeer_recalls.insert(peer_hash, response_rx);
+        }
+    }
+
+    fn drain_sync_autopeer_recalls(&mut self) {
+        let mut answered = Vec::new();
+        for (peer_hash, response) in &mut self.sync_autopeer_recalls {
+            match response.try_recv() {
+                Err(oneshot::error::TryRecvError::Empty) => {}
+                Ok(TransportQueryResponse::RecalledDestination(Some(recalled))) => {
+                    answered.push((*peer_hash, Some(recalled)));
+                }
+                _ => answered.push((*peer_hash, None)),
+            }
+        }
+        for (peer_hash, recalled) in answered {
+            self.sync_autopeer_recalls.remove(&peer_hash);
+            let Some(recalled) = recalled else {
+                continue;
+            };
+            let Some(pn) = recalled
+                .app_data
+                .as_deref()
+                .and_then(lxmf_core::handlers::parse_pn_announce_data)
+            else {
+                continue;
+            };
+            if !pn.node_state || !self.config.autopeer {
+                continue;
+            }
+            self.learn_identity(&peer_hash, recalled.public_key, recalled.ratchet, None);
+            tracing::debug!(
+                peer = %hex::encode(peer_hash),
+                "auto-peering with propagation node discovered via incoming sync"
+            );
+            if self.router.autopeer(AutopeerCandidate {
+                destination_hash: peer_hash,
+                timebase: pn.timebase as f64,
+                transfer_limit: Some(pn.transfer_limit as f64),
+                sync_limit: Some(pn.sync_limit as f64),
+                stamp_cost: Some(pn.stamp_cost),
+                stamp_flexibility: Some(pn.stamp_flex),
+                peering_cost: Some(pn.peering_cost),
+                hops: Some(
+                    self.route_hops
+                        .get(&peer_hash)
+                        .copied()
+                        .unwrap_or(recalled.hops),
+                ),
+                metadata: Some(pn.metadata.clone()),
+            }) {
+                self.peer_state_dirty = true;
+            }
+        }
+    }
+
+    /// Drop loaded peers whose identity did not resolve in time
+    /// (Python `enable_propagation()`); static peers start over.
+    fn drive_peer_identity_resolution(&mut self, now: f64) {
+        if self.peer_identity_deadlines.is_empty() {
+            return;
+        }
+        let pending = self.peer_identity_deadlines.clone();
+        for (peer_hash, (wait, deadline)) in pending {
+            if self.known_identities.contains_key(&hex::encode(peer_hash))
+                || !self.router.peers.contains_key(&peer_hash)
+            {
+                self.peer_identity_deadlines.remove(&peer_hash);
+            } else if deadline.is_none() {
+                self.peer_identity_deadlines
+                    .insert(peer_hash, (wait, Some(now + wait)));
+                queue_path_request(&self.transport_tx, peer_hash, false, "loaded peer");
+                self.recall_identity(peer_hash);
+            } else if deadline.is_some_and(|deadline| now >= deadline) {
+                self.peer_identity_deadlines.remove(&peer_hash);
+                tracing::debug!(
+                    peer = %hex::encode(peer_hash),
+                    "peer could not be loaded, because its identity could not be recalled"
+                );
+                self.router.peers.remove(&peer_hash);
+                self.forget_peer(&peer_hash);
+                if self.router.static_peers.contains(&peer_hash) {
+                    let mut peer = LxmPeer::new(peer_hash);
+                    peer.is_static = true;
+                    self.router.peers.insert(peer_hash, peer);
+                    queue_path_request(&self.transport_tx, peer_hash, false, "static peer");
+                }
+            } else if !self.identity_recalls.contains_key(&peer_hash) {
+                self.recall_identity(peer_hash);
+            }
         }
     }
 
@@ -3452,35 +3790,39 @@ impl LxmdRunner {
     /// from the four-second router maintenance job loop.
     fn drive_propagation_sync(&mut self) {
         self.poll_download_commits();
-        let mut peer_handled_updates = None;
-        let mut peer_terminal_result = None;
-        if let Some(ref mut sync) = self.propagation_sync {
+        let now = now_f64();
+        self.drive_peer_path_checks(now);
+        let mut peers_to_persist = HashSet::new();
+        let mut finished = Vec::new();
+        let mut resync = Vec::new();
+        for (peer_hash, sync) in &mut self.peer_syncs {
             sync.drain_events(&self.known_identities);
             sync.tick();
-            let updates = sync.take_handled_updates();
-            if !updates.is_empty()
-                && let Some(peer_hash) = sync.node_dest_hash()
-            {
-                peer_handled_updates = Some((peer_hash, updates));
+            let handled = sync.take_handled_updates();
+            let dropped = sync.take_dropped_unhandled_updates();
+            let terminal = sync.take_terminal_peer_result();
+            let Some(peer) = self.router.peers.get_mut(peer_hash) else {
+                finished.push(*peer_hash);
+                continue;
+            };
+            if !handled.is_empty() || !dropped.is_empty() {
+                for transient_id in &handled {
+                    peer.add_handled_message(transient_id);
+                }
+                for transient_id in &dropped {
+                    peer.remove_unhandled_message(transient_id);
+                }
+                peers_to_persist.insert(*peer_hash);
             }
-            peer_terminal_result = sync.take_terminal_peer_result();
-        }
-
-        let mut peers_to_persist = HashSet::new();
-        if let Some((peer_hash, updates)) = peer_handled_updates
-            && let Some(peer) = self.router.peers.get_mut(&peer_hash)
-        {
-            for transient_id in updates {
-                peer.add_handled_message(&transient_id);
-            }
-            peers_to_persist.insert(peer_hash);
-        }
-        if let Some(result) = peer_terminal_result
-            && let Some(peer) = self.router.peers.get_mut(&result.peer_hash)
-        {
+            let Some(result) = terminal else {
+                continue;
+            };
+            finished.push(*peer_hash);
             if let Some(rate) = result.link_establishment_rate {
+                // Python link_established() and the LINK_READY branch of sync().
                 peer.link_establishment_rate = rate;
                 peer.heard();
+                peer.next_sync_attempt = 0.0;
             }
             match result.state {
                 lxmf_core::propagation_sync::PeerSyncTerminalState::Complete => {
@@ -3490,6 +3832,14 @@ impl LxmdRunner {
                     if let Some(rate) = result.sync_transfer_rate {
                         peer.sync_transfer_rate = rate;
                     }
+                    if result.outgoing > 0 {
+                        peer.heard();
+                        if peer.sync_strategy == lxmf_core::constants::SyncStrategy::Persistent
+                            && peer.unhandled_message_count() > 0
+                        {
+                            resync.push(result.peer_hash);
+                        }
+                    }
                     peer.sync_complete();
                     if result.generation_exhausted
                         && let Some(generation) = result.offer_generation
@@ -3497,11 +3847,23 @@ impl LxmdRunner {
                         peer.mark_offer_generation_processed(generation);
                     }
                 }
+                lxmf_core::propagation_sync::PeerSyncTerminalState::NoPath => {
+                    // LXMPeer.sync: no link was made; begin_sync already applied the backoff step.
+                    peer.state = lxmf_core::constants::PeerState::Idle;
+                    peer.alive = false;
+                }
                 lxmf_core::propagation_sync::PeerSyncTerminalState::Failed => {
                     peer.sync_failed();
                 }
             }
             peers_to_persist.insert(result.peer_hash);
+        }
+        for peer_hash in finished {
+            self.peer_syncs.remove(&peer_hash);
+        }
+        // Python resource_concluded(): a persistent peer with messages left syncs again.
+        for peer_hash in resync {
+            self.attempt_peer_sync(peer_hash, now);
         }
         for peer_hash in peers_to_persist {
             if let (Some(node), Some(peer)) = (
@@ -3748,8 +4110,9 @@ impl LxmdRunner {
         self.drain_control_commands();
         self.drain_identity_recalls();
         self.drain_peering_key_results();
-        self.queue_due_peer_syncs();
-        self.drive_pending_peer_syncs();
+        self.drain_sync_autopeer_recalls();
+        self.drive_peer_identity_resolution(now);
+        self.run_peer_jobs(now);
         self.drain_backchannel_events();
 
         self.router.process_deferred_stamps();
@@ -3757,7 +4120,13 @@ impl LxmdRunner {
         // Advance the router jobloop counters (transient-cache cleaning, store
         // cull, peer rotation at Python cadences). `process_outbound_with_direct`
         // does not drive these.
+        let peers_before = self.router.peers.keys().copied().collect::<Vec<_>>();
         self.router.run_jobs_tick();
+        for peer_hash in peers_before {
+            if !self.router.peers.contains_key(&peer_hash) {
+                self.forget_peer(&peer_hash);
+            }
+        }
 
         if let Some(ref mut ld) = self.link_delivery {
             ld.drain_events(&self.known_identities);
@@ -3829,6 +4198,7 @@ impl LxmdRunner {
                 status.state,
                 lxmf_core::propagation_client::PropagationClientState::Complete
                     | lxmf_core::propagation_client::PropagationClientState::Partial
+                    | lxmf_core::propagation_client::PropagationClientState::NoPath
                     | lxmf_core::propagation_client::PropagationClientState::Failed
             );
             propagation_status = Some(status);
@@ -3866,7 +4236,6 @@ impl LxmdRunner {
             }
         }
         if self.prop_maintenance_task.is_none() && now - self.last_cull > 300.0 {
-            self.router.cull_stamp_costs();
             // Reserve only metadata under the lock. Native durable deletion
             // barriers run on one joined worker, away from receipt dispatch.
             if let Some(ref pn) = self.propagation_node
@@ -4064,19 +4433,7 @@ impl LxmdRunner {
                 }
 
                 if peer_removed {
-                    self.pending_peer_syncs.remove(&event.destination_hash);
-                    if let Some(sync) = self.propagation_sync.as_mut() {
-                        sync.cancel_peer_sync(&event.destination_hash);
-                    }
-                    if let Some(node) = self.propagation_node.as_ref()
-                        && let Ok(mut node) = node.lock()
-                        && let Err(error) = node.delete_peer(&event.destination_hash)
-                    {
-                        tracing::warn!(
-                            peer = %dest_hex,
-                            "failed to remove retired propagation peer: {error}"
-                        );
-                    }
+                    self.forget_peer(&event.destination_hash);
                 } else if peer_changed {
                     let offer_constraints_changed =
                         previous_offer_constraints.is_some_and(|previous| {
@@ -4087,15 +4444,10 @@ impl LxmdRunner {
                                 != Some(previous)
                         });
                     if offer_constraints_changed
-                        && self
-                            .propagation_sync
-                            .as_mut()
-                            .is_some_and(|sync| sync.cancel_peer_sync(&event.destination_hash))
+                        && self.cancel_peer_sync(&event.destination_hash)
+                        && let Some(peer) = self.router.peers.get_mut(&event.destination_hash)
                     {
-                        if let Some(peer) = self.router.peers.get_mut(&event.destination_hash) {
-                            peer.link_closed();
-                        }
-                        self.pending_peer_syncs.insert(event.destination_hash);
+                        peer.link_closed();
                     }
                     if let (Some(node), Some(peer)) = (
                         self.propagation_node.as_ref(),
@@ -4187,6 +4539,7 @@ impl LxmdRunner {
             apply_propagation_store_commit(
                 &mut self.router,
                 self.propagation_node.as_ref(),
+                &mut self.peer_distribution_queue,
                 result,
             );
         }
@@ -4438,11 +4791,36 @@ impl LxmdRunner {
                 }
             }
         }
+        let accounted = result
+            .entries
+            .iter()
+            .map(|entry| {
+                (
+                    rns_crypto::sha::full_hash(&entry.lxmf_data),
+                    entry.lxmf_data.len() as u64,
+                )
+            })
+            .collect::<Vec<_>>();
+        if let PropagationStoreWriteOrigin::Peer(peer_hash) = write_origin {
+            self.recall_sync_autopeer(peer_hash);
+        }
         let reserved = write_plans.len();
-        if let Some(node) = self.propagation_node.clone()
+        if write_plans.is_empty() {
+            apply_propagation_store_commit(
+                &mut self.router,
+                self.propagation_node.as_ref(),
+                &mut self.peer_distribution_queue,
+                PropagationStoreCommitResult {
+                    origin: write_origin,
+                    accounted,
+                    committed: Vec::new(),
+                },
+            );
+        } else if let Some(node) = self.propagation_node.clone()
             && let Some(task) = spawn_propagation_store_writes(
                 node,
                 write_plans,
+                accounted,
                 write_origin,
                 self.prop_store_commit_tx.clone(),
                 "propagation Resource ingress",
@@ -4516,8 +4894,10 @@ impl LxmdRunner {
         apply_propagation_store_commit(
             &mut self.router,
             self.propagation_node.as_ref(),
+            &mut self.peer_distribution_queue,
             PropagationStoreCommitResult {
                 origin: PropagationStoreWriteOrigin::Client,
+                accounted: std::mem::take(&mut result.accounted),
                 committed: std::mem::take(&mut result.committed),
             },
         );
@@ -5380,6 +5760,9 @@ impl LxmdRunner {
             if let Some(handle) = &self.endpoint_dispatch {
                 delivery.set_link_endpoint_dispatch_handle(handle.clone());
             }
+            delivery.set_link_request_stamper(rns_runtime::link_stamp::blocking_stamper(
+                self.transport_tx.clone(),
+            ));
             self.link_delivery = Some(delivery);
         }
         self.ensure_backchannel_sender();
@@ -6401,6 +6784,7 @@ pub(crate) async fn main() {
                 apply_propagation_store_commit(
                     &mut runner.router,
                     runner.propagation_node.as_ref(),
+                    &mut runner.peer_distribution_queue,
                     result,
                 );
                 runner.drain_link_packets();
@@ -6465,6 +6849,7 @@ pub(crate) async fn main() {
         apply_propagation_store_commit(
             &mut runner.router,
             runner.propagation_node.as_ref(),
+            &mut runner.peer_distribution_queue,
             result,
         );
     }
@@ -6491,6 +6876,9 @@ pub(crate) async fn main() {
             one_shot_status = Some(1);
         }
     }
+    // Python exit_handler() saves every peer's synchronisation state.
+    runner.flush_peer_distribution_queue();
+    runner.save_all_peers();
     if let Err(e) = runner.router.save_state(&runner.data_dir) {
         tracing::warn!("Failed to save router state on shutdown: {e}");
         if one_shot_status.is_some() {
@@ -6678,6 +7066,100 @@ mod tests {
             runner.known_identities.get(&node_hex),
             Some(&node.get_public_key())
         );
+    }
+
+    /// Python `LXMPeer.sync()`: with no path a sync requests one and waits
+    /// `PATH_REQUEST_GRACE`; a path still missing defers the sync without a link.
+    #[tokio::test]
+    async fn peer_sync_without_a_path_requests_one_and_backs_off_without_a_link() {
+        let temp = tempfile::tempdir().unwrap();
+        initialize_storage_namespace(temp.path()).unwrap();
+        let (tx, mut rx) = mpsc::channel(1024);
+        let mut runner = LxmdRunner::new(DaemonConfig::default(), temp.path(), tx, None).unwrap();
+        while rx.try_recv().is_ok() {}
+        let peer_hash = [0x77; 16];
+        let mut peer = LxmPeer::new(peer_hash);
+        peer.alive = true;
+        peer.last_heard = now_f64();
+        peer.stamp_cost = Some(0.0);
+        peer.stamp_cost_flexibility = Some(0.0);
+        peer.peering_cost = 0.0;
+        peer.add_unhandled_message(&[0x31; 32]);
+        runner.router.peers.insert(peer_hash, peer);
+
+        let answer_no_path = |rx: &mut mpsc::Receiver<TransportMessage>| {
+            let mut requested_path = false;
+            while let Ok(message) = rx.try_recv() {
+                match message {
+                    TransportMessage::Rpc {
+                        query: TransportQuery::HasPath { dest },
+                        response_tx,
+                    } if dest == peer_hash => {
+                        let _ = response_tx.send(TransportQueryResponse::BoolResult(false));
+                    }
+                    TransportMessage::RequestPath { destination_hash } => {
+                        assert_eq!(destination_hash, peer_hash);
+                        requested_path = true;
+                    }
+                    TransportMessage::SendLinkRequest { .. } => {
+                        panic!("link opened without a path")
+                    }
+                    _ => {}
+                }
+            }
+            requested_path
+        };
+
+        let now = now_f64();
+        runner.attempt_peer_sync(peer_hash, now);
+        assert!(!answer_no_path(&mut rx));
+        runner.drive_peer_path_checks(now);
+        assert!(answer_no_path(&mut rx), "a path request is sent");
+        assert!(runner.peer_syncs.is_empty());
+
+        runner.drive_peer_path_checks(now + 1.0);
+        assert!(
+            runner.peer_path_checks.contains_key(&peer_hash),
+            "still within the grace"
+        );
+        let after_grace = now + lxmf_core::constants::PATH_REQUEST_GRACE;
+        runner.drive_peer_path_checks(after_grace);
+        answer_no_path(&mut rx);
+        runner.drive_peer_path_checks(after_grace);
+        assert!(runner.peer_syncs.is_empty());
+        let peer = &runner.router.peers[&peer_hash];
+        assert!(!peer.alive);
+        assert_eq!(
+            peer.sync_backoff,
+            lxmf_core::constants::SYNC_BACKOFF_STEP as f64
+        );
+        assert!(!answer_no_path(&mut rx));
+    }
+
+    /// Python `propagation_resource_concluded()` peers with an unpeered sender
+    /// whose recalled announce shows an enabled propagation node.
+    #[tokio::test]
+    async fn sync_from_unpeered_propagation_node_autopeers_from_recalled_announce() {
+        let node = Identity::new();
+        let app_data =
+            propagation_announce_app_data(&lxmf_core::handlers::PropagationNodeAnnounceData::new(
+                true, 256, 10240, 16.0, 3.0, 18.0,
+            ));
+        let (announce, node_hex) = lxmf_announce(&node, "lxmf.propagation", Some(&app_data));
+        let (tx, _driver) = transport_that_heard(&announce).await;
+        let temp = tempfile::tempdir().unwrap();
+        initialize_storage_namespace(temp.path()).unwrap();
+        let mut runner = LxmdRunner::new(DaemonConfig::default(), temp.path(), tx, None).unwrap();
+        let node_hash: [u8; 16] = hex::decode(&node_hex).unwrap().try_into().unwrap();
+
+        runner.recall_sync_autopeer(node_hash);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !runner.router.peers.contains_key(&node_hash) {
+            assert!(Instant::now() < deadline, "the sending node is peered");
+            runner.drain_sync_autopeer_recalls();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(runner.router.peers[&node_hash].autopeered);
     }
 
     /// A propagation node the daemon never heard announced is recalled from
@@ -7099,31 +7581,22 @@ mod tests {
     }
 
     #[test]
-    fn propagation_accounting_advances_only_for_durable_commits() {
+    fn propagation_accounting_counts_duplicates_and_distributes_only_new_entries() {
         let peer_hash = [0x21; 16];
         let first_id = [0x31; 32];
         let second_id = [0x32; 32];
         let mut router = LxmRouter::new(Default::default());
         router.peers.insert(peer_hash, LxmPeer::new(peer_hash));
+        let mut distribution = Vec::new();
 
         apply_propagation_store_commit(
             &mut router,
             None,
+            &mut distribution,
             PropagationStoreCommitResult {
                 origin: PropagationStoreWriteOrigin::Peer(peer_hash),
-                committed: Vec::new(),
-            },
-        );
-        let peer = router.peers.get(&peer_hash).unwrap();
-        assert_eq!(peer.incoming, 0);
-        assert_eq!(peer.rx_bytes, 0);
-
-        apply_propagation_store_commit(
-            &mut router,
-            None,
-            PropagationStoreCommitResult {
-                origin: PropagationStoreWriteOrigin::Peer(peer_hash),
-                committed: vec![(first_id, 120), (second_id, 180)],
+                accounted: vec![(first_id, 120), (second_id, 180)],
+                committed: vec![(first_id, 120)],
             },
         );
         let peer = router.peers.get(&peer_hash).unwrap();
@@ -7131,16 +7604,20 @@ mod tests {
         assert_eq!(peer.rx_bytes, 300);
         assert!(peer.handled_messages.contains(&first_id));
         assert!(peer.handled_messages.contains(&second_id));
+        assert_eq!(distribution, vec![(first_id, Some(peer_hash))]);
 
         apply_propagation_store_commit(
             &mut router,
             None,
+            &mut distribution,
             PropagationStoreCommitResult {
                 origin: PropagationStoreWriteOrigin::Client,
+                accounted: vec![([0x41; 32], 64), ([0x41; 32], 64)],
                 committed: vec![([0x41; 32], 64)],
             },
         );
-        assert_eq!(router.client_propagation_messages_received, 1);
+        assert_eq!(router.client_propagation_messages_received, 2);
+        assert_eq!(distribution.last(), Some(&([0x41; 32], None)));
     }
 
     #[test]
@@ -7259,24 +7736,6 @@ mod tests {
         drop(rx);
 
         assert!(queue_control_command(&tx, ControlCommand::Sync([0x24; 16])).is_none());
-    }
-
-    #[test]
-    fn peer_sync_round_robin_does_not_starve_large_peer_sets() {
-        let peers = (0u8..128).map(|byte| [byte; 16]).collect::<Vec<_>>();
-        let mut cursor = None;
-        let mut selected = HashSet::new();
-
-        for _ in 0..peers.len() {
-            let next = round_robin_peer_order(peers.clone(), cursor)[0];
-            assert!(
-                selected.insert(next),
-                "selected a peer twice before a full pass"
-            );
-            cursor = Some(next);
-        }
-
-        assert_eq!(selected.len(), 128);
     }
 
     #[tokio::test]

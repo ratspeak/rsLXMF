@@ -30,6 +30,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use rns_crypto::ed25519::{Ed25519PrivateKey, Ed25519PublicKey};
 use rns_link::link::{CloseReason, Link, LinkAction};
+use rns_link::stamp::{LinkRequestStamper, LinkStampPolicy};
 use rns_protocol::resource::{
     InboundTransfer, MAX_EFFICIENT_SIZE, MAX_RESOURCE_SIZE, MAX_SEGMENTS, MultiSegmentInbound,
     OutboundTransfer, RANDOM_HASH_SIZE, ResourceError, TransferAction,
@@ -39,7 +40,7 @@ use rns_transport::link_messages::DestinationEvent;
 use rns_transport::messages::{
     InterfaceId, LinkEndpointBindResult, LinkEndpointBinding, LinkEndpointLifecycleEvent,
     LinkEndpointRole, LinkEndpointSendResult, LinkEndpointUnbindResult, OutboundRequest,
-    TransportMessage,
+    TransportMessage, TransportQuery, TransportQueryResponse,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -55,6 +56,8 @@ use crate::types::PropagationTransientId;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PropagationClientState {
     Idle,
+    /// Checking for, or waiting on, a path to the node before linking.
+    PathRequested,
     LinkEstablishing,
     LinkEstablished,
     /// `/get` with `[None, None]` sent.
@@ -70,6 +73,8 @@ pub enum PropagationClientState {
     /// At least one downloaded item lacked durable local acceptance in this cycle.
     Partial,
     Complete,
+    /// No path to the node arrived within the path timeout.
+    NoPath,
     Failed,
 }
 
@@ -227,6 +232,7 @@ pub struct PropagationClient {
     receiving_for: Option<PropagationClientState>,
     identity_pub: Option<[u8; 64]>,
     identity_key: Option<Ed25519PrivateKey>,
+    link_stamper: LinkRequestStamper,
     /// Phase 1 response: transient IDs the server has.
     available_messages: Vec<Vec<u8>>,
     /// Messages we already have locally.
@@ -269,7 +275,16 @@ pub struct PropagationClient {
     started_at: Option<Instant>,
     timeout: Duration,
     identified: bool,
+    path_query: Option<oneshot::Receiver<TransportQueryResponse>>,
+    bitrate_query: Option<oneshot::Receiver<TransportQueryResponse>>,
+    path_requested_at: Option<Instant>,
+    path_timeout: Duration,
 }
+
+/// Python `Reticulum.MINIMUM_BITRATE`.
+const MINIMUM_BITRATE: u64 = 5;
+/// Python `LXMRouter.PR_PATH_TIMEOUT`, in seconds.
+pub const PR_PATH_TIMEOUT: u64 = 10;
 
 impl PropagationClient {
     pub fn new(
@@ -299,6 +314,7 @@ impl PropagationClient {
             receiving_for: None,
             identity_pub,
             identity_key,
+            link_stamper: LinkRequestStamper::without_recall(LinkStampPolicy::default()),
             available_messages: Vec::new(),
             local_messages: HashSet::new(),
             local_message_expiry: HashMap::new(),
@@ -334,7 +350,17 @@ impl PropagationClient {
             started_at: None,
             timeout: Duration::from_secs(120),
             identified: false,
+            path_query: None,
+            bitrate_query: None,
+            path_requested_at: None,
+            path_timeout: Duration::ZERO,
         }
+    }
+
+    /// Stamp new link requests with this stamper's policy and announced costs.
+    /// The default stamps only when `always_stamp_lrs` is set.
+    pub fn set_link_request_stamper(&mut self, stamper: LinkRequestStamper) {
+        self.link_stamper = stamper;
     }
 
     pub fn set_propagation_node(&mut self, dest_hash: [u8; 16]) {
@@ -548,6 +574,7 @@ impl PropagationClient {
             self.status.state,
             PropagationClientState::Complete
                 | PropagationClientState::Partial
+                | PropagationClientState::NoPath
                 | PropagationClientState::Failed
         ) {
             return false;
@@ -585,6 +612,7 @@ impl PropagationClient {
             PropagationClientState::Idle
                 | PropagationClientState::Complete
                 | PropagationClientState::Partial
+                | PropagationClientState::NoPath
                 | PropagationClientState::Failed
         ) {
             return false;
@@ -593,6 +621,7 @@ impl PropagationClient {
             self.status.state,
             PropagationClientState::Complete
                 | PropagationClientState::Partial
+                | PropagationClientState::NoPath
                 | PropagationClientState::Failed
         ) {
             self.cleanup();
@@ -601,8 +630,126 @@ impl PropagationClient {
         if !self.pending_transport.is_empty() {
             return false;
         }
+        // LXMRouter.request_messages_from_propagation_node: link only once a path is known.
+        if !self.query_path(node_hash) {
+            return false;
+        }
+        self.status = PropagationTransferStatus {
+            state: PropagationClientState::PathRequested,
+            ..PropagationTransferStatus::default()
+        };
+        self.max_messages = max_messages.filter(|limit| *limit > 0);
+        true
+    }
 
-        let (link, request_data) = Link::new_initiator(node_hash, 1);
+    fn query_path(&mut self, node_hash: [u8; 16]) -> bool {
+        let (response_tx, response_rx) = oneshot::channel();
+        if !self.queue_transport(TransportMessage::Rpc {
+            query: TransportQuery::HasPath { dest: node_hash },
+            response_tx,
+        }) {
+            return false;
+        }
+        self.path_query = Some(response_rx);
+        true
+    }
+
+    /// LXMRouter.__request_messages_path_job: request a path once, wait up to
+    /// `max(PR_PATH_TIMEOUT, path_request_wait())`, then link or end in `NoPath`.
+    fn poll_path_wait(&mut self) {
+        if self.status.state != PropagationClientState::PathRequested {
+            return;
+        }
+        let Some(node_hash) = self.outbound_propagation_node else {
+            self.fail();
+            return;
+        };
+        if let Some(receiver) = self.bitrate_query.as_mut() {
+            match receiver.try_recv() {
+                Ok(TransportQueryResponse::InterfaceStats(interfaces)) => {
+                    self.bitrate_query = None;
+                    let lowest = interfaces
+                        .iter()
+                        .filter(|interface| interface.online && interface.bitrate > 0)
+                        .map(|interface| interface.bitrate)
+                        .min();
+                    // Transport.medium_path_timeout
+                    if let Some(lowest) = lowest {
+                        let medium = 2.0
+                            * ((rns_wire::constants::MTU * 8) as f64
+                                / lowest.max(MINIMUM_BITRATE) as f64)
+                            + rns_wire::constants::DEFAULT_PER_HOP_TIMEOUT;
+                        self.path_timeout = self.path_timeout.max(Duration::from_secs_f64(medium));
+                    }
+                }
+                Err(oneshot::error::TryRecvError::Empty) => {}
+                Ok(_) | Err(oneshot::error::TryRecvError::Closed) => self.bitrate_query = None,
+            }
+        }
+        let Some(receiver) = self.path_query.as_mut() else {
+            return;
+        };
+        let has_path = match receiver.try_recv() {
+            Ok(TransportQueryResponse::BoolResult(has_path)) => has_path,
+            Err(oneshot::error::TryRecvError::Empty) => return,
+            Ok(_) | Err(oneshot::error::TryRecvError::Closed) => {
+                self.path_query = None;
+                self.fail();
+                return;
+            }
+        };
+        self.path_query = None;
+        if has_path {
+            self.bitrate_query = None;
+            self.path_requested_at = None;
+            if !self.establish_link(node_hash) {
+                self.fail();
+            }
+            return;
+        }
+        match self.path_requested_at {
+            None => {
+                tracing::debug!(
+                    node = %hex_encode(&node_hash),
+                    "no path known for message download from propagation node, requesting path"
+                );
+                if !self.queue_transport(TransportMessage::RequestPath {
+                    destination_hash: node_hash,
+                }) {
+                    self.fail();
+                    return;
+                }
+                let (response_tx, response_rx) = oneshot::channel();
+                if self.queue_transport(TransportMessage::Rpc {
+                    query: TransportQuery::GetInterfaceStats,
+                    response_tx,
+                }) {
+                    self.bitrate_query = Some(response_rx);
+                }
+                self.path_requested_at = Some(Instant::now());
+                self.path_timeout = Duration::from_secs(PR_PATH_TIMEOUT.max(PATH_REQUEST_WAIT));
+            }
+            Some(requested_at) if requested_at.elapsed() >= self.path_timeout => {
+                tracing::debug!("propagation node path request timed out");
+                self.cleanup();
+                self.status = PropagationTransferStatus {
+                    state: PropagationClientState::NoPath,
+                    ..PropagationTransferStatus::default()
+                };
+                return;
+            }
+            Some(_) => {}
+        }
+        if !self.query_path(node_hash) {
+            self.fail();
+        }
+    }
+
+    fn establish_link(&mut self, node_hash: [u8; 16]) -> bool {
+        let Ok((link, request_data)) = self.link_stamper.new_initiator(node_hash, 1) else {
+            tracing::warn!("propagation client link request stamp generation failed");
+            return false;
+        };
         let link_id = link.link_id;
 
         if !self.queue_transport(TransportMessage::RegisterDestination {
@@ -657,7 +804,6 @@ impl PropagationClient {
         self.endpoint_release_queued = false;
         self.pending_endpoint_bind = None;
         self.started_at = Some(Instant::now());
-        self.max_messages = max_messages.filter(|limit| *limit > 0);
         self.identified = false;
         self.available_messages.clear();
         self.received_messages.clear();
@@ -2016,6 +2162,7 @@ impl PropagationClient {
             self.cleanup();
             return;
         }
+        self.poll_path_wait();
         self.poll_admissions();
 
         if let Some(started) = self.started_at
@@ -2087,7 +2234,7 @@ impl PropagationClient {
         }
 
         match self.status.state {
-            PropagationClientState::Idle => {}
+            PropagationClientState::Idle | PropagationClientState::PathRequested => {}
             PropagationClientState::LinkEstablishing => {}
             PropagationClientState::LinkEstablished => {
                 if !self.identified {
@@ -2106,6 +2253,7 @@ impl PropagationClient {
             | PropagationClientState::AwaitingAdmission => {}
             PropagationClientState::Complete
             | PropagationClientState::Partial
+            | PropagationClientState::NoPath
             | PropagationClientState::Failed => {
                 self.cleanup();
             }
@@ -2573,6 +2721,9 @@ impl PropagationClient {
 
     fn cleanup(&mut self) {
         self.link_request_result = None;
+        self.path_query = None;
+        self.bitrate_query = None;
+        self.path_requested_at = None;
         self.pending_transport
             .retain(|message| !matches!(message, TransportMessage::SendLinkRequest { .. }));
         self.revoke_admissions();
@@ -2786,7 +2937,7 @@ mod tests {
         let mut client = PropagationClient::new(tx, None, None);
         client.set_propagation_node([0xBB; 16]);
 
-        assert!(client.start_download());
+        start_with_path(&mut client, &mut rx);
         assert_eq!(
             client.status.state,
             PropagationClientState::LinkEstablishing
@@ -2803,6 +2954,84 @@ mod tests {
             outbound.unwrap(),
             TransportMessage::SendLinkRequest { .. }
         ));
+    }
+
+    fn start_with_path(client: &mut PropagationClient, rx: &mut mpsc::Receiver<TransportMessage>) {
+        assert!(client.start_download());
+        answer_path_query(rx, true);
+        client.tick();
+    }
+
+    fn answer_path_query(rx: &mut mpsc::Receiver<TransportMessage>, has_path: bool) -> bool {
+        let mut requested_path = false;
+        while let Ok(message) = rx.try_recv() {
+            match message {
+                TransportMessage::Rpc {
+                    query: TransportQuery::HasPath { .. },
+                    response_tx,
+                } => {
+                    let _ = response_tx.send(TransportQueryResponse::BoolResult(has_path));
+                }
+                TransportMessage::Rpc {
+                    query: TransportQuery::GetInterfaceStats,
+                    response_tx,
+                } => {
+                    let _ = response_tx.send(TransportQueryResponse::InterfaceStats(Vec::new()));
+                }
+                TransportMessage::RequestPath { .. } => requested_path = true,
+                TransportMessage::SendLinkRequest { .. } => panic!("link request without a path"),
+                _ => {}
+            }
+        }
+        requested_path
+    }
+
+    #[test]
+    fn download_waits_for_a_node_path_before_linking() {
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut client = PropagationClient::new(tx, None, None);
+        client.set_propagation_node([0xB6; 16]);
+        assert!(client.start_download());
+        assert_eq!(client.state(), PropagationClientState::PathRequested);
+        assert!(!answer_path_query(&mut rx, false));
+        client.tick();
+        assert!(
+            answer_path_query(&mut rx, false),
+            "missing path is requested"
+        );
+        client.tick();
+        assert!(!answer_path_query(&mut rx, true), "path is requested once");
+        assert_eq!(client.state(), PropagationClientState::PathRequested);
+        client.tick();
+        assert_eq!(client.state(), PropagationClientState::LinkEstablishing);
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            TransportMessage::RegisterDestination { .. }
+        ));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            TransportMessage::SendLinkRequest { .. }
+        ));
+
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut client = PropagationClient::new(tx, None, None);
+        client.set_propagation_node([0xB7; 16]);
+        assert!(client.start_download());
+        answer_path_query(&mut rx, false);
+        client.tick();
+        assert!(answer_path_query(&mut rx, false));
+        client.tick();
+        assert_eq!(
+            client.path_timeout,
+            Duration::from_secs(PR_PATH_TIMEOUT.max(PATH_REQUEST_WAIT))
+        );
+        client.path_requested_at = Some(ago_or_skip!(client.path_timeout));
+        answer_path_query(&mut rx, false);
+        client.tick();
+        assert_eq!(client.state(), PropagationClientState::NoPath);
+        assert!(client.link.is_none());
+        assert!(client.acknowledge_transfer());
+        assert!(client.start_download(), "a later cycle may retry");
     }
 
     #[test]
@@ -2827,12 +3056,15 @@ mod tests {
         client.set_propagation_node([0xB2; 16]);
 
         assert!(client.start_download());
-        assert_eq!(client.pending_transport.len(), 2);
+        assert_eq!(client.pending_transport.len(), 1);
         assert!(matches!(
             rx.try_recv().unwrap(),
             TransportMessage::DeregisterDestination { .. }
         ));
         client.tick();
+        answer_path_query(&mut rx, true);
+        client.tick();
+        assert_eq!(client.pending_transport.len(), 1);
         assert!(matches!(
             rx.try_recv().unwrap(),
             TransportMessage::RegisterDestination { .. }
@@ -2896,7 +3128,7 @@ mod tests {
         let mut client = PropagationClient::new(tx, None, None);
         client.set_propagation_node([0xBC; 16]);
 
-        assert!(client.start_download());
+        start_with_path(&mut client, &mut rx);
         while rx.try_recv().is_ok() {}
 
         assert!(!client.start_download());
@@ -3400,10 +3632,10 @@ mod tests {
 
     #[test]
     fn test_timeout_fails() {
-        let (tx, _rx) = mpsc::channel(64);
+        let (tx, mut rx) = mpsc::channel(64);
         let mut client = PropagationClient::new(tx, None, None);
         client.set_propagation_node([0xCC; 16]);
-        client.start_download();
+        start_with_path(&mut client, &mut rx);
         assert_eq!(
             client.status.state,
             PropagationClientState::LinkEstablishing
@@ -3442,7 +3674,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(64);
         let mut client = PropagationClient::new(tx, None, None);
         client.set_propagation_node([0xDD; 16]);
-        client.start_download();
+        start_with_path(&mut client, &mut rx);
         while rx.try_recv().is_ok() {}
 
         client.status.state = PropagationClientState::Complete;

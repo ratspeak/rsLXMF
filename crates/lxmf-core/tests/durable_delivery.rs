@@ -357,6 +357,23 @@ fn adapter_processing_memory_shares_peak_budget_without_second_worker() {
     assert!(ProcessingLease::try_acquire(1).is_ok());
 }
 
+fn answer_node_path(
+    receiver: &mut tokio::sync::mpsc::Receiver<rns_transport::messages::TransportMessage>,
+) {
+    use rns_transport::messages::{TransportMessage, TransportQuery, TransportQueryResponse};
+    while let Ok(message) = receiver.try_recv() {
+        if let TransportMessage::Rpc {
+            query: TransportQuery::HasPath { .. },
+            response_tx,
+        } = message
+        {
+            response_tx
+                .send(TransportQueryResponse::BoolResult(true))
+                .unwrap();
+        }
+    }
+}
+
 fn reject_link_request(
     receiver: &mut tokio::sync::mpsc::Receiver<rns_transport::messages::TransportMessage>,
 ) {
@@ -395,6 +412,8 @@ fn link_capacity_failure_reaches_all_three_initiators_before_establishment_timeo
     let mut client = PropagationClient::new(tx, None, None);
     client.set_propagation_node([3; 16]);
     assert!(client.start_download());
+    answer_node_path(&mut rx);
+    client.tick();
     reject_link_request(&mut rx);
     client.tick();
     assert_eq!(
@@ -404,6 +423,8 @@ fn link_capacity_failure_reaches_all_three_initiators_before_establishment_timeo
     let (tx, mut rx) = tokio::sync::mpsc::channel(32);
     let mut sync = PropagationSyncTask::new(tx, [8; 16]);
     assert!(sync.request_sync_now([3; 16]));
+    answer_node_path(&mut rx);
+    sync.tick();
     reject_link_request(&mut rx);
     sync.tick();
     assert_eq!(
@@ -417,6 +438,8 @@ fn canceled_download_closes_exact_request_admission_reply() {
     let mut client = lxmf_core::propagation_client::PropagationClient::new(tx, None, None);
     client.set_propagation_node([3; 16]);
     assert!(client.start_download());
+    answer_node_path(&mut rx);
+    client.tick();
     client.cancel_download();
     let mut found = false;
     while let Ok(message) = rx.try_recv() {

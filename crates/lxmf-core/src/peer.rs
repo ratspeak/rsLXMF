@@ -73,6 +73,24 @@ struct StoredPeerV2 {
     metadata: Option<HashMap<u8, Vec<u8>>>,
     last_heard: f64,
     alive: bool,
+    #[serde(default)]
+    link_establishment_rate: f64,
+    #[serde(default)]
+    sync_transfer_rate: f64,
+    #[serde(default)]
+    last_sync_attempt: f64,
+    #[serde(default)]
+    offered: u64,
+    #[serde(default)]
+    outgoing: u64,
+    #[serde(default)]
+    incoming: u64,
+    #[serde(default)]
+    rx_bytes: u64,
+    #[serde(default)]
+    tx_bytes: u64,
+    #[serde(default)]
+    unhandled_ids: Option<Vec<Vec<u8>>>,
 }
 
 /// Immutable inputs for one outbound propagation offer.
@@ -96,6 +114,8 @@ pub struct OutboundOfferPolicy {
     pub autopeered: bool,
     pub is_static: bool,
     pub metadata: Option<HashMap<u8, Vec<u8>>>,
+    /// Messages queued for this peer; `None` offers every live store entry.
+    pub unhandled_messages: Option<HashSet<PropagationTransientId>>,
 }
 
 impl OutboundOfferPolicy {
@@ -119,6 +139,7 @@ impl OutboundOfferPolicy {
             autopeered: false,
             is_static: false,
             metadata: None,
+            unhandled_messages: None,
         }
     }
 
@@ -156,8 +177,6 @@ pub struct LxmPeer {
     pub state: PeerState,
     pub sync_strategy: SyncStrategy,
     pub last_sync: f64,
-    unhandled_count: u32,
-    unhandled_count_cached: bool,
     pub unreachable_count: u32,
     pub autopeered: bool,
     pub stamp_cost: Option<f64>,
@@ -198,6 +217,8 @@ pub struct LxmPeer {
     pub is_static: bool,
     /// Message hashes already handled by this peer, for sync filtering.
     pub handled_messages: HashSet<PropagationTransientId>,
+    /// Messages distributed to this peer and not yet handled by it.
+    pub unhandled_messages: HashSet<PropagationTransientId>,
 }
 
 impl LxmPeer {
@@ -208,8 +229,6 @@ impl LxmPeer {
             state: PeerState::Idle,
             sync_strategy: SyncStrategy::default(),
             last_sync: 0.0,
-            unhandled_count: 0,
-            unhandled_count_cached: false,
             unreachable_count: 0,
             autopeered: false,
             stamp_cost: None,
@@ -221,8 +240,8 @@ impl LxmPeer {
             currently_transferring_messages: None,
             link_alive: false,
             created_at: now,
-            last_heard: now,
-            alive: true,
+            last_heard: 0.0,
+            alive: false,
             peering_timebase: 0.0,
             link_establishment_rate: 0.0,
             sync_transfer_rate: 0.0,
@@ -238,6 +257,7 @@ impl LxmPeer {
             last_offer_generation: 0,
             is_static: false,
             handled_messages: HashSet::new(),
+            unhandled_messages: HashSet::new(),
         }
     }
 
@@ -288,6 +308,8 @@ impl LxmPeer {
         peer.peering_cost = peering_cost.unwrap_or(PEERING_COST);
         peer.metadata = bounded_peer_metadata(metadata);
         peer.autopeered = true;
+        peer.alive = true;
+        peer.last_heard = now_f64();
         peer
     }
 
@@ -388,18 +410,19 @@ impl LxmPeer {
         OutboundOfferPolicy::from(self)
     }
 
-    pub fn add_unhandled_message(&mut self) {
-        self.unhandled_count_cached = false;
-        self.unhandled_count += 1;
+    /// Queue a message for this peer unless it already handled it.
+    pub fn add_unhandled_message(&mut self, hash: &PropagationTransientId) {
+        if !self.handled_messages.contains(hash) {
+            self.unhandled_messages.insert(*hash);
+        }
     }
 
-    pub fn unhandled_messages(&self) -> u32 {
-        self.unhandled_count
+    pub fn remove_unhandled_message(&mut self, hash: &PropagationTransientId) {
+        self.unhandled_messages.remove(hash);
     }
 
-    pub fn set_unhandled_count(&mut self, count: u32) {
-        self.unhandled_count = count;
-        self.unhandled_count_cached = true;
+    pub fn unhandled_message_count(&self) -> usize {
+        self.unhandled_messages.len()
     }
 
     pub fn heard(&mut self) {
@@ -411,6 +434,7 @@ impl LxmPeer {
 
     pub fn add_handled_message(&mut self, hash: &PropagationTransientId) {
         self.handled_messages.insert(*hash);
+        self.unhandled_messages.remove(hash);
     }
 
     pub fn has_handled(&self, hash: &PropagationTransientId) -> bool {
@@ -429,6 +453,9 @@ impl LxmPeer {
     pub fn to_bytes_with_handled(&self) -> Vec<u8> {
         let mut handled: Vec<Vec<u8>> = self.handled_messages.iter().map(|h| h.to_vec()).collect();
         handled.sort();
+        let mut unhandled: Vec<Vec<u8>> =
+            self.unhandled_messages.iter().map(|h| h.to_vec()).collect();
+        unhandled.sort();
         let data = StoredPeerV2 {
             version: STORED_PEER_VERSION,
             destination_hash: self.destination_hash.to_vec(),
@@ -449,6 +476,15 @@ impl LxmPeer {
             metadata: self.metadata.clone(),
             last_heard: self.last_heard,
             alive: self.alive,
+            link_establishment_rate: self.link_establishment_rate,
+            sync_transfer_rate: self.sync_transfer_rate,
+            last_sync_attempt: self.last_sync_attempt,
+            offered: self.offered,
+            outgoing: self.outgoing,
+            incoming: self.incoming,
+            rx_bytes: self.rx_bytes,
+            tx_bytes: self.tx_bytes,
+            unhandled_ids: Some(unhandled),
         };
         rmp_serde::to_vec_named(&data).unwrap_or_default()
     }
@@ -457,8 +493,15 @@ impl LxmPeer {
     ///
     /// [`to_bytes_with_handled`]: Self::to_bytes_with_handled
     pub fn from_bytes_with_handled(data: &[u8]) -> Option<Self> {
+        Self::decode_stored(data).map(|(peer, _)| peer)
+    }
+
+    /// Decode a stored peer and report whether the record predates per-peer
+    /// unhandled sets, when every unhandled store entry was offered.
+    pub(crate) fn decode_stored(data: &[u8]) -> Option<(Self, bool)> {
         if let Ok(stored) = rmp_serde::from_slice::<StoredPeerV2>(data) {
-            return Self::from_stored_v2(stored);
+            let legacy = stored.unhandled_ids.is_none();
+            return Self::from_stored_v2(stored).map(|peer| (peer, legacy));
         }
 
         let (
@@ -478,6 +521,9 @@ impl LxmPeer {
         let mut dest_hash = [0u8; 16];
         dest_hash.copy_from_slice(&dest_hash_vec);
         let mut peer = Self::new(dest_hash);
+        // The legacy record kept no liveness; treat the peer as just heard.
+        peer.alive = true;
+        peer.last_heard = now_f64();
         peer.last_sync = last_sync;
         peer.unreachable_count = unreachable_count;
         peer.peering_cost = peering_cost;
@@ -497,7 +543,7 @@ impl LxmPeer {
                 }
             })
             .collect();
-        Some(peer)
+        Some((peer, true))
     }
 
     fn from_stored_v2(stored: StoredPeerV2) -> Option<Self> {
@@ -525,8 +571,22 @@ impl LxmPeer {
         peer.metadata = stored.metadata;
         peer.last_heard = stored.last_heard;
         peer.alive = stored.alive;
+        peer.link_establishment_rate = stored.link_establishment_rate;
+        peer.sync_transfer_rate = stored.sync_transfer_rate;
+        peer.last_sync_attempt = stored.last_sync_attempt;
+        peer.offered = stored.offered;
+        peer.outgoing = stored.outgoing;
+        peer.incoming = stored.incoming;
+        peer.rx_bytes = stored.rx_bytes;
+        peer.tx_bytes = stored.tx_bytes;
         peer.handled_messages = stored
             .handled_ids
+            .into_iter()
+            .filter_map(|value| value.try_into().ok())
+            .collect();
+        peer.unhandled_messages = stored
+            .unhandled_ids
+            .unwrap_or_default()
             .into_iter()
             .filter_map(|value| value.try_into().ok())
             .collect();
@@ -535,10 +595,33 @@ impl LxmPeer {
 
     pub fn mark_unreachable(&mut self) {
         self.unreachable_count += 1;
-        let now = now_f64();
-        if now - self.last_heard > MAX_UNREACHABLE as f64 {
+    }
+
+    /// Opening checks of Python `LXMPeer.sync()`: record the attempt and
+    /// report whether the backoff has elapsed. An attempt during backoff
+    /// marks a peer not heard since its last attempt as unreachable.
+    pub fn sync_attempt(&mut self, now: f64) -> bool {
+        self.last_sync_attempt = now;
+        if now > self.next_sync_attempt {
+            return true;
+        }
+        if self.last_sync_attempt > self.last_heard {
             self.alive = false;
         }
+        false
+    }
+
+    /// A path request for this peer went unanswered within
+    /// [`PATH_REQUEST_GRACE`]; defer the sync as Python `LXMPeer.sync()` does.
+    pub fn path_request_failed(&mut self, now: f64) {
+        self.sync_backoff += SYNC_BACKOFF_STEP as f64;
+        self.next_sync_attempt = now + self.sync_backoff;
+        self.alive = false;
+    }
+
+    /// Whether this peer has been silent longer than [`MAX_UNREACHABLE`].
+    pub fn unreachable_too_long(&self, now: f64) -> bool {
+        now > self.last_heard + MAX_UNREACHABLE as f64
     }
 
     pub fn should_sync(&self) -> bool {
@@ -648,6 +731,7 @@ impl LxmPeer {
         self.next_sync_attempt = 0.0;
         self.last_heard = now_f64();
         self.alive = true;
+        self.sync_backoff = 0.0;
         self.link_alive = true;
     }
 
@@ -702,68 +786,46 @@ impl From<&LxmPeer> for OutboundOfferPolicy {
             autopeered: peer.autopeered,
             is_static: peer.is_static,
             metadata: peer.metadata.clone(),
+            unhandled_messages: Some(peer.unhandled_messages.clone()),
         }
     }
 }
 
-/// Return the input index of an idle peer with unhandled messages.
+/// Choose the next peer to sync as Python `LXMRouter.sync_peers()` does.
 ///
-/// Alive peers take priority: sort them by descending transfer rate and choose
-/// the first. This selection is deterministic; adding unknown-speed peers to
-/// the candidate pool does not randomize the choice as Python `sync_peers()` does.
-/// If no alive peer qualifies, choose the first unresponsive peer whose backoff
-/// has elapsed. Backoff is not checked in the alive-peer branch.
-pub fn select_sync_peer(peers: &[&LxmPeer]) -> Option<usize> {
-    if peers.is_empty() {
-        return None;
-    }
+/// Alive idle peers with unhandled messages form the waiting pool; the pick is
+/// random among the [`FASTEST_N_RANDOM_POOL`] fastest of them plus as many
+/// peers of unknown speed. With no waiting peer, the pick is random among
+/// unreachable idle peers whose backoff has elapsed. Returns an input index.
+pub fn select_sync_peer(peers: &[&LxmPeer], now: f64) -> Option<usize> {
+    use rand::seq::SliceRandom;
 
-    let mut alive_with_unhandled: Vec<(usize, &LxmPeer)> = peers
-        .iter()
-        .enumerate()
-        .filter(|(_, p)| p.alive && p.state == PeerState::Idle && p.unhandled_messages() > 0)
-        .map(|(i, p)| (i, *p))
+    let candidate =
+        |peer: &LxmPeer| peer.state == PeerState::Idle && !peer.unhandled_messages.is_empty();
+    let mut waiting: Vec<usize> = (0..peers.len())
+        .filter(|&i| candidate(peers[i]) && peers[i].alive)
         .collect();
-
-    if !alive_with_unhandled.is_empty() {
-        alive_with_unhandled.sort_by(|a, b| {
-            b.1.sync_transfer_rate
-                .partial_cmp(&a.1.sync_transfer_rate)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        let pool_size = alive_with_unhandled.len().min(FASTEST_N_RANDOM_POOL);
-
-        let unknown_speed: Vec<(usize, &LxmPeer)> = alive_with_unhandled
+    let pool: Vec<usize> = if !waiting.is_empty() {
+        let unknown_speed: Vec<usize> = waiting
             .iter()
-            .filter(|(_, p)| p.sync_transfer_rate == 0.0)
             .copied()
+            .filter(|&i| peers[i].sync_transfer_rate == 0.0)
             .collect();
-
-        let mut pool: Vec<usize> = alive_with_unhandled[..pool_size]
-            .iter()
-            .map(|(i, _)| *i)
-            .collect();
-        for (i, _) in unknown_speed.iter().take(pool_size) {
-            if !pool.contains(i) {
-                pool.push(*i);
-            }
-        }
-
-        // Deterministic first-of-pool pick; callers that want randomization do it themselves.
-        return pool.into_iter().next();
-    }
-
-    let unresponsive: Vec<(usize, &LxmPeer)> = peers
-        .iter()
-        .enumerate()
-        .filter(|(_, p)| {
-            !p.alive && p.state == PeerState::Idle && p.unhandled_messages() > 0 && p.should_sync()
-        })
-        .map(|(i, p)| (i, *p))
-        .collect();
-
-    unresponsive.first().map(|(i, _)| *i)
+        waiting.sort_by(|&a, &b| {
+            peers[b]
+                .sync_transfer_rate
+                .total_cmp(&peers[a].sync_transfer_rate)
+        });
+        waiting.truncate(FASTEST_N_RANDOM_POOL);
+        let fastest = waiting.len();
+        waiting.extend(unknown_speed.into_iter().take(fastest));
+        waiting
+    } else {
+        (0..peers.len())
+            .filter(|&i| candidate(peers[i]) && !peers[i].alive && now > peers[i].next_sync_attempt)
+            .collect()
+    };
+    pool.choose(&mut rand::thread_rng()).copied()
 }
 
 fn now_f64() -> f64 {
@@ -786,7 +848,8 @@ mod tests {
         let peer = LxmPeer::new([0xAA; 16]);
         assert_eq!(peer.state, PeerState::Idle);
         assert_eq!(peer.sync_strategy, SyncStrategy::Persistent);
-        assert!(peer.alive);
+        assert!(!peer.alive);
+        assert_eq!(peer.last_heard, 0.0);
         assert_eq!(peer.unreachable_count, 0);
     }
 
@@ -985,10 +1048,29 @@ mod tests {
     }
 
     #[test]
-    fn test_mark_unreachable() {
+    fn sync_attempt_during_backoff_marks_unheard_peer_unreachable() {
         let mut peer = LxmPeer::new([0; 16]);
-        peer.last_heard = 0.0;
-        peer.mark_unreachable();
+        peer.alive = true;
+        peer.last_heard = 100.0;
+        peer.next_sync_attempt = 500.0;
+        assert!(!peer.sync_attempt(200.0));
+        assert_eq!(peer.last_sync_attempt, 200.0);
+        assert!(!peer.alive);
+
+        peer.alive = true;
+        peer.last_heard = 300.0;
+        assert!(!peer.sync_attempt(250.0));
+        assert!(peer.alive, "a peer heard after the attempt stays alive");
+        assert!(peer.sync_attempt(600.0));
+    }
+
+    #[test]
+    fn unanswered_path_request_adds_backoff_and_marks_unreachable() {
+        let mut peer = LxmPeer::new([0; 16]);
+        peer.alive = true;
+        peer.path_request_failed(1000.0);
+        assert_eq!(peer.sync_backoff, SYNC_BACKOFF_STEP as f64);
+        assert_eq!(peer.next_sync_attempt, 1000.0 + SYNC_BACKOFF_STEP as f64);
         assert!(!peer.alive);
     }
 
@@ -1044,11 +1126,16 @@ mod tests {
     #[test]
     fn test_add_unhandled() {
         let mut peer = LxmPeer::new([0; 16]);
-        assert_eq!(peer.unhandled_messages(), 0);
+        assert_eq!(peer.unhandled_message_count(), 0);
 
-        peer.add_unhandled_message();
-        peer.add_unhandled_message();
-        assert_eq!(peer.unhandled_messages(), 2);
+        peer.add_unhandled_message(&tid(1));
+        peer.add_unhandled_message(&tid(1));
+        peer.add_unhandled_message(&tid(2));
+        assert_eq!(peer.unhandled_message_count(), 2);
+
+        peer.add_handled_message(&tid(1));
+        peer.add_unhandled_message(&tid(1));
+        assert_eq!(peer.unhandled_message_count(), 1);
     }
 
     #[test]
@@ -1096,30 +1183,31 @@ mod tests {
     #[test]
     fn test_select_sync_peer_basic() {
         let mut peer1 = LxmPeer::new([0x01; 16]);
-        peer1.add_unhandled_message();
-        peer1.sync_transfer_rate = 100.0;
+        peer1.add_unhandled_message(&tid(1));
+        peer1.alive = true;
 
         let mut peer2 = LxmPeer::new([0x02; 16]);
-        peer2.add_unhandled_message();
-        peer2.sync_transfer_rate = 200.0;
+        peer2.add_unhandled_message(&tid(1));
+        peer2.next_sync_attempt = f64::MAX;
 
         let peers: Vec<&LxmPeer> = vec![&peer1, &peer2];
-        let selected = select_sync_peer(&peers);
-        assert!(selected.is_some());
-        assert_eq!(selected.unwrap(), 1);
+        assert_eq!(select_sync_peer(&peers, 1.0), Some(0));
+        peer1.alive = false;
+        let peers: Vec<&LxmPeer> = vec![&peer1, &peer2];
+        assert_eq!(select_sync_peer(&peers, 1.0), Some(0));
     }
 
     #[test]
     fn test_select_sync_peer_empty() {
         let peers: Vec<&LxmPeer> = vec![];
-        assert!(select_sync_peer(&peers).is_none());
+        assert!(select_sync_peer(&peers, 1.0).is_none());
     }
 
     #[test]
     fn test_select_sync_peer_no_unhandled() {
         let peer = LxmPeer::new([0x01; 16]);
         let peers: Vec<&LxmPeer> = vec![&peer];
-        assert!(select_sync_peer(&peers).is_none());
+        assert!(select_sync_peer(&peers, 1.0).is_none());
     }
 
     #[test]

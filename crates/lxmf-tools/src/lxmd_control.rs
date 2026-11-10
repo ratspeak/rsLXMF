@@ -193,8 +193,8 @@ pub fn encode_router_control_stats(
             .map(|(_, value)| Value::from(*value as u64))
             .unwrap_or(Value::Nil);
         let unhandled = node
-            .map(|node| node.unhandled_message_count(&peer.handled_messages))
-            .unwrap_or_else(|| peer.unhandled_messages() as usize);
+            .map(|node| node.unhandled_message_count(&peer.unhandled_messages))
+            .unwrap_or_else(|| peer.unhandled_message_count());
 
         let peer_map = Value::Map(vec![
             (Value::String("type".into()), Value::from(peer_type)),
@@ -1120,7 +1120,7 @@ mod tests {
         let mut peer = LxmPeer::new(peer_hash);
         peer.offered = 4;
         peer.outgoing = 2;
-        peer.set_unhandled_count(1);
+        peer.add_unhandled_message(&[0x31; 32]);
         router.peers.insert(peer_hash, peer);
         router.static_peers.push(peer_hash);
 

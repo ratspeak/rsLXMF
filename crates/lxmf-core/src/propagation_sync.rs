@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use rns_crypto::ed25519::{Ed25519PrivateKey, Ed25519PublicKey};
 use rns_link::link::{CloseReason, Link, LinkAction};
+use rns_link::stamp::{LinkRequestStamper, LinkStampPolicy};
 use rns_protocol::resource::{
     MAX_EFFICIENT_SIZE, MultiSegmentOutbound, OutboundTransfer, ResourceError, TransferAction,
 };
@@ -27,12 +28,12 @@ use rns_transport::link_messages::DestinationEvent;
 use rns_transport::messages::{
     InterfaceId, LinkEndpointBindResult, LinkEndpointBinding, LinkEndpointLifecycleEvent,
     LinkEndpointRole, LinkEndpointSendResult, LinkEndpointUnbindResult, OutboundRequest,
-    TransportMessage,
+    TransportMessage, TransportQuery, TransportQueryResponse,
 };
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::constants::OFFER_REQUEST_PATH;
+use crate::constants::{OFFER_REQUEST_PATH, PATH_REQUEST_GRACE};
 use crate::peer::{LxmPeer, OutboundOfferPolicy};
 use crate::propagation::hex_encode;
 use crate::propagation_node::{
@@ -45,17 +46,23 @@ use crate::types::PropagationTransientId;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncTaskState {
     Idle,
+    /// Checking for, or waiting on, a path to the peer before linking.
+    PathRequested,
     Establishing,
     Offering,
     AwaitingResponse,
     Transferring,
     Complete,
+    /// No path to the peer arrived within the path request grace.
+    NoPath,
     Failed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerSyncTerminalState {
     Complete,
+    /// The path request was not answered; no link was attempted.
+    NoPath,
     Failed,
 }
 
@@ -166,9 +173,11 @@ pub struct PropagationSyncTask {
     offer_preparation_rx: Option<oneshot::Receiver<PreparedSyncOffer>>,
     ready_prepared_offer: Option<PreparedSyncOffer>,
     handled_updates: Vec<PropagationTransientId>,
+    dropped_unhandled_updates: Vec<PropagationTransientId>,
     runtime_handle: Option<tokio::runtime::Handle>,
     identity_pub: Option<[u8; 64]>,
     identity_key: Option<Ed25519PrivateKey>,
+    link_stamper: LinkRequestStamper,
     active_offer_generation: Option<u64>,
     generation_exhausted: bool,
     terminal_result: Option<PeerSyncTerminalResult>,
@@ -180,6 +189,8 @@ pub struct PropagationSyncTask {
     transfer_wire_size: u64,
     transfer_started: Option<Instant>,
     link_establishment_rate: Option<f64>,
+    path_query: Option<oneshot::Receiver<TransportQueryResponse>>,
+    path_requested_at: Option<Instant>,
 }
 
 impl PropagationSyncTask {
@@ -220,9 +231,11 @@ impl PropagationSyncTask {
             offer_preparation_rx: None,
             ready_prepared_offer: None,
             handled_updates: Vec::new(),
+            dropped_unhandled_updates: Vec::new(),
             runtime_handle: tokio::runtime::Handle::try_current().ok(),
             identity_pub: None,
             identity_key: None,
+            link_stamper: LinkRequestStamper::without_recall(LinkStampPolicy::default()),
             active_offer_generation: None,
             generation_exhausted: false,
             terminal_result: None,
@@ -234,6 +247,8 @@ impl PropagationSyncTask {
             transfer_wire_size: 0,
             transfer_started: None,
             link_establishment_rate: None,
+            path_query: None,
+            path_requested_at: None,
         }
     }
 
@@ -282,9 +297,11 @@ impl PropagationSyncTask {
             offer_preparation_rx: None,
             ready_prepared_offer: None,
             handled_updates: Vec::new(),
+            dropped_unhandled_updates: Vec::new(),
             runtime_handle: tokio::runtime::Handle::try_current().ok(),
             identity_pub: None,
             identity_key: None,
+            link_stamper: LinkRequestStamper::without_recall(LinkStampPolicy::default()),
             active_offer_generation: None,
             generation_exhausted: false,
             terminal_result: None,
@@ -296,6 +313,8 @@ impl PropagationSyncTask {
             transfer_wire_size: 0,
             transfer_started: None,
             link_establishment_rate: None,
+            path_query: None,
+            path_requested_at: None,
         })
     }
 
@@ -338,9 +357,11 @@ impl PropagationSyncTask {
             offer_preparation_rx: None,
             ready_prepared_offer: None,
             handled_updates: Vec::new(),
+            dropped_unhandled_updates: Vec::new(),
             runtime_handle: tokio::runtime::Handle::try_current().ok(),
             identity_pub: None,
             identity_key: None,
+            link_stamper: LinkRequestStamper::without_recall(LinkStampPolicy::default()),
             active_offer_generation: None,
             generation_exhausted: false,
             terminal_result: None,
@@ -352,6 +373,8 @@ impl PropagationSyncTask {
             transfer_wire_size: 0,
             transfer_started: None,
             link_establishment_rate: None,
+            path_query: None,
+            path_requested_at: None,
         }
     }
 
@@ -375,7 +398,7 @@ impl PropagationSyncTask {
         }
         self.node_dest_hash = Some(dest_hash);
         self.offer_policy = None;
-        if !self.start_sync(dest_hash) {
+        if !self.begin_attempt(dest_hash) {
             return false;
         }
         self.last_sync = Instant::now();
@@ -392,11 +415,17 @@ impl PropagationSyncTask {
         let dest_hash = policy.peer_hash;
         self.node_dest_hash = Some(dest_hash);
         self.offer_policy = Some(policy);
-        if !self.start_sync(dest_hash) {
+        if !self.begin_attempt(dest_hash) {
             return false;
         }
         self.last_sync = Instant::now();
         true
+    }
+
+    /// Stamp new link requests with this stamper's policy and announced costs.
+    /// The default stamps only when `always_stamp_lrs` is set.
+    pub fn set_link_request_stamper(&mut self, stamper: LinkRequestStamper) {
+        self.link_stamper = stamper;
     }
 
     /// Configure the local identity used for Link identification. Production
@@ -412,6 +441,12 @@ impl PropagationSyncTask {
     /// `LxmPeer` and persist it; draining alone performs no write.
     pub fn take_handled_updates(&mut self) -> Vec<PropagationTransientId> {
         std::mem::take(&mut self.handled_updates)
+    }
+
+    /// Drain IDs that offer preparation dropped from the peer's unhandled set
+    /// for an insufficient stamp value. They are not handled by the peer.
+    pub fn take_dropped_unhandled_updates(&mut self) -> Vec<PropagationTransientId> {
+        std::mem::take(&mut self.dropped_unhandled_updates)
     }
 
     pub fn take_terminal_peer_result(&mut self) -> Option<PeerSyncTerminalResult> {
@@ -452,6 +487,7 @@ impl PropagationSyncTask {
         self.active_offer_generation = None;
         self.generation_exhausted = false;
         self.handled_updates.clear();
+        self.dropped_unhandled_updates.clear();
         self.terminal_result = None;
         self.reset_attempt_accounting();
         self.state = SyncTaskState::Idle;
@@ -629,8 +665,10 @@ impl PropagationSyncTask {
                     self.state = SyncTaskState::Failed;
                     return;
                 }
-                let establishment_rate =
-                    self.link.as_ref().and_then(|link| link.establishment_rate);
+                let establishment_rate = self
+                    .link
+                    .as_ref()
+                    .and_then(|link| link.get_establishment_rate());
                 self.link_establishment_rate = establishment_rate;
                 if let (Some(peer), Some(link_id)) = (self.peer.as_mut(), self.link_id) {
                     peer.link_established(link_id, establishment_rate);
@@ -1148,14 +1186,21 @@ impl PropagationSyncTask {
         }
 
         if !self.pending_transport.is_empty()
-            && !matches!(self.state, SyncTaskState::Complete | SyncTaskState::Failed)
+            && !matches!(
+                self.state,
+                SyncTaskState::Complete | SyncTaskState::NoPath | SyncTaskState::Failed
+            )
         {
             return;
         }
 
         if !matches!(
             self.state,
-            SyncTaskState::Idle | SyncTaskState::Complete | SyncTaskState::Failed
+            SyncTaskState::Idle
+                | SyncTaskState::PathRequested
+                | SyncTaskState::Complete
+                | SyncTaskState::NoPath
+                | SyncTaskState::Failed
         ) {
             self.drive_link_watchdog();
         }
@@ -1168,12 +1213,13 @@ impl PropagationSyncTask {
                     && let Some(node_hash) = self.node_dest_hash
                 {
                     if self.message_count() > 0 {
-                        let _ = self.start_sync(node_hash);
+                        let _ = self.begin_attempt(node_hash);
                     } else {
                         self.last_sync = Instant::now();
                     }
                 }
             }
+            SyncTaskState::PathRequested => self.poll_path_wait(),
             SyncTaskState::Establishing | SyncTaskState::AwaitingResponse => {}
             SyncTaskState::Offering => {
                 self.send_offer_request();
@@ -1181,17 +1227,17 @@ impl PropagationSyncTask {
             SyncTaskState::Transferring => {
                 self.drive_transfers();
             }
-            SyncTaskState::Complete | SyncTaskState::Failed => {
+            SyncTaskState::Complete | SyncTaskState::NoPath | SyncTaskState::Failed => {
                 if self.terminal_result.is_none()
                     && let Some(peer_hash) = self.node_dest_hash
                 {
                     let complete = self.state == SyncTaskState::Complete;
                     self.terminal_result = Some(PeerSyncTerminalResult {
                         peer_hash,
-                        state: if complete {
-                            PeerSyncTerminalState::Complete
-                        } else {
-                            PeerSyncTerminalState::Failed
+                        state: match self.state {
+                            SyncTaskState::Complete => PeerSyncTerminalState::Complete,
+                            SyncTaskState::NoPath => PeerSyncTerminalState::NoPath,
+                            _ => PeerSyncTerminalState::Failed,
                         },
                         offer_generation: complete
                             .then_some(self.active_offer_generation)
@@ -1342,11 +1388,20 @@ impl PropagationSyncTask {
                     offer,
                     generation,
                     terminal_handled_ids,
+                    dropped_unhandled_ids,
                     generation_exhausted,
                 } => {
                     self.active_offer_generation = Some(generation);
                     self.generation_exhausted = generation_exhausted;
                     self.record_handled_updates(&terminal_handled_ids);
+                    for transient_id in dropped_unhandled_ids {
+                        if !self.dropped_unhandled_updates.contains(&transient_id) {
+                            self.dropped_unhandled_updates.push(transient_id);
+                        }
+                        if let Some(peer) = self.peer.as_mut() {
+                            peer.remove_unhandled_message(&transient_id);
+                        }
+                    }
                     if offer.transient_ids.is_empty()
                         && let Ok(mut node) = self.propagation_node.lock()
                     {
@@ -1423,6 +1478,80 @@ impl PropagationSyncTask {
         }
     }
 
+    /// LXMPeer.sync: link only once a path is known.
+    fn begin_attempt(&mut self, node_hash: [u8; 16]) -> bool {
+        self.path_requested_at = None;
+        if !self.query_path(node_hash) {
+            self.state = SyncTaskState::Failed;
+            return false;
+        }
+        self.state = SyncTaskState::PathRequested;
+        true
+    }
+
+    fn query_path(&mut self, node_hash: [u8; 16]) -> bool {
+        let (response_tx, response_rx) = oneshot::channel();
+        if !self.queue_transport(TransportMessage::Rpc {
+            query: TransportQuery::HasPath { dest: node_hash },
+            response_tx,
+        }) {
+            return false;
+        }
+        self.path_query = Some(response_rx);
+        true
+    }
+
+    /// Without a path, request one, check again after `PATH_REQUEST_GRACE`,
+    /// and end in `NoPath` if it is still missing.
+    fn poll_path_wait(&mut self) {
+        let Some(node_hash) = self.node_dest_hash else {
+            self.state = SyncTaskState::Failed;
+            return;
+        };
+        if let Some(receiver) = self.path_query.as_mut() {
+            let has_path = match receiver.try_recv() {
+                Ok(TransportQueryResponse::BoolResult(has_path)) => has_path,
+                Err(oneshot::error::TryRecvError::Empty) => return,
+                Ok(_) | Err(oneshot::error::TryRecvError::Closed) => {
+                    self.path_query = None;
+                    self.state = SyncTaskState::Failed;
+                    return;
+                }
+            };
+            self.path_query = None;
+            if has_path {
+                self.path_requested_at = None;
+                let _ = self.start_sync(node_hash);
+                return;
+            }
+            if self.path_requested_at.is_some() {
+                tracing::debug!(
+                    peer = %hex_encode(&node_hash),
+                    "path request was not answered, retrying sync with peer later"
+                );
+                self.path_requested_at = None;
+                self.state = SyncTaskState::NoPath;
+                return;
+            }
+            tracing::debug!(peer = %hex_encode(&node_hash), "no path to peer exists, requesting");
+            if !self.queue_transport(TransportMessage::RequestPath {
+                destination_hash: node_hash,
+            }) {
+                self.state = SyncTaskState::Failed;
+                return;
+            }
+            self.path_requested_at = Some(Instant::now());
+            return;
+        }
+        if self
+            .path_requested_at
+            .is_some_and(|requested| requested.elapsed().as_secs_f64() >= PATH_REQUEST_GRACE)
+            && !self.query_path(node_hash)
+        {
+            self.state = SyncTaskState::Failed;
+        }
+    }
+
     fn start_sync(&mut self, node_hash: [u8; 16]) -> bool {
         self.pending_transport.clear();
         self.preserve_pending_on_cleanup = false;
@@ -1437,7 +1566,11 @@ impl PropagationSyncTask {
         self.active_transfer_ids.clear();
         self.active_offer_generation = None;
         self.generation_exhausted = false;
-        let (link, request_data) = Link::new_initiator(node_hash, 1);
+        let Ok((link, request_data)) = self.link_stamper.new_initiator(node_hash, 1) else {
+            tracing::warn!("propagation sync link request stamp generation failed");
+            self.state = SyncTaskState::Failed;
+            return false;
+        };
         let link_id = link.link_id;
 
         self.link = Some(link);
@@ -1771,6 +1904,8 @@ impl PropagationSyncTask {
     /// Python LXMPeer.py:540-542.
     fn cleanup_sync(&mut self) {
         self.link_request_result = None;
+        self.path_query = None;
+        self.path_requested_at = None;
         self.pending_transport
             .retain(|message| !matches!(message, TransportMessage::SendLinkRequest { .. }));
         // No transfer packet should survive the attempt it belongs to. The
@@ -2341,6 +2476,72 @@ mod tests {
         task.last_sync = Instant::now();
     }
 
+    /// Answer queued path queries, then tick; returns whether a path was requested.
+    fn answer_sync_path(
+        task: &mut PropagationSyncTask,
+        rx: &mut mpsc::Receiver<TransportMessage>,
+        has_path: bool,
+    ) -> bool {
+        let mut requested_path = false;
+        while let Ok(message) = rx.try_recv() {
+            match message {
+                TransportMessage::Rpc {
+                    query: TransportQuery::HasPath { .. },
+                    response_tx,
+                } => {
+                    let _ = response_tx.send(TransportQueryResponse::BoolResult(has_path));
+                }
+                TransportMessage::RequestPath { .. } => requested_path = true,
+                TransportMessage::SendLinkRequest { .. } => panic!("link request without a path"),
+                _ => {}
+            }
+        }
+        task.tick();
+        requested_path
+    }
+
+    #[test]
+    fn peer_sync_waits_for_a_peer_path_before_linking() {
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut task = test_task(tx, [0xAA; 16]);
+        assert!(task.request_sync_now([0xB6; 16]));
+        assert_eq!(task.state, SyncTaskState::PathRequested);
+        assert!(!answer_sync_path(&mut task, &mut rx, false));
+        assert!(
+            answer_sync_path(&mut task, &mut rx, false),
+            "missing path is requested"
+        );
+        assert_eq!(task.state, SyncTaskState::PathRequested);
+        task.path_requested_at = Some(ago_or_skip!(Duration::from_secs_f64(PATH_REQUEST_GRACE)));
+        task.tick();
+        assert!(
+            !answer_sync_path(&mut task, &mut rx, true),
+            "path is requested once"
+        );
+        assert_eq!(task.state, SyncTaskState::Establishing);
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            TransportMessage::RegisterDestination { .. }
+        ));
+
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut task = test_task(tx, [0xAA; 16]);
+        assert!(task.request_sync_now([0xB7; 16]));
+        answer_sync_path(&mut task, &mut rx, false);
+        assert!(answer_sync_path(&mut task, &mut rx, false));
+        task.path_requested_at = Some(ago_or_skip!(Duration::from_secs_f64(PATH_REQUEST_GRACE)));
+        task.tick();
+        answer_sync_path(&mut task, &mut rx, false);
+        assert_eq!(task.state, SyncTaskState::NoPath);
+        task.tick();
+        assert_eq!(task.state, SyncTaskState::Idle);
+        assert!(task.link_id.is_none());
+        assert_eq!(
+            task.take_terminal_peer_result().unwrap().state,
+            PeerSyncTerminalState::NoPath
+        );
+    }
+
     #[test]
     fn test_sync_task_creation() {
         let (tx, _rx) = mpsc::channel(16);
@@ -2405,6 +2606,7 @@ mod tests {
 
         assert_eq!(task.message_count(), 1);
         task.tick();
+        answer_sync_path(&mut task, &mut rx, true);
         assert_eq!(task.state, SyncTaskState::Establishing);
         assert!(matches!(
             rx.try_recv().unwrap(),
@@ -2449,6 +2651,7 @@ mod tests {
         task.accept_fixture(&msg);
 
         task.tick();
+        answer_sync_path(&mut task, &mut rx, true);
         assert_eq!(task.state, SyncTaskState::Establishing);
         assert!(task.link_id.is_some());
 
@@ -2466,7 +2669,7 @@ mod tests {
 
     #[test]
     fn test_sync_timeout() {
-        let (tx, _rx) = mpsc::channel(64);
+        let (tx, mut rx) = mpsc::channel(64);
         let mut task = test_task(tx, [0xAA; 16]);
         task.set_node([0xBB; 16]);
         make_sync_due(&mut task);
@@ -2483,6 +2686,7 @@ mod tests {
         task.accept_fixture(&msg);
 
         task.tick();
+        answer_sync_path(&mut task, &mut rx, true);
         assert_eq!(task.state, SyncTaskState::Establishing);
 
         task.sync_timeout = Duration::ZERO;
@@ -2571,10 +2775,11 @@ mod tests {
         let mut task = test_task(tx, [0xAA; 16]);
 
         assert!(task.request_sync_now([0xBB; 16]));
-        assert_eq!(task.pending_transport.len(), 2);
+        assert_eq!(task.pending_transport.len(), 1);
 
         let _blocker = rx.try_recv().unwrap();
         task.tick();
+        answer_sync_path(&mut task, &mut rx, true);
         assert!(matches!(
             rx.try_recv().unwrap(),
             TransportMessage::RegisterDestination { .. }
@@ -2709,6 +2914,7 @@ mod tests {
         task.accept_fixture(&msg);
 
         task.tick();
+        answer_sync_path(&mut task, &mut rx, true);
         while let Ok(message) = rx.try_recv() {
             if let TransportMessage::SendLinkRequest { result_tx, .. } = message {
                 let _ = result_tx.send(Ok(()));
@@ -2943,14 +3149,14 @@ mod tests {
 
         task.send_offer_request();
 
-        let mut updates = task.take_handled_updates();
-        updates.sort();
-        let mut expected = vec![
-            rns_crypto::sha::full_hash(&low),
-            rns_crypto::sha::full_hash(&oversized),
-        ];
-        expected.sort();
-        assert_eq!(updates, expected);
+        assert_eq!(
+            task.take_handled_updates(),
+            vec![rns_crypto::sha::full_hash(&oversized)]
+        );
+        assert_eq!(
+            task.take_dropped_unhandled_updates(),
+            vec![rns_crypto::sha::full_hash(&low)]
+        );
         assert_eq!(task.state, SyncTaskState::Complete);
         assert!(task.generation_exhausted);
         assert!(rx.try_recv().is_err());
@@ -3254,7 +3460,7 @@ mod tests {
 
     #[test]
     fn test_peer_created_on_sync_start() {
-        let (tx, _rx) = mpsc::channel(64);
+        let (tx, mut rx) = mpsc::channel(64);
         let mut task = test_task(tx, [0xAA; 16]);
         task.set_node([0xBB; 16]);
         make_sync_due(&mut task);
@@ -3273,6 +3479,7 @@ mod tests {
         task.accept_fixture(&msg);
 
         task.tick();
+        answer_sync_path(&mut task, &mut rx, true);
         assert_eq!(task.state, SyncTaskState::Establishing);
 
         let peer = task.peer().expect("peer should exist after sync start");
@@ -3282,10 +3489,11 @@ mod tests {
 
     #[test]
     fn request_sync_now_starts_without_waiting_for_interval() {
-        let (tx, _rx) = mpsc::channel(64);
+        let (tx, mut rx) = mpsc::channel(64);
         let mut task = test_task(tx, [0xAA; 16]);
 
         task.request_sync_now([0xBB; 16]);
+        answer_sync_path(&mut task, &mut rx, true);
 
         assert_eq!(task.node_dest_hash(), Some([0xBB; 16]));
         assert_eq!(task.state, SyncTaskState::Establishing);
@@ -3439,6 +3647,11 @@ mod tests {
         };
         result_tx.send(LinkEndpointBindResult::Bound).unwrap();
         task.poll_endpoint_control();
+        // Python stores Link.get_establishment_rate(), in bits per second.
+        let bits = task.link.as_ref().unwrap().get_establishment_rate();
+        assert!(bits.is_some_and(|rate| rate > 0.0));
+        assert_eq!(task.link_establishment_rate, bits);
+        assert_eq!(task.peer().unwrap().link_establishment_rate, bits.unwrap());
         task.send_offer_request();
 
         let mut contexts = Vec::new();
@@ -3477,6 +3690,7 @@ mod tests {
         task.accept_fixture(&msg);
 
         task.tick();
+        answer_sync_path(&mut task, &mut rx, true);
         while rx.try_recv().is_ok() {}
 
         assert!(task.peer().is_some());

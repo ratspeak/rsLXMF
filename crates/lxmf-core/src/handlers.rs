@@ -950,7 +950,7 @@ impl PropagationRequestHandler {
                 (Value::String("incoming".into()), Value::from(peer.incoming)),
                 (
                     Value::String("unhandled".into()),
-                    Value::from(peer.unhandled_messages() as u64),
+                    Value::from(peer.unhandled_message_count() as u64),
                 ),
             ]);
             peer_entries.push((Value::Binary(hash.to_vec()), peer_map));

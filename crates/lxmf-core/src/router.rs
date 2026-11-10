@@ -21,7 +21,7 @@ use crate::message::{
     LxMessage, LxMessageDraft, MessageError, MessageMetadata, RecipientStamp, ResumableLxMessage,
     SignedLxMessage, VerifiedLxMessage,
 };
-use crate::peer::{LxmPeer, OutboundOfferPolicy};
+use crate::peer::LxmPeer;
 use crate::propagation::PropagationStore;
 use crate::propagation_client::PropagationTransferStatus;
 use crate::stamper;
@@ -1429,55 +1429,52 @@ impl LxmRouter {
         self.state_snapshot().save_state(state_dir)
     }
 
-    /// Return peer destination hashes that are due for sync and mark each as
-    /// `LinkEstablishing` so concurrent calls don't double-schedule.
-    ///
-    /// Python's `LXMRouter.sync_peers()` drives network I/O directly; in Rust
-    /// network I/O lives outside the router, so callers (e.g. `lxmd`) feed this
-    /// list into whatever sync task manages link establishment.
-    pub fn sync_peers(&mut self) -> Vec<[u8; 16]> {
-        let mut due = Vec::new();
-        for (hash, peer) in self.peers.iter_mut() {
-            if peer.alive
-                && peer.state == PeerState::Idle
-                && peer.unhandled_messages() > 0
-                && peer.should_sync()
-            {
-                peer.begin_sync();
-                due.push(*hash);
-            }
+    /// One peer-sync job pass of Python `LXMRouter.sync_peers()`: remove
+    /// non-static peers unreachable for [`MAX_UNREACHABLE`] and choose at most
+    /// one peer to sync. Peers that conclusively processed the current store
+    /// generation are skipped. The caller performs the sync attempt and
+    /// deletes persisted state for the culled peers.
+    pub fn sync_peers(&mut self, now: f64, offer_generation: u64) -> PeerSyncPass {
+        let culled: Vec<[u8; 16]> = self
+            .peers
+            .iter()
+            .filter(|(hash, peer)| {
+                peer.unreachable_too_long(now) && !self.static_peers.contains(hash)
+            })
+            .map(|(hash, _)| *hash)
+            .collect();
+        for hash in &culled {
+            self.peers.remove(hash);
         }
-        due
-    }
-
-    /// Return authoritative policies for peers that have not processed the
-    /// current propagation-store generation. Prefers eligible alive peers; if
-    /// none are alive, returns eligible unresponsive peers. Snapshots clone peer
-    /// policy/handled-ID state and are sorted by peer hash. Exact message
-    /// eligibility is checked during offer preparation.
-    ///
-    /// The method does not mutate peer state, allowing a single shared sync
-    /// task to accept one policy before the daemon marks that peer started.
-    pub fn sync_peer_policies_for_store(&self, offer_generation: u64) -> Vec<OutboundOfferPolicy> {
-        let eligible = self
+        let candidates: Vec<&LxmPeer> = self
             .peers
             .values()
+            // A long-unreachable static peer is kept but not synced.
             .filter(|peer| {
-                peer.state == PeerState::Idle
-                    && peer.should_sync()
-                    && peer.needs_offer_generation(offer_generation)
+                !peer.unreachable_too_long(now) && peer.needs_offer_generation(offer_generation)
             })
-            .collect::<Vec<_>>();
-        let has_alive = eligible.iter().any(|peer| peer.alive);
-        let mut policies = eligible
-            .into_iter()
-            .filter(|peer| peer.alive == has_alive)
-            .map(OutboundOfferPolicy::from)
-            .collect::<Vec<_>>();
-        policies.sort_by_key(|policy| policy.peer_hash);
-        policies
+            .collect();
+        let selected = crate::peer::select_sync_peer(&candidates, now)
+            .map(|index| candidates[index].destination_hash);
+        PeerSyncPass { culled, selected }
     }
 
+    /// Python `flush_peer_distribution_queue()`: queue each newly stored
+    /// message for every current peer except the one it came from.
+    pub fn flush_peer_distribution(
+        &mut self,
+        entries: &[(PropagationTransientId, Option<[u8; 16]>)],
+    ) {
+        for (peer_hash, peer) in self.peers.iter_mut() {
+            for (transient_id, from_peer) in entries {
+                if *from_peer != Some(*peer_hash) {
+                    peer.add_unhandled_message(transient_id);
+                }
+            }
+        }
+    }
+
+    /// Python `LXMRouter.peer()`: a new peer is refused once `max_peers` is reached.
     pub fn add_peer(&mut self, peer: LxmPeer) -> bool {
         if self.peers.len() >= self.config.max_peers {
             return false;
@@ -1811,7 +1808,7 @@ impl LxmRouter {
                         offered: peer.offered,
                         outgoing: peer.outgoing,
                         incoming: peer.incoming,
-                        unhandled: peer.unhandled_messages(),
+                        unhandled: peer.unhandled_message_count() as u32,
                     },
                 )
             })
@@ -1863,8 +1860,7 @@ impl LxmRouter {
         let rotation_headroom = (self.config.max_peers * ROTATION_HEADROOM_PCT / 100).max(1);
         let required_drops = self.peers.len() as isize
             - (self.config.max_peers as isize - rotation_headroom as isize);
-
-        if required_drops <= 0 || self.peers.len() <= 1 {
+        if required_drops <= 0 || self.peers.len() as isize - required_drops <= 1 {
             return;
         }
 
@@ -1878,21 +1874,32 @@ impl LxmRouter {
             return;
         }
 
-        let mut drop_candidates: Vec<([u8; 16], f64)> = self
+        let fully_synced = self
             .peers
-            .iter()
-            .filter(|(hash, peer)| {
-                !self.static_peers.contains(hash)
-                    && peer.state == PeerState::Idle
-                    && peer.offered > 0
-            })
-            .map(|(hash, peer)| (*hash, peer.acceptance_rate()))
-            .collect();
+            .values()
+            .any(|peer| peer.unhandled_message_count() == 0);
+        let mut waiting = Vec::new();
+        let mut unresponsive = Vec::new();
+        for (hash, peer) in &self.peers {
+            if (fully_synced && peer.unhandled_message_count() != 0)
+                || self.static_peers.contains(hash)
+                || peer.state != PeerState::Idle
+            {
+                continue;
+            }
+            if !peer.alive {
+                unresponsive.push((*hash, peer.acceptance_rate()));
+            } else if peer.offered > 0 {
+                waiting.push((*hash, peer.acceptance_rate()));
+            }
+        }
+        // prioritise_rotating_unreachable_peers is off by default upstream.
+        let mut drop_pool = unresponsive;
+        drop_pool.extend(waiting);
+        drop_pool.sort_by(|a, b| a.1.total_cmp(&b.1));
 
-        drop_candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-
-        let drop_count = (required_drops as usize).min(drop_candidates.len());
-        for (hash, ar) in drop_candidates.into_iter().take(drop_count) {
+        let drop_count = (required_drops as usize).min(drop_pool.len());
+        for (hash, ar) in drop_pool.into_iter().take(drop_count) {
             if ar < ROTATION_AR_MAX {
                 self.unpeer(&hash);
             }
@@ -2678,6 +2685,15 @@ pub struct RouterStats {
     pub propagation_entries: usize,
     pub propagation_size: usize,
     pub stamp_costs_cached: usize,
+}
+
+/// Outcome of one [`LxmRouter::sync_peers`] pass.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PeerSyncPass {
+    /// Peers removed for excessive unreachability.
+    pub culled: Vec<[u8; 16]>,
+    /// The peer to attempt a sync with, if any.
+    pub selected: Option<[u8; 16]>,
 }
 
 /// Per-peer stats for control status.
@@ -3641,100 +3657,44 @@ mod tests {
     }
 
     #[test]
-    fn test_sync_peers_picks_due_peers() {
+    fn sync_peers_skips_busy_and_empty_peers_and_culls_long_unreachable() {
+        let now = now_f64();
         let mut router = LxmRouter::new(RouterConfig::default());
 
-        let mut peer_due = LxmPeer::new([0x01; 16]);
-        peer_due.add_unhandled_message();
-        router.add_peer(peer_due);
+        let mut due = LxmPeer::new([0x01; 16]);
+        due.alive = true;
+        due.last_heard = now;
+        due.add_unhandled_message(&[0x31; 32]);
+        router.add_peer(due);
 
-        let peer_idle_no_msgs = LxmPeer::new([0x02; 16]);
-        router.add_peer(peer_idle_no_msgs);
+        let mut idle_no_msgs = LxmPeer::new([0x02; 16]);
+        idle_no_msgs.alive = true;
+        idle_no_msgs.last_heard = now;
+        router.add_peer(idle_no_msgs);
 
-        let mut peer_in_flight = LxmPeer::new([0x03; 16]);
-        peer_in_flight.add_unhandled_message();
-        peer_in_flight.begin_sync();
-        router.add_peer(peer_in_flight);
+        let mut in_flight = LxmPeer::new([0x03; 16]);
+        in_flight.alive = true;
+        in_flight.last_heard = now;
+        in_flight.add_unhandled_message(&[0x31; 32]);
+        in_flight.begin_sync();
+        router.add_peer(in_flight);
 
-        let due = router.sync_peers();
-        assert_eq!(due, vec![[0x01; 16]]);
+        let mut gone = LxmPeer::new([0x04; 16]);
+        gone.last_heard = now - MAX_UNREACHABLE as f64 - 1.0;
+        router.add_peer(gone);
 
-        // Subsequent call returns empty — the due peer is now LinkEstablishing.
-        assert!(router.sync_peers().is_empty());
-    }
-
-    #[test]
-    fn store_generation_scheduler_skips_unchanged_and_reenables_on_store_or_policy_change() {
-        let peer_hash = [0x11; 16];
-        let mut router = LxmRouter::new(RouterConfig::default());
-        let mut peer = LxmPeer::from_announce(
-            peer_hash,
-            10.0,
-            Some(1.0),
-            Some(2.0),
-            Some(16.0),
-            Some(3.0),
-            Some(18.0),
-        );
-        peer.mark_offer_generation_processed(5);
-        router.add_peer(peer);
-
-        assert!(router.sync_peer_policies_for_store(5).is_empty());
-        let due = router.sync_peer_policies_for_store(6);
-        assert_eq!(due.len(), 1);
-        assert_eq!(due[0].peer_hash, peer_hash);
-        assert_eq!(router.peers[&peer_hash].state, PeerState::Idle);
+        let pass = router.sync_peers(now, 1);
+        assert_eq!(pass.selected, Some([0x01; 16]));
+        assert_eq!(pass.culled, vec![[0x04; 16]]);
+        assert!(!router.peers.contains_key(&[0x04; 16]));
 
         router
             .peers
-            .get_mut(&peer_hash)
+            .get_mut(&[0x01; 16])
             .unwrap()
-            .mark_offer_generation_processed(6);
-        assert!(router.sync_peer_policies_for_store(6).is_empty());
-        assert!(router.autopeer(AutopeerCandidate {
-            destination_hash: peer_hash,
-            timebase: 11.0,
-            transfer_limit: Some(1.0),
-            sync_limit: Some(2.0),
-            stamp_cost: Some(12.0),
-            stamp_flexibility: Some(3.0),
-            peering_cost: Some(18.0),
-            metadata: Some(std::collections::HashMap::new()),
-            hops: Some(1),
-        }));
-        assert_eq!(router.sync_peer_policies_for_store(6).len(), 1);
-    }
-
-    #[test]
-    fn store_generation_scheduler_falls_back_to_backoff_expired_unresponsive_peers() {
-        let alive_hash = [0x21; 16];
-        let fallback_hash = [0x22; 16];
-        let mut router = LxmRouter::new(RouterConfig::default());
-        let alive = LxmPeer::new(alive_hash);
-        let mut fallback = LxmPeer::new(fallback_hash);
-        fallback.alive = false;
-        fallback.next_sync_attempt = 0.0;
-        assert!(router.add_peer(alive));
-        assert!(router.add_peer(fallback));
-
-        let policies = router.sync_peer_policies_for_store(1);
-        assert_eq!(
-            policies
-                .iter()
-                .map(|policy| policy.peer_hash)
-                .collect::<Vec<_>>(),
-            vec![alive_hash]
-        );
-
-        router.peers.get_mut(&alive_hash).unwrap().begin_sync();
-        let policies = router.sync_peer_policies_for_store(1);
-        assert_eq!(
-            policies
-                .iter()
-                .map(|policy| policy.peer_hash)
-                .collect::<Vec<_>>(),
-            vec![fallback_hash]
-        );
+            .mark_offer_generation_processed(1);
+        assert_eq!(router.sync_peers(now, 1).selected, None);
+        assert_eq!(router.sync_peers(now, 2).selected, Some([0x01; 16]));
     }
 
     #[test]
