@@ -79,8 +79,7 @@ pub struct Args {
     #[arg(long)]
     pub exampleconfig: bool,
 
-    /// Default to warning-level logging for service use; -v/-q override this.
-    /// The process remains in the foreground.
+    /// Service mode; the process remains in the foreground.
     #[arg(short = 's', long)]
     pub service: bool,
 

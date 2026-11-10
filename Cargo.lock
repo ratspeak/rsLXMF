@@ -686,6 +686,7 @@ dependencies = [
  "rns-crypto",
  "rns-identity",
  "rns-runtime",
+ "rns-tools",
  "rns-transport",
  "rns-wire",
  "serde_json",
@@ -693,7 +694,6 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
- "tracing-subscriber",
  "zeroize",
 ]
 
@@ -1192,6 +1192,32 @@ dependencies = [
  "tokio",
  "tracing",
  "zeroize",
+]
+
+[[package]]
+name = "rns-tools"
+version = "1.4.0"
+dependencies = [
+ "base64",
+ "bytes",
+ "clap",
+ "hex",
+ "nix 0.29.0",
+ "rmp-serde",
+ "rmpv",
+ "rns-crypto",
+ "rns-identity",
+ "rns-interface",
+ "rns-runtime",
+ "rns-transport",
+ "rns-wire",
+ "serde",
+ "serde_json",
+ "serialport",
+ "sha2",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

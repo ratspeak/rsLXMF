@@ -919,27 +919,21 @@ fn handle_pn_offer_request(
     }
 }
 
-fn setup_logging(verbose: u8, quiet: u8, service: bool) {
-    let level = match (verbose, quiet) {
-        (v, _) if v >= 3 => tracing::Level::TRACE,
-        (2, _) => tracing::Level::DEBUG,
-        (1, _) => tracing::Level::INFO,
-        (0, 0) => {
-            if service {
-                tracing::Level::WARN
-            } else {
-                tracing::Level::INFO
-            }
-        }
-        (_, q) if q >= 2 => tracing::Level::ERROR,
-        (_, 1) => tracing::Level::WARN,
-        _ => tracing::Level::INFO,
+/// Python `lxmd.program_setup`/`_remote_init`: the daemon starts from its own
+/// config's `loglevel` (a missing file is the default config it writes first);
+/// control commands never read it and start at Notice.
+fn setup_logging(args: &Args, config_dir: &Path, rns_config_dir: &Path, control_command: bool) {
+    let configured = if control_command {
+        None
+    } else {
+        rns_runtime::config::Config::from_file(&config_dir.join("config"))
+            .or_else(|_| rns_runtime::config::Config::parse(example_config()))
+            .ok()
+            .and_then(|c| c.section("logging")?.get_int("loglevel"))
     };
-
-    tracing_subscriber::fmt()
-        .with_max_level(level)
-        .with_target(false)
-        .init();
+    let level = rns_tools::Utility::Lxmd.loglevel(configured, args.verbose, args.quiet, false);
+    let timestamps = rns_tools::config_log_timestamps(rns_config_dir);
+    rns_tools::init_tracing(level, timestamps, true, std::io::stdout);
 }
 
 fn now_f64() -> f64 {
@@ -5872,10 +5866,11 @@ pub(crate) async fn main() {
         return;
     }
 
-    setup_logging(args.verbose, args.quiet, args.service);
-
     let (config_dir, rns_config_dir) =
         resolve_config_dirs(args.config.as_deref(), args.rnsconfig.as_deref());
+    let is_control_command =
+        args.status || args.peers || args.sync.is_some() || args.unpeer.is_some();
+    setup_logging(&args, &config_dir, &rns_config_dir, is_control_command);
 
     if args.migrate_propagation_store {
         let result = (|| -> std::io::Result<()> {
@@ -5931,8 +5926,6 @@ pub(crate) async fn main() {
         return;
     }
 
-    let is_control_command =
-        args.status || args.peers || args.sync.is_some() || args.unpeer.is_some();
     let control_preflight = if is_control_command {
         let peer_hash = if args.status || args.peers {
             None
