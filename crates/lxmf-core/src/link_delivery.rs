@@ -2155,6 +2155,16 @@ impl LinkDeliveryManager {
                         );
                         continue;
                     }
+                    // Link.py:1030; packet proofs reach the Link only as receipts (Transport.py:2997-3036).
+                    let link_receives = header.flags.packet_type
+                        != rns_wire::flags::PacketType::Proof
+                        || header.context == rns_wire::context::PacketContext::ResourcePrf;
+                    if link_receives
+                        && header.context != rns_wire::context::PacketContext::Keepalive
+                        && let Some(delivery) = self.pending.get_mut(&link_id)
+                    {
+                        delivery.link.record_inbound_data();
+                    }
 
                     match header.context {
                         rns_wire::context::PacketContext::Lrproof
@@ -5393,7 +5403,6 @@ fn drive_link_action(
             false
         }
         LinkAction::TransitionedToStale => {
-            // Python sends one more keepalive when an initiator transitions stale.
             send_keepalive_packet(
                 transport_tx,
                 pending_transport,
@@ -5488,7 +5497,7 @@ fn send_link_close_payload(
 }
 
 fn link_data_idle_for(link: &Link) -> Duration {
-    link.no_data_for().min(link.no_outbound_for())
+    link.no_data_for()
 }
 
 fn direct_link_idle_expired(delivery: &PendingDelivery) -> bool {
