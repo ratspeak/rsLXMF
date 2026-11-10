@@ -48,10 +48,12 @@ use lxmf_core::router::{
     AutopeerCandidate, DirectDeliveryPlan, DirectDeliveryPlanInput, DirectReusableLinkState,
     DirectRouteSnapshot, LxmRouter, OutboundAction, plan_direct_delivery,
 };
-use lxmf_tools::daemon::{DaemonConfig, create_router_with_transport, persist_inbound_and_execute};
+use lxmf_tools::daemon::{
+    DaemonConfig, PythonLxmdConfig, create_router_with_transport, persist_inbound_and_execute,
+};
 use lxmf_tools::lxmd_cli::{
-    Args, example_config, load_hash_list, normalize_hash_hex, parse_destination_hash,
-    parse_send_fields_json,
+    Args, default_config_file_text, example_config, load_hash_list, normalize_hash_hex,
+    parse_destination_hash, parse_send_fields_json,
 };
 use lxmf_tools::lxmd_control::{
     CONTROL_APP_NAME, ControlCommandKind, ControlResponse, decode_control_response,
@@ -877,20 +879,94 @@ fn handle_pn_offer_request(
 }
 
 /// Python `lxmd.program_setup`/`_remote_init`: the daemon starts from its own
-/// config's `loglevel` (a missing file is the default config it writes first);
-/// control commands never read it and start at Notice.
-fn setup_logging(args: &Args, config_dir: &Path, rns_config_dir: &Path, control_command: bool) {
-    let configured = if control_command {
-        None
-    } else {
-        rns_runtime::config::Config::from_file(&config_dir.join("config"))
-            .or_else(|_| rns_runtime::config::Config::parse(example_config()))
-            .ok()
-            .and_then(|c| c.section("logging")?.get_int("loglevel"))
-    };
+/// config's `loglevel` and logs to `<configdir>/logfile` in service mode;
+/// control commands never read the config and start at Notice on stdout.
+fn setup_logging(
+    args: &Args,
+    configured: Option<i64>,
+    service_log_dir: Option<&Path>,
+    rns_config_dir: &Path,
+) {
     let level = rns_tools::Utility::Lxmd.loglevel(configured, args.verbose, args.quiet, false);
     let timestamps = rns_tools::config_log_timestamps(rns_config_dir);
-    rns_tools::init_tracing(level, timestamps, true, std::io::stdout);
+    match service_log_dir {
+        Some(dir) => {
+            let path = dir.join("logfile");
+            rns_tools::init_tracing(level, timestamps, false, move || {
+                PythonLogFile(path.clone())
+            });
+        }
+        None => rns_tools::init_tracing(level, timestamps, true, std::io::stdout),
+    }
+}
+
+/// Python `RNS.log` with `LOG_FILE`: append each line, rotate to
+/// `logfile.1` past `LOG_MAXSIZE`, and fall back to the console on error.
+struct PythonLogFile(PathBuf);
+
+impl std::io::Write for PythonLogFile {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        const LOG_MAXSIZE: u64 = 5 * 1024 * 1024;
+        let written = (|| {
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.0)?;
+            file.write_all(buf)?;
+            if file.metadata()?.len() > LOG_MAXSIZE {
+                let previous = self.0.with_file_name("logfile.1");
+                let _ = std::fs::remove_file(&previous);
+                std::fs::rename(&self.0, previous)?;
+            }
+            std::io::Result::Ok(())
+        })();
+        match written {
+            Ok(()) => Ok(buf.len()),
+            Err(_) => std::io::stdout().write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Python `program_setup`: write the default config on first run, and
+/// `RNS.panic()` when the file cannot be parsed. Returns whether it was created.
+fn load_or_create_daemon_config(config_dir: &Path) -> (rns_runtime::config::Config, bool) {
+    let config_path = config_dir.join("config");
+    let created = !config_path.is_file();
+    if created {
+        let written = std::fs::create_dir_all(config_dir)
+            .and_then(|()| std::fs::write(&config_path, default_config_file_text()));
+        if let Err(error) = written {
+            println!(
+                "Could not create the default configuration file at {}: {error}",
+                config_path.display()
+            );
+            std::process::exit(1);
+        }
+    }
+    match rns_runtime::config::Config::from_file(&config_path) {
+        Ok(config) => (config, created),
+        Err(_) => {
+            println!(
+                "Could not parse the configuration at {}",
+                config_path.display()
+            );
+            println!("Check your configuration file for errors!");
+            std::process::exit(255);
+        }
+    }
+}
+
+/// Python adds the timeout to `time.time()`; an infinite or NaN timeout never expires.
+fn control_timeout(args: &Args) -> f64 {
+    match args.timeout {
+        Some(timeout) if timeout != 0.0 => timeout,
+        _ if args.status || args.peers => 5.0,
+        _ => 10.0,
+    }
 }
 
 fn now_f64() -> f64 {
@@ -1845,10 +1921,10 @@ impl LxmdRunner {
 
         let identity_path = paths.preferred_identity_path().to_path_buf();
         let identity = if identity_path.exists() {
-            tracing::info!("Loading identity from {}", identity_path.display());
+            rns_transport::notice!("Loading identity from {}", identity_path.display());
             Identity::from_file(&identity_path)?
         } else {
-            tracing::info!("No identity found, generating new one");
+            rns_transport::notice!("No identity found, generating new one");
             let id = Identity::new();
             id.to_file(&paths.identity_path)?;
             id
@@ -1863,7 +1939,7 @@ impl LxmdRunner {
         let control_dest_hash =
             Destination::hash_from_name_and_identity(CONTROL_APP_NAME, Some(&identity.hash));
 
-        tracing::info!(
+        rns_transport::notice!(
             "Identity: {} (LXMF: {})",
             &identity_hash[..16],
             &hex::encode(lxmf_dest_hash)[..16],
@@ -2118,6 +2194,10 @@ impl LxmdRunner {
             )?;
             prop_link_mgr.set_accounting_event_channel(prop_accounting_tx);
             prop_link_mgr.set_resource_strategy(rns_runtime::prelude::ResourceStrategy::AcceptApp);
+            // LXMRouter.clean_links: idle propagation links are torn down.
+            prop_link_mgr.set_data_inactivity_timeout(Some(std::time::Duration::from_secs(
+                lxmf_core::constants::P_LINK_MAX_INACTIVITY,
+            )));
 
             let pn_for_handler = pn.clone();
             let offer_path_hash = rns_crypto::sha::truncated_hash(
@@ -5782,15 +5862,62 @@ pub(crate) async fn main() {
     let args = Args::parse();
 
     if args.exampleconfig {
-        print!("{}", example_config());
+        println!("{}", example_config());
         return;
     }
 
     let (config_dir, rns_config_dir) =
         resolve_config_dirs(args.config.as_deref(), args.rnsconfig.as_deref());
+    // Python tests the strings for truth, so an empty hash starts the daemon.
+    let sync_hash = args.sync.as_deref().filter(|hash| !hash.is_empty());
+    let unpeer_hash = args.unpeer.as_deref().filter(|hash| !hash.is_empty());
     let is_control_command =
-        args.status || args.peers || args.sync.is_some() || args.unpeer.is_some();
-    setup_logging(&args, &config_dir, &rns_config_dir, is_control_command);
+        args.status || args.peers || sync_hash.is_some() || unpeer_hash.is_some();
+
+    let daemon_setup = if is_control_command || args.migrate_propagation_store {
+        None
+    } else {
+        // Python creates the storage directories before it reads the config.
+        if let Err(error) = initialize_storage_namespace(&config_dir) {
+            println!("Failed to establish private daemon storage namespace: {error}");
+            std::process::exit(1);
+        }
+        let (config, created) = load_or_create_daemon_config(&config_dir);
+        let loaded = DaemonConfig::from_config(&config).and_then(|daemon_config| {
+            Ok((
+                daemon_config,
+                PythonLxmdConfig::from_config(&config)?.target_loglevel,
+            ))
+        });
+        match loaded {
+            Ok((daemon_config, loglevel)) => Some((daemon_config, loglevel, created)),
+            Err(error) => {
+                println!(
+                    "Could not apply LXM Daemon configuration. The contained exception was: {error}"
+                );
+                std::process::exit(1);
+            }
+        }
+    };
+    setup_logging(
+        &args,
+        daemon_setup.as_ref().and_then(|(_, loglevel, _)| *loglevel),
+        daemon_setup
+            .as_ref()
+            .filter(|_| args.service)
+            .map(|_| config_dir.as_path()),
+        &rns_config_dir,
+    );
+    if daemon_setup
+        .as_ref()
+        .is_some_and(|(_, _, created)| *created)
+    {
+        tracing::info!("Could not load config file, creating default configuration file...");
+        tracing::info!(
+            "Default config file created. Make any necessary changes in {} and restart lxmd if needed.",
+            config_dir.join("config").display()
+        );
+    }
 
     if args.migrate_propagation_store {
         let result = (|| -> std::io::Result<()> {
@@ -5850,7 +5977,7 @@ pub(crate) async fn main() {
         let peer_hash = if args.status || args.peers {
             None
         } else {
-            args.sync.as_deref().or(args.unpeer.as_deref())
+            sync_hash.or(unpeer_hash)
         };
         match preflight_control_command(
             &config_dir,
@@ -5868,33 +5995,9 @@ pub(crate) async fn main() {
         None
     };
 
-    if !is_control_command && let Err(error) = initialize_storage_namespace(&config_dir) {
-        tracing::error!(%error, "Failed to establish private daemon storage namespace");
-        std::process::exit(1);
-    }
-    let config_path = config_dir.join("config");
-    let config = match rns_runtime::config::Config::from_file(&config_path) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(
-                "Could not load config from {}: {}",
-                config_path.display(),
-                e
-            );
-            tracing::info!("Using default configuration");
-            rns_runtime::config::Config::parse(rns_runtime::config::Config::default_config())
-                .expect("default config must parse")
-        }
-    };
-
-    let mut daemon_config = match DaemonConfig::from_config(&config) {
-        Ok(daemon_config) => daemon_config,
-        Err(error) => {
-            tracing::error!("Could not apply LXM Daemon configuration: {error}");
-            eprintln!("Could not apply LXM Daemon configuration: {error}");
-            std::process::exit(3);
-        }
-    };
+    let mut daemon_config = daemon_setup
+        .map(|(daemon_config, _, _)| daemon_config)
+        .unwrap_or_default();
     if args.propagation_node {
         daemon_config.propagation_enabled = true;
     }
@@ -5902,13 +6005,15 @@ pub(crate) async fn main() {
         daemon_config.on_inbound_command = Some(on_inbound.clone());
     }
 
-    tracing::info!("LXMF Daemon starting");
-    if let Some(ref name) = daemon_config.display_name {
-        tracing::info!("Display name: {}", name);
+    if !is_control_command {
+        rns_transport::notice!("LXMF Daemon starting");
+        if let Some(ref name) = daemon_config.display_name {
+            tracing::info!("Display name: {}", name);
+        }
     }
 
-    if daemon_config.propagation_enabled {
-        tracing::info!(
+    if !is_control_command && daemon_config.propagation_enabled {
+        rns_transport::notice!(
             "Propagation node enabled (stamp_cost={}, max_peers={}, autopeer={})",
             daemon_config.propagation_stamp_cost,
             daemon_config.max_peers,
@@ -5937,7 +6042,7 @@ pub(crate) async fn main() {
     .await
     {
         Ok(h) => {
-            tracing::info!(
+            tracing::debug!(
                 "RNS initialized: mode={:?}, interfaces={}",
                 h.instance_mode,
                 h.interface_configs.len(),
@@ -5946,7 +6051,13 @@ pub(crate) async fn main() {
         }
         Err(e) => {
             tracing::error!("Failed to initialize RNS: {e:?}");
-            return;
+            if let rns_runtime::reticulum::ReticulumError::Config(
+                rns_runtime::config::ConfigError::Parse { .. },
+            ) = e
+            {
+                std::process::exit(255);
+            }
+            std::process::exit(1);
         }
     };
     rns_handle
@@ -5975,14 +6086,11 @@ pub(crate) async fn main() {
                 std::process::exit(4);
             }
         };
-        let timeout = args
-            .timeout
-            .unwrap_or(if args.status || args.peers { 5.0 } else { 10.0 })
-            .max(0.0);
-        if !wait_for_online_interface(&rns_handle, Duration::from_secs_f64(timeout.min(5.0))).await
-        {
-            println!("No online Reticulum interface became available, exiting now");
-            std::process::exit(200);
+        let timeout = control_timeout(&args);
+        // Python's TCP client interfaces finish their initial connect (up to 5 s)
+        // inside `RNS.Reticulum()`, before the control timeout starts.
+        if !rns_handle.interface_configs.is_empty() {
+            wait_for_online_interface(&rns_handle, Duration::from_secs(5)).await;
         }
         let target_identity_hash = match preflight.remote_hash {
             Some(remote_hash) => {
@@ -6028,7 +6136,7 @@ pub(crate) async fn main() {
             return;
         }
 
-        if args.sync.is_some() {
+        if sync_hash.is_some() {
             let peer_hash = preflight
                 .peer_hash
                 .expect("sync preflight should include peer hash");
@@ -6051,7 +6159,7 @@ pub(crate) async fn main() {
             return;
         }
 
-        if args.unpeer.is_some() {
+        if unpeer_hash.is_some() {
             let peer_hash = preflight
                 .peer_hash
                 .expect("unpeer preflight should include peer hash");
@@ -6073,6 +6181,18 @@ pub(crate) async fn main() {
             println!("Broke peering with <{}>", hex::encode(peer_hash));
             return;
         }
+    }
+
+    // Python `program_setup` exits 4 when an existing identity file cannot be loaded.
+    let identity_path = LxmdPaths::new(&config_dir)
+        .preferred_identity_path()
+        .to_path_buf();
+    if identity_path.is_file() && Identity::from_file(&identity_path).is_err() {
+        tracing::error!(
+            "Could not load the Primary Identity from {}",
+            identity_path.display()
+        );
+        std::process::exit(4);
     }
 
     let mut runner = match LxmdRunner::new(
@@ -6134,7 +6254,7 @@ pub(crate) async fn main() {
 
     runner.refresh_control_state();
 
-    tracing::info!("LXMF router initialized");
+    rns_transport::notice!("LXMF router initialized");
 
     // Python's enable_propagation() always announces the node, independent of
     // the deferred start jobs.
@@ -6382,7 +6502,7 @@ pub(crate) async fn main() {
     }
 
     if !shutdown.is_triggered() {
-        tracing::info!("LXMF Daemon running. Press Ctrl+C to stop.");
+        rns_transport::notice!("LXMF Daemon running. Press Ctrl+C to stop.");
     }
 
     // Event-driven for inbound, periodic for outbound and maintenance.
@@ -6479,7 +6599,7 @@ pub(crate) async fn main() {
         }
     }
 
-    tracing::info!("LXMF Daemon shutting down");
+    rns_transport::notice!("LXMF Daemon shutting down");
     runner.close_announce_subscriptions().await;
     runner.prop_get_workers.close_and_join().await;
     // Revoke new packet admission, then retain and join every already admitted

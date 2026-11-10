@@ -56,6 +56,26 @@ pub enum DaemonConfigError {
         key: &'static str,
         value: String,
     },
+    /// Python `as_int` raises and lxmd exits.
+    #[error("[{section}] {key} = {value:?} is not an integer")]
+    NotAnInteger {
+        section: &'static str,
+        key: &'static str,
+        value: String,
+    },
+    /// Python `as_bool` raises and lxmd exits.
+    #[error("[{section}] {key} = {value:?} is not a boolean")]
+    NotABoolean {
+        section: &'static str,
+        key: &'static str,
+        value: String,
+    },
+    /// Python `bytes.fromhex` or the `LXMRouter` length check raises.
+    #[error("[propagation] static_peers entry {0:?} is not a 16-byte hexadecimal destination hash")]
+    InvalidStaticPeer(String),
+    /// `LXMRouter` raises on a negative peer limit.
+    #[error("[propagation] max_peers = {0} must not be negative")]
+    NegativeMaxPeers(i64),
     /// Stamps at this cost cannot be generated (`STAMP_COST_CAP`).
     #[error("[{section}] {key} = {value} must be a finite cost below 100")]
     CostOutOfRange {
@@ -120,10 +140,19 @@ impl PythonLxmdConfig {
         let propagation = config.section("propagation");
         let logging = config.section("logging");
 
-        let propagation_transfer_max_accepted_size = propagation
-            .and_then(|sec| sec.get_float("propagation_message_max_accepted_size"))
-            .map(|v| v.max(0.38))
-            .unwrap_or(256.0);
+        // The legacy key is still parsed (and can raise) before the new one overwrites it.
+        get_cost(
+            propagation,
+            "propagation",
+            "propagation_transfer_max_accepted_size",
+        )?;
+        let propagation_transfer_max_accepted_size = get_float_or_floor(
+            propagation,
+            "propagation",
+            "propagation_message_max_accepted_size",
+            256.0,
+            0.38,
+        )?;
 
         let peer_stamp_cost = generated_cost(
             floored_cost(lxmf, "lxmf", "stamp_cost", 1.0, 12.0)?,
@@ -167,91 +196,203 @@ impl PythonLxmdConfig {
             MAX_PEERING_COST,
         )?;
 
+        // Parsed so a malformed value aborts as in Python; the throttle time itself is fixed.
+        get_cost(propagation, "propagation", "propagation_stamp_throttle")?;
+        let static_peers = get_list(propagation, "static_peers");
+        for peer in &static_peers {
+            parse_static_peer(peer)?;
+        }
+        let max_peers = get_int(propagation, "propagation", "max_peers")?;
+        if let Some(value) = max_peers.filter(|value| *value < 0) {
+            return Err(DaemonConfigError::NegativeMaxPeers(value));
+        }
+
         Ok(Self {
             display_name: lxmf
                 .and_then(|sec| sec.get("display_name"))
                 .unwrap_or("Anonymous Peer")
                 .to_string(),
-            peer_announce_at_start: get_bool_or(lxmf, "announce_at_start", false),
-            peer_announce_interval: get_int(lxmf, "announce_interval").map(|v| v * 60),
+            peer_announce_at_start: get_bool_or(lxmf, "lxmf", "announce_at_start", false)?,
+            peer_announce_interval: get_int(lxmf, "lxmf", "announce_interval")?
+                .map(|v| v.saturating_mul(60)),
             peer_stamp_cost,
             delivery_transfer_max_accepted_size: get_float_or_floor(
                 lxmf,
+                "lxmf",
                 "delivery_transfer_max_accepted_size",
                 1.0,
                 0.38,
-            ),
+            )?,
             on_inbound: lxmf
                 .and_then(|sec| sec.get("on_inbound"))
                 .map(ToString::to_string),
-            enable_propagation_node: get_bool_or(propagation, "enable_node", false),
+            enable_propagation_node: get_bool_or(propagation, "propagation", "enable_node", false)?,
             node_name: propagation
                 .and_then(|sec| sec.get("node_name"))
                 .map(ToString::to_string),
-            auth_required: get_bool_or(propagation, "auth_required", false),
-            node_announce_at_start: get_bool_or(propagation, "announce_at_start", false),
-            autopeer: get_bool_or(propagation, "autopeer", true),
-            autopeer_maxdepth: get_int(propagation, "autopeer_maxdepth"),
+            auth_required: get_bool_or(propagation, "propagation", "auth_required", false)?,
+            node_announce_at_start: get_bool_or(
+                propagation,
+                "propagation",
+                "announce_at_start",
+                false,
+            )?,
+            autopeer: get_bool_or(propagation, "propagation", "autopeer", true)?,
+            autopeer_maxdepth: get_int(propagation, "propagation", "autopeer_maxdepth")?,
             sequential_pn_stamp_validation: get_bool_or(
                 propagation,
+                "propagation",
                 "sequential_pn_stamp_validation",
                 true,
-            ),
+            )?,
             static_peers_bypass_sequential: get_bool_or(
                 propagation,
+                "propagation",
                 "static_peers_bypass_sequential",
                 true,
-            ),
-            max_inbound_syncs: get_int(propagation, "max_inbound_syncs")
+            )?,
+            max_inbound_syncs: get_int(propagation, "propagation", "max_inbound_syncs")?
                 .map(|value| value.max(PN_MIN_MAX_INBOUND_SYNCS as i64))
                 .unwrap_or(PN_DEFAULT_MAX_INBOUND_SYNCS as i64),
-            node_announce_interval: get_int(propagation, "announce_interval").map(|v| v * 60),
+            node_announce_interval: get_int(propagation, "propagation", "announce_interval")?
+                .map(|v| v.saturating_mul(60)),
             message_storage_limit: get_float_or_floor(
                 propagation,
+                "propagation",
                 "message_storage_limit",
                 500.0,
                 0.005,
-            ),
+            )?,
             propagation_transfer_max_accepted_size,
             propagation_sync_max_accepted_size: get_float_or_floor(
                 propagation,
+                "propagation",
                 "propagation_sync_max_accepted_size",
                 256.0 * 40.0,
                 0.38,
-            ),
+            )?,
             propagation_stamp_cost_target,
             propagation_stamp_cost_flexibility,
             peering_cost,
             remote_peering_cost_max,
             prioritised_lxmf_destinations: get_list(propagation, "prioritise_destinations"),
             control_allowed_identities: get_list(propagation, "control_allowed"),
-            static_peers: get_list(propagation, "static_peers"),
-            max_peers: get_int(propagation, "max_peers"),
-            from_static_only: get_bool_or(propagation, "from_static_only", false),
-            target_loglevel: get_int(logging, "loglevel"),
+            static_peers,
+            max_peers,
+            from_static_only: get_bool_or(propagation, "propagation", "from_static_only", false)?,
+            target_loglevel: get_int(logging, "logging", "loglevel")?,
         })
     }
 }
 
-fn get_bool_or(section: Option<&ConfigSection>, key: &str, default: bool) -> bool {
-    section.and_then(|sec| sec.get_bool(key)).unwrap_or(default)
+/// A key that is present but not a scalar string fails every ConfigObj `as_*`.
+fn raw_value(section: Option<&ConfigSection>, key: &str) -> Option<String> {
+    let sec = section?;
+    sec.has(key)
+        .then(|| sec.get(key).map(ToString::to_string).unwrap_or_default())
 }
 
-fn get_int(section: Option<&ConfigSection>, key: &str) -> Option<i64> {
-    section.and_then(|sec| sec.get_int(key))
-}
-
-fn get_float_or_floor(section: Option<&ConfigSection>, key: &str, default: f64, floor: f64) -> f64 {
+/// ConfigObj `as_bool`; `None` when absent.
+fn get_bool(
+    section: Option<&ConfigSection>,
+    section_name: &'static str,
+    key: &'static str,
+) -> Result<Option<bool>, DaemonConfigError> {
+    let Some(raw) = raw_value(section, key) else {
+        return Ok(None);
+    };
     section
-        .and_then(|sec| sec.get_float(key))
-        .map(|value| value.max(floor))
-        .unwrap_or(default)
+        .and_then(|sec| sec.get_bool(key))
+        .map(Some)
+        .ok_or(DaemonConfigError::NotABoolean {
+            section: section_name,
+            key,
+            value: raw,
+        })
+}
+
+fn get_bool_or(
+    section: Option<&ConfigSection>,
+    section_name: &'static str,
+    key: &'static str,
+    default: bool,
+) -> Result<bool, DaemonConfigError> {
+    Ok(get_bool(section, section_name, key)?.unwrap_or(default))
+}
+
+/// ConfigObj `as_int`, which is Python `int()`; `None` when absent.
+fn get_int(
+    section: Option<&ConfigSection>,
+    section_name: &'static str,
+    key: &'static str,
+) -> Result<Option<i64>, DaemonConfigError> {
+    let Some(raw) = raw_value(section, key) else {
+        return Ok(None);
+    };
+    parse_python_int(&raw)
+        .map(Some)
+        .ok_or(DaemonConfigError::NotAnInteger {
+            section: section_name,
+            key,
+            value: raw,
+        })
+}
+
+/// Python `int(str)`: optional sign, decimal digits, single underscores between digits.
+fn parse_python_int(raw: &str) -> Option<i64> {
+    let s = raw.trim();
+    let digits = s.strip_prefix(['+', '-']).unwrap_or(s);
+    let bytes = digits.as_bytes();
+    let well_formed = !bytes.is_empty()
+        && bytes.iter().enumerate().all(|(i, &b)| {
+            b.is_ascii_digit()
+                || (b == b'_'
+                    && i > 0
+                    && bytes[i - 1].is_ascii_digit()
+                    && bytes.get(i + 1).is_some_and(u8::is_ascii_digit))
+        });
+    if !well_formed {
+        return None;
+    }
+    s.replace('_', "").parse().ok()
+}
+
+fn get_float_or_floor(
+    section: Option<&ConfigSection>,
+    section_name: &'static str,
+    key: &'static str,
+    default: f64,
+    floor: f64,
+) -> Result<f64, DaemonConfigError> {
+    Ok(get_cost(section, section_name, key)?.map_or(default, |value| value.max(floor)))
 }
 
 fn get_list(section: Option<&ConfigSection>, key: &str) -> Vec<String> {
     section
         .and_then(|sec| sec.get_list(key))
         .unwrap_or_default()
+}
+
+/// Python `bytes.fromhex` followed by the `LXMRouter` static peer length check.
+fn parse_static_peer(raw: &str) -> Result<[u8; 16], DaemonConfigError> {
+    let invalid = || DaemonConfigError::InvalidStaticPeer(raw.to_string());
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(16);
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        let pair = bytes.get(i..i + 2).ok_or_else(invalid)?;
+        if !pair.iter().all(u8::is_ascii_hexdigit) {
+            return Err(invalid());
+        }
+        let pair = std::str::from_utf8(pair).map_err(|_| invalid())?;
+        out.push(u8::from_str_radix(pair, 16).map_err(|_| invalid())?);
+        i += 2;
+    }
+    out.try_into().map_err(|_| invalid())
 }
 
 /// Daemon configuration parsed from an INI config file.
@@ -389,7 +530,8 @@ impl DaemonConfig {
                 .max_peers
                 .and_then(|value| usize::try_from(value).ok())
                 .unwrap_or(MAX_PEERS),
-            autopeer: py.autopeer,
+            // Python compares hops against a negative depth and never autopeers.
+            autopeer: py.autopeer && py.autopeer_maxdepth.is_none_or(|depth| depth >= 0),
             autopeer_maxdepth: py
                 .autopeer_maxdepth
                 .and_then(|value| usize::try_from(value).ok())

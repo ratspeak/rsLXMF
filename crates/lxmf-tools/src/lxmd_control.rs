@@ -64,9 +64,21 @@ pub async fn query_control(
             path,
             encode_control_payload(payload),
             0,
-            Duration::from_secs_f64(timeout_secs.max(0.0)),
+            control_deadline(timeout_secs),
         )
         .await
+}
+
+/// Python adds the timeout to `time.time()`: a negative one has already
+/// expired, and an infinite or NaN one never does.
+fn control_deadline(timeout_secs: f64) -> Duration {
+    const NEVER: Duration = Duration::from_secs(u32::MAX as u64);
+    if timeout_secs.is_nan() {
+        return NEVER;
+    }
+    Duration::try_from_secs_f64(timeout_secs.max(0.0))
+        .unwrap_or(NEVER)
+        .min(NEVER)
 }
 
 fn encode_control_payload(payload: Vec<u8>) -> Vec<u8> {
@@ -868,6 +880,16 @@ fn encode_value(value: &Value) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn control_deadline_accepts_every_python_float_timeout() {
+        assert_eq!(control_deadline(-1.0), Duration::ZERO);
+        assert_eq!(control_deadline(1.5), Duration::from_millis(1500));
+        let never = Duration::from_secs(u32::MAX as u64);
+        for timeout in [f64::INFINITY, f64::NAN, 1e300] {
+            assert_eq!(control_deadline(timeout), never, "{timeout}");
+        }
+    }
 
     #[test]
     fn control_payload_preserves_every_peer_hash_prefix_as_binary() {

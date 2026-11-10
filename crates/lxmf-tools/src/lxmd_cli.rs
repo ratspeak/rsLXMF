@@ -31,7 +31,8 @@ impl SendMethod {
     name = "lxmd-rs",
     bin_name = "lxmd-rs",
     about = "LXMF Propagation Daemon",
-    version
+    version,
+    infer_long_args = true
 )]
 pub struct Args {
     /// Path to configuration directory.
@@ -181,78 +182,16 @@ pub fn parse_destination_hash(raw: &str) -> Result<[u8; 16], String> {
     Ok(hash)
 }
 
+/// Python `lxmd.__default_lxmd_config__` (LXMF 1.3.0), printed by
+/// `--exampleconfig` and written on first run.
 pub fn example_config() -> &'static str {
-    r#"# This is an example LXM Daemon config file.
-[propagation]
+    include_str!("lxmd_default_config.txt")
+}
 
-enable_node = no
-
-# control_allowed = 7d7e542829b40f32364499b27438dba8, 437229f8e29598b2282b88bad5e44698
-
-# node_name = Anonymous Propagation Node
-
-announce_interval = 360
-
-announce_at_start = yes
-
-autopeer = yes
-
-autopeer_maxdepth = 6
-
-# Validate inbound propagation stamp batches sequentially by default.
-# sequential_pn_stamp_validation = yes
-
-# Let configured static peers bypass sequential validation and inbound limits.
-# static_peers_bypass_sequential = yes
-
-# Threshold for new inbound propagation sync offers. Already accepted offers
-# and static-peer bypass can exceed this value.
-# max_inbound_syncs = 3
-
-# message_storage_limit = 500
-
-# propagation_message_max_accepted_size = 256
-
-# propagation_sync_max_accepted_size = 10240
-
-# propagation_stamp_cost_target = 16
-
-# propagation_stamp_cost_flexibility = 3
-
-# peering_cost = 18
-
-# remote_peering_cost_max = 26
-
-# max_peers = 20
-
-# static_peers = e17f833c4ddf8890dd3a79a6fea8161d, 5a2d0029b6e5ec87020abaea0d746da4
-
-# prioritise_destinations = 4a594a8cced4a8f6adf23a8ac67b4011
-
-# from_static_only = True
-
-auth_required = no
-
-
-[lxmf]
-
-display_name = Anonymous Peer
-
-announce_at_start = no
-
-# announce_interval = 360
-
-# stamp_cost = 12
-
-delivery_transfer_max_accepted_size = 1
-
-# on_inbound = /path/to/handler
-
-
-[logging]
-
-loglevel = 4
-"#
+/// The file Python `create_default_config` writes: ConfigObj drops the
+/// trailing blank line of the default text.
+pub fn default_config_file_text() -> String {
+    format!("{}\n", example_config().trim_end_matches('\n'))
 }
 
 /// Parse a plaintext destination-hash list: one 16-byte hex value per line.

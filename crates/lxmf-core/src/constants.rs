@@ -176,7 +176,7 @@ pub const PATH_REQUEST_WAIT: u64 = 7;
 pub const MAX_PATHLESS_TRIES: u32 = 1;
 /// Maximum link inactivity before teardown (seconds).
 pub const LINK_MAX_INACTIVITY: u64 = 10 * 60;
-/// Python propagation-link inactivity limit, in seconds; retained as a reference value.
+/// Inbound propagation links with no data for this long are torn down (seconds).
 pub const P_LINK_MAX_INACTIVITY: u64 = 3 * 60;
 pub const MESSAGE_EXPIRY: u64 = 30 * 24 * 60 * 60;
 pub const STAMP_COST_EXPIRY: u64 = 45 * 24 * 60 * 60;

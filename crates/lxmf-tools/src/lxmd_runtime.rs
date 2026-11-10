@@ -276,6 +276,16 @@ pub fn preflight_control_command(
                 .to_string(),
         });
     }
+    // Python `_remote_init` loads the identity before the remote hash is parsed.
+    if rns_identity::identity::Identity::from_file(&identity_path).is_err() {
+        return Err(ControlPreflightError {
+            exit_code: 4,
+            message: format!(
+                "Could not load the Primary Identity from {}",
+                identity_path.display()
+            ),
+        });
+    }
 
     let remote_hash = match remote_hash {
         Some(raw) => Some(parse_python_control_hash(raw, "remote")?),
@@ -553,6 +563,12 @@ mod tests {
 
         let identity = temp.join("identity");
         std::fs::write(&identity, b"identity").unwrap();
+        let unloadable = preflight_control_command(&temp, None, None, Some("zz")).unwrap_err();
+        assert_eq!(unloadable.exit_code, 4);
+
+        rns_identity::identity::Identity::new()
+            .to_file(&identity)
+            .unwrap();
         let invalid_remote = preflight_control_command(&temp, None, None, Some("zz")).unwrap_err();
         assert_eq!(invalid_remote.exit_code, 203);
         assert!(

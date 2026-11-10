@@ -284,7 +284,7 @@ fn clap_requires_send_argument() {
 }
 
 #[test]
-fn status_and_peers_fail_before_link_without_an_online_interface() {
+fn status_and_peers_time_out_without_a_reachable_node() {
     let lxmf_dir = TestDir::new("lxmf");
     let rns_dir = TestDir::new("rns");
     write_rust_identity(&lxmf_dir.path().join("identity"));
@@ -303,6 +303,8 @@ discover_interfaces = No
     )
     .expect("write no-interface Reticulum config");
 
+    // Python `if not args.timeout` turns 0 into the 5 s default.
+    let started = std::time::Instant::now();
     let output = Command::new(env!("CARGO_BIN_EXE_lxmd-rs"))
         .arg("--config")
         .arg(lxmf_dir.path())
@@ -312,38 +314,28 @@ discover_interfaces = No
         .arg("--peers")
         .arg("--timeout")
         .arg("0")
+        .arg("-v")
         .output()
         .expect("lxmd-rs subprocess should run");
 
     assert_eq!(
         output.status.code(),
         Some(200),
-        "expected interface-readiness failure, got:\n{}",
+        "expected the control query to time out, got:\n{}",
         combined_output(&output)
     );
-    assert!(
-        combined_output(&output)
-            .contains("No online Reticulum interface became available, exiting now"),
-        "expected specific interface-readiness error, got:\n{}",
-        combined_output(&output)
+    assert_eq!(
+        stdout(&output),
+        "Getting lxmd statistics timed out, exiting now\n",
+        "control commands print only the result on stdout"
     );
     assert!(
-        lxmf_dir.path().join("identity").is_file(),
-        "--config should use the configured lxmd identity path"
+        (4..9).contains(&started.elapsed().as_secs()),
+        "--timeout 0 must fall back to the default"
     );
     assert!(
-        !lxmf_dir.path().join("storage").exists(),
-        "--status/--peers should not start local daemon state"
-    );
-
-    let logs = combined_output(&output);
-    assert!(
-        logs.contains("Using default configuration"),
-        "missing LXMF config should fall back to defaults, got logs:\n{logs}"
-    );
-    assert!(
-        logs.contains("interfaces=0"),
-        "test config should avoid live Reticulum interfaces, got logs:\n{logs}"
+        !lxmf_dir.path().join("storage").exists() && !lxmf_dir.path().join("config").exists(),
+        "--status/--peers must not start local daemon state"
     );
 }
 

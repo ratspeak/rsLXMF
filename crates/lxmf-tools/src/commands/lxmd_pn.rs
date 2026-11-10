@@ -720,6 +720,7 @@ mod tests {
         LinkManagerAccountingEvent::ResourceCompletion(ResourceCompletion {
             link_id,
             resource_hash: resource_id,
+            last_segment_hash: resource_id,
             data,
             metadata: None,
         })
