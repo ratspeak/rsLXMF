@@ -2305,7 +2305,8 @@ impl LxmdRunner {
                             }
                         };
                         let (bytes, served) = reply;
-                        let outcome = bytes.map_or(RequestOutcome::Drop, RequestOutcome::Reply);
+                        let outcome =
+                            bytes.map_or(RequestOutcome::Drop, RequestOutcome::ReplyValue);
                         // Retain the actual worker and request capability until
                         // exact-owner dispatch accepts or refuses the response.
                         if let Ok(dispatch) = responder.respond(outcome)
