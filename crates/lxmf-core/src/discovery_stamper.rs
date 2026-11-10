@@ -1,23 +1,11 @@
-//! LXMF-backed stamper for Reticulum interface discovery.
+//! Stamper for Reticulum interface discovery.
 //!
-//! # Layering
-//!
-//! Python `RNS.Discovery.InterfaceAnnouncer` loads `LXMF.LXStamper` when
-//! initialized, requiring LXMF for on-network discovery. Rust keeps
-//! Reticulum below LXMF, so `rns-transport` depends on a trait object and
-//! the concrete implementation lives here.
-//!
-//! # Workblock: Python parity
-//!
-//! Python discovery uses `LXStamper.stamp_workblock(infohash, expand_rounds=20)`
-//! in `InterfaceAnnouncer`, where `stamp_workblock` is the
-//! HKDF-expanded construction: one HKDF expand per round, each round
-//! producing 256 bytes, total `expand_rounds * 256` bytes.
-//! [`crate::stamper::stamp_workblock`] is the same construction.
-//!
+//! Upstream's discovery stamper is `RNS.Stamps` (Discovery.py:87,266);
+//! [`LxmfDiscoveryStamper`] delegates to
+//! `rns_transport::discovery::RnsDiscoveryStamper` for callers that install it.
 use rns_transport::discovery::DiscoveryStamper;
 
-use crate::stamper::{stamp_valid, stamp_value, stamp_workblock};
+use crate::stamper::{stamp_valid, stamp_workblock};
 
 /// Python `RNS.Discovery.InterfaceAnnouncer.WORKBLOCK_EXPAND_ROUNDS`,
 /// the expand-round count discovery uses when building its workblock.
@@ -26,81 +14,41 @@ use crate::stamper::{stamp_valid, stamp_value, stamp_workblock};
 /// interface, so this path has to stay cheap enough for periodic announces.
 pub const DISCOVERY_WORKBLOCK_EXPAND_ROUNDS: usize = 20;
 
-/// Default attempt budget for one discovery stamp search. Exhaustion returns
-/// `None`, allowing the announcer to skip this preparation attempt and retry.
-/// The budget limits attempts, not elapsed time. The requested generation cost
-/// comes from the per-interface announce configuration.
+/// Attempt budget for [`generate_discovery_stamp`] callers. The
+/// [`LxmfDiscoveryStamper`] trait implementation has no cap.
 pub const DISCOVERY_MAX_ITERATIONS: u64 = 5_000_000;
 
-/// PoW stamper for on-network discovery announces. Thin wrapper around
-/// [`lxmf_core::stamper`](crate::stamper) that binds the exact Python
-/// discovery construction (HKDF workblock with 20 expand rounds).
-///
-/// Clonable and `Send + Sync`; the default instance is fine for most
-/// users.
+/// Discovery stamper; delegates to
+/// [`rns_transport::discovery::RnsDiscoveryStamper`], which has no attempt cap.
 #[derive(Debug, Clone, Default)]
 pub struct LxmfDiscoveryStamper {
-    /// Override the iteration cap; defaults to [`DISCOVERY_MAX_ITERATIONS`].
-    /// Zero means "use the default".
-    max_iterations: u64,
+    _private: (),
 }
 
 impl LxmfDiscoveryStamper {
-    /// Build a stamper with a custom iteration cap. Zero selects
-    /// [`DISCOVERY_MAX_ITERATIONS`], as does [`LxmfDiscoveryStamper::default`].
-    /// This differs from [`generate_discovery_stamp`], where zero allows no attempts.
-    pub fn with_max_iterations(max_iterations: u64) -> Self {
-        Self { max_iterations }
-    }
-
-    fn effective_max_iterations(&self) -> u64 {
-        if self.max_iterations == 0 {
-            DISCOVERY_MAX_ITERATIONS
-        } else {
-            self.max_iterations
-        }
+    /// Discovery generation has no attempt cap upstream; the argument is ignored.
+    #[deprecated(note = "discovery stamp generation has no attempt cap; use `default()`")]
+    pub fn with_max_iterations(_max_iterations: u64) -> Self {
+        Self::default()
     }
 }
 
 impl DiscoveryStamper for LxmfDiscoveryStamper {
-    fn generate(&self, infohash: &[u8; 32], target_value: u8) -> Option<Vec<u8>> {
-        if target_value == 0 {
-            return Some(vec![0u8; 32]);
-        }
-
-        let workblock = stamp_workblock(infohash, DISCOVERY_WORKBLOCK_EXPAND_ROUNDS);
-
-        for _ in 0..self.effective_max_iterations() {
-            let candidate = crate::stamper::rand_bytes();
-            if stamp_valid(&candidate, target_value, &workblock) {
-                return Some(candidate.to_vec());
-            }
-        }
-        None
+    fn generate(
+        &self,
+        infohash: &[u8; 32],
+        target_value: f64,
+        ctl: &rns_identity::stamps::StampControl,
+    ) -> Option<Vec<u8>> {
+        rns_transport::discovery::RnsDiscoveryStamper.generate(infohash, target_value, ctl)
     }
 
-    fn value(&self, infohash: &[u8; 32], stamp: &[u8]) -> u8 {
-        if stamp.len() != 32 {
-            return 0;
-        }
-        let mut stamp_arr = [0u8; 32];
-        stamp_arr.copy_from_slice(stamp);
-        let workblock = stamp_workblock(infohash, DISCOVERY_WORKBLOCK_EXPAND_ROUNDS);
-        let v = stamp_value(&workblock, &stamp_arr);
-        v.min(u8::MAX as u32) as u8
+    fn value(&self, infohash: &[u8; 32], stamp: &[u8]) -> f64 {
+        rns_transport::discovery::RnsDiscoveryStamper.value(infohash, stamp)
     }
 
-    fn valid(&self, infohash: &[u8; 32], stamp: &[u8], required_value: u8) -> bool {
-        if required_value == 0 {
-            return true;
-        }
-        if stamp.len() != 32 {
-            return false;
-        }
-        let mut stamp_arr = [0u8; 32];
-        stamp_arr.copy_from_slice(stamp);
-        let workblock = stamp_workblock(infohash, DISCOVERY_WORKBLOCK_EXPAND_ROUNDS);
-        stamp_valid(&stamp_arr, required_value, &workblock)
+    fn valid(&self, infohash: &[u8; 32], stamp: &[u8], required_value: f64) -> bool {
+        rns_transport::discovery::RnsDiscoveryStamper.valid(infohash, stamp, required_value)
     }
 }
 
@@ -130,79 +78,57 @@ pub fn generate_discovery_stamp(
 mod tests {
     use super::*;
     use rns_crypto::sha::sha256;
+    use rns_identity::stamps::StampControl;
+    use std::sync::atomic::Ordering;
 
     fn mk_infohash(seed: &[u8]) -> [u8; 32] {
         sha256(seed)
     }
 
     #[test]
-    fn cost_zero_generates_immediately_and_is_always_valid() {
-        let stamper = LxmfDiscoveryStamper::default();
+    fn cost_zero_returns_a_random_stamp_valid_at_zero() {
         let infohash = mk_infohash(b"cost-zero");
-        let stamp = stamper.generate(&infohash, 0).unwrap();
-        assert_eq!(stamp.len(), 32);
-        assert!(stamper.valid(&infohash, &stamp, 0));
+        let ctl = StampControl::default();
+        let a = LxmfDiscoveryStamper::default()
+            .generate(&infohash, 0.0, &ctl)
+            .unwrap();
+        let b = LxmfDiscoveryStamper::default()
+            .generate(&infohash, 0.0, &ctl)
+            .unwrap();
+        assert_eq!(a.len(), 32);
+        assert_ne!(a, b);
+        assert!(LxmfDiscoveryStamper::default().valid(&infohash, &a, 0.0));
     }
 
     #[test]
-    fn generate_stamp_passes_valid() {
-        let stamper = LxmfDiscoveryStamper::with_max_iterations(200_000);
-        let infohash = mk_infohash(b"generate-round-trip");
-        let cost = 6;
-        let stamp = stamper.generate(&infohash, cost);
-        assert!(stamp.is_some(), "cost={cost} should be findable within cap");
-        assert!(stamper.valid(&infohash, &stamp.unwrap(), cost));
-    }
-
-    #[test]
-    fn value_reports_leading_zero_bits() {
-        let stamper = LxmfDiscoveryStamper::with_max_iterations(200_000);
+    fn generated_stamp_value_meets_fractional_target() {
         let infohash = mk_infohash(b"value-check");
-        let cost = 4;
-        let stamp = stamper.generate(&infohash, cost).unwrap();
-        let value = stamper.value(&infohash, &stamp);
-        assert!(value >= cost, "value {value} must be >= cost {cost}");
+        let stamp = LxmfDiscoveryStamper::default()
+            .generate(&infohash, 6.5, &StampControl::default())
+            .unwrap();
+        let value = LxmfDiscoveryStamper::default().value(&infohash, &stamp);
+        assert!(value >= 6.5, "value {value}");
+        assert!(LxmfDiscoveryStamper::default().valid(&infohash, &stamp, 6.5));
     }
 
     #[test]
-    fn invalid_stamp_is_rejected() {
-        let stamper = LxmfDiscoveryStamper::default();
+    fn invalid_and_short_stamps_are_rejected() {
         let infohash = mk_infohash(b"invalid");
-        let bogus = [0xFFu8; 32];
-        assert!(!stamper.valid(&infohash, &bogus, 32));
+        assert!(!LxmfDiscoveryStamper::default().valid(&infohash, &[0xFF; 32], 32.0));
+        assert!(LxmfDiscoveryStamper::default().value(&infohash, &[0u8; 16]) < 8.0);
+        assert!(!LxmfDiscoveryStamper::default().valid(&infohash, &[0xFF; 16], 8.0));
     }
 
     #[test]
-    fn non_32_byte_stamp_is_rejected() {
-        let stamper = LxmfDiscoveryStamper::default();
-        let infohash = mk_infohash(b"wrong-size");
-        // Non-standard length; must not panic, must not validate.
-        assert_eq!(stamper.value(&infohash, &[0u8; 16]), 0);
-        assert!(!stamper.valid(&infohash, &[0u8; 16], 8));
-    }
-
-    #[test]
-    fn generate_gives_up_when_cap_exhausted() {
-        // Cost 64 is astronomically unreachable in a handful of iters.
+    fn cancelled_generation_returns_none() {
+        let ctl = StampControl::default();
+        ctl.cancel.store(true, Ordering::Relaxed);
+        #[allow(deprecated)]
         let stamper = LxmfDiscoveryStamper::with_max_iterations(10);
-        let infohash = mk_infohash(b"unreachable");
-        assert!(stamper.generate(&infohash, 64).is_none());
-    }
-
-    #[test]
-    fn two_generated_stamps_both_validate_independently() {
-        let stamper = LxmfDiscoveryStamper::with_max_iterations(200_000);
-        let a = mk_infohash(b"a");
-        let b = mk_infohash(b"b");
-        let cost = 4;
-        let sa = stamper.generate(&a, cost).unwrap();
-        let sb = stamper.generate(&b, cost).unwrap();
-        assert!(stamper.valid(&a, &sa, cost));
-        assert!(stamper.valid(&b, &sb, cost));
-        // Cross-validation MUST fail (different workblocks).
         assert!(
-            !stamper.valid(&a, &sb, 16) || stamper.value(&a, &sb) < 16,
-            "cross-infohash stamp must not clear a meaningful cost"
+            stamper
+                .generate(&mk_infohash(b"unreachable"), 64.0, &ctl)
+                .is_none()
         );
     }
 
@@ -216,8 +142,7 @@ mod tests {
         let infohash = mk_infohash(b"helper");
         let stamp = generate_discovery_stamp(&infohash, 4, 200_000);
         assert!(stamp.is_some());
-        let stamper = LxmfDiscoveryStamper::default();
-        assert!(stamper.valid(&infohash, &stamp.unwrap(), 4));
+        assert!(LxmfDiscoveryStamper::default().valid(&infohash, &stamp.unwrap(), 4.0));
     }
 
     #[test]
