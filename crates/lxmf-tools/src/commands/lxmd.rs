@@ -3988,8 +3988,6 @@ impl LxmdRunner {
                 // Outbound costs read slot 5 as given; peering reads int() of it.
                 let outbound_cost =
                     lxmf_core::handlers::pn_stamp_cost_from_app_data(data).unwrap_or(pn.stamp_cost);
-                self.router
-                    .set_stamp_cost(event.destination_hash, outbound_cost);
                 self.node_policies.insert(
                     event.destination_hash,
                     AdvertisedNodePolicy {
