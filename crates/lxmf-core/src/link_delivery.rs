@@ -2446,7 +2446,7 @@ impl LinkDeliveryManager {
             hops: 0,
             transport_id: None,
             destination_hash: *link_id,
-            context: rns_wire::context::PacketContext::LinkProof,
+            context: rns_wire::context::PacketContext::None,
         };
         let mut proof_raw = proof_header.pack();
         proof_raw.extend_from_slice(&proof_data);
@@ -9322,10 +9322,7 @@ mod tests {
             rns_wire::flags::PacketType::Proof
         );
         assert_eq!(proof_header.destination_hash, link_id);
-        assert_eq!(
-            proof_header.context,
-            rns_wire::context::PacketContext::LinkProof
-        );
+        assert_eq!(proof_header.context, rns_wire::context::PacketContext::None);
         assert!(
             responder_link.validate_packet_proof(&packet_hash, &proof_raw[proof_offset..]),
             "initiator-side proof must be signed with the link key"
@@ -9838,10 +9835,7 @@ mod tests {
 
         let (proof_header, proof_offset) =
             rns_wire::header::PacketHeader::unpack(&proof_raw).unwrap();
-        assert_eq!(
-            proof_header.context,
-            rns_wire::context::PacketContext::LinkProof
-        );
+        assert_eq!(proof_header.context, rns_wire::context::PacketContext::None);
         assert!(
             responder_link.validate_packet_proof(&packet_hash, &proof_raw[proof_offset..]),
             "link proof must hash the received Header2 packet shape"
