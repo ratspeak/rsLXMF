@@ -261,6 +261,7 @@ impl PnInboundRuntime {
         logical_resource_id: LogicalResourceId,
         data_size: usize,
         peer_identity_hash: Option<[u8; 16]>,
+        app_flag: bool,
     ) -> bool {
         if self.quarantined_links.contains(&link_id) {
             return false;
@@ -274,7 +275,11 @@ impl PnInboundRuntime {
             // A later split segment retains the original exact owner. If its
             // advertisement is now rejected, the accounting conclusion owns
             // terminal cleanup.
-            return self.resource_policy_allows(data_size, existing.peer_destination_hash);
+            return self.resource_policy_allows(
+                data_size,
+                existing.peer_destination_hash,
+                app_flag,
+            );
         }
 
         let admission_record = self
@@ -317,8 +322,8 @@ impl PnInboundRuntime {
 
         let capacity_allows = self.resource_bypasses_limits(owner_peer_destination)
             || self.active_limited_resource_count() < self.admission.config().max_inbound_syncs;
-        let policy_allows =
-            capacity_allows && self.resource_policy_allows(data_size, owner_peer_destination);
+        let policy_allows = capacity_allows
+            && self.resource_policy_allows(data_size, owner_peer_destination, app_flag);
         if !policy_allows {
             // A first AcceptApp rejection creates no Reticulum lifecycle event,
             // so the offer record must be released synchronously here.
@@ -344,9 +349,12 @@ impl PnInboundRuntime {
         &self,
         data_size: usize,
         peer_destination_hash: Option<[u8; 16]>,
+        app_flag: bool,
     ) -> bool {
+        // Client uploads set the Resource app flag and skip the static-peer gate.
         data_size <= self.max_resource_bytes
             && (!self.admission.config().from_static_only
+                || app_flag
                 || peer_destination_hash
                     .as_ref()
                     .is_some_and(|peer| self.admission.is_static_peer(peer)))
@@ -775,7 +783,7 @@ mod tests {
             Err(OfferResponse::ErrorThrottled)
         );
 
-        assert!(runtime.accept_resource(link(1), resource(3), 10, Some(identity(2))));
+        assert!(runtime.accept_resource(link(1), resource(3), 10, Some(identity(2)), false));
         runtime.handle_accounting_event(started(link(1), resource(3)));
         let job = runtime
             .handle_accounting_event(completed(link(1), resource(3), vec![]))
@@ -794,7 +802,7 @@ mod tests {
         );
         assert_eq!(runtime.admission_state(&link(1)), None);
 
-        assert!(runtime.accept_resource(link(1), resource(3), 10, Some(identity(2))));
+        assert!(runtime.accept_resource(link(1), resource(3), 10, Some(identity(2)), false));
         runtime.handle_accounting_event(started(link(1), resource(3)));
         let job = runtime
             .handle_accounting_event(completed(link(1), resource(3), vec![1]))
@@ -806,7 +814,7 @@ mod tests {
         runtime
             .conclude_validation(job.token(), job.link_id(), PnValidationOutcome::Valid)
             .unwrap();
-        assert!(runtime.accept_resource(link(1), resource(4), 10, Some(identity(2))));
+        assert!(runtime.accept_resource(link(1), resource(4), 10, Some(identity(2)), false));
         runtime.handle_accounting_event(started(link(1), resource(4)));
         let client_job = runtime
             .handle_accounting_event(completed(link(1), resource(4), vec![2]))
@@ -825,7 +833,7 @@ mod tests {
             identity(4),
             &PnOfferEvaluation::WantAll,
         );
-        assert!(runtime.accept_resource(link(3), resource(5), 10, Some(identity(4))));
+        assert!(runtime.accept_resource(link(3), resource(5), 10, Some(identity(4)), false));
         runtime.handle_accounting_event(started(link(3), resource(5)));
         runtime.handle_accounting_event(completed(link(3), resource(5), vec![6]));
         assert_eq!(
@@ -837,7 +845,7 @@ mod tests {
             runtime.commit_offer(postponed, &PnOfferEvaluation::HaveAll),
             Err(OfferResponse::ErrorThrottled)
         );
-        assert!(runtime.accept_resource(link(1), resource(7), 10, Some(identity(2))));
+        assert!(runtime.accept_resource(link(1), resource(7), 10, Some(identity(2)), false));
         runtime.handle_accounting_event(started(link(1), resource(7)));
         let job = runtime
             .handle_accounting_event(completed(link(1), resource(7), vec![8]))
@@ -858,9 +866,9 @@ mod tests {
             100,
         );
 
-        assert!(runtime.accept_resource(link(1), resource(3), 100, Some(peer)));
+        assert!(runtime.accept_resource(link(1), resource(3), 100, Some(peer), false));
         assert!(
-            runtime.accept_resource(link(1), resource(3), 100, Some(identity(9))),
+            runtime.accept_resource(link(1), resource(3), 100, Some(identity(9)), false),
             "later split advertisements retain the exact original owner"
         );
     }
@@ -874,8 +882,8 @@ mod tests {
             identity(2),
             &PnOfferEvaluation::WantAll,
         );
-        assert!(runtime.accept_resource(link(1), resource(3), 10, Some(identity(2))));
-        assert!(runtime.accept_resource(link(1), resource(4), 10, Some(identity(2))));
+        assert!(runtime.accept_resource(link(1), resource(3), 10, Some(identity(2)), false));
+        assert!(runtime.accept_resource(link(1), resource(4), 10, Some(identity(2)), false));
 
         runtime.handle_accounting_event(started(link(1), resource(4)));
         let extra = runtime
@@ -917,7 +925,7 @@ mod tests {
         );
         assert_eq!(runtime.correlation_count(), 0);
 
-        assert!(runtime.accept_resource(link(1), resource(3), 10, Some(identity(2))));
+        assert!(runtime.accept_resource(link(1), resource(3), 10, Some(identity(2)), false));
         runtime.handle_accounting_event(started(link(1), resource(3)));
         assert_eq!(
             runtime.admission_state(&link(1)),
@@ -934,7 +942,7 @@ mod tests {
             identity(2),
             &PnOfferEvaluation::WantAll,
         );
-        assert!(runtime.accept_resource(link(1), resource(3), 10, Some(identity(2))));
+        assert!(runtime.accept_resource(link(1), resource(3), 10, Some(identity(2)), false));
 
         runtime.handle_accounting_event(started(link(1), resource(3)));
         let job = runtime
@@ -980,7 +988,7 @@ mod tests {
             identity(2),
             &PnOfferEvaluation::WantAll,
         );
-        assert!(runtime.accept_resource(link(1), resource(3), 10, Some(identity(2))));
+        assert!(runtime.accept_resource(link(1), resource(3), 10, Some(identity(2)), false));
         runtime.handle_accounting_event(started(link(1), resource(3)));
         let job = runtime
             .handle_accounting_event(completed(link(1), resource(3), vec![4]))
@@ -1018,7 +1026,7 @@ mod tests {
             identity(2),
             &PnOfferEvaluation::WantAll,
         );
-        assert!(!runtime.accept_resource(link(1), resource(3), 1_001, Some(identity(2))));
+        assert!(!runtime.accept_resource(link(1), resource(3), 1_001, Some(identity(2)), false));
         assert_eq!(runtime.admission_state(&link(1)), None);
     }
 
@@ -1035,9 +1043,12 @@ mod tests {
             100,
         );
 
-        assert!(runtime.accept_resource(link(1), resource(3), 100, Some(peer)));
-        assert!(!runtime.accept_resource(link(2), resource(4), 100, Some(identity(9))));
-        assert!(!runtime.accept_resource(link(3), resource(5), 100, None));
+        assert!(runtime.accept_resource(link(1), resource(3), 100, Some(peer), false));
+        assert!(!runtime.accept_resource(link(2), resource(4), 100, Some(identity(9)), false));
+        assert!(!runtime.accept_resource(link(3), resource(5), 100, None, false));
+        assert!(runtime.accept_resource(link(4), resource(6), 100, Some(identity(9)), true));
+        assert!(runtime.accept_resource(link(5), resource(7), 100, None, true));
+        assert!(!runtime.accept_resource(link(6), resource(8), 101, None, true));
     }
 
     #[test]
@@ -1049,7 +1060,7 @@ mod tests {
             identity(2),
             &PnOfferEvaluation::WantAll,
         );
-        assert!(runtime.accept_resource(link(1), resource(3), 10, Some(identity(2))));
+        assert!(runtime.accept_resource(link(1), resource(3), 10, Some(identity(2)), false));
         runtime.handle_accounting_event(started(link(1), resource(3)));
         runtime.handle_accounting_event(concluded(
             link(1),
@@ -1083,7 +1094,8 @@ mod tests {
                 link_id,
                 resource_id,
                 10,
-                Some(identity(index as u8 + 20))
+                Some(identity(index as u8 + 20)),
+                false
             ));
             runtime.handle_accounting_event(started(link_id, resource_id));
             runtime.handle_accounting_event(concluded(link_id, resource_id, conclusion));
@@ -1113,7 +1125,7 @@ mod tests {
     #[test]
     fn invalid_unidentified_client_closes_without_shared_throttle_state() {
         let mut runtime = runtime(PnInboundAdmissionConfig::default());
-        assert!(runtime.accept_resource(link(1), resource(3), 10, None));
+        assert!(runtime.accept_resource(link(1), resource(3), 10, None, false));
         runtime.handle_accounting_event(started(link(1), resource(3)));
         let job = runtime
             .handle_accounting_event(completed(link(1), resource(3), vec![4]))
@@ -1128,7 +1140,7 @@ mod tests {
         assert!(claim.should_close_link());
         assert_eq!(runtime.throttle_count(), 0);
         assert!(runtime.is_link_quarantined(&link(1)));
-        assert!(!runtime.accept_resource(link(1), resource(4), 10, None));
+        assert!(!runtime.accept_resource(link(1), resource(4), 10, None, false));
         assert!(matches!(
             runtime.preflight_offer(link(1), Some(identity(5))),
             Err(OfferResponse::ErrorThrottled)
@@ -1142,8 +1154,8 @@ mod tests {
             max_inbound_syncs: 1,
             ..PnInboundAdmissionConfig::default()
         });
-        assert!(runtime.accept_resource(link(1), resource(2), 10, Some(identity(3))));
-        assert!(!runtime.accept_resource(link(4), resource(5), 10, Some(identity(6))));
+        assert!(runtime.accept_resource(link(1), resource(2), 10, Some(identity(3)), false));
+        assert!(!runtime.accept_resource(link(4), resource(5), 10, Some(identity(6)), false));
 
         runtime.handle_accounting_event(started(link(1), resource(2)));
         let job = runtime
@@ -1155,14 +1167,14 @@ mod tests {
             LinkResourceConclusion::Complete,
         ));
         assert!(
-            !runtime.accept_resource(link(4), resource(5), 10, Some(identity(6))),
+            !runtime.accept_resource(link(4), resource(5), 10, Some(identity(6)), false),
             "a completed Resource retains its slot through stamp validation"
         );
 
         runtime
             .conclude_validation(job.token(), job.link_id(), PnValidationOutcome::Valid)
             .unwrap();
-        assert!(runtime.accept_resource(link(4), resource(5), 10, Some(identity(6))));
+        assert!(runtime.accept_resource(link(4), resource(5), 10, Some(identity(6)), false));
     }
 
     #[test]
@@ -1179,8 +1191,8 @@ mod tests {
             [peer_destination],
             100,
         );
-        assert!(bypass.accept_resource(link(1), resource(3), 10, Some(peer)));
-        assert!(bypass.accept_resource(link(1), resource(4), 10, Some(peer)));
+        assert!(bypass.accept_resource(link(1), resource(3), 10, Some(peer), false));
+        assert!(bypass.accept_resource(link(1), resource(4), 10, Some(peer), false));
 
         let mut limited = PnInboundRuntime::new(
             PnInboundAdmissionConfig {
@@ -1192,7 +1204,7 @@ mod tests {
             [peer_destination],
             100,
         );
-        assert!(limited.accept_resource(link(1), resource(3), 10, Some(peer)));
-        assert!(!limited.accept_resource(link(1), resource(4), 10, Some(peer)));
+        assert!(limited.accept_resource(link(1), resource(3), 10, Some(peer), false));
+        assert!(!limited.accept_resource(link(1), resource(4), 10, Some(peer), false));
     }
 }

@@ -3151,10 +3151,12 @@ impl LinkDeliveryManager {
                                 } else {
                                     delivery.message.auto_compress
                                 };
+                                // Propagation deposits carry the Resource app flag.
                                 let transfer_result = build_resource_transfer(
                                     &delivery.link,
                                     packed,
                                     auto_compress,
+                                    delivery.packed_override.is_some(),
                                     rtt,
                                 );
                                 match transfer_result {
@@ -5500,6 +5502,7 @@ fn build_resource_transfer(
     link: &Link,
     packed: Vec<u8>,
     auto_compress: bool,
+    app_flag: bool,
     rtt: Duration,
 ) -> Result<(OutboundTransfer, Option<LazyMultiSegmentOutbound>), ResourceError> {
     if packed.len() <= MAX_EFFICIENT_SIZE {
@@ -5509,10 +5512,11 @@ fn build_resource_transfer(
             }
             None => OutboundTransfer::new(packed, auto_compress, rtt)?,
         };
-        return Ok((transfer, None));
+        return Ok((transfer.with_app_flag(app_flag), None));
     }
 
-    let mut remaining = LazyMultiSegmentOutbound::new(packed, auto_compress)?;
+    let mut remaining =
+        LazyMultiSegmentOutbound::new(packed, auto_compress)?.with_app_flag(app_flag);
     let first = next_resource_segment(link, &mut remaining)?.ok_or(ResourceError::Incomplete)?;
     let remaining = (remaining.remaining_segments() > 0).then_some(remaining);
     Ok((OutboundTransfer::from_prebuilt(first, rtt), remaining))
@@ -9453,6 +9457,7 @@ mod tests {
                 &responder_link,
                 payload[(segment_index - 1) * segment_size..segment_index * segment_size].to_vec(),
                 false,
+                false,
                 Duration::from_millis(25),
             )
             .unwrap();
@@ -9572,6 +9577,7 @@ mod tests {
             &responder_link,
             vec![0x44; 128],
             false,
+            false,
             Duration::from_millis(25),
         )
         .unwrap();
@@ -9633,6 +9639,7 @@ mod tests {
         let (mut transfer, _) = build_resource_transfer(
             &responder_link,
             vec![0x33; 4_096],
+            false,
             false,
             Duration::from_millis(25),
         )
@@ -9708,6 +9715,7 @@ mod tests {
         let (mut transfer, _) = build_resource_transfer(
             &responder_link,
             vec![0x22; 128],
+            false,
             false,
             Duration::from_millis(25),
         )

@@ -2189,6 +2189,7 @@ impl LxmdRunner {
                             resource_id,
                             advertisement.data_size,
                             remote_identity_hash,
+                            advertisement.flags.app_flag,
                         )
                     })
                     .unwrap_or(false)
