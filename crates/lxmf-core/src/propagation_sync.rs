@@ -924,7 +924,8 @@ impl PropagationSyncTask {
                 TransferAction::None
                 | TransferAction::SendAdvertisement(_)
                 | TransferAction::SendProof(_)
-                | TransferAction::SendRequest(_) => {}
+                | TransferAction::SendRequest(_)
+                | TransferAction::QueryProofCache(_) => {}
             }
         }
     }
@@ -1746,6 +1747,20 @@ impl PropagationSyncTask {
                 }
                 TransferAction::Failed(_) => {
                     self.fail_active_transfer();
+                    break;
+                }
+                TransferAction::QueryProofCache(proof_data) => {
+                    let Some(link_id) = self.link_id else {
+                        break;
+                    };
+                    let packet_hash =
+                        rns_protocol::resource::resource_proof_packet_hash(&link_id, &proof_data);
+                    if !self.queue_transport(TransportMessage::CacheRequest {
+                        packet_hash,
+                        destination_hash: link_id,
+                    }) {
+                        self.fail_active_transfer();
+                    }
                     break;
                 }
                 TransferAction::None => break,

@@ -5821,7 +5821,9 @@ fn dispatch_inbound_resource_action(
         TransferAction::None | TransferAction::Complete | TransferAction::Failed(_) => {
             return Ok(());
         }
-        TransferAction::SendAdvertisement(_) | TransferAction::SendPart(_, _) => {
+        TransferAction::SendAdvertisement(_)
+        | TransferAction::SendPart(_, _)
+        | TransferAction::QueryProofCache(_) => {
             return Err("invalid inbound Resource action");
         }
     };
@@ -6250,6 +6252,23 @@ fn dispatch_action(
             }
             delivery.state = DeliveryState::Failed;
             ActionOutcome::Fail("resource transfer cancelled".to_string())
+        }
+        TransferAction::QueryProofCache(proof_data) => {
+            if let Err(reason) = stage_transport(
+                transport_tx,
+                pending_transport,
+                TransportMessage::CacheRequest {
+                    packet_hash: rns_protocol::resource::resource_proof_packet_hash(
+                        link_id,
+                        &proof_data,
+                    ),
+                    destination_hash: *link_id,
+                },
+            ) {
+                delivery.state = DeliveryState::Failed;
+                return ActionOutcome::Fail(reason.to_string());
+            }
+            ActionOutcome::Break
         }
         TransferAction::None => ActionOutcome::Break,
     }
