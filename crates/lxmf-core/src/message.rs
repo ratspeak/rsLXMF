@@ -419,16 +419,16 @@ impl LxMessage {
     /// Stamp checking is pure; the returned value is valid only for this request's policy.
     pub fn validate_stamp_with_tickets(
         &self,
-        target_cost: u8,
+        target_cost: f64,
         tickets: Option<&[Vec<u8>]>,
     ) -> bool {
         self.validated_stamp_value(target_cost, tickets).is_some()
     }
     pub fn validated_stamp_value(
         &self,
-        target_cost: u8,
+        target_cost: f64,
         tickets: Option<&[Vec<u8>]>,
-    ) -> Option<u16> {
+    ) -> Option<f64> {
         let stamp = self.stamp.as_ref()?.as_bytes();
         if let Some(tickets) = tickets {
             for ticket in tickets {
@@ -446,7 +446,7 @@ impl LxMessage {
         let stamp = <&[u8; 32]>::try_from(stamp).ok()?;
         let work = crate::stamper::stamp_workblock(&self.message_id, STAMP_WORKBLOCK_EXPAND_ROUNDS);
         crate::stamper::stamp_valid(stamp, target_cost, &work)
-            .then(|| crate::stamper::stamp_value(&work, stamp) as u16)
+            .then(|| crate::stamper::stamp_value(&work, stamp))
     }
     /// Update [`auto_compress`](MessageMetadata::auto_compress) based on a peer's cached announce app_data.
     ///

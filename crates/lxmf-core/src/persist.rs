@@ -295,14 +295,14 @@ mod tests {
         costs.insert(
             [0xAA; 16],
             StampCostEntry {
-                cost: 12,
+                cost: Some(12.5),
                 recorded_at: 1_700_000_000.0,
             },
         );
         save_stamp_costs(tmp.path(), &costs).unwrap();
         let loaded = load_stamp_costs(tmp.path()).unwrap();
         assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[&[0xAA; 16]].cost, 12);
+        assert_eq!(loaded[&[0xAA; 16]].cost, Some(12.5));
     }
 
     #[test]

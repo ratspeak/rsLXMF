@@ -1,14 +1,15 @@
 //! Shared propagation preparation for daemon and embedding applications.
 use crate::constants::STAMP_WORKBLOCK_EXPAND_ROUNDS_PN;
 use crate::message::{LxMessage, MessageError};
+use crate::stamper::StampControl;
 use bytes::Bytes;
-use std::sync::atomic::AtomicBool;
 
 pub const NODE_METADATA_MAX_AGE: f64 = 45.0 * 86400.0;
 
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct AdvertisedNodePolicy {
-    pub stamp_cost: u8,
+    /// Announced propagation stamp cost; generation clamps it to `0..=100`.
+    pub stamp_cost: f64,
     pub transfer_limit_kb: f64,
     pub recorded_at: f64,
 }
@@ -70,15 +71,35 @@ pub struct PropagationEnvelope {
     transient_id: [u8; 32],
     encryption_binding: [u8; 32],
     stamp: [u8; 32],
-    stamp_value: u32,
-    required_cost: u8,
+    stamp_value: f64,
+    required_cost: f64,
+}
+
+/// Python `get_outbound_propagation_cost` clamps the node's cost into `0..=100`.
+fn outbound_pn_cost(cost: f64) -> f64 {
+    cost.clamp(0.0, crate::stamper::STAMP_COST_CAP)
+}
+
+fn generate_pn_stamp(
+    transient_id: &[u8; 32],
+    cost: f64,
+    ctl: &StampControl,
+) -> Result<([u8; 32], f64), MessageError> {
+    crate::stamper::generate_stamp(
+        transient_id,
+        outbound_pn_cost(cost),
+        STAMP_WORKBLOCK_EXPAND_ROUNDS_PN,
+        ctl,
+    )
+    .map_err(|e| MessageError::PackFailed(format!("PN stamp generation failed: {e}")))?
+    .ok_or_else(|| MessageError::PackFailed("PN stamp generation cancelled".into()))
 }
 
 impl PropagationEnvelope {
     pub fn new<F>(
         message: LxMessage,
         encryption_binding: [u8; 32],
-        required_cost: u8,
+        required_cost: f64,
         encrypt: F,
     ) -> Result<Self, MessageError>
     where
@@ -89,15 +110,15 @@ impl PropagationEnvelope {
             encryption_binding,
             required_cost,
             encrypt,
-            &AtomicBool::new(false),
+            &StampControl::default(),
         )
     }
     pub fn new_cancellable<F>(
         message: LxMessage,
         encryption_binding: [u8; 32],
-        required_cost: u8,
+        required_cost: f64,
         encrypt: F,
-        cancel: &AtomicBool,
+        ctl: &StampControl,
     ) -> Result<Self, MessageError>
     where
         F: FnOnce(&[u8]) -> Result<Vec<u8>, MessageError>,
@@ -107,28 +128,7 @@ impl PropagationEnvelope {
         ciphertext.extend_from_slice(&message.destination_hash());
         ciphertext.extend_from_slice(&encrypted);
         let transient_id = rns_crypto::sha::full_hash(&ciphertext);
-        let (stamp, generated_value) = crate::stamper::generate_stamp_cancellable(
-            &transient_id,
-            required_cost,
-            STAMP_WORKBLOCK_EXPAND_ROUNDS_PN,
-            cancel,
-        )
-        .ok_or_else(|| MessageError::PackFailed("PN stamp generation failed".into()))?;
-        // The general stamper's cost-zero shortcut reports the required lower
-        // bound. Envelopes carry the measured value used by strict relay ingress.
-        let stamp_value = if required_cost == 0 {
-            crate::stamper::stamp_value(
-                &crate::stamper::stamp_workblock(&transient_id, STAMP_WORKBLOCK_EXPAND_ROUNDS_PN),
-                &stamp,
-            )
-        } else {
-            generated_value
-        };
-        if cancel.load(std::sync::atomic::Ordering::Acquire) {
-            return Err(MessageError::PackFailed(
-                "PN stamp generation cancelled".into(),
-            ));
-        }
+        let (stamp, stamp_value) = generate_pn_stamp(&transient_id, required_cost, ctl)?;
         Ok(Self {
             message,
             ciphertext: ciphertext.into(),
@@ -151,8 +151,12 @@ impl PropagationEnvelope {
     pub fn stamp(&self) -> &[u8; 32] {
         &self.stamp
     }
-    pub fn stamp_value(&self) -> u32 {
+    pub fn stamp_value(&self) -> f64 {
         self.stamp_value
+    }
+    /// Whether the saved stamp already meets a node's announced cost.
+    pub fn meets(&self, cost: f64) -> bool {
+        crate::stamper::value_meets(self.stamp_value, outbound_pn_cost(cost))
     }
     pub fn matches(&self, message: &LxMessage, encryption_binding: &[u8; 32]) -> bool {
         self.message.wire_bytes() == message.wire_bytes()
@@ -166,27 +170,22 @@ impl PropagationEnvelope {
         node: PreparedNode,
         timestamp: f64,
     ) -> Result<Vec<u8>, MessageError> {
-        self.pack_for_cancellable(node, timestamp, &AtomicBool::new(false))
+        self.pack_for_cancellable(node, timestamp, &StampControl::default())
     }
     pub fn pack_for_cancellable(
         &mut self,
         node: PreparedNode,
         timestamp: f64,
-        cancel: &AtomicBool,
+        ctl: &StampControl,
     ) -> Result<Vec<u8>, MessageError> {
         if !timestamp.is_finite() {
             return Err(MessageError::PackFailed(
                 "propagation timestamp must be finite".into(),
             ));
         }
-        if self.stamp_value < u32::from(node.policy.stamp_cost) {
-            (self.stamp, self.stamp_value) = crate::stamper::generate_stamp_cancellable(
-                &self.transient_id,
-                node.policy.stamp_cost,
-                STAMP_WORKBLOCK_EXPAND_ROUNDS_PN,
-                cancel,
-            )
-            .ok_or_else(|| MessageError::PackFailed("PN stamp regeneration failed".into()))?;
+        if !self.meets(node.policy.stamp_cost) {
+            (self.stamp, self.stamp_value) =
+                generate_pn_stamp(&self.transient_id, node.policy.stamp_cost, ctl)?;
         }
         self.required_cost = node.policy.stamp_cost;
         let blob_len = self
@@ -239,7 +238,7 @@ mod tests {
     #[test]
     fn offline_recipient_key_is_sufficient_and_zero_cost_is_explicit() {
         let policy = AdvertisedNodePolicy {
-            stamp_cost: 0,
+            stamp_cost: 0.0,
             transfer_limit_kb: 256.,
             recorded_at: 100.,
         };
@@ -262,7 +261,7 @@ mod tests {
             .unwrap()
             .finalize(None)
             .unwrap();
-        let mut envelope = PropagationEnvelope::new(msg, [4; 32], 0, |p| Ok(p.to_vec())).unwrap();
+        let mut envelope = PropagationEnvelope::new(msg, [4; 32], 0.0, |p| Ok(p.to_vec())).unwrap();
         let before = envelope.ciphertext.clone();
         let tid = envelope.transient_id();
         assert_eq!(
@@ -275,23 +274,23 @@ mod tests {
         let mut prepared = PreparedNode {
             node: [5; 16],
             policy: AdvertisedNodePolicy {
-                stamp_cost: 0,
+                stamp_cost: 0.0,
                 transfer_limit_kb: 256.,
                 recorded_at: 100.,
             },
         };
         let first = envelope.pack_for(prepared, 101.).unwrap();
-        prepared.policy.stamp_cost = 4;
+        prepared.policy.stamp_cost = 4.5;
         let next = envelope.pack_for(prepared, 102.).unwrap();
         assert_eq!(envelope.ciphertext(), &before);
         assert_eq!(envelope.transient_id(), tid);
-        assert!(envelope.stamp_value() >= 4);
+        assert!(envelope.stamp_value() >= 4.5);
         assert_ne!(first, next);
         assert!(
             crate::stamper::stamp_value(
                 &crate::stamper::stamp_workblock(&tid, STAMP_WORKBLOCK_EXPAND_ROUNDS_PN),
                 envelope.stamp()
-            ) >= 4
+            ) >= 4.5
         );
     }
 }

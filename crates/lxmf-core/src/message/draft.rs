@@ -18,7 +18,7 @@ pub struct LxMessageDraft {
     pub metadata: MessageMetadata,
     pub include_ticket: bool,
     pub outbound_ticket: Option<[u8; 16]>,
-    pub stamp_cost: Option<u8>,
+    pub stamp_cost: Option<f64>,
     ticket_barrier: Option<Arc<()>>,
 }
 impl Deref for LxMessageDraft {
@@ -37,7 +37,7 @@ impl DerefMut for LxMessageDraft {
 pub struct SignedLxMessage {
     message: LxMessage,
     outbound_ticket: Option<[u8; 16]>,
-    stamp_cost: Option<u8>,
+    stamp_cost: Option<f64>,
 }
 impl Deref for SignedLxMessage {
     type Target = MessageMetadata;
@@ -324,7 +324,7 @@ impl SignedLxMessage {
     pub(crate) fn restored(
         message: LxMessage,
         outbound_ticket: Option<[u8; 16]>,
-        stamp_cost: Option<u8>,
+        stamp_cost: Option<f64>,
     ) -> Self {
         Self {
             message,
@@ -373,16 +373,27 @@ impl SignedLxMessage {
     pub fn fields(&self) -> Fields<'_> {
         self.message.fields()
     }
-    pub fn stamp_cost(&self) -> Option<u8> {
+    /// The signed, unstamped message, for failing it without a stamp.
+    pub fn into_unstamped(self) -> LxMessage {
+        self.message
+    }
+    pub fn stamp_cost(&self) -> Option<f64> {
         self.stamp_cost
     }
     pub fn outbound_ticket(&self) -> Option<[u8; 16]> {
         self.outbound_ticket
     }
     /// Compute the optional recipient stamp without changing the signed body.
-    /// Runs synchronously; proof of work uses [`crate::stamper::generate_stamp`]
-    /// and its attempt budget.
+    /// Runs synchronously until the proof of work is found; a cost Python
+    /// cannot generate is an error.
     pub fn generate_recipient_stamp(&self) -> Result<Option<RecipientStamp>, MessageError> {
+        self.generate_recipient_stamp_with(&crate::stamper::StampControl::default())
+    }
+    /// [`Self::generate_recipient_stamp`], stopped by `ctl`'s cancel flag or deadline.
+    pub fn generate_recipient_stamp_with(
+        &self,
+        ctl: &crate::stamper::StampControl,
+    ) -> Result<Option<RecipientStamp>, MessageError> {
         if let Some(ticket) = self.outbound_ticket {
             let mut material = [0u8; 48];
             material[..16].copy_from_slice(&ticket);
@@ -392,29 +403,43 @@ impl SignedLxMessage {
         let Some(cost) = self.stamp_cost else {
             return Ok(None);
         };
-        crate::stamper::generate_stamp(&self.message_id(), cost, STAMP_WORKBLOCK_EXPAND_ROUNDS)
+        crate::stamper::generate_stamp(&self.message_id(), cost, STAMP_WORKBLOCK_EXPAND_ROUNDS, ctl)
+            .map_err(packed)?
             .map(|(stamp, _)| Some(RecipientStamp::ProofOfWork(stamp)))
-            .ok_or_else(|| packed("recipient stamp generation failed"))
+            .ok_or_else(|| packed("recipient stamp generation stopped"))
     }
     pub fn finalize(self, stamp: Option<RecipientStamp>) -> Result<LxMessage, MessageError> {
+        self.try_finalize(stamp).map_err(|failed| failed.0)
+    }
+    /// [`Self::finalize`], returning the unstamped message with the error so
+    /// the caller can still fail it.
+    pub fn try_finalize(
+        self,
+        stamp: Option<RecipientStamp>,
+    ) -> Result<LxMessage, Box<(MessageError, LxMessage)>> {
         let Some(stamp) = stamp else {
             return Ok(self.message);
         };
-        let size = self
-            .message
+        match Self::stamped(&self.message, &stamp) {
+            Ok(message) => Ok(message),
+            Err(error) => Err(Box::new((error, self.message))),
+        }
+    }
+    fn stamped(message: &LxMessage, stamp: &RecipientStamp) -> Result<LxMessage, MessageError> {
+        let size = message
             .wire
             .len()
             .checked_add(2 + stamp.as_bytes().len())
             .ok_or_else(|| packed("length overflow"))?;
-        self.message.limits.check_wire(size)?;
+        message.limits.check_wire(size)?;
         let mut wire = Vec::with_capacity(size);
-        wire.extend_from_slice(&self.message.wire);
+        wire.extend_from_slice(&message.wire);
         wire[96] = 0x95;
         write_bin(&mut wire, stamp.as_bytes())?;
-        let mut message = LxMessage::unpack_owned(wire.into(), self.message.limits)?;
-        debug_assert_eq!(message.message_id, self.message.message_id);
-        message.metadata = self.message.metadata;
-        Ok(message)
+        let mut stamped = LxMessage::unpack_owned(wire.into(), message.limits)?;
+        debug_assert_eq!(stamped.message_id, message.message_id);
+        stamped.metadata = message.metadata.clone();
+        Ok(stamped)
     }
 }
 fn packed(error: impl std::fmt::Display) -> MessageError {

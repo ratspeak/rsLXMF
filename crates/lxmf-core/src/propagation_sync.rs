@@ -2934,7 +2934,7 @@ mod tests {
                 .accept_blob_fixture(&oversized, 2)
         );
         let mut policy = OutboundOfferPolicy::unrestricted(node_hash);
-        policy.minimum_stamp_cost = 1;
+        policy.minimum_stamp_cost = 1.0;
         policy.propagation_transfer_limit = Some(0.5);
         let mut task = PropagationSyncTask::with_shared_node(tx, shared_node);
         task.set_node(node_hash);

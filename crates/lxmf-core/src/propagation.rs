@@ -15,7 +15,8 @@ pub struct PropagationEntry {
     pub message_hash: [u8; 32],
     pub destination_hash: [u8; 16],
     pub stored_at: f64,
-    pub stamp_value: u8,
+    /// Quantized stamp value, as Python stores it.
+    pub stamp_value: f64,
     pub size: usize,
     pub collected: bool,
     /// When true, the stored file contains `lxmf_data || propagation_stamp`.
@@ -30,7 +31,7 @@ impl PropagationEntry {
         message_hash: [u8; 32],
         destination_hash: [u8; 16],
         size: usize,
-        stamp_value: u8,
+        stamp_value: f64,
     ) -> Self {
         Self {
             transient_id,
@@ -49,7 +50,7 @@ impl PropagationEntry {
         message_hash: [u8; 32],
         destination_hash: [u8; 16],
         size: usize,
-        stamp_value: u8,
+        stamp_value: f64,
     ) -> Self {
         let mut entry = Self::new(
             transient_id,
@@ -62,13 +63,18 @@ impl PropagationEntry {
         entry
     }
 
-    /// Format: `{hex_transient_id}_{timestamp}_{stamp_value}`.
+    /// Python's message-store name `{hex_transient_id}_{received}_{stamp_value}`,
+    /// with both numbers in Python float form and no value part for value 0.
     pub fn filename(&self) -> String {
+        let value = if self.stamp_value > 0.0 {
+            format!("_{:?}", self.stamp_value)
+        } else {
+            String::new()
+        };
         format!(
-            "{}_{:.0}_{}",
+            "{}_{:?}{value}",
             hex_encode(&self.transient_id),
-            self.stored_at,
-            self.stamp_value
+            self.stored_at
         )
     }
 
@@ -79,19 +85,19 @@ impl PropagationEntry {
     /// # Panics
     /// Non-ASCII input can panic when sliced at hexadecimal byte-pair offsets.
     /// Validate that untrusted filenames are ASCII before calling.
-    pub fn parse_filename(filename: &str) -> Option<(PropagationTransientId, f64, u8)> {
+    pub fn parse_filename(filename: &str) -> Option<(PropagationTransientId, f64, f64)> {
         let parts: Vec<&str> = filename.split('_').collect();
         match parts.len() {
             3 => {
                 let tid = hex_decode_32(parts[0])?;
                 let ts: f64 = parts[1].parse().ok()?;
-                let sv: u8 = parts[2].parse().ok()?;
-                Some((tid, ts, sv))
+                let sv: f64 = parts[2].parse().ok()?;
+                Some((tid, ts, crate::stamper::quantize_cost(sv).ok()?))
             }
             2 => {
                 let tid = hex_decode_32(parts[0])?;
                 let ts: f64 = parts[1].parse().ok()?;
-                Some((tid, ts, 0))
+                Some((tid, ts, 0.0))
             }
             _ => None,
         }
@@ -252,7 +258,7 @@ impl PropagationStore {
         priority_weight * age_weight * entry.size as f64
     }
 
-    pub fn get_stamp_value(&self, transient_id: &PropagationTransientId) -> Option<u8> {
+    pub fn get_stamp_value(&self, transient_id: &PropagationTransientId) -> Option<f64> {
         self.entries.get(transient_id).map(|e| e.stamp_value)
     }
 
@@ -396,7 +402,7 @@ mod tests {
             message_hash: [0xBB; 32],
             destination_hash: [0xCC; 16],
             stored_at: 1234567890.0,
-            stamp_value: 8,
+            stamp_value: 8.0,
             size: 500,
             collected: false,
             stamped: false,
@@ -407,7 +413,8 @@ mod tests {
         );
         let parts: Vec<&str> = fname.split('_').collect();
         assert_eq!(parts.len(), 3);
-        assert_eq!(parts[2], "8");
+        assert_eq!(parts[1], "1234567890.0");
+        assert_eq!(parts[2], "8.0");
     }
 
     #[test]
@@ -417,7 +424,30 @@ mod tests {
         let (tid, ts, sv) = PropagationEntry::parse_filename(fname).unwrap();
         assert_eq!(tid[0], 0xaa);
         assert_eq!(ts, 1234567890.0);
-        assert_eq!(sv, 16);
+        assert_eq!(sv, 16.0);
+    }
+
+    #[test]
+    fn parse_filename_reads_python_float_names() {
+        let tid = "ab".repeat(32);
+        for (name, value) in [
+            (format!("{tid}_1794274814.6018312_8.0"), 8.0),
+            (format!("{tid}_1794274814.6018312_16.25"), 16.25),
+            (format!("{tid}_1794274814.6018312_0.7421875"), 0.7421875),
+        ] {
+            let (_, ts, sv) = PropagationEntry::parse_filename(&name).unwrap();
+            assert_eq!(ts, 1794274814.6018312);
+            assert_eq!(sv, value);
+        }
+    }
+
+    #[test]
+    fn filename_omits_zero_value_and_writes_fractional_value() {
+        let mut entry = PropagationEntry::new(tid(0xAA), [0; 32], [0; 16], 10, 16.25);
+        entry.stored_at = 1794274814.6018312;
+        assert!(entry.filename().ends_with("_1794274814.6018312_16.25"));
+        entry.stamp_value = 0.0;
+        assert!(entry.filename().ends_with("_1794274814.6018312"));
     }
 
     #[test]
@@ -426,7 +456,7 @@ mod tests {
         let (tid, ts, sv) = PropagationEntry::parse_filename(&fname).unwrap();
         assert_eq!(tid[0], 0xaa);
         assert_eq!(ts, 1234567890.0);
-        assert_eq!(sv, 0);
+        assert_eq!(sv, 0.0);
     }
 
     #[test]
@@ -440,7 +470,7 @@ mod tests {
         let mut store = PropagationStore::new();
         assert!(store.is_empty());
 
-        let entry = PropagationEntry::new(tid(0xAA), [0xBB; 32], [0xCC; 16], 500, 8);
+        let entry = PropagationEntry::new(tid(0xAA), [0xBB; 32], [0xCC; 16], 500, 8.0);
         store.insert(entry);
 
         assert_eq!(store.len(), 1);
@@ -457,14 +487,14 @@ mod tests {
             [0xBB; 32],
             [0xCC; 16],
             500,
-            8,
+            8.0,
         ));
         store.insert(PropagationEntry::new(
             tid(0xDD),
             [0xEE; 32],
             [0xCC; 16],
             300,
-            4,
+            4.0,
         ));
 
         assert_eq!(store.total_size(), 800);
@@ -480,9 +510,9 @@ mod tests {
         let dest1 = [0xAA; 16];
         let dest2 = [0xBB; 16];
 
-        store.insert(PropagationEntry::new(tid(0x01), [0; 32], dest1, 100, 0));
-        store.insert(PropagationEntry::new(tid(0x02), [0; 32], dest1, 200, 0));
-        store.insert(PropagationEntry::new(tid(0x03), [0; 32], dest2, 300, 0));
+        store.insert(PropagationEntry::new(tid(0x01), [0; 32], dest1, 100, 0.0));
+        store.insert(PropagationEntry::new(tid(0x02), [0; 32], dest1, 200, 0.0));
+        store.insert(PropagationEntry::new(tid(0x03), [0; 32], dest2, 300, 0.0));
 
         assert_eq!(store.entries_for_destination(&dest1).len(), 2);
         assert_eq!(store.entries_for_destination(&dest2).len(), 1);
@@ -491,8 +521,8 @@ mod tests {
     #[test]
     fn test_transient_ids() {
         let mut store = PropagationStore::new();
-        store.insert(PropagationEntry::new(tid(0x01), [0; 32], [0; 16], 100, 0));
-        store.insert(PropagationEntry::new(tid(0x02), [0; 32], [0; 16], 200, 0));
+        store.insert(PropagationEntry::new(tid(0x01), [0; 32], [0; 16], 100, 0.0));
+        store.insert(PropagationEntry::new(tid(0x02), [0; 32], [0; 16], 200, 0.0));
 
         let ids = store.transient_ids();
         assert_eq!(ids.len(), 2);
@@ -506,16 +536,16 @@ mod tests {
 
         store.ignore_destination(ignored_dest);
 
-        let entry1 = PropagationEntry::new(tid(0x01), [0; 32], ignored_dest, 100, 0);
+        let entry1 = PropagationEntry::new(tid(0x01), [0; 32], ignored_dest, 100, 0.0);
         assert!(!store.insert(entry1));
         assert_eq!(store.len(), 0);
 
-        let entry2 = PropagationEntry::new(tid(0x02), [0; 32], allowed_dest, 200, 0);
+        let entry2 = PropagationEntry::new(tid(0x02), [0; 32], allowed_dest, 200, 0.0);
         assert!(store.insert(entry2));
         assert_eq!(store.len(), 1);
 
         store.unignore_destination(&ignored_dest);
-        let entry3 = PropagationEntry::new(tid(0x03), [0; 32], ignored_dest, 100, 0);
+        let entry3 = PropagationEntry::new(tid(0x03), [0; 32], ignored_dest, 100, 0.0);
         assert!(store.insert(entry3));
         assert_eq!(store.len(), 2);
     }
@@ -573,12 +603,12 @@ mod tests {
     fn test_cull_by_weight() {
         let mut store = PropagationStore::new();
 
-        let mut entry1 = PropagationEntry::new(tid(0x01), [0; 32], [0xAA; 16], 500, 0);
+        let mut entry1 = PropagationEntry::new(tid(0x01), [0; 32], [0xAA; 16], 500, 0.0);
         entry1.stored_at = 1000.0;
         store.entries.insert(entry1.transient_id, entry1.clone());
         store.total_size += 500;
 
-        let mut entry2 = PropagationEntry::new(tid(0x02), [0; 32], [0xBB; 16], 300, 0);
+        let mut entry2 = PropagationEntry::new(tid(0x02), [0; 32], [0xBB; 16], 300, 0.0);
         entry2.stored_at = now_f64();
         store.entries.insert(entry2.transient_id, entry2.clone());
         store.total_size += 300;
@@ -622,7 +652,7 @@ mod tests {
             message_hash: [0; 32],
             destination_hash: [0xAA; 16],
             stored_at: now,
-            stamp_value: 0,
+            stamp_value: 0.0,
             size: 1000,
             collected: false,
             stamped: false,
@@ -645,9 +675,15 @@ mod tests {
     #[test]
     fn test_get_stamp_value() {
         let mut store = PropagationStore::new();
-        store.insert(PropagationEntry::new(tid(0xAA), [0; 32], [0; 16], 100, 12));
+        store.insert(PropagationEntry::new(
+            tid(0xAA),
+            [0; 32],
+            [0; 16],
+            100,
+            12.0,
+        ));
 
-        assert_eq!(store.get_stamp_value(&tid(0xAA)), Some(12));
+        assert_eq!(store.get_stamp_value(&tid(0xAA)), Some(12.0));
         assert_eq!(store.get_stamp_value(&tid(0xBB)), None);
     }
 }

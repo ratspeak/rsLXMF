@@ -376,7 +376,7 @@ mod tests {
         let mut session = SyncSession::new(peer_hash);
 
         let mut store = PropagationStore::new();
-        store.insert(PropagationEntry::new(tid(0x01), [0; 32], [0; 16], 100, 0));
+        store.insert(PropagationEntry::new(tid(0x01), [0; 32], [0; 16], 100, 0.0));
 
         let offer = SyncOffer {
             peering_key: vec![0xFF; 32],

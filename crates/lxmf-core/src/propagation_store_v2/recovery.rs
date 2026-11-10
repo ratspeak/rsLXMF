@@ -22,7 +22,7 @@ pub struct RecoveryEntry {
 pub struct RecoveryPolicy {
     pub maximum_store_bytes: usize,
     pub maximum_message_bytes: usize,
-    pub minimum_stamp_cost: u8,
+    pub minimum_stamp_cost: f64,
 }
 #[derive(Debug, Clone, Copy)]
 pub struct RecoveryReport {
@@ -33,7 +33,7 @@ pub struct RecoveryReport {
 fn validate(
     record: &RecoveryEntry,
     bytes: &[u8],
-    minimum_stamp_cost: u8,
+    minimum_stamp_cost: f64,
 ) -> io::Result<EntryManifest> {
     let tail = if record.stamped { 32 } else { 0 };
     if bytes.len() < 112 + tail
@@ -62,16 +62,15 @@ fn validate(
             &record.transient_id,
             crate::constants::STAMP_WORKBLOCK_EXPAND_ROUNDS_PN,
         );
-        let value = crate::stamper::stamp_value(&workblock, stamp).min(255) as u8;
-        if value < minimum_stamp_cost {
+        if !crate::stamper::stamp_valid(stamp, minimum_stamp_cost, &workblock) {
             return Err(invalid("recovered stamp does not meet node policy"));
         }
-        value
+        crate::stamper::stamp_value(&workblock, stamp)
     } else {
-        if minimum_stamp_cost > 0 {
+        if minimum_stamp_cost > 0.0 {
             return Err(invalid("unstamped recovery does not meet node policy"));
         }
-        0
+        0.0
     };
     let mut destination = [0; 16];
     destination.copy_from_slice(&bytes[..16]);
@@ -216,7 +215,7 @@ mod tests {
         RecoveryPolicy {
             maximum_store_bytes: 8192,
             maximum_message_bytes: 4096,
-            minimum_stamp_cost: 0,
+            minimum_stamp_cost: 0.0,
         }
     }
     fn record(bytes: &[u8], name: &str) -> RecoveryEntry {

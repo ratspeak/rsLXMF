@@ -1,181 +1,57 @@
-//! LXMF Stamp system: Proof-of-Work generation and validation.
+//! LXMF stamps: proof of work for messages, propagation and peering.
 //!
-//! Python reference: LXMF/LXStamper.py.
-//!
-//! A single workblock construction is used for all stamp kinds (message,
-//! propagation-node, peering), matching Python `LXStamper.stamp_workblock`:
-//! per-round HKDF expansion concatenated into a `expand_rounds * 256` byte
-//! workblock. Only the expand-round count differs per kind (see
-//! `STAMP_WORKBLOCK_EXPAND_ROUNDS{,_PN,_PEERING}` in constants.rs).
-//!
-//! Rust validation requires at least `cost` leading zero bits in
-//! `SHA-256(workblock || stamp)`. Python uses an inclusive numeric threshold,
-//! `result <= 1 << (256 - cost)`; the exact equality boundary differs for
-//! nonzero cost.
+//! Python reference: `LXMF/LXStamper.py`, which takes the workblock, value,
+//! validity and generation from `RNS.Stamps`. Only the expand-round counts per
+//! stamp kind are LXMF's own (`STAMP_WORKBLOCK_EXPAND_ROUNDS{,_PN,_PEERING}`
+//! in constants.rs). Costs and values are fractional on the 1/256 grid.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 
-use rand::RngCore;
-use rns_crypto::hkdf::hkdf_sha256;
-use rns_crypto::sha::sha256;
-use sha2::{Digest, Sha256};
+pub use rns_identity::stamps::{
+    STAMP_COST_CAP, STAMP_COST_CAP_FP, StampControl, StampError, cost_from_fp, cost_to_fp,
+    quantize_cost, stamp_value, stamp_workblock,
+};
+
+use crate::constants::{
+    LXMF_OVERHEAD, STAMP_SIZE, STAMP_WORKBLOCK_EXPAND_ROUNDS_PEERING,
+    STAMP_WORKBLOCK_EXPAND_ROUNDS_PN,
+};
 
 /// Parsed propagation-node stamp parts: `(transient_id, lxm_data, value, stamp)`.
-pub type PropagationStampParts = ([u8; 32], Vec<u8>, u32, [u8; 32]);
+pub type PropagationStampParts = ([u8; 32], Vec<u8>, f64, [u8; 32]);
 
-/// Matches Python `LXStamper.stamp_workblock(material, expand_rounds)`:
-///
-/// For each round n in 0..expand_rounds:
-///   salt = SHA256(material + msgpack.packb(n))
-///   workblock += HKDF(length=256, derive_from=material, salt=salt, context=None)
-///
-/// Produces `expand_rounds * 256` bytes.
-pub fn stamp_workblock(material: &[u8], expand_rounds: usize) -> Vec<u8> {
-    let mut workblock = Vec::with_capacity(expand_rounds * 256);
-
-    for n in 0..expand_rounds {
-        let n_packed = pack_msgpack_uint(n);
-
-        let mut salt_input = Vec::with_capacity(material.len() + n_packed.len());
-        salt_input.extend_from_slice(material);
-        salt_input.extend_from_slice(&n_packed);
-        let salt = sha256(&salt_input);
-
-        let chunk = hkdf_sha256(256, material, Some(&salt), None)
-            .expect("HKDF expand failed for stamp workblock");
-        workblock.extend_from_slice(&chunk);
-    }
-
-    workblock
+/// Python `stamp_valid`: the stamp hash meets the fixed-point target of
+/// `cost`. A cost of 0 always passes; a non-finite cost never does.
+pub fn stamp_valid(stamp: &[u8], cost: f64, workblock: &[u8]) -> bool {
+    rns_identity::stamps::stamp_valid(stamp, cost, workblock).unwrap_or(false)
 }
 
-fn pack_msgpack_uint(n: usize) -> Vec<u8> {
-    let value = rmpv::Value::Integer(rmpv::Integer::from(n as u64));
-    crate::encode_value(&value)
+/// Whether a stamp of `value` passes [`stamp_valid`] at `cost`.
+pub fn value_meets(value: f64, cost: f64) -> bool {
+    quantize_cost(cost).is_ok_and(|cost| value >= cost)
 }
 
-fn leading_zero_bits(data: &[u8]) -> u32 {
-    let mut count = 0u32;
-    for &byte in data {
-        if byte == 0 {
-            count += 8;
-        } else {
-            count += byte.leading_zeros();
-            break;
-        }
-    }
-    count
-}
-
-/// Leading zero bits of `SHA-256(workblock || stamp)`. Matches Python `stamp_value()`.
-pub fn stamp_value(workblock: &[u8], stamp: &[u8; 32]) -> u32 {
-    let mut hasher = Sha256::new();
-    hasher.update(workblock);
-    stamp_value_from_base(&hasher, stamp)
-}
-
-pub fn stamp_valid(stamp: &[u8; 32], cost: u8, workblock: &[u8]) -> bool {
-    if cost == 0 {
-        return true;
-    }
-    stamp_value(workblock, stamp) >= cost as u32
-}
-
-/// Attempt budget for [`generate_stamp`] and [`generate_stamp_cancellable`]:
-/// `64 * 2^cost`. Returns `None` for costs at least 58 because the budget would
-/// overflow `u64`. This limits attempts, not elapsed time. Deferred stamp
-/// workers use explicit cancellation and do not use this budget.
-pub fn stamp_iteration_cap(cost: u8) -> Option<u64> {
-    if cost >= 58 {
-        return None;
-    }
-    Some(64u64 << cost)
-}
-
-/// Single-threaded brute-force stamp search. Bounded by
-/// [`stamp_iteration_cap`]; returns `None` when the cap is exhausted or the
-/// requested cost has no supported iteration budget.
-pub fn generate_stamp(material: &[u8], cost: u8, expand_rounds: usize) -> Option<([u8; 32], u32)> {
-    generate_stamp_cancellable(material, cost, expand_rounds, &AtomicBool::new(false))
-}
-
-/// Synchronous search with the [`stamp_iteration_cap`] attempt budget.
-/// Checks cancellation before workblock construction and every 1,000 attempts;
-/// workblock construction itself is not interrupted. Run on a blocking worker
-/// when called from async code.
-pub fn generate_stamp_cancellable(
+/// Python `LXStamper.generate_stamp`: a 32-byte stamp and its real value.
+/// Costs outside `0..=100` are refused as Python refuses them; a cost of 0
+/// still returns a random stamp. `None` means cancelled or past the deadline.
+pub fn generate_stamp(
     material: &[u8],
-    cost: u8,
+    cost: f64,
     expand_rounds: usize,
-    cancel: &AtomicBool,
-) -> Option<([u8; 32], u32)> {
-    if cancel.load(Ordering::Acquire) {
-        return None;
-    }
-    if cost == 0 {
-        return Some(([0u8; 32], 0));
-    }
-    let started = std::time::Instant::now();
-    let max_iterations = stamp_iteration_cap(cost)?;
-
-    let workblock = stamp_workblock(material, expand_rounds);
-    let mut base_hasher = Sha256::new();
-    base_hasher.update(&workblock);
-    let mut rng = rand::thread_rng();
-
-    for iteration in 0..max_iterations {
-        if iteration % 1000 == 0 && cancel.load(Ordering::Acquire) {
-            return None;
-        }
-        let stamp = rand_bytes_from(&mut rng);
-        let value = stamp_value_from_base(&base_hasher, &stamp);
-        if value >= cost as u32 {
-            let elapsed_ms = started.elapsed().as_millis() as u64;
-            if elapsed_ms > 250 {
-                tracing::info!(cost, value, elapsed_ms, "stamp generated");
-            }
-            return Some((stamp, value));
-        }
-    }
-    tracing::warn!(
-        cost,
-        elapsed_ms = started.elapsed().as_millis() as u64,
-        "stamp search exhausted iteration cap"
-    );
-    None
-}
-
-/// Stamp search with a configurable iteration limit (for tests).
-pub fn generate_stamp_limited(
-    material: &[u8],
-    cost: u8,
-    expand_rounds: usize,
-    max_iterations: u64,
-) -> Option<[u8; 32]> {
-    if cost == 0 {
-        return Some([0u8; 32]);
-    }
-
-    let workblock = stamp_workblock(material, expand_rounds);
-    let mut base_hasher = Sha256::new();
-    base_hasher.update(&workblock);
-    let mut rng = rand::thread_rng();
-
-    for _ in 0..max_iterations {
-        let stamp = rand_bytes_from(&mut rng);
-        if stamp_value_from_base(&base_hasher, &stamp) >= cost as u32 {
-            return Some(stamp);
-        }
-    }
-
-    None
+    ctl: &StampControl,
+) -> Result<Option<([u8; 32], f64)>, StampError> {
+    let generated =
+        rns_identity::stamps::generate_stamp(material, cost, expand_rounds, STAMP_SIZE, ctl)?;
+    Ok(generated.map(|(stamp, value)| {
+        let stamp: [u8; 32] = stamp.try_into().expect("stamp size is 32");
+        (stamp, value)
+    }))
 }
 
 pub fn validate_stamp(
     message_id: &[u8; 32],
-    stamp: &[u8; 32],
-    cost: u8,
+    stamp: &[u8],
+    cost: f64,
     expand_rounds: usize,
 ) -> bool {
     let workblock = stamp_workblock(message_id, expand_rounds);
@@ -183,45 +59,27 @@ pub fn validate_stamp(
 }
 
 /// Python reference: `LXStamper.validate_peering_key`.
-///
-/// `peering_id` = self_identity_hash || remote_identity_hash (32 bytes typical).
-/// Uses `STAMP_WORKBLOCK_EXPAND_ROUNDS_PEERING` for workblock generation.
-pub fn validate_peering_key(peering_id: &[u8], peering_key: &[u8; 32], target_cost: u8) -> bool {
-    let workblock = stamp_workblock(
-        peering_id,
-        crate::constants::STAMP_WORKBLOCK_EXPAND_ROUNDS_PEERING,
-    );
+pub fn validate_peering_key(peering_id: &[u8], peering_key: &[u8], target_cost: f64) -> bool {
+    let workblock = stamp_workblock(peering_id, STAMP_WORKBLOCK_EXPAND_ROUNDS_PEERING);
     stamp_valid(peering_key, target_cost, &workblock)
 }
 
 /// Python reference: `LXStamper.validate_pn_stamp`.
 ///
 /// `transient_data = lxm_data || stamp` where stamp is the last 32 bytes.
-/// Uses `STAMP_WORKBLOCK_EXPAND_ROUNDS_PN` for workblock generation.
-pub fn validate_pn_stamp(transient_data: &[u8], target_cost: u8) -> Option<PropagationStampParts> {
-    let stamp_size = 32;
-    let lxmf_overhead = crate::constants::LXMF_OVERHEAD;
-
-    if transient_data.len() <= lxmf_overhead + stamp_size {
+pub fn validate_pn_stamp(transient_data: &[u8], target_cost: f64) -> Option<PropagationStampParts> {
+    if transient_data.len() <= LXMF_OVERHEAD + STAMP_SIZE {
         return None;
     }
-
-    let split = transient_data.len() - stamp_size;
+    let split = transient_data.len() - STAMP_SIZE;
     let lxm_data = &transient_data[..split];
-    let stamp_bytes = &transient_data[split..];
-    let mut stamp = [0u8; 32];
-    stamp.copy_from_slice(stamp_bytes);
-
+    let stamp: [u8; 32] = transient_data[split..].try_into().ok()?;
     let transient_id = rns_crypto::sha::full_hash(lxm_data);
-    let workblock = stamp_workblock(
-        &transient_id,
-        crate::constants::STAMP_WORKBLOCK_EXPAND_ROUNDS_PN,
-    );
-
-    let value = stamp_value(&workblock, &stamp);
-    if value < target_cost as u32 {
+    let workblock = stamp_workblock(&transient_id, STAMP_WORKBLOCK_EXPAND_ROUNDS_PN);
+    if !stamp_valid(&stamp, target_cost, &workblock) {
         return None;
     }
+    let value = stamp_value(&workblock, &stamp);
     Some((transient_id, lxm_data.to_vec(), value, stamp))
 }
 
@@ -230,30 +88,31 @@ pub fn validate_pn_stamp(transient_data: &[u8], target_cost: u8) -> Option<Propa
 /// receiver does not stop the worker.
 #[derive(Clone)]
 pub struct DeferredStampHandle {
-    cancel: Arc<AtomicBool>,
+    ctl: StampControl,
 }
 
 impl DeferredStampHandle {
     pub fn cancel(&self) {
-        self.cancel.store(true, Ordering::Relaxed);
+        self.ctl.cancel.store(true, Ordering::Relaxed);
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.cancel.load(Ordering::Relaxed)
+        self.ctl.cancel.load(Ordering::Relaxed)
     }
 }
 
 #[derive(Debug)]
 pub enum DeferredStampResult {
-    Success { stamp: [u8; 32], value: u32 },
+    Success {
+        stamp: [u8; 32],
+        value: f64,
+    },
     Cancelled,
+    /// The cost cannot be generated, as Python's `generate_stamp` raises.
+    Failed(StampError),
 }
 
 /// Spawn a deferred stamp-generation task on a blocking worker.
-///
-/// Returns a cancellation handle and a oneshot receiver for the result.
-/// The search has no iteration cap; see [`spawn_deferred_stamp_on`] for its
-/// cancellation contract.
 ///
 /// # Panics
 /// Panics when called outside a Tokio runtime.
@@ -269,7 +128,7 @@ pub enum DeferredStampResult {
 )]
 pub fn spawn_deferred_stamp(
     message_id: [u8; 32],
-    cost: u8,
+    cost: f64,
     expand_rounds: usize,
 ) -> (
     DeferredStampHandle,
@@ -279,372 +138,170 @@ pub fn spawn_deferred_stamp(
     spawn_deferred_stamp_on(&handle, message_id, cost, expand_rounds)
 }
 
-/// Spawn on an explicit runtime handle, without requiring a current runtime
-/// context on the calling thread.
-///
-/// After workblock construction, a nonzero-cost search checks cancellation
-/// between batches of 1,000 attempts and runs until success or cancellation.
-/// It does not apply [`stamp_iteration_cap`]. Keep the cancellation handle and
-/// call `cancel()` when abandoning the result.
+/// Spawn on an explicit runtime handle. The search runs until it succeeds or
+/// the handle is cancelled; an invalid cost reports `Failed` at once.
 pub fn spawn_deferred_stamp_on(
     runtime: &tokio::runtime::Handle,
     message_id: [u8; 32],
-    cost: u8,
+    cost: f64,
     expand_rounds: usize,
 ) -> (
     DeferredStampHandle,
     tokio::sync::oneshot::Receiver<DeferredStampResult>,
 ) {
-    let cancel = Arc::new(AtomicBool::new(false));
+    let ctl = StampControl::default();
     let (tx, rx) = tokio::sync::oneshot::channel();
-
-    let cancel_flag = cancel.clone();
+    let worker_ctl = ctl.clone();
     runtime.spawn_blocking(move || {
-        if cost == 0 {
-            let _ = tx.send(DeferredStampResult::Success {
-                stamp: [0u8; 32],
-                value: 0,
-            });
-            return;
-        }
-
-        let workblock = stamp_workblock(&message_id, expand_rounds);
-        let mut base_hasher = Sha256::new();
-        base_hasher.update(&workblock);
-        let mut rng = rand::thread_rng();
-
-        loop {
-            if cancel_flag.load(Ordering::Relaxed) {
-                let _ = tx.send(DeferredStampResult::Cancelled);
-                return;
-            }
-
-            // Check cancellation every 1000 iterations.
-            for _ in 0..1000 {
-                let stamp = rand_bytes_from(&mut rng);
-                let value = stamp_value_from_base(&base_hasher, &stamp);
-                if value >= cost as u32 {
-                    let _ = tx.send(DeferredStampResult::Success { stamp, value });
-                    return;
-                }
-            }
-        }
+        let result = match generate_stamp(&message_id, cost, expand_rounds, &worker_ctl) {
+            Ok(Some((stamp, value))) => DeferredStampResult::Success { stamp, value },
+            Ok(None) => DeferredStampResult::Cancelled,
+            Err(error) => DeferredStampResult::Failed(error),
+        };
+        let _ = tx.send(result);
     });
-
-    (DeferredStampHandle { cancel }, rx)
-}
-
-pub(crate) fn rand_bytes() -> [u8; 32] {
-    let mut rng = rand::thread_rng();
-    rand_bytes_from(&mut rng)
-}
-
-fn rand_bytes_from(rng: &mut impl RngCore) -> [u8; 32] {
-    let mut bytes = [0u8; 32];
-    rng.fill_bytes(&mut bytes);
-    bytes
-}
-
-fn stamp_value_from_base(base_hasher: &Sha256, stamp: &[u8; 32]) -> u32 {
-    let mut hasher = base_hasher.clone();
-    hasher.update(stamp);
-    let hash = hasher.finalize();
-    leading_zero_bits(&hash)
+    (DeferredStampHandle { ctl }, rx)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::constants::{STAMP_WORKBLOCK_EXPAND_ROUNDS, STAMP_WORKBLOCK_EXPAND_ROUNDS_PN};
+    use rns_crypto::sha::sha256;
 
-    #[test]
-    fn test_workblock_deterministic() {
-        let id = sha256(b"test message id");
-        let wb1 = stamp_workblock(&id, 10);
-        let wb2 = stamp_workblock(&id, 10);
-        assert_eq!(wb1, wb2);
-        assert_eq!(wb1.len(), 10 * 256);
+    fn found(material: &[u8], cost: f64, rounds: usize) -> ([u8; 32], f64) {
+        generate_stamp(material, cost, rounds, &StampControl::default())
+            .unwrap()
+            .unwrap()
     }
 
     #[test]
-    fn test_workblock_different_rounds() {
-        let id = sha256(b"test");
-        let wb1 = stamp_workblock(&id, 10);
-        let wb2 = stamp_workblock(&id, 20);
-        assert_ne!(wb1, wb2);
-    }
-
-    /// Workblock for the default message expand rounds matches the Python
-    /// construction's size: 3000 rounds * 256 bytes.
-    #[test]
-    fn test_workblock_message_rounds_size() {
+    fn workblock_uses_lxmf_expand_rounds() {
         let id = sha256(b"size check");
-        let wb = stamp_workblock(&id, STAMP_WORKBLOCK_EXPAND_ROUNDS);
-        assert_eq!(wb.len(), STAMP_WORKBLOCK_EXPAND_ROUNDS * 256);
+        assert_eq!(
+            stamp_workblock(&id, STAMP_WORKBLOCK_EXPAND_ROUNDS).len(),
+            STAMP_WORKBLOCK_EXPAND_ROUNDS * 256
+        );
+        assert_eq!(stamp_workblock(&id, 0), id.to_vec());
     }
 
     #[test]
-    fn test_leading_zero_bits() {
-        assert_eq!(leading_zero_bits(&[0xFF]), 0);
-        assert_eq!(leading_zero_bits(&[0x00, 0xFF]), 8);
-        assert_eq!(leading_zero_bits(&[0x00, 0x00, 0xFF]), 16);
-        assert_eq!(leading_zero_bits(&[0x0F]), 4);
-        assert_eq!(leading_zero_bits(&[0x01]), 7);
-        assert_eq!(leading_zero_bits(&[0x00, 0x01]), 15);
+    fn zero_cost_generates_a_random_stamp_with_its_real_value() {
+        let id = sha256(b"zero cost");
+        let (stamp, value) = found(&id, 0.0, 20);
+        assert_ne!(stamp, [0u8; 32]);
+        assert_eq!(value, stamp_value(&stamp_workblock(&id, 20), &stamp));
+        assert!(stamp_valid(&stamp, 0.0, &[]));
     }
 
     #[test]
-    fn test_stamp_valid_cost_zero() {
-        let stamp = [0u8; 32];
-        let workblock = [0u8; 32];
-        assert!(stamp_valid(&stamp, 0, &workblock));
-    }
-
-    #[test]
-    fn test_generate_stamp_cost_zero() {
-        let id = sha256(b"test");
-        let (stamp, value) = generate_stamp(&id, 0, 20).unwrap();
-        assert_eq!(stamp, [0u8; 32]);
-        assert_eq!(value, 0);
-    }
-
-    /// T0-4: the stamp search is bounded — an unsatisfiable (hostile) cost
-    /// returns `None` immediately instead of pinning the thread forever.
-    #[test]
-    fn test_generate_stamp_capped_for_hostile_cost() {
-        assert_eq!(stamp_iteration_cap(1), Some(128));
-        assert_eq!(stamp_iteration_cap(26), Some(64u64 << 26));
-        assert!(stamp_iteration_cap(57).is_some());
-        assert_eq!(stamp_iteration_cap(58), None);
-        assert_eq!(stamp_iteration_cap(255), None);
-
-        let id = sha256(b"hostile cost");
-        // Cost 255 must fail fast (cap is None — no workblock spin at all).
-        assert!(generate_stamp(&id, 255, 20).is_none());
-        // Sane costs still succeed.
-        assert!(generate_stamp(&id, 4, 20).is_some());
-    }
-
-    #[test]
-    fn test_generate_and_validate_stamp() {
-        let id = sha256(b"test message for stamping");
-        let cost = 4;
-
-        let stamp = generate_stamp_limited(&id, cost, STAMP_WORKBLOCK_EXPAND_ROUNDS, 1_000_000);
-        assert!(stamp.is_some(), "should find a stamp with cost={cost}");
-
-        let stamp = stamp.unwrap();
-        assert!(validate_stamp(
-            &id,
-            &stamp,
-            cost,
-            STAMP_WORKBLOCK_EXPAND_ROUNDS
-        ));
-    }
-
-    #[test]
-    fn test_validate_wrong_stamp() {
-        let id = sha256(b"test");
-        let wrong_stamp = [0xFFu8; 32];
-        assert!(!validate_stamp(&id, &wrong_stamp, 32, 20));
-    }
-
-    #[test]
-    fn test_generate_stamp_limited_fails() {
-        let id = sha256(b"test");
-        let result = generate_stamp_limited(&id, 128, 20, 10);
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_stamp_value_consistency() {
-        let id = sha256(b"consistency test");
-        let cost = 4;
-        if let Some(stamp) = generate_stamp_limited(&id, cost, 20, 1_000_000) {
-            let workblock = stamp_workblock(&id, 20);
-            let value = stamp_value(&workblock, &stamp);
-            assert!(value >= cost as u32);
-            assert!(stamp_valid(&stamp, cost, &workblock));
+    fn generation_refuses_costs_outside_the_cap() {
+        let ctl = StampControl::default();
+        for cost in [100.5, 150.0, 255.0, -1.0, f64::NAN] {
+            assert!(generate_stamp(&[7; 32], cost, 1, &ctl).is_err(), "{cost}");
         }
     }
 
     #[test]
-    fn test_workblock_arbitrary_length_input() {
-        let short_material = b"short";
-        let wb = stamp_workblock(short_material, 5);
-        assert_eq!(wb.len(), 5 * 256);
-
-        let wb2 = stamp_workblock(short_material, 5);
-        assert_eq!(wb, wb2);
-
-        let wb3 = stamp_workblock(b"other", 5);
-        assert_ne!(wb, wb3);
+    fn fractional_cost_generates_and_validates() {
+        let id = sha256(b"fractional");
+        let (stamp, value) = found(&id, 4.5, 10);
+        assert!(value >= 4.5);
+        assert!(validate_stamp(&id, &stamp, 4.5, 10));
+        assert!(!validate_stamp(&id, &stamp, value + 1.0 / 256.0, 10));
     }
 
     #[test]
-    fn test_different_expand_round_constants() {
-        let id = sha256(b"test expand rounds");
-        let wb_pn = stamp_workblock(&id, STAMP_WORKBLOCK_EXPAND_ROUNDS_PN);
-        let wb_peering =
-            stamp_workblock(&id, crate::constants::STAMP_WORKBLOCK_EXPAND_ROUNDS_PEERING);
-        // Workblocks are prefix-stable per construction; only length differs.
-        assert_eq!(wb_pn[..wb_peering.len()], wb_peering[..]);
-        assert_eq!(wb_pn.len(), STAMP_WORKBLOCK_EXPAND_ROUNDS_PN * 256);
-        assert_eq!(
-            wb_peering.len(),
-            crate::constants::STAMP_WORKBLOCK_EXPAND_ROUNDS_PEERING * 256
-        );
-    }
-
-    /// The first 256-byte chunk of the workblock is identical regardless of
-    /// total round count — Python builds it incrementally the same way.
-    #[test]
-    fn test_workblock_prefix_stability() {
-        let id = sha256(b"prefix stability");
-        let wb_small = stamp_workblock(&id, 2);
-        let wb_large = stamp_workblock(&id, 5);
-        assert_eq!(wb_small[..], wb_large[..2 * 256]);
+    fn non_finite_target_never_validates() {
+        assert!(!stamp_valid(&[0u8; 32], f64::NAN, b"x"));
     }
 
     #[test]
-    fn test_deferred_stamp_handle_cancel() {
+    fn peering_key_validates_at_its_value() {
+        let peering_id = [0xAA; 32];
+        let (key, value) = found(&peering_id, 3.25, STAMP_WORKBLOCK_EXPAND_ROUNDS_PEERING);
+        assert!(validate_peering_key(&peering_id, &key, 3.25));
+        assert!(validate_peering_key(&peering_id, &key, value));
+        assert!(!validate_peering_key(
+            &peering_id,
+            &key,
+            value + 1.0 / 256.0
+        ));
+        assert!(validate_peering_key(&peering_id, &[0xFF; 32], 0.0));
+    }
+
+    #[test]
+    fn pn_stamp_too_short_is_rejected() {
+        let short_data = vec![0u8; LXMF_OVERHEAD + 32];
+        assert!(validate_pn_stamp(&short_data, 0.0).is_none());
+    }
+
+    #[test]
+    fn pn_stamp_parts_carry_the_fractional_value() {
+        let lxm_data = vec![0xAB; LXMF_OVERHEAD + 64];
+        let tid = rns_crypto::sha::full_hash(&lxm_data);
+        let (stamp, value) = found(&tid, 2.5, STAMP_WORKBLOCK_EXPAND_ROUNDS_PN);
+        let mut transient_data = lxm_data.clone();
+        transient_data.extend_from_slice(&stamp);
+        let (transient_id, extracted, got, extracted_stamp) =
+            validate_pn_stamp(&transient_data, 2.5).unwrap();
+        assert_eq!(transient_id, tid);
+        assert_eq!(extracted, lxm_data);
+        assert_eq!(extracted_stamp, stamp);
+        assert_eq!(got, value);
+        assert!(validate_pn_stamp(&transient_data, value + 1.0 / 256.0).is_none());
+    }
+
+    #[test]
+    fn deferred_stamp_handle_cancel() {
         let handle = DeferredStampHandle {
-            cancel: Arc::new(AtomicBool::new(false)),
+            ctl: StampControl::default(),
         };
         assert!(!handle.is_cancelled());
         handle.cancel();
         assert!(handle.is_cancelled());
     }
 
-    /// End-to-end: a stamp worker running a high-cost PoW must observe the
-    /// cancellation flag and report `DeferredStampResult::Cancelled`
-    /// without panicking. This exercises the worker checkpoint rather than
-    /// only the handle state.
     #[tokio::test]
-    async fn test_deferred_stamp_cancelled_mid_computation() {
-        // Cost 32 is intentionally high enough that the worker is still
-        // looping when cancellation is requested.
+    async fn deferred_stamp_cancelled_mid_computation() {
         let id = sha256(b"mid-pow cancel");
-        let (handle, rx) = spawn_deferred_stamp(id, 32, 10);
-
-        // Allow the worker to enter its inner loop.
+        let (handle, rx) = spawn_deferred_stamp(id, 32.0, 10);
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         handle.cancel();
-
         let result = tokio::time::timeout(std::time::Duration::from_secs(3), rx)
             .await
-            .expect("worker should report back within 3s of cancel")
+            .expect("worker reports back after cancel")
             .expect("oneshot sender dropped");
-
         assert!(
             matches!(result, DeferredStampResult::Cancelled),
-            "worker must report Cancelled after handle.cancel(), got {result:?}"
+            "{result:?}"
         );
     }
 
-    /// Cost=0 is the degenerate case: no work to do, oneshot fires
-    /// immediately with a zero stamp + value. Cancelling after the fact
-    /// must not race or produce a spurious Cancelled result.
     #[tokio::test]
-    async fn test_deferred_stamp_zero_cost_completes_before_cancel() {
-        let id = sha256(b"zero cost");
-        let (handle, rx) = spawn_deferred_stamp(id, 0, 10);
-
+    async fn deferred_stamp_refuses_cost_above_cap() {
+        let (_handle, rx) = spawn_deferred_stamp([9; 32], 150.0, 1);
         let result = tokio::time::timeout(std::time::Duration::from_secs(3), rx)
             .await
-            .expect("cost=0 returns immediately")
-            .expect("oneshot sender dropped");
-
+            .unwrap()
+            .unwrap();
         assert!(
-            matches!(result, DeferredStampResult::Success { value: 0, .. }),
-            "cost=0 returns Success with zero value, got {result:?}"
-        );
-        // The handle remains usable after completion; cancel is a no-op here.
-        handle.cancel();
-        assert!(handle.is_cancelled());
-    }
-
-    #[test]
-    fn test_workblock_peering_id_length() {
-        let mut peering_id = Vec::with_capacity(32);
-        peering_id.extend_from_slice(&[0xAA; 16]);
-        peering_id.extend_from_slice(&[0xBB; 16]);
-        let wb = stamp_workblock(
-            &peering_id,
-            crate::constants::STAMP_WORKBLOCK_EXPAND_ROUNDS_PEERING,
-        );
-        assert_eq!(
-            wb.len(),
-            crate::constants::STAMP_WORKBLOCK_EXPAND_ROUNDS_PEERING * 256
+            matches!(result, DeferredStampResult::Failed(_)),
+            "{result:?}"
         );
     }
 
-    #[test]
-    fn test_validate_peering_key_cost_zero() {
-        let peering_id = [0xAA; 32];
-        let peering_key = [0xFF; 32];
-        assert!(validate_peering_key(&peering_id, &peering_key, 0));
-    }
-
-    #[test]
-    fn test_validate_peering_key_invalid() {
-        let mut peering_id = Vec::with_capacity(32);
-        peering_id.extend_from_slice(&[0xAA; 16]);
-        peering_id.extend_from_slice(&[0xBB; 16]);
-        let peering_key = [0xFF; 32];
-        assert!(!validate_peering_key(&peering_id, &peering_key, 32));
-    }
-
-    #[test]
-    fn test_validate_pn_stamp_too_short() {
-        let short_data = vec![0u8; crate::constants::LXMF_OVERHEAD + 32];
-        assert!(validate_pn_stamp(&short_data, 0).is_none());
-    }
-
-    #[test]
-    fn test_validate_pn_stamp_extracts_parts() {
-        let lxm_data = vec![0xAB; crate::constants::LXMF_OVERHEAD + 64];
-        let stamp = [0u8; 32];
-
-        let mut transient_data = lxm_data.clone();
-        transient_data.extend_from_slice(&stamp);
-
-        let result = validate_pn_stamp(&transient_data, 0);
-        assert!(result.is_some());
-
-        let (transient_id, extracted_lxm, value, extracted_stamp) = result.unwrap();
-        assert_eq!(extracted_lxm, lxm_data);
-        assert_eq!(extracted_stamp, stamp);
-        assert_eq!(transient_id, rns_crypto::sha::full_hash(&lxm_data));
-        let _ = value;
-    }
-
-    #[test]
-    fn test_stamp_value_matches_direct_sha256_of_workblock_and_stamp() {
-        let material = sha256(b"propagation transient id");
-        let workblock = stamp_workblock(&material, STAMP_WORKBLOCK_EXPAND_ROUNDS_PN);
-        let stamp = [0x5Au8; 32];
-
-        let mut direct = Vec::with_capacity(workblock.len() + stamp.len());
-        direct.extend_from_slice(&workblock);
-        direct.extend_from_slice(&stamp);
-        let direct_hash = sha256(&direct);
-
-        assert_eq!(
-            stamp_value(&workblock, &stamp),
-            leading_zero_bits(&direct_hash)
-        );
-    }
-
-    #[test]
-    fn test_validate_pn_stamp_high_cost_fails() {
-        let lxm_data = vec![0xCD; crate::constants::LXMF_OVERHEAD + 100];
-        let stamp = [0xFF; 32];
-
-        let mut transient_data = lxm_data.clone();
-        transient_data.extend_from_slice(&stamp);
-
-        let result = validate_pn_stamp(&transient_data, 32);
-        assert!(result.is_none());
+    #[tokio::test]
+    async fn deferred_stamp_zero_cost_completes_with_real_value() {
+        let id = sha256(b"zero cost");
+        let (_handle, rx) = spawn_deferred_stamp(id, 0.0, 10);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let DeferredStampResult::Success { stamp, value } = result else {
+            panic!("{result:?}");
+        };
+        assert_eq!(value, stamp_value(&stamp_workblock(&id, 10), &stamp));
     }
 }

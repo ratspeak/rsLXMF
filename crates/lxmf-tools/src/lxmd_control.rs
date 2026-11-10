@@ -231,15 +231,15 @@ pub fn encode_router_control_stats(
             ),
             (
                 Value::String("target_stamp_cost".into()),
-                option_u8(peer.stamp_cost),
+                option_f64(peer.stamp_cost),
             ),
             (
                 Value::String("stamp_cost_flexibility".into()),
-                option_u8(peer.stamp_cost_flexibility),
+                option_f64(peer.stamp_cost_flexibility),
             ),
             (
                 Value::String("peering_cost".into()),
-                Value::from(peer.peering_cost as u64),
+                Value::F64(peer.peering_cost),
             ),
             (Value::String("peering_key".into()), peering_key_value),
             (
@@ -303,19 +303,19 @@ pub fn encode_router_control_stats(
         ),
         (
             Value::String("target_stamp_cost".into()),
-            Value::from(router.config.propagation_stamp_cost as u64),
+            Value::F64(router.config.propagation_stamp_cost),
         ),
         (
             Value::String("stamp_cost_flexibility".into()),
-            Value::from(router.config.propagation_stamp_flex as u64),
+            Value::F64(router.config.propagation_stamp_flex),
         ),
         (
             Value::String("peering_cost".into()),
-            Value::from(router.config.ext.peering_cost as u64),
+            Value::F64(router.config.ext.peering_cost),
         ),
         (
             Value::String("max_peering_cost".into()),
-            Value::from(router.config.ext.max_peering_cost as u64),
+            Value::F64(router.config.ext.max_peering_cost),
         ),
         (
             Value::String("autopeer_maxdepth".into()),
@@ -506,13 +506,13 @@ pub fn format_remote_status(
         ));
         out.push_str(&format!(
             "Required propagation stamp cost is {}, flexibility is {}\n",
-            map_u64(stats, "target_stamp_cost").unwrap_or(0),
-            map_u64(stats, "stamp_cost_flexibility").unwrap_or(0),
+            map_python_str(stats, "target_stamp_cost"),
+            map_python_str(stats, "stamp_cost_flexibility"),
         ));
         out.push_str(&format!(
             "Peering cost is {}, max remote peering cost is {}\n",
-            map_u64(stats, "peering_cost").unwrap_or(0),
-            map_u64(stats, "max_peering_cost").unwrap_or(0),
+            map_python_str(stats, "peering_cost"),
+            map_python_str(stats, "max_peering_cost"),
         ));
         out.push_str(&format!("Accepting propagated messages from {who}\n"));
         out.push_str(&format!(
@@ -624,9 +624,9 @@ pub fn format_remote_status(
             ));
             out.push_str(&format!(
                 "    Costs      : Propagation {} (flex {}), peering {}\n",
-                map_optional_display(peer, "target_stamp_cost"),
-                map_optional_display(peer, "stamp_cost_flexibility"),
-                map_optional_display(peer, "peering_cost"),
+                map_optional_cost(peer, "target_stamp_cost"),
+                map_optional_cost(peer, "stamp_cost_flexibility"),
+                map_optional_cost(peer, "peering_cost"),
             ));
             out.push_str(&format!("    Sync key   : {peering_key}\n"));
             out.push_str(&format!(
@@ -710,13 +710,6 @@ fn map_display(value: &Value, key: &str) -> String {
     map_value(value, key)
         .map(value_to_display)
         .unwrap_or_else(|| "None".to_string())
-}
-
-fn map_optional_display(value: &Value, key: &str) -> String {
-    match map_value(value, key) {
-        Some(v) if !v.is_nil() => value_to_display(v),
-        _ => "unknown".to_string(),
-    }
 }
 
 fn value_to_display(value: &Value) -> String {
@@ -839,8 +832,21 @@ fn format_python_float(value: f64) -> String {
     }
 }
 
-fn option_u8(value: Option<u8>) -> Value {
-    value.map(|v| Value::from(v as u64)).unwrap_or(Value::Nil)
+fn map_optional_cost(value: &Value, key: &str) -> String {
+    match map_value(value, key) {
+        Some(v) if !v.is_nil() => map_python_str(value, key),
+        _ => "unknown".to_string(),
+    }
+}
+
+/// Python `str()` of a number: floats keep their decimal point.
+fn map_python_str(value: &Value, key: &str) -> String {
+    match map_value(value, key) {
+        Some(Value::F64(f)) => format!("{f:?}"),
+        Some(Value::F32(f)) => format!("{:?}", f64::from(*f)),
+        Some(v) if !v.is_nil() => value_to_display(v),
+        _ => "0".to_string(),
+    }
 }
 
 fn option_f64(value: Option<f64>) -> Value {

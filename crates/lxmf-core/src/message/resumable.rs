@@ -7,20 +7,24 @@ const HEADER_LEN: usize = 96;
 /// `0xC1` is never valid MessagePack, so no LXMF parser reads a stored form as
 /// a message.
 const MAGIC: [u8; 4] = [0xc1, b'L', b'X', b'R'];
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;
+/// Version 1 stored an integer floor; it is still read.
+const VERSION_INTEGER_FLOOR: u8 = 1;
 const DIGEST_LEN: usize = 16;
 const FLOOR_AT: usize = HEADER_LEN + MAGIC.len() + 1;
 const STAMP_AT: usize = FLOOR_AT + 2;
 
 /// A signed, unstamped message stored so delivery can resume after a restart.
 ///
-/// Version 1 holds, in order:
+/// Version 2 holds, in order:
 /// - the signed header: destination, source and signature (96 bytes);
 /// - the bytes `0xC1`, `L`, `X`, `R`, then the version byte;
-/// - the stamp cost the message was signed under: a presence byte and a value;
+/// - the stamp cost the message was signed under, as a big-endian fixed-point
+///   cost on the 1/256 grid, 0 meaning none (version 1 held a presence byte
+///   and an integer cost);
 /// - reserved slots for a finished recipient stamp (a length byte of 0, 16
 ///   or 32, then the stamp) and a propagation envelope (a big-endian `u32`
-///   length, then the envelope). Version 1 writes both empty, and a reader of
+///   length, then the envelope). Both are written empty, and a reader of
 ///   this version ignores filled slots and redoes that work;
 /// - the signed payload;
 /// - the first 16 bytes of the SHA-256 of everything before them.
@@ -31,7 +35,7 @@ const STAMP_AT: usize = FLOOR_AT + 2;
 #[derive(Clone, PartialEq, Eq)]
 pub struct ResumableLxMessage {
     bytes: Bytes,
-    stamp_cost_floor: Option<u8>,
+    stamp_cost_floor: Option<u16>,
     payload_at: usize,
 }
 
@@ -44,12 +48,16 @@ impl std::fmt::Debug for ResumableLxMessage {
 }
 
 impl ResumableLxMessage {
-    pub(super) fn new(wire: &[u8], stamp_cost: Option<u8>) -> Self {
+    pub(super) fn new(wire: &[u8], stamp_cost: Option<f64>) -> Self {
+        let floor_fp = stamp_cost
+            .and_then(|cost| crate::stamper::cost_to_fp(cost).ok())
+            .unwrap_or(0);
+        let stamp_cost = (floor_fp > 0).then_some(floor_fp);
         let mut bytes = Vec::with_capacity(wire.len() + STAMP_AT + 5 + DIGEST_LEN);
         bytes.extend_from_slice(&wire[..HEADER_LEN]);
         bytes.extend_from_slice(&MAGIC);
         bytes.push(VERSION);
-        bytes.extend_from_slice(&[u8::from(stamp_cost.is_some()), stamp_cost.unwrap_or(0)]);
+        bytes.extend_from_slice(&floor_fp.to_be_bytes());
         bytes.push(0);
         bytes.extend_from_slice(&0u32.to_be_bytes());
         let payload_at = bytes.len();
@@ -75,16 +83,21 @@ impl ResumableLxMessage {
         if bytes[HEADER_LEN..HEADER_LEN + MAGIC.len()] != MAGIC {
             return Err(invalid("not a stored message"));
         }
-        if bytes[HEADER_LEN + MAGIC.len()] != VERSION {
+        let version = bytes[HEADER_LEN + MAGIC.len()];
+        if version != VERSION && version != VERSION_INTEGER_FLOOR {
             return Err(invalid("unsupported version"));
         }
         let digest_at = bytes.len() - DIGEST_LEN;
         if sha256(&bytes[..digest_at])[..DIGEST_LEN] != bytes[digest_at..] {
             return Err(invalid("damaged"));
         }
-        let stamp_cost_floor = match bytes[FLOOR_AT..STAMP_AT] {
-            [0, 0] => None,
-            [1, cost] => Some(cost),
+        let floor = [bytes[FLOOR_AT], bytes[FLOOR_AT + 1]];
+        let stamp_cost_floor = match (version, floor) {
+            (_, [0, 0]) => None,
+            (VERSION_INTEGER_FLOOR, [1, cost]) => Some(u16::from(cost.min(100)) * 256),
+            (VERSION, _) if u16::from_be_bytes(floor) <= crate::stamper::STAMP_COST_CAP_FP => {
+                Some(u16::from_be_bytes(floor))
+            }
             _ => return Err(invalid("invalid stamp cost")),
         };
         let stamp_len = usize::from(bytes[STAMP_AT]);
@@ -114,8 +127,9 @@ impl ResumableLxMessage {
         &self.bytes
     }
 
-    pub(crate) fn stamp_cost_floor(&self) -> Option<u8> {
+    pub(crate) fn stamp_cost_floor(&self) -> Option<f64> {
         self.stamp_cost_floor
+            .map(|fp| crate::stamper::cost_from_fp(u32::from(fp)))
     }
 
     /// The signed, unstamped message. Its signature is not yet checked.

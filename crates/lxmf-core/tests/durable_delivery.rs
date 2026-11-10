@@ -241,21 +241,21 @@ fn processing_admission_fails_promptly_without_partial_credit_deadlock() {
 #[test]
 fn propagation_retry_keeps_ciphertext_and_tid_when_cost_rises() {
     let msg = message(None);
-    let mut envelope = PropagationEnvelope::new(msg, [6; 32], 0, |p| Ok(p.to_vec())).unwrap();
+    let mut envelope = PropagationEnvelope::new(msg, [6; 32], 0.0, |p| Ok(p.to_vec())).unwrap();
     let initial = envelope.ciphertext().clone();
     let tid = envelope.transient_id();
     let policy = AdvertisedNodePolicy {
-        stamp_cost: 0,
+        stamp_cost: 0.0,
         transfer_limit_kb: 256.,
         recorded_at: 100.,
     };
     let mut ready = propagation_readiness([8; 16], true, true, Some(policy), true, 101.).unwrap();
     envelope.pack_for(ready, 101.).unwrap();
-    ready.policy.stamp_cost = 4;
+    ready.policy.stamp_cost = 4.0;
     envelope.pack_for(ready, 102.).unwrap();
     assert_eq!(envelope.ciphertext(), &initial);
     assert_eq!(envelope.transient_id(), tid);
-    assert!(envelope.stamp_value() >= 4);
+    assert!(envelope.stamp_value() >= 4.0);
     assert_eq!(
         propagation_readiness([8; 16], true, true, None, true, 101.).unwrap_err(),
         MissingPropagationInput::NodePolicy

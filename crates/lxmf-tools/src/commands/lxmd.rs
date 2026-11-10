@@ -213,7 +213,7 @@ fn round_robin_peer_order(
 #[derive(Debug)]
 struct ValidatedPnEntry {
     lxmf_data: Vec<u8>,
-    stamp_value: u32,
+    stamp_value: f64,
     stamp_data: [u8; 32],
 }
 
@@ -248,7 +248,7 @@ struct PnPacketValidationJob {
     receipt: Option<rns_runtime::link_manager::LinkPacketReceipt>,
     node: Arc<Mutex<PropagationNode>>,
     max_transfer_bytes: usize,
-    min_cost: u8,
+    min_cost: f64,
     #[cfg(test)]
     store_delay: Duration,
     #[cfg(test)]
@@ -466,8 +466,8 @@ fn enqueue_pn_packet_validation(
 #[derive(Debug)]
 struct PeeringKeyWorkerResult {
     peer_hash: [u8; 16],
-    peering_cost: u8,
-    peering_key: Option<([u8; 32], u32)>,
+    peering_cost: f64,
+    peering_key: Option<([u8; 32], f64)>,
 }
 
 fn accepts_delivery_resource(data_size: usize, limit_kb: f64) -> bool {
@@ -547,9 +547,9 @@ async fn forward_inbound_resource_cancellations(
 struct PeerOfferConstraints {
     transfer_limit: Option<f64>,
     sync_limit: Option<f64>,
-    stamp_cost: Option<u8>,
-    stamp_flexibility: Option<u8>,
-    peering_cost: u8,
+    stamp_cost: Option<f64>,
+    stamp_flexibility: Option<f64>,
+    peering_cost: f64,
 }
 
 impl From<&LxmPeer> for PeerOfferConstraints {
@@ -566,13 +566,17 @@ impl From<&LxmPeer> for PeerOfferConstraints {
 
 fn generate_peering_key_job(
     peer_hash: [u8; 16],
-    peering_cost: u8,
+    peering_cost: f64,
     peer_identity_hash: [u8; 16],
     local_identity_hash: [u8; 16],
 ) -> PeeringKeyWorkerResult {
     let mut peer = LxmPeer::new(peer_hash);
     peer.peering_cost = peering_cost;
-    let _ = peer.generate_peering_key(&peer_identity_hash, &local_identity_hash);
+    let _ = peer.generate_peering_key(
+        &peer_identity_hash,
+        &local_identity_hash,
+        &lxmf_core::stamper::StampControl::default(),
+    );
     PeeringKeyWorkerResult {
         peer_hash,
         peering_cost,
@@ -583,7 +587,7 @@ fn generate_peering_key_job(
 fn validate_pn_resource_job(
     job: PnValidationJob,
     max_transfer_bytes: usize,
-    min_cost: u8,
+    min_cost: f64,
 ) -> PnValidationWorkerResult {
     let token = job.token();
     let link_id = job.link_id();
@@ -651,7 +655,7 @@ fn validate_pn_packet_job(
     link_id: [u8; 16],
     data: Bytes,
     max_transfer_bytes: usize,
-    min_cost: u8,
+    min_cost: f64,
 ) -> PnPacketValidationWorkerResult {
     let mut result = PnPacketValidationWorkerResult {
         link_id,
@@ -728,16 +732,13 @@ fn execute_pn_packet_job(job: PnPacketValidationJob) -> PnPacketExecution {
                 return PnPacketExecution { result, pending };
             }
         };
-    // Validate the complete packet before admitting even its first entry.
+    // Python stores every valid entry, then rejects the packet if any failed.
     let mut validated = Vec::with_capacity(entries.len());
     for entry in entries {
         match ValidatedOpaquePropagationBlob::validate(entry, job.min_cost) {
             Some(blob) => validated.push(blob),
             None => result.rejected += 1,
         }
-    }
-    if result.rejected != 0 {
-        return PnPacketExecution { result, pending };
     }
     #[cfg(test)]
     if let Some(timing) = result.timing.as_mut() {
@@ -1434,7 +1435,7 @@ enum PropagationPreparationError {
 }
 struct PendingPropagationEnvelope {
     binding: [u8; 32],
-    cost: u8,
+    cost: f64,
     result: oneshot::Receiver<Result<PropagationEnvelope, MessageError>>,
     cancel: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -1486,12 +1487,12 @@ fn validate_download_policy(
     msg: &LxMessage,
     public_key: Option<[u8; 64]>,
     tickets: &[[u8; 16]],
-    cost: u8,
+    cost: f64,
 ) -> Result<(), SuppressionReason> {
     if public_key.is_some_and(|key| msg.verify(&key).is_err()) {
         return Err(SuppressionReason::InvalidSignature);
     }
-    if cost > 0 {
+    if cost > 0.0 {
         let Some(stamp) = msg.recipient_stamp().map(|s| s.as_bytes()) else {
             return Err(SuppressionReason::InvalidStamp);
         };
@@ -2149,10 +2150,8 @@ impl LxmdRunner {
                 max_message_size: configured_kilobytes_to_bytes(config.propagation_limit_kb),
                 max_offer_size: configured_kilobytes_to_bytes(config.sync_limit_kb),
                 max_message_age: lxmf_core::constants::MESSAGE_EXPIRY,
-                min_stamp_cost: config
-                    .propagation_stamp_cost
-                    .saturating_sub(config.propagation_stamp_flex),
-                ..Default::default()
+                min_stamp_cost: config.min_accepted_stamp_cost(),
+                peering_cost: config.peering_cost,
             };
             let prop_storage_path = paths.propagation_store_dir.clone();
             let pn = Arc::new(Mutex::new(PropagationNode::with_storage(
@@ -2957,7 +2956,7 @@ impl LxmdRunner {
                 // a completed key stale if its measured value is still high
                 // enough for the current policy.
                 if let Some((key, value)) = result.peering_key
-                    && value >= peer.peering_cost as u32
+                    && value >= peer.peering_cost
                 {
                     peer.peering_key = Some((key, value));
                     applied = true;
@@ -3052,7 +3051,7 @@ impl LxmdRunner {
                 continue;
             };
             let policy = self.router.peers.get(&peer_hash).and_then(|peer| {
-                (peer.stamp_costs_known() && (peer.peering_cost == 0 || peer.peering_key_ready()))
+                (peer.stamp_costs_known() && (peer.peering_cost == 0.0 || peer.peering_key_ready()))
                     .then(|| OutboundOfferPolicy::from(peer))
             });
             if let Some(policy) = policy {
@@ -3899,20 +3898,26 @@ impl LxmdRunner {
                 .insert(event.destination_hash, event.hops.max(1));
 
             if event.name_hash == delivery_name_hash {
-                if let Some(ref data) = event.app_data
-                    && let Some((display_name, stamp_cost)) =
-                        lxmf_core::handlers::parse_announce_app_data(data)
+                if let Some(name) = event
+                    .app_data
+                    .as_deref()
+                    .and_then(lxmf_core::handlers::display_name_from_app_data)
                 {
-                    if let Some(name) = display_name {
-                        tracing::info!(dest = %dest_hex, name = %name, "announce display name");
-                    }
-                    if let Some(cost) = stamp_cost {
-                        self.router.set_stamp_cost(event.destination_hash, cost);
+                    tracing::info!(dest = %dest_hex, name = %name, "announce display name");
+                }
+                // Python's handler records the announced cost, including none,
+                // and keeps the cached cost when the data cannot be decoded.
+                match lxmf_core::handlers::announced_stamp_cost(event.app_data.as_deref()) {
+                    Ok(cost) => {
+                        self.router.update_stamp_cost(event.destination_hash, cost);
                         tracing::debug!(
                             dest = %dest_hex,
-                            stamp_cost = cost,
-                            "learned delivery stamp cost from announce"
+                            stamp_cost = ?cost,
+                            "updated delivery stamp cost from announce"
                         );
+                    }
+                    Err(error) => {
+                        tracing::debug!(dest = %dest_hex, %error, "kept cached stamp cost");
                     }
                 }
                 let triggered = self
@@ -3933,12 +3938,15 @@ impl LxmdRunner {
                     lxmf_core::handlers::parse_pn_announce_data(data).map(|pn| (data, pn))
                 })
             {
+                // Outbound costs read slot 5 as given; peering reads int() of it.
+                let outbound_cost =
+                    lxmf_core::handlers::pn_stamp_cost_from_app_data(data).unwrap_or(pn.stamp_cost);
                 self.router
-                    .set_stamp_cost(event.destination_hash, pn.stamp_cost);
+                    .set_stamp_cost(event.destination_hash, outbound_cost);
                 self.node_policies.insert(
                     event.destination_hash,
                     AdvertisedNodePolicy {
-                        stamp_cost: pn.stamp_cost,
+                        stamp_cost: outbound_cost,
                         transfer_limit_kb: pn.transfer_limit as f64,
                         recorded_at: now_f64(),
                     },
@@ -4308,10 +4316,7 @@ impl LxmdRunner {
         let token = job.token();
         let link_id = job.link_id();
         let max_transfer_bytes = configured_kilobytes_to_bytes(self.config.sync_limit_kb);
-        let min_cost = self
-            .config
-            .propagation_stamp_cost
-            .saturating_sub(self.config.propagation_stamp_flex);
+        let min_cost = self.config.min_accepted_stamp_cost();
         let result_tx = self.prop_validation_tx.clone();
 
         tokio::spawn(async move {
@@ -4366,11 +4371,10 @@ impl LxmdRunner {
             && let Ok(mut node) = node.lock()
         {
             for entry in &result.entries {
-                let stamp_value = u8::try_from(entry.stamp_value).unwrap_or(u8::MAX);
                 if let Some(plan) = node.plan_accept_stamped_propagated_blob(
                     &entry.lxmf_data,
                     &entry.stamp_data,
-                    stamp_value,
+                    entry.stamp_value,
                 ) {
                     write_plans.push((plan, entry.lxmf_data.len() as u64));
                 }
@@ -4432,10 +4436,7 @@ impl LxmdRunner {
             receipt,
             node,
             max_transfer_bytes: configured_kilobytes_to_bytes(self.config.propagation_limit_kb),
-            min_cost: self
-                .config
-                .propagation_stamp_cost
-                .saturating_sub(self.config.propagation_stamp_flex),
+            min_cost: self.config.min_accepted_stamp_cost(),
             #[cfg(test)]
             store_delay: self.pn_packet_store_delay,
             #[cfg(test)]
@@ -4616,9 +4617,9 @@ impl LxmdRunner {
                 .ticket_store
                 .inbound_tokens(&msg.source_hash(), now_f64());
             let cost = if self.config.enforce_stamps {
-                self.config.stamp_cost.unwrap_or(0)
+                self.config.stamp_cost.unwrap_or(0.0)
             } else {
-                0
+                0.0
             };
             let disposition = if self.source_blackholed(&msg.source_hash()) {
                 DurableDisposition::PolicyDiscard
@@ -4709,7 +4710,7 @@ impl LxmdRunner {
     fn download_epochs(&self) -> AdmissionEpochs {
         let mut policy = b"lxmd admission policy v1".to_vec();
         policy.push(u8::from(self.config.enforce_stamps));
-        policy.push(self.config.stamp_cost.unwrap_or(0));
+        policy.extend_from_slice(&self.config.stamp_cost.unwrap_or(0.0).to_be_bytes());
         let mut blocked = self
             .blackholed_identities
             .iter()
@@ -4962,7 +4963,7 @@ impl LxmdRunner {
             return false;
         }
         let required_cost = match self.config.stamp_cost {
-            Some(c) if c > 0 => c,
+            Some(c) if c > 0.0 => c,
             _ => return false,
         };
         let stamp = match msg.recipient_stamp().map(|stamp| stamp.as_bytes()) {
@@ -5579,7 +5580,7 @@ impl LxmdRunner {
         }
         if let Some(envelope) = self.propagation_envelopes.get_mut(&id)
             && envelope.matches(message, &binding)
-            && envelope.stamp_value() >= u32::from(prepared.policy.stamp_cost)
+            && envelope.meets(prepared.policy.stamp_cost)
         {
             return envelope
                 .pack_for(prepared, now_f64())
@@ -5594,8 +5595,8 @@ impl LxmdRunner {
             .filter(|envelope| envelope.matches(message, &binding));
         let message = message.clone();
         let cost = prepared.policy.stamp_cost;
-        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let worker_cancel = cancel.clone();
+        let worker_ctl = lxmf_core::stamper::StampControl::default();
+        let cancel = worker_ctl.cancel.clone();
         let (tx, result) = oneshot::channel();
         self.propagation_preparation_tasks
             .push(tokio::task::spawn_blocking(move || {
@@ -5614,10 +5615,10 @@ impl LxmdRunner {
                                     .encrypt(plaintext, ratchet.as_ref())
                                     .map_err(|e| MessageError::PackFailed(e.to_string()))
                             },
-                            &worker_cancel,
+                            &worker_ctl,
                         )?,
                     };
-                    envelope.pack_for_cancellable(prepared, now_f64(), &worker_cancel)?;
+                    envelope.pack_for_cancellable(prepared, now_f64(), &worker_ctl)?;
                     Ok(envelope)
                 })();
                 let _ = tx.send(outcome);
@@ -5825,7 +5826,7 @@ pub(crate) async fn main() {
                 })?;
                 let source = rns_runtime::config::Config::from_file(&config_dir.join("config"))
                     .map_err(std::io::Error::other)?;
-                let config = DaemonConfig::from_config(&source);
+                let config = DaemonConfig::from_config(&source).map_err(std::io::Error::other)?;
                 let policy = RecoveryPolicy {
                     maximum_store_bytes: config
                         .message_storage_limit
@@ -5833,9 +5834,7 @@ pub(crate) async fn main() {
                     maximum_message_bytes: configured_kilobytes_to_bytes(
                         config.propagation_limit_kb,
                     ),
-                    minimum_stamp_cost: config
-                        .propagation_stamp_cost
-                        .saturating_sub(config.propagation_stamp_flex),
+                    minimum_stamp_cost: config.min_accepted_stamp_cost(),
                 };
                 let recovered = import_trusted_recovery_manifest(&guard, manifest, digest, policy)?;
                 println!(
@@ -5898,7 +5897,14 @@ pub(crate) async fn main() {
         }
     };
 
-    let mut daemon_config = DaemonConfig::from_config(&config);
+    let mut daemon_config = match DaemonConfig::from_config(&config) {
+        Ok(daemon_config) => daemon_config,
+        Err(error) => {
+            tracing::error!("Could not apply LXM Daemon configuration: {error}");
+            eprintln!("Could not apply LXM Daemon configuration: {error}");
+            std::process::exit(3);
+        }
+    };
     if args.propagation_node {
         daemon_config.propagation_enabled = true;
     }
@@ -7020,7 +7026,7 @@ mod tests {
             std::env::var_os("RATSPEAK_PN_TEST_CONFIG").expect("private fixture config"),
         );
         let config = rns_runtime::config::Config::from_file(&config_dir.join("config")).unwrap();
-        let config = DaemonConfig::from_config(&config);
+        let config = DaemonConfig::from_config(&config).unwrap();
         assert!(config.propagation_enabled);
         let shutdown = ShutdownSignal::new();
         let rns_config = config_dir.join("rns");
@@ -7552,7 +7558,7 @@ mod tests {
         let explicit_limit = rns_runtime::config::Config::parse(
             "[lxmf]\ndelivery_transfer_max_accepted_size = 1000\n",
         )
-        .map(|config| DaemonConfig::from_config(&config))
+        .map(|config| DaemonConfig::from_config(&config).unwrap())
         .unwrap()
         .delivery_transfer_max_accepted_size;
         assert_eq!(explicit_limit, 1000.0);
@@ -7582,7 +7588,7 @@ mod tests {
             ));
             let (tx, _rx) = mpsc::channel::<TransportMessage>(64);
             let config = DaemonConfig {
-                stamp_cost: Some(12),
+                stamp_cost: Some(12.0),
                 enforce_stamps,
                 ..Default::default()
             };
@@ -7594,7 +7600,7 @@ mod tests {
                 announce.app_data.as_deref().expect("delivery app data"),
             )
             .expect("valid delivery app data");
-            assert_eq!(stamp_cost, Some(12));
+            assert_eq!(stamp_cost, Some(12.0));
             drop(runner);
             let _ = std::fs::remove_dir_all(&temp);
         }
@@ -7865,7 +7871,7 @@ mod tests {
         .unwrap();
         assert_eq!(decoded.wire_bytes(), missing.wire_bytes());
         assert_eq!(
-            validate_download_policy(&decoded, Some(sender.get_public_key()), &[], 8),
+            validate_download_policy(&decoded, Some(sender.get_public_key()), &[], 8.0),
             Err(SuppressionReason::InvalidStamp)
         );
         assert!(store.haves(recipient.hash, [9; 16], 101).is_empty());
@@ -7876,7 +7882,7 @@ mod tests {
                 .exists()
         );
         assert_eq!(
-            validate_download_policy(&decoded, Some(sender.get_public_key()), &[], 0),
+            validate_download_policy(&decoded, Some(sender.get_public_key()), &[], 0.0),
             Ok(())
         );
         assert!(matches!(
@@ -7893,7 +7899,7 @@ mod tests {
         corrupt[32] ^= 1;
         let corrupt = LxMessage::unpack(&corrupt).unwrap();
         assert_eq!(
-            validate_download_policy(&corrupt, Some(sender.get_public_key()), &[], 0),
+            validate_download_policy(&corrupt, Some(sender.get_public_key()), &[], 0.0),
             Err(SuppressionReason::InvalidSignature)
         );
         let ticket = [7u8; 16];
@@ -7914,7 +7920,7 @@ mod tests {
             MessageDecodeLimits::default(),
         )
         .unwrap();
-        validate_download_policy(&accepted, Some(sender.get_public_key()), &[ticket], 8).unwrap();
+        validate_download_policy(&accepted, Some(sender.get_public_key()), &[ticket], 8.0).unwrap();
         let scope = AdmissionScope {
             identity: recipient.hash,
             node: [9; 16],
@@ -8078,7 +8084,7 @@ mod tests {
         let node = Arc::new(Mutex::new(
             PropagationNode::with_storage(
                 PropagationNodeConfig {
-                    peering_cost: 0,
+                    peering_cost: 0.0,
                     ..PropagationNodeConfig::default()
                 },
                 local_identity,
@@ -8121,9 +8127,9 @@ mod tests {
     fn peer_key_worker_binds_remote_identity_before_local_identity() {
         let remote_identity = [0x21; 16];
         let local_identity = [0x43; 16];
-        let result = generate_peering_key_job([0x65; 16], 1, remote_identity, local_identity);
+        let result = generate_peering_key_job([0x65; 16], 1.0, remote_identity, local_identity);
         let (key, value) = result.peering_key.expect("cost-one key");
-        assert!(value >= 1);
+        assert!(value >= 1.0);
 
         let mut peering_id = [0u8; 32];
         peering_id[..16].copy_from_slice(&remote_identity);
@@ -8131,7 +8137,7 @@ mod tests {
         assert!(lxmf_core::stamper::validate_peering_key(
             &peering_id,
             &key,
-            1
+            1.0
         ));
     }
 
@@ -8141,7 +8147,7 @@ mod tests {
         let result = validate_pn_resource_job(
             PnValidationJob::for_test(wrapper.clone(), false),
             wrapper.len(),
-            0,
+            0.0,
         );
         assert_eq!(result.outcome, PnValidationOutcome::UnauthorizedMultiple);
         assert!(result.entries.is_empty());
@@ -8150,7 +8156,7 @@ mod tests {
         let result = validate_pn_resource_job(
             PnValidationJob::for_test(wrapper.clone(), true),
             wrapper.len(),
-            0,
+            0.0,
         );
         assert_eq!(result.outcome, PnValidationOutcome::Valid);
         assert_eq!(result.entries.len(), 2);
@@ -8161,10 +8167,53 @@ mod tests {
     fn packet_validation_worker_handles_hundred_plus_entries_off_loop() {
         let wrapper = pn_test_wrapper((0..128).map(pn_test_entry).collect());
 
-        let result = validate_pn_packet_job([0x91; 16], wrapper.clone().into(), wrapper.len(), 0);
+        let result = validate_pn_packet_job([0x91; 16], wrapper.clone().into(), wrapper.len(), 0.0);
 
         assert_eq!(result.entries.len(), 128);
         assert_eq!(result.rejected, 0);
+    }
+
+    #[test]
+    fn mixed_packet_stores_valid_entries_then_rejects() {
+        let mut valid = None;
+        let mut invalid = None;
+        for stamp_byte in 0u8..=u8::MAX {
+            let entry = pn_test_entry(stamp_byte);
+            if lxmf_core::stamper::validate_pn_stamp(&entry, 1.0).is_some() {
+                valid.get_or_insert(entry);
+            } else {
+                invalid.get_or_insert(entry);
+            }
+            if valid.is_some() && invalid.is_some() {
+                break;
+            }
+        }
+        let valid = valid.unwrap();
+        let valid_id = rns_crypto::sha::full_hash(&valid[..valid.len() - 32]);
+        let wrapper = pn_test_wrapper(vec![valid, invalid.unwrap()]);
+        let temporary = tempfile::tempdir().unwrap();
+        let node = Arc::new(Mutex::new(
+            PropagationNode::with_storage(
+                PropagationNodeConfig::default(),
+                [0x11; 16],
+                temporary.path().join("store"),
+            )
+            .unwrap(),
+        ));
+        let execution = execute_pn_packet_job(PnPacketValidationJob {
+            link_id: [0x93; 16],
+            data: wrapper.clone().into(),
+            receipt: None,
+            node: node.clone(),
+            max_transfer_bytes: wrapper.len(),
+            min_cost: 1.0,
+            store_delay: Duration::ZERO,
+            enqueued_at: Instant::now(),
+        });
+        assert_eq!(execution.result.rejected, 1);
+        assert!(execution.result.stored);
+        assert_eq!(execution.result.committed.len(), 1);
+        assert_eq!(execution.result.committed[0].0, valid_id);
     }
 
     #[test]
@@ -8178,7 +8227,7 @@ mod tests {
                 [0; 16],
             ))),
             max_transfer_bytes: 1,
-            min_cost: 0,
+            min_cost: 0.0,
             store_delay: Duration::ZERO,
             enqueued_at: Instant::now(),
         };
@@ -8198,7 +8247,7 @@ mod tests {
 
     #[test]
     fn malformed_packet_validation_requests_link_teardown() {
-        let result = validate_pn_packet_job([0x92; 16], Bytes::from_static(&[0xc1]), 1, 0);
+        let result = validate_pn_packet_job([0x92; 16], Bytes::from_static(&[0xc1]), 1, 0.0);
 
         assert!(result.entries.is_empty());
         assert!(result.malformed);
@@ -8211,7 +8260,7 @@ mod tests {
         let mut invalid = None;
         for stamp_byte in 0u8..=u8::MAX {
             let entry = pn_test_entry(stamp_byte);
-            if lxmf_core::stamper::validate_pn_stamp(&entry, 1).is_some() {
+            if lxmf_core::stamper::validate_pn_stamp(&entry, 1.0).is_some() {
                 valid.get_or_insert(entry);
             } else {
                 invalid.get_or_insert(entry);
@@ -8224,7 +8273,7 @@ mod tests {
         let result = validate_pn_resource_job(
             PnValidationJob::for_test(wrapper.clone(), true),
             wrapper.len(),
-            1,
+            1.0,
         );
         assert_eq!(result.outcome, PnValidationOutcome::InvalidStamp);
         assert_eq!(result.entries.len(), 1);
@@ -8234,14 +8283,14 @@ mod tests {
     #[test]
     fn pn_validation_worker_fails_malformed_or_oversized_wrapper() {
         let malformed = vec![0xc1];
-        let result = validate_pn_resource_job(PnValidationJob::for_test(malformed, true), 100, 0);
+        let result = validate_pn_resource_job(PnValidationJob::for_test(malformed, true), 100, 0.0);
         assert_eq!(result.outcome, PnValidationOutcome::Failed);
 
         let wrapper = pn_test_wrapper(vec![pn_test_entry(0)]);
         let result = validate_pn_resource_job(
             PnValidationJob::for_test(wrapper.clone(), true),
             wrapper.len() - 1,
-            0,
+            0.0,
         );
         assert_eq!(result.outcome, PnValidationOutcome::Failed);
     }

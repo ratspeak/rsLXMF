@@ -12,7 +12,7 @@ fn payload(destination: [u8; 16]) -> Bytes {
     bytes.into()
 }
 fn validated(bytes: Bytes) -> ValidatedOpaquePropagationBlob {
-    ValidatedOpaquePropagationBlob::validate(bytes, 0).unwrap()
+    ValidatedOpaquePropagationBlob::validate(bytes, 0.0).unwrap()
 }
 fn request(wants: Option<Vec<[u8; 32]>>, haves: Option<Vec<[u8; 32]>>) -> Vec<u8> {
     let ids = |value: Option<Vec<[u8; 32]>>| {

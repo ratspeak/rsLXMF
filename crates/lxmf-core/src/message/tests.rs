@@ -359,7 +359,7 @@ fn recipient_stamp_array_range_and_malformed_dispositions() {
         assert_eq!(m.wire_bytes(), bytes);
         assert!(m.verify_signature(&key().public_key()));
         if !valid {
-            assert!(!m.validate_stamp_with_tickets(0, None));
+            assert!(!m.validate_stamp_with_tickets(0.0, None));
         }
     }
     for stamp in [vec![0xc0], vec![0x91, 0], vec![0xc4, 1, 0], vec![0xa0]] {
@@ -381,13 +381,13 @@ fn recipient_ticket_stamp_and_missing_stamp_policy() {
     let signed = d.sign(&key()).unwrap();
     let stamp = signed.generate_recipient_stamp().unwrap();
     let m = signed.finalize(stamp).unwrap();
-    assert!(m.validate_stamp_with_tickets(255, Some(&[vec![3; 16]])));
+    assert!(m.validate_stamp_with_tickets(255.0, Some(&[vec![3; 16]])));
     assert_eq!(
-        m.validated_stamp_value(255, Some(&[vec![3; 16]])),
+        m.validated_stamp_value(255.0, Some(&[vec![3; 16]])),
         Some(COST_TICKET)
     );
-    assert!(!m.validate_stamp_with_tickets(1, Some(&[vec![4; 16]])));
-    assert!(!freeze(draft()).validate_stamp_with_tickets(0, None));
+    assert!(!m.validate_stamp_with_tickets(1.0, Some(&[vec![4; 16]])));
+    assert!(!freeze(draft()).validate_stamp_with_tickets(0.0, None));
     let signed = draft().sign(&key()).unwrap();
     assert_eq!(signed.generate_recipient_stamp().unwrap(), None);
 }
@@ -744,7 +744,7 @@ fn resumable_identity() -> rns_identity::identity::Identity {
 
 fn resumable_signed(
     identity: &rns_identity::identity::Identity,
-    cost: Option<u8>,
+    cost: Option<f64>,
 ) -> SignedLxMessage {
     let source = rns_identity::destination::Destination::hash_from_name_and_identity(
         "lxmf.delivery",
@@ -765,14 +765,18 @@ fn resumable_signed(
 
 #[test]
 fn resumable_form_bytes_are_pinned() {
-    let signed = resumable_signed(&resumable_identity(), Some(8));
+    let signed = resumable_signed(&resumable_identity(), Some(8.5));
     let stored = signed.to_resumable();
     let bytes = stored.as_bytes().to_vec();
     let wire = signed.finalize(None).unwrap().wire_bytes().to_vec();
     assert_eq!(bytes[..96], wire[..96], "the signed header leads");
     assert_eq!(bytes[96..100], [0xc1, b'L', b'X', b'R']);
-    assert_eq!(bytes[100], 1, "version");
-    assert_eq!(bytes[101..103], [1, 8], "stamp-cost floor");
+    assert_eq!(bytes[100], 2, "version");
+    assert_eq!(
+        bytes[101..103],
+        [8, 0x80],
+        "stamp-cost floor 8.5 in fixed point"
+    );
     assert_eq!(bytes[103], 0, "no recipient stamp yet");
     assert_eq!(bytes[104..108], [0; 4], "no propagation envelope yet");
     let digest_at = bytes.len() - 16;
@@ -791,14 +795,36 @@ fn resumable_form_bytes_are_pinned() {
             "cbdadee740fb728eef746f5e23c3bc3121fcaea60eaff41eb4d011d4ae64eb8f",
             "8a900be403ca81baac788cf29bd9d64cab486ff0c3923571f11e4a21b4c34005",
             "c14c5852",
+            "02",
+            "0880",
+            "00",
+            "00000000",
+            "94cb41d954fc40000000c406526573756d65c40548656c6c6f80",
+            "cc26bb944896b6a1d957f3b3ac4510ea",
+        )
+    );
+}
+
+#[test]
+fn resumable_form_with_integer_floor_still_loads() {
+    let stored = ResumableLxMessage::from_bytes(
+        hex::decode(concat!(
+            "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+            "58ead48e0227a546df7a9712ea53572c",
+            "cbdadee740fb728eef746f5e23c3bc3121fcaea60eaff41eb4d011d4ae64eb8f",
+            "8a900be403ca81baac788cf29bd9d64cab486ff0c3923571f11e4a21b4c34005",
+            "c14c5852",
             "01",
             "0108",
             "00",
             "00000000",
             "94cb41d954fc40000000c406526573756d65c40548656c6c6f80",
             "370fdcdb14f43dd52931349474302403",
-        )
-    );
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(stored.stamp_cost_floor(), Some(8.0));
 }
 
 #[test]
@@ -819,7 +845,7 @@ fn resumable_form_is_not_a_wire_message() {
 
 #[test]
 fn resumable_form_round_trips_and_rejects_damage() {
-    let stored = resumable_signed(&resumable_identity(), Some(8)).to_resumable();
+    let stored = resumable_signed(&resumable_identity(), Some(8.0)).to_resumable();
     let bytes = stored.as_bytes().to_vec();
     assert_eq!(
         ResumableLxMessage::from_bytes(bytes.clone()).unwrap(),
@@ -840,7 +866,7 @@ fn resumable_form_round_trips_and_rejects_damage() {
         bytes[at..].copy_from_slice(&digest[..16]);
         bytes
     };
-    for (at, value) in [(100, 2), (101, 2), (103, 7), (108, 0x95)] {
+    for (at, value) in [(100, 3), (101, 0x65), (103, 7), (108, 0x95)] {
         let mut unknown = bytes.clone();
         unknown[at] = value;
         assert!(

@@ -5,7 +5,15 @@
 //! `rns_transport::discovery::RnsDiscoveryStamper` for callers that install it.
 use rns_transport::discovery::DiscoveryStamper;
 
+use rand::RngCore;
+
 use crate::stamper::{stamp_valid, stamp_workblock};
+
+fn random_stamp() -> [u8; 32] {
+    let mut stamp = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut stamp);
+    stamp
+}
 
 /// Python `RNS.Discovery.InterfaceAnnouncer.WORKBLOCK_EXPAND_ROUNDS`,
 /// the expand-round count discovery uses when building its workblock.
@@ -54,7 +62,7 @@ impl DiscoveryStamper for LxmfDiscoveryStamper {
 
 /// Synchronous discovery stamp search with 20 HKDF workblock rounds and an
 /// explicit attempt limit. Uses the same construction as
-/// [`crate::stamper::generate_stamp_limited`], without a transport runtime.
+/// [`crate::stamper::generate_stamp`], without a transport runtime.
 /// For nonzero cost, a zero iteration limit returns `None`.
 pub fn generate_discovery_stamp(
     infohash: &[u8; 32],
@@ -62,12 +70,12 @@ pub fn generate_discovery_stamp(
     max_iterations: u64,
 ) -> Option<[u8; 32]> {
     if target_value == 0 {
-        return Some([0u8; 32]);
+        return Some(random_stamp());
     }
     let workblock = stamp_workblock(infohash, DISCOVERY_WORKBLOCK_EXPAND_ROUNDS);
     for _ in 0..max_iterations {
-        let candidate = crate::stamper::rand_bytes();
-        if stamp_valid(&candidate, target_value, &workblock) {
+        let candidate = random_stamp();
+        if stamp_valid(&candidate, f64::from(target_value), &workblock) {
             return Some(candidate);
         }
     }
@@ -149,6 +157,6 @@ mod tests {
     fn generate_discovery_stamp_cost_zero_is_instant() {
         let infohash = mk_infohash(b"helper-zero");
         let stamp = generate_discovery_stamp(&infohash, 0, 1);
-        assert_eq!(stamp, Some([0u8; 32]));
+        assert!(stamp.is_some());
     }
 }

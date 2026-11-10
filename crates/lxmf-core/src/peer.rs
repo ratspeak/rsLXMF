@@ -14,9 +14,9 @@ type LegacyStoredPeer = (
     Vec<u8>,
     f64,
     u32,
-    u8,
-    Option<u8>,
-    Option<u8>,
+    f64,
+    Option<f64>,
+    Option<f64>,
     bool,
     bool,
     Vec<Vec<u8>>,
@@ -60,16 +60,16 @@ struct StoredPeerV2 {
     destination_hash: Vec<u8>,
     last_sync: f64,
     unreachable_count: u32,
-    peering_cost: u8,
-    stamp_cost: Option<u8>,
-    stamp_cost_flexibility: Option<u8>,
+    peering_cost: f64,
+    stamp_cost: Option<f64>,
+    stamp_cost_flexibility: Option<f64>,
     autopeered: bool,
     is_static: bool,
     handled_ids: Vec<Vec<u8>>,
     peering_timebase: f64,
     propagation_transfer_limit: Option<f64>,
     propagation_sync_limit: Option<f64>,
-    peering_key: Option<(Vec<u8>, u32)>,
+    peering_key: Option<(Vec<u8>, f64)>,
     metadata: Option<HashMap<u8, Vec<u8>>>,
     last_heard: f64,
     alive: bool,
@@ -84,14 +84,14 @@ struct StoredPeerV2 {
 pub struct OutboundOfferPolicy {
     pub peer_hash: [u8; 16],
     pub handled_messages: HashSet<PropagationTransientId>,
-    pub stamp_cost: Option<u8>,
-    pub stamp_cost_flexibility: Option<u8>,
-    pub minimum_stamp_cost: u8,
-    pub peering_cost: u8,
+    pub stamp_cost: Option<f64>,
+    pub stamp_cost_flexibility: Option<f64>,
+    pub minimum_stamp_cost: f64,
+    pub peering_cost: f64,
     pub propagation_transfer_limit: Option<f64>,
     pub propagation_sync_limit: Option<f64>,
     pub peering_key: Vec<u8>,
-    pub peering_key_value: Option<u32>,
+    pub peering_key_value: Option<f64>,
     pub peering_timebase: f64,
     pub autopeered: bool,
     pub is_static: bool,
@@ -109,7 +109,7 @@ impl OutboundOfferPolicy {
             handled_messages: HashSet::new(),
             stamp_cost: None,
             stamp_cost_flexibility: None,
-            minimum_stamp_cost: 0,
+            minimum_stamp_cost: 0.0,
             peering_cost: PEERING_COST,
             propagation_transfer_limit: None,
             propagation_sync_limit: None,
@@ -160,13 +160,13 @@ pub struct LxmPeer {
     unhandled_count_cached: bool,
     pub unreachable_count: u32,
     pub autopeered: bool,
-    pub stamp_cost: Option<u8>,
-    pub stamp_cost_flexibility: Option<u8>,
+    pub stamp_cost: Option<f64>,
+    pub stamp_cost_flexibility: Option<f64>,
     /// Peering cost used for outbound peering-key generation.
-    pub peering_cost: u8,
+    pub peering_cost: f64,
     /// Cached peering stamp and work value, generated or restored from storage.
     /// Use [`Self::peering_key_ready`] to check it against the current cost.
-    pub peering_key: Option<([u8; 32], u32)>,
+    pub peering_key: Option<([u8; 32], f64)>,
     /// Per-transfer propagation limit in decimal kilobytes (1 kB = 1000 bytes).
     pub propagation_transfer_limit: Option<f64>,
     /// Per-sync propagation limit in decimal kilobytes (1 kB = 1000 bytes).
@@ -251,9 +251,9 @@ impl LxmPeer {
         timebase: f64,
         transfer_limit: Option<f64>,
         sync_limit: Option<f64>,
-        stamp_cost: Option<u8>,
-        stamp_flexibility: Option<u8>,
-        peering_cost: Option<u8>,
+        stamp_cost: Option<f64>,
+        stamp_flexibility: Option<f64>,
+        peering_cost: Option<f64>,
     ) -> Self {
         Self::from_announce_with_metadata(
             destination_hash,
@@ -274,9 +274,9 @@ impl LxmPeer {
         timebase: f64,
         transfer_limit: Option<f64>,
         sync_limit: Option<f64>,
-        stamp_cost: Option<u8>,
-        stamp_flexibility: Option<u8>,
-        peering_cost: Option<u8>,
+        stamp_cost: Option<f64>,
+        stamp_flexibility: Option<f64>,
+        peering_cost: Option<f64>,
         metadata: Option<HashMap<u8, Vec<u8>>>,
     ) -> Self {
         let mut peer = Self::new(destination_hash);
@@ -304,9 +304,9 @@ impl LxmPeer {
         timebase: f64,
         transfer_limit: Option<f64>,
         sync_limit: Option<f64>,
-        stamp_cost: Option<u8>,
-        stamp_flexibility: Option<u8>,
-        peering_cost: Option<u8>,
+        stamp_cost: Option<f64>,
+        stamp_flexibility: Option<f64>,
+        peering_cost: Option<f64>,
     ) -> bool {
         let metadata = self.metadata.clone();
         self.refresh_from_announce_with_metadata(
@@ -329,9 +329,9 @@ impl LxmPeer {
         timebase: f64,
         transfer_limit: Option<f64>,
         sync_limit: Option<f64>,
-        stamp_cost: Option<u8>,
-        stamp_flexibility: Option<u8>,
-        peering_cost: Option<u8>,
+        stamp_cost: Option<f64>,
+        stamp_flexibility: Option<f64>,
+        peering_cost: Option<f64>,
         metadata: Option<HashMap<u8, Vec<u8>>>,
     ) -> bool {
         if timebase <= self.peering_timebase {
@@ -358,7 +358,7 @@ impl LxmPeer {
         // the daemon must generate a replacement before taking a snapshot.
         if self
             .peering_key
-            .is_some_and(|(_, value)| value < self.peering_cost as u32)
+            .is_some_and(|(_, value)| value < self.peering_cost)
         {
             self.peering_key = None;
         }
@@ -370,12 +370,12 @@ impl LxmPeer {
 
     /// Effective minimum stamp cost this peer will accept, using the peer's
     /// announced flexibility when known (Python `LXMPeer.sync`: cost - flex).
-    pub fn minimum_accepted_stamp_cost(&self) -> u8 {
+    pub fn minimum_accepted_stamp_cost(&self) -> f64 {
         match self.stamp_cost {
             Some(cost) => {
-                cost.saturating_sub(self.stamp_cost_flexibility.unwrap_or(PROPAGATION_COST_FLEX))
+                (cost - self.stamp_cost_flexibility.unwrap_or(PROPAGATION_COST_FLEX)).max(0.0)
             }
-            None => 0,
+            None => 0.0,
         }
     }
 
@@ -565,7 +565,7 @@ impl LxmPeer {
     /// This trusts the stored/public value; it does not revalidate the key.
     pub fn peering_key_ready(&self) -> bool {
         if let Some((_, value)) = self.peering_key {
-            value >= self.peering_cost as u32
+            value >= self.peering_cost
         } else {
             false
         }
@@ -573,7 +573,7 @@ impl LxmPeer {
 
     /// Cached peering-key work value (leading zero bits), if present.
     /// Restored or caller-supplied values are returned without recomputation.
-    pub fn peering_key_value(&self) -> Option<u32> {
+    pub fn peering_key_value(&self) -> Option<f64> {
         self.peering_key.map(|(_, value)| value)
     }
 
@@ -584,14 +584,15 @@ impl LxmPeer {
     ///
     /// Returns immediately when a key is already cached; it does not revalidate
     /// that key against a changed cost. Use [`Self::peering_key_ready`] for that
-    /// check. Otherwise runs synchronous proof of work with
-    /// [`crate::stamper::generate_stamp`]'s attempt budget.
+    /// check. Otherwise runs synchronous proof of work until found or `ctl`
+    /// stops it; a peering cost above `STAMP_COST_CAP` fails at once.
     ///
     /// Python reference: `LXMPeer.generate_peering_key`.
     pub fn generate_peering_key(
         &mut self,
         peer_identity_hash: &[u8; 16],
         our_identity_hash: &[u8; 16],
+        ctl: &crate::stamper::StampControl,
     ) -> bool {
         if self.peering_key.is_some() {
             return true;
@@ -601,18 +602,17 @@ impl LxmPeer {
         key_material.extend_from_slice(peer_identity_hash);
         key_material.extend_from_slice(our_identity_hash);
 
-        // Bounded search (stamper::stamp_iteration_cap): an announce-supplied
-        // hostile peering_cost can no longer pin this thread forever.
         match crate::stamper::generate_stamp(
             &key_material,
             self.peering_cost,
             crate::constants::STAMP_WORKBLOCK_EXPAND_ROUNDS_PEERING,
+            ctl,
         ) {
-            Some((stamp, value)) => {
+            Ok(Some((stamp, value))) if value >= self.peering_cost => {
                 self.peering_key = Some((stamp, value));
                 true
             }
-            None => false,
+            _ => false,
         }
     }
 
@@ -684,7 +684,7 @@ impl From<&LxmPeer> for OutboundOfferPolicy {
     fn from(peer: &LxmPeer) -> Self {
         let peering_key = peer
             .peering_key
-            .filter(|(_, value)| *value >= peer.peering_cost as u32)
+            .filter(|(_, value)| *value >= peer.peering_cost)
             .map(|(stamp, _)| stamp.to_vec())
             .unwrap_or_default();
         Self {
@@ -793,38 +793,38 @@ mod tests {
     #[test]
     fn test_minimum_stamp_cost() {
         let mut peer = LxmPeer::new([0; 16]);
-        assert_eq!(peer.minimum_accepted_stamp_cost(), 0);
+        assert_eq!(peer.minimum_accepted_stamp_cost(), 0.0);
 
-        peer.stamp_cost = Some(16);
-        assert_eq!(peer.minimum_accepted_stamp_cost(), 13);
+        peer.stamp_cost = Some(16.0);
+        assert_eq!(peer.minimum_accepted_stamp_cost(), 13.0);
 
         // cost < flex must saturate at 0.
-        peer.stamp_cost = Some(2);
-        assert_eq!(peer.minimum_accepted_stamp_cost(), 0);
+        peer.stamp_cost = Some(2.0);
+        assert_eq!(peer.minimum_accepted_stamp_cost(), 0.0);
 
         // Announced flexibility overrides the default.
-        peer.stamp_cost = Some(16);
-        peer.stamp_cost_flexibility = Some(5);
-        assert_eq!(peer.minimum_accepted_stamp_cost(), 11);
-        peer.stamp_cost_flexibility = Some(0);
-        assert_eq!(peer.minimum_accepted_stamp_cost(), 16);
+        peer.stamp_cost = Some(16.0);
+        peer.stamp_cost_flexibility = Some(5.0);
+        assert_eq!(peer.minimum_accepted_stamp_cost(), 11.0);
+        peer.stamp_cost_flexibility = Some(0.0);
+        assert_eq!(peer.minimum_accepted_stamp_cost(), 16.0);
     }
 
     #[test]
     fn outbound_offer_policy_captures_authoritative_peer_state() {
         let mut peer = LxmPeer::new([0xAA; 16]);
-        peer.stamp_cost = Some(16);
-        peer.stamp_cost_flexibility = Some(3);
+        peer.stamp_cost = Some(16.0);
+        peer.stamp_cost_flexibility = Some(3.0);
         peer.propagation_transfer_limit = Some(1.5);
         peer.propagation_sync_limit = Some(4.5);
-        peer.peering_cost = 18;
-        peer.peering_key = Some(([0x77; 32], 18));
+        peer.peering_cost = 18.0;
+        peer.peering_key = Some(([0x77; 32], 18.0));
         peer.add_handled_message(&tid(0x11));
 
         let policy = peer.outbound_offer_policy();
 
         assert_eq!(policy.peer_hash, [0xAA; 16]);
-        assert_eq!(policy.minimum_stamp_cost, 13);
+        assert_eq!(policy.minimum_stamp_cost, 13.0);
         assert_eq!(policy.propagation_transfer_limit, Some(1.5));
         assert_eq!(policy.propagation_sync_limit, Some(4.5));
         assert_eq!(policy.peering_key, vec![0x77; 32]);
@@ -838,27 +838,34 @@ mod tests {
             200.0,
             Some(2.0),
             Some(8.0),
-            Some(16),
-            Some(3),
-            Some(18),
+            Some(16.0),
+            Some(3.0),
+            Some(18.0),
         );
 
         assert!(!peer.refresh_from_announce(
             199.0,
             Some(1.0),
             Some(4.0),
-            Some(8),
-            Some(1),
-            Some(4),
+            Some(8.0),
+            Some(1.0),
+            Some(4.0),
         ));
         assert_eq!(peer.peering_timebase, 200.0);
         assert_eq!(peer.propagation_transfer_limit, Some(2.0));
-        assert_eq!(peer.stamp_cost, Some(16));
+        assert_eq!(peer.stamp_cost, Some(16.0));
 
-        peer.peering_key = Some(([0x55; 32], 18));
-        assert!(peer.refresh_from_announce(201.0, Some(3.0), None, Some(20), Some(4), Some(19),));
+        peer.peering_key = Some(([0x55; 32], 18.0));
+        assert!(peer.refresh_from_announce(
+            201.0,
+            Some(3.0),
+            None,
+            Some(20.0),
+            Some(4.0),
+            Some(19.0),
+        ));
         assert_eq!(peer.propagation_sync_limit, Some(3.0));
-        assert_eq!(peer.stamp_cost, Some(20));
+        assert_eq!(peer.stamp_cost, Some(20.0));
         assert!(peer.peering_key.is_none(), "under-cost key must be cleared");
     }
 
@@ -869,11 +876,11 @@ mod tests {
             1234.0,
             Some(1.25),
             Some(9.5),
-            Some(16),
-            Some(3),
-            Some(18),
+            Some(16.0),
+            Some(3.0),
+            Some(18.0),
         );
-        peer.peering_key = Some(([0x66; 32], 19));
+        peer.peering_key = Some(([0x66; 32], 19.0));
         peer.metadata = Some(HashMap::from([(0, vec![1, 2, 3])]));
         peer.add_handled_message(&tid(0x22));
 
@@ -881,7 +888,7 @@ mod tests {
         assert_eq!(restored.peering_timebase, 1234.0);
         assert_eq!(restored.propagation_transfer_limit, Some(1.25));
         assert_eq!(restored.propagation_sync_limit, Some(9.5));
-        assert_eq!(restored.peering_key, Some(([0x66; 32], 19)));
+        assert_eq!(restored.peering_key, Some(([0x66; 32], 19.0)));
         assert_eq!(restored.metadata, Some(HashMap::from([(0, vec![1, 2, 3])])));
         assert!(restored.has_handled(&tid(0x22)));
 
@@ -889,9 +896,9 @@ mod tests {
             vec![0xBB; 16],
             42.0,
             2,
-            18,
-            Some(12),
-            Some(2),
+            18.0,
+            Some(12.0),
+            Some(2.0),
             true,
             false,
             vec![tid(0x33).to_vec()],
@@ -899,7 +906,7 @@ mod tests {
         let legacy_bytes = rmp_serde::to_vec(&legacy).unwrap();
         let restored_legacy = LxmPeer::from_bytes_with_handled(&legacy_bytes).unwrap();
         assert_eq!(restored_legacy.destination_hash, [0xBB; 16]);
-        assert_eq!(restored_legacy.stamp_cost, Some(12));
+        assert_eq!(restored_legacy.stamp_cost, Some(12.0));
         assert!(restored_legacy.has_handled(&tid(0x33)));
     }
 
@@ -917,9 +924,9 @@ mod tests {
             10.0,
             Some(1.0),
             Some(2.0),
-            Some(12),
-            Some(3),
-            Some(18),
+            Some(12.0),
+            Some(3.0),
+            Some(18.0),
             Some(metadata),
         );
         let retained = peer.metadata.as_ref().unwrap();
@@ -946,15 +953,15 @@ mod tests {
     #[test]
     fn newer_policy_invalidates_processed_store_generation() {
         let mut peer =
-            LxmPeer::from_announce([0xAA; 16], 10.0, None, None, Some(16), Some(3), None);
+            LxmPeer::from_announce([0xAA; 16], 10.0, None, None, Some(16.0), Some(3.0), None);
         peer.mark_offer_generation_processed(7);
         assert!(!peer.needs_offer_generation(7));
 
-        assert!(peer.refresh_from_announce(11.0, None, None, Some(12), Some(3), None));
+        assert!(peer.refresh_from_announce(11.0, None, None, Some(12.0), Some(3.0), None));
         assert!(peer.needs_offer_generation(7));
 
         peer.mark_offer_generation_processed(7);
-        assert!(peer.refresh_from_announce(12.0, None, None, Some(12), Some(3), None));
+        assert!(peer.refresh_from_announce(12.0, None, None, Some(12.0), Some(3.0), None));
         assert!(
             !peer.needs_offer_generation(7),
             "a newer announce with unchanged offer constraints must not rescan an unchanged store"
@@ -966,12 +973,14 @@ mod tests {
     #[test]
     fn test_generate_peering_key_capped() {
         let mut peer = LxmPeer::new([0xAA; 16]);
-        peer.peering_cost = 255;
-        assert!(!peer.generate_peering_key(&[0xBB; 16], &[0xCC; 16]));
+        let ctl = crate::stamper::StampControl::default();
+        peer.peering_cost = 255.0;
+        assert!(!peer.generate_peering_key(&[0xBB; 16], &[0xCC; 16], &ctl));
         assert!(peer.peering_key.is_none());
 
-        peer.peering_cost = 4;
-        assert!(peer.generate_peering_key(&[0xBB; 16], &[0xCC; 16]));
+        peer.peering_cost = 4.5;
+        assert!(peer.generate_peering_key(&[0xBB; 16], &[0xCC; 16], &ctl));
+        assert!(peer.peering_key.is_some_and(|(_, value)| value >= 4.5));
         assert!(peer.peering_key.is_some());
     }
 
@@ -1049,16 +1058,16 @@ mod tests {
             1000.0,
             Some(256.0),
             Some(10240.0),
-            Some(16),
-            Some(3),
-            Some(18),
+            Some(16.0),
+            Some(3.0),
+            Some(18.0),
         );
         assert_eq!(peer.peering_timebase, 1000.0);
         assert_eq!(peer.propagation_transfer_limit, Some(256.0));
         assert_eq!(peer.propagation_sync_limit, Some(10240.0));
-        assert_eq!(peer.stamp_cost, Some(16));
-        assert_eq!(peer.stamp_cost_flexibility, Some(3));
-        assert_eq!(peer.peering_cost, 18);
+        assert_eq!(peer.stamp_cost, Some(16.0));
+        assert_eq!(peer.stamp_cost_flexibility, Some(3.0));
+        assert_eq!(peer.peering_cost, 18.0);
         assert!(peer.autopeered);
     }
 
@@ -1077,10 +1086,10 @@ mod tests {
         let mut peer = LxmPeer::new([0; 16]);
         assert!(!peer.stamp_costs_known());
 
-        peer.stamp_cost = Some(16);
+        peer.stamp_cost = Some(16.0);
         assert!(!peer.stamp_costs_known());
 
-        peer.stamp_cost_flexibility = Some(3);
+        peer.stamp_cost_flexibility = Some(3.0);
         assert!(peer.stamp_costs_known());
     }
 

@@ -2421,7 +2421,7 @@ impl LinkDeliveryManager {
             let mut input = plaintext.as_slice();
             let rejection = rmpv::decode::read_value(&mut input).ok();
             if input.is_empty()
-                && matches!(rejection, Some(rmpv::Value::Array(ref a)) if a.len() == 1 && a[0].as_u64() == Some(245))
+                && matches!(rejection, Some(rmpv::Value::Array(ref a)) if a.first().and_then(rmpv::Value::as_u64) == Some(245))
             {
                 delivery.message.mark_rejected();
                 delivery.state = DeliveryState::Rejected;
@@ -3893,7 +3893,11 @@ impl LinkDeliveryManager {
                     resource_id,
                 );
             }
-            if delivery.state == DeliveryState::Complete {
+            // A node that rejects a stamp tears the link down; the rejection stands.
+            if matches!(
+                delivery.state,
+                DeliveryState::Complete | DeliveryState::Rejected
+            ) {
                 return true;
             }
             if delivery.state == DeliveryState::Idle {
@@ -9082,6 +9086,29 @@ mod tests {
         );
         assert_eq!(mgr.pending_count(), 0);
         assert_eq!(mgr.session_count(), 0);
+    }
+
+    #[test]
+    fn propagation_stamp_rejection_survives_link_close() {
+        let (tx, _rx) = mpsc::channel(64);
+        let mut mgr = LinkDeliveryManager::new(tx, None, None);
+        let msg = crate::message::test_message(
+            [0xAA; 16],
+            [0xBB; 16],
+            "Propagation",
+            "deposit",
+            crate::constants::DeliveryMethod::Propagated,
+        );
+        let link_id = mgr
+            .start_packed_delivery(msg, [0xC2; 16], 1, b"packed propagation".to_vec(), false)
+            .unwrap();
+        let delivery = mgr.pending.get_mut(&link_id).unwrap();
+        delivery.message.mark_rejected();
+        delivery.state = DeliveryState::Rejected;
+        assert!(mgr.handle_link_closed(&link_id, None));
+        let delivery = mgr.pending.get(&link_id).unwrap();
+        assert_eq!(delivery.state, DeliveryState::Rejected);
+        assert_ne!(delivery.failure_reason.as_deref(), Some("link closed"));
     }
 
     #[test]

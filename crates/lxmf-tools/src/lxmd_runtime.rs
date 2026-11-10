@@ -163,7 +163,7 @@ pub fn format_local_peers(peers: &[LocalPeerView]) -> String {
     out
 }
 
-pub fn delivery_announce_app_data(display_name: Option<&str>, stamp_cost: Option<u8>) -> Vec<u8> {
+pub fn delivery_announce_app_data(display_name: Option<&str>, stamp_cost: Option<f64>) -> Vec<u8> {
     lxmf_core::handlers::get_announce_app_data(display_name, stamp_cost)
 }
 
@@ -452,28 +452,35 @@ mod tests {
 
     #[test]
     fn delivery_announce_app_data_matches_python_msgpack() {
-        // Python 1.0.1: msgpack([display_name, stamp_cost, [SF_COMPRESSION]])
-        // — LXMRouter.py:999-1001.
+        // LXMF 1.3.0 LXMRouter.get_announce_app_data output.
         assert_eq!(
-            hex::encode(delivery_announce_app_data(Some("Test"), Some(16))),
-            "93c40454657374109100"
+            hex::encode(delivery_announce_app_data(Some("Test"), Some(16.0))),
+            "94c40454657374109100cb4030000000000000"
+        );
+        assert_eq!(
+            hex::encode(delivery_announce_app_data(Some("x"), Some(8.5))),
+            "94c40178099100cb4021000000000000"
         );
         assert_eq!(
             hex::encode(delivery_announce_app_data(None, None)),
-            "93c0c09100"
+            "94c0c09100c0"
         );
     }
 
     #[test]
     fn propagation_announce_app_data_matches_python_msgpack() {
-        let mut data =
-            lxmf_core::handlers::PropagationNodeAnnounceData::new(true, 256, 10_240, 16, 3, 18);
+        let mut data = lxmf_core::handlers::PropagationNodeAnnounceData::new(
+            true, 256, 10_240, 16.25, 3.0, 18.5,
+        );
         data.timebase = 1_700_000_000;
         data.set_name("Node");
 
         assert_eq!(
             hex::encode(propagation_announce_app_data(&data)),
-            "97c2ce6553f100c3cd0100cd2800931003128101c4044e6f6465"
+            concat!(
+                "98c2ce6553f100c3cd0100cd2800931103138101c4044e6f6465",
+                "93cb4030400000000000cb4008000000000000cb4032800000000000"
+            )
         );
     }
 

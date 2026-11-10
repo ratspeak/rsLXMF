@@ -51,9 +51,10 @@ pub enum CompressionSupport {
 
 /// Parsed propagation-node announce data.
 ///
-/// Wire layout is a 7-element msgpack array:
+/// Wire layout is an 8-element msgpack array:
 /// `[false, timebase, node_state, transfer_limit_kb, sync_limit_kb,
-/// [stamp_cost, stamp_flex, peering_cost], metadata]`.
+/// [ceil(stamp_cost), ceil(stamp_flex), ceil(peering_cost)], metadata,
+/// [stamp_cost, stamp_flex, peering_cost]]`.
 ///
 /// Python reference: `LXMRouter.get_propagation_node_app_data`.
 #[derive(Debug, Clone)]
@@ -69,9 +70,10 @@ pub struct PropagationNodeAnnounceData {
     pub transfer_limit: u64,
     /// Per-sync limit in decimal kilobytes (1 kB = 1000 bytes).
     pub sync_limit: u64,
-    pub stamp_cost: u8,
-    pub stamp_flex: u8,
-    pub peering_cost: u8,
+    /// Propagation stamp cost, flexibility and peering cost as announced.
+    pub stamp_cost: f64,
+    pub stamp_flex: f64,
+    pub peering_cost: f64,
     pub metadata: HashMap<u8, Vec<u8>>,
 }
 
@@ -80,9 +82,9 @@ impl PropagationNodeAnnounceData {
         node_state: bool,
         transfer_limit: u64,
         sync_limit: u64,
-        stamp_cost: u8,
-        stamp_flex: u8,
-        peering_cost: u8,
+        stamp_cost: f64,
+        stamp_flex: f64,
+        peering_cost: f64,
     ) -> Self {
         Self {
             legacy: false,
@@ -116,11 +118,9 @@ impl PropagationNodeAnnounceData {
 pub fn get_propagation_node_app_data(data: &PropagationNodeAnnounceData) -> Vec<u8> {
     use rmpv::Value;
 
-    let stamp_costs = Value::Array(vec![
-        Value::from(data.stamp_cost as u64),
-        Value::from(data.stamp_flex as u64),
-        Value::from(data.peering_cost as u64),
-    ]);
+    let costs = [data.stamp_cost, data.stamp_flex, data.peering_cost];
+    let ceil_costs = Value::Array(costs.iter().map(|c| Value::from(c.ceil() as i64)).collect());
+    let stamp_costs = Value::Array(costs.iter().map(|c| Value::F64(*c)).collect());
 
     let metadata = {
         let mut map = Vec::new();
@@ -136,8 +136,9 @@ pub fn get_propagation_node_app_data(data: &PropagationNodeAnnounceData) -> Vec<
         Value::Boolean(data.node_state),
         Value::from(data.transfer_limit),
         Value::from(data.sync_limit),
-        stamp_costs,
+        ceil_costs,
         metadata,
+        stamp_costs,
     ]);
 
     crate::encode_value(&announce_data)
@@ -389,10 +390,11 @@ pub fn pn_announce_data_is_valid(data: &[u8]) -> bool {
 
 /// Parse propagation-node announce data that [`pn_announce_data_is_valid`] accepts.
 ///
-/// Values are extracted with `int()` as the Python announce handler does; it
-/// returns `None` where that handler's conversion raises. Limits below zero
-/// become zero and costs saturate to the `u8` range. Fractional costs in slot
-/// 7 are not read. Only metadata with `u8` keys and binary values is retained.
+/// Limits are extracted with `int()` as the Python announce handler does.
+/// Costs come from the fractional slot 7 when present, else from `int()` of
+/// slot 5, as the handler takes them. Limits below zero become zero; announces with a
+/// non-finite cost are refused. Only metadata with `u8` keys and binary values
+/// is retained.
 pub fn parse_pn_announce_data(data: &[u8]) -> Option<PropagationNodeAnnounceData> {
     let value = valid_pn_announce(data)?;
     let int_at = |index: usize| python_int(&python_index(&value, index)?);
@@ -401,9 +403,21 @@ pub fn parse_pn_announce_data(data: &[u8]) -> Option<PropagationNodeAnnounceData
     let limit = |raw: i128| raw.clamp(0, i128::from(u64::MAX)) as u64;
     let transfer_limit = limit(int_at(3)?);
     let sync_limit = limit(int_at(4)?);
-    let costs = python_index(&value, 5)?;
-    let cost =
-        |index: usize| python_int(&python_index(&costs, index)?).map(|raw| raw.clamp(0, 255) as u8);
+    let ceil_costs = python_index(&value, 5)?;
+    for index in 0..3 {
+        python_int(&python_index(&ceil_costs, index)?)?;
+    }
+    let fractional = python_len(&value)? > 7;
+    let costs = python_index(&value, if fractional { 7 } else { 5 })?;
+    // Without slot 7 the handler takes int() of slot 5.
+    let cost = |index: usize| {
+        let item = python_index(&costs, index)?;
+        if fractional {
+            python_float(&item).filter(|c| c.is_finite())
+        } else {
+            python_int(&item).map(|c| c as f64)
+        }
+    };
     let (stamp_cost, stamp_flex, peering_cost) = (cost(0)?, cost(1)?, cost(2)?);
 
     let mut metadata = HashMap::new();
@@ -429,35 +443,38 @@ pub fn parse_pn_announce_data(data: &[u8]) -> Option<PropagationNodeAnnounceData
     })
 }
 
-/// Extract the integer stamp cost from propagation-node announce data.
-///
-/// Uses [`parse_pn_announce_data`]; the fractional slot 7 is not read.
-pub fn pn_stamp_cost_from_app_data(data: &[u8]) -> Option<u8> {
-    parse_pn_announce_data(data).map(|p| p.stamp_cost)
+/// Python `pn_stamp_cost_from_app_data`: slot 7's cost when present, else slot 5's.
+pub fn pn_stamp_cost_from_app_data(data: &[u8]) -> Option<f64> {
+    let value = valid_pn_announce(data)?;
+    let slot = if python_len(&value)? > 7 { 7 } else { 5 };
+    python_float(&python_index(&python_index(&value, slot)?, 0)?)
 }
 
-/// Encode delivery-announce `app_data` as msgpack
-/// `[display_name, stamp_cost, supported_functionality]` where the feature
-/// list advertises [`SF_COMPRESSION`].
-///
-/// `stamp_cost` must be in `1..=254`; out-of-range or `None` values are encoded as nil.
-/// The name is encoded unchanged, as Python `LXMRouter.get_announce_app_data` does.
-pub fn get_announce_app_data(display_name: Option<&str>, stamp_cost: Option<u8>) -> Vec<u8> {
+/// Encode delivery-announce `app_data` as Python `LXMRouter.get_announce_app_data`:
+/// `[display_name, ceil(cost), [SF_COMPRESSION], cost]`, where `cost` is the
+/// quantized stamp cost when it lies in `(0, STAMP_COST_CAP)` and nil otherwise.
+/// The name is encoded unchanged.
+pub fn get_announce_app_data(display_name: Option<&str>, stamp_cost: Option<f64>) -> Vec<u8> {
     use rmpv::Value;
 
     let name_val = display_name.map_or(Value::Nil, |name| Value::Binary(name.as_bytes().to_vec()));
-
-    let cost_val = match stamp_cost {
-        Some(cost) if cost > 0 && cost < 255 => Value::from(cost as u64),
+    let quantized = stamp_cost
+        .filter(|cost| *cost > 0.0 && *cost < crate::stamper::STAMP_COST_CAP)
+        .and_then(|cost| crate::stamper::quantize_cost(cost).ok());
+    let ceil_val = match quantized {
+        Some(cost) if cost != 0.0 => Value::from(cost.ceil() as i64),
         _ => Value::Nil,
     };
-
+    let cost_val = quantized.map_or(Value::Nil, Value::F64);
     let supported_functionality =
         Value::Array(vec![Value::from(crate::constants::SF_COMPRESSION as u64)]);
 
-    let peer_data = Value::Array(vec![name_val, cost_val, supported_functionality]);
-
-    crate::encode_value(&peer_data)
+    crate::encode_value(&Value::Array(vec![
+        name_val,
+        ceil_val,
+        supported_functionality,
+        cost_val,
+    ]))
 }
 
 /// First byte of the MessagePack delivery-announce format (fixarray or array16);
@@ -477,7 +494,7 @@ fn announce_list(data: &[u8]) -> Option<Vec<rmpv::Value>> {
 /// Parse delivery-announce `app_data`, returning `(display_name, stamp_cost)`
 /// as [`display_name_from_app_data`] and [`stamp_cost_from_app_data`] return them.
 /// Returns `None` for empty data.
-pub fn parse_announce_app_data(data: &[u8]) -> Option<(Option<String>, Option<u8>)> {
+pub fn parse_announce_app_data(data: &[u8]) -> Option<(Option<String>, Option<f64>)> {
     if data.is_empty() {
         return None;
     }
@@ -486,6 +503,12 @@ pub fn parse_announce_app_data(data: &[u8]) -> Option<(Option<String>, Option<u8
         stamp_cost_from_app_data(data),
     ))
 }
+
+/// Delivery-announce `app_data` whose stamp cost cannot be read: Python's
+/// announce handler raises on it and leaves the cached cost unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("delivery announce stamp cost could not be decoded")]
+pub struct UndecodableStampCost;
 
 /// Python `display_name_from_app_data`: the raw name with NUL characters and
 /// surrounding whitespace removed. Original-format data is decoded as UTF-8.
@@ -504,27 +527,53 @@ pub fn display_name_from_app_data(data: &[u8]) -> Option<String> {
     Some(crate::presentation::python_strip(&name.replace('\0', "")).to_string())
 }
 
-/// Python `stamp_cost_from_app_data`: element 3 when it is an integer, else
-/// element 1, as a `u8` when representable. A fractional element 3 is not
-/// read; element 1 carries its ceiling.
-pub fn stamp_cost_from_app_data(data: &[u8]) -> Option<u8> {
-    if !is_announce_array_marker(*data.first()?) {
-        return None;
-    }
-    let items = announce_list(data)?;
-    if items.len() < 2 {
-        return None;
-    }
-    let cost = match items.get(3) {
-        Some(rmpv::Value::Integer(n)) if items.len() > 3 => n.as_i64(),
-        _ => match &items[1] {
-            rmpv::Value::Integer(n) => n.as_i64(),
-            rmpv::Value::F64(f) if f.fract() == 0.0 => Some(*f as i64),
-            rmpv::Value::F32(f) if f.fract() == 0.0 => Some(*f as i64),
-            _ => None,
-        },
+/// The stamp cost a delivery announce carries, as Python's announce handler
+/// passes it to `update_stamp_cost`. `Ok(None)` means no cost was announced
+/// (no app data, the original format, a short list or nil): the cached cost
+/// must be replaced by none. `Err` means the data could not be decoded or the
+/// cost is not a number, and the cached cost must be kept.
+///
+/// Element 3 is used when it is an integer or float, else element 1. Values
+/// are returned as given, including negative values and costs above
+/// `STAMP_COST_CAP`; generation refuses those. A boolean counts as 0 or 1.
+pub fn announced_stamp_cost(data: Option<&[u8]>) -> Result<Option<f64>, UndecodableStampCost> {
+    let Some(first) = data.and_then(|d| d.first()) else {
+        return Ok(None);
     };
-    cost.and_then(|c| u8::try_from(c).ok())
+    if !is_announce_array_marker(*first) {
+        return Ok(None);
+    }
+    let value = decode_python(data.unwrap_or_default()).ok_or(UndecodableStampCost)?;
+    let rmpv::Value::Array(items) = value else {
+        return Ok(None);
+    };
+    if items.len() < 2 {
+        return Ok(None);
+    }
+    let number = |value: &rmpv::Value| match value {
+        rmpv::Value::Integer(n) => n
+            .as_i64()
+            .map(|i| i as f64)
+            .or(n.as_u64().map(|u| u as f64)),
+        rmpv::Value::F32(f) => Some(f64::from(*f)),
+        rmpv::Value::F64(f) => Some(*f),
+        _ => None,
+    };
+    if let Some(cost) = items.get(3).and_then(number) {
+        return Ok(Some(cost));
+    }
+    match &items[1] {
+        rmpv::Value::Nil => Ok(None),
+        rmpv::Value::Boolean(b) => Ok(Some(f64::from(u8::from(*b)))),
+        other => number(other).map(Some).ok_or(UndecodableStampCost),
+    }
+}
+
+/// Python `stamp_cost_from_app_data`: the announced stamp cost, or `None`
+/// when none is announced or it cannot be read. Use [`announced_stamp_cost`]
+/// to tell those apart.
+pub fn stamp_cost_from_app_data(data: &[u8]) -> Option<f64> {
+    announced_stamp_cost(Some(data)).ok().flatten()
 }
 
 /// Parse advertised `SF_COMPRESSION` support in delivery-announce `app_data`.
@@ -960,7 +1009,7 @@ mod tests {
         assert!(parsed.node_state);
         assert_eq!(parsed.transfer_limit, 10240);
         assert_eq!(parsed.sync_limit, 10240);
-        assert_eq!(parsed.stamp_cost, 16);
+        assert_eq!(parsed.stamp_cost, 16.0);
     }
 
     #[test]
@@ -1013,7 +1062,10 @@ mod tests {
         let negative = parse_pn_announce_data(&encode(Value::from(-1), Value::from(16))).unwrap();
         assert_eq!(negative.transfer_limit, 0);
         let large = parse_pn_announce_data(&encode(Value::from(10240), Value::from(256))).unwrap();
-        assert_eq!(large.stamp_cost, 255);
+        assert_eq!(large.stamp_cost, 256.0);
+        let fractional =
+            parse_pn_announce_data(&encode(Value::from(10240), Value::F64(16.75))).unwrap();
+        assert_eq!(fractional.stamp_cost, 16.0);
         // int(nan) raises in the Python announce handler although validity passes.
         let nan = encode(Value::from(10240), Value::F64(f64::NAN));
         assert!(pn_announce_data_is_valid(&nan));
@@ -1026,38 +1078,58 @@ mod tests {
             true,
             PROPAGATION_LIMIT as u64,
             SYNC_LIMIT as u64,
-            20,
-            3,
-            18,
+            20.0,
+            3.0,
+            18.0,
         );
         let packed = get_propagation_node_app_data(&data);
-        assert_eq!(pn_stamp_cost_from_app_data(&packed), Some(20));
+        assert_eq!(pn_stamp_cost_from_app_data(&packed), Some(20.0));
     }
 
     #[test]
     fn test_delivery_announce_data_roundtrip() {
-        let packed = get_announce_app_data(Some("Alice"), Some(12));
+        let packed = get_announce_app_data(Some("Alice"), Some(12.0));
         let (name, cost) = parse_announce_app_data(&packed).unwrap();
         assert_eq!(name, Some("Alice".to_string()));
-        assert_eq!(cost, Some(12));
+        assert_eq!(cost, Some(12.0));
     }
 
     #[test]
-    fn test_delivery_announce_data_matches_python_101_bytes() {
-        // Python 1.0.1 oracle: msgpack([b"Test", 16, [SF_COMPRESSION]]) — LXMRouter.py:999-1001.
-        assert_eq!(
-            hex::encode(get_announce_app_data(Some("Test"), Some(16))),
-            "93c40454657374109100"
-        );
-        assert_eq!(hex::encode(get_announce_app_data(None, None)), "93c0c09100");
+    fn delivery_announce_data_matches_python_bytes() {
+        // LXMF 1.3.0 LXMRouter.get_announce_app_data output.
+        for (name, cost, want) in [
+            (
+                Some("Test"),
+                Some(16.0),
+                "94c40454657374109100cb4030000000000000",
+            ),
+            (None, None, "94c0c09100c0"),
+            (
+                Some("Alice"),
+                Some(12.0),
+                "94c405416c6963650c9100cb4028000000000000",
+            ),
+            (None, Some(8.0), "94c0089100cb4020000000000000"),
+            (Some("x"), Some(8.5), "94c40178099100cb4021000000000000"),
+        ] {
+            assert_eq!(hex::encode(get_announce_app_data(name, cost)), want);
+        }
+    }
+
+    #[test]
+    fn delivery_announce_omits_costs_outside_zero_to_cap() {
+        for cost in [0.0, -1.0, 100.0, 150.0, f64::NAN] {
+            let packed = get_announce_app_data(Some("x"), Some(cost));
+            assert_eq!(hex::encode(&packed), "94c40178c09100c0", "{cost}");
+        }
     }
 
     #[test]
     fn test_delivery_announce_data_no_name() {
-        let packed = get_announce_app_data(None, Some(8));
+        let packed = get_announce_app_data(None, Some(8.0));
         let (name, cost) = parse_announce_app_data(&packed).unwrap();
         assert!(name.is_none());
-        assert_eq!(cost, Some(8));
+        assert_eq!(cost, Some(8.0));
     }
 
     #[test]
@@ -1078,7 +1150,7 @@ mod tests {
 
     #[test]
     fn test_delivery_announce_data_cost_zero_treated_as_none() {
-        let packed = get_announce_app_data(Some("Test"), Some(0));
+        let packed = get_announce_app_data(Some("Test"), Some(0.0));
         let (name, cost) = parse_announce_app_data(&packed).unwrap();
         assert_eq!(name, Some("Test".to_string()));
         assert!(cost.is_none());
@@ -1086,19 +1158,19 @@ mod tests {
 
     #[test]
     fn test_display_name_from_app_data() {
-        let packed = get_announce_app_data(Some("Alice"), Some(12));
+        let packed = get_announce_app_data(Some("Alice"), Some(12.0));
         assert_eq!(
             display_name_from_app_data(&packed),
             Some("Alice".to_string())
         );
 
-        let packed = get_announce_app_data(None, Some(12));
+        let packed = get_announce_app_data(None, Some(12.0));
         assert_eq!(display_name_from_app_data(&packed), None);
     }
 
     #[test]
     fn test_display_name_from_app_data_strips_null_bytes_and_whitespace() {
-        let packed = get_announce_app_data(Some(" \0Alice\0 "), Some(12));
+        let packed = get_announce_app_data(Some(" \0Alice\0 "), Some(12.0));
         assert_eq!(
             display_name_from_app_data(&packed),
             Some("Alice".to_string())
@@ -1109,7 +1181,7 @@ mod tests {
     fn test_display_name_from_app_data_returns_raw_unicode() {
         let packed = get_announce_app_data(
             Some("  Ａlice\u{202e}\u{e000}\u{1f680}\nNetwork  "),
-            Some(12),
+            Some(12.0),
         );
         assert_eq!(
             display_name_from_app_data(&packed),
@@ -1119,11 +1191,88 @@ mod tests {
 
     #[test]
     fn test_stamp_cost_from_app_data() {
-        let packed = get_announce_app_data(Some("Alice"), Some(12));
-        assert_eq!(stamp_cost_from_app_data(&packed), Some(12));
+        let packed = get_announce_app_data(Some("Alice"), Some(12.0));
+        assert_eq!(stamp_cost_from_app_data(&packed), Some(12.0));
 
         let packed = get_announce_app_data(Some("Alice"), None);
         assert_eq!(stamp_cost_from_app_data(&packed), None);
+    }
+
+    #[test]
+    fn announced_stamp_cost_matches_python_handler() {
+        // LXMF 1.3.0 stamp_cost_from_app_data; "raise" leaves the cache unchanged.
+        let ok = |cost: Option<f64>| Ok::<_, UndecodableStampCost>(cost);
+        let cases: [(&str, Result<Option<f64>, UndecodableStampCost>); 16] = [
+            ("", ok(None)),
+            ("726177206e616d65", ok(None)),
+            ("91c40141", ok(None)),
+            ("92c40141c0", ok(None)),
+            ("92c4014108", ok(Some(8.0))),
+            ("94c40141099100cb4021000000000000", ok(Some(8.5))),
+            ("94c40141c09100c0", ok(None)),
+            ("93c40141cd012c9100", ok(Some(300.0))),
+            ("93c40141cb401e6666666666669100", ok(Some(7.6))),
+            ("94c40141089100cb401d000000000000", ok(Some(7.25))),
+            ("93c40141fb9100", ok(Some(-5.0))),
+            ("93c40141c39100", ok(Some(1.0))),
+            ("94c40141089100c40178", ok(Some(8.0))),
+            ("93c40141c401789100", Err(UndecodableStampCost)),
+            ("93c1", Err(UndecodableStampCost)),
+            ("92c4", Err(UndecodableStampCost)),
+        ];
+        assert_eq!(announced_stamp_cost(None), Ok(None));
+        for (data, want) in cases {
+            let data = hex::decode(data).unwrap();
+            assert_eq!(
+                announced_stamp_cost(Some(&data)),
+                want,
+                "{}",
+                hex::encode(&data)
+            );
+        }
+    }
+
+    #[test]
+    fn pn_announce_costs_follow_python_slot_rules() {
+        // LXMF 1.3.0 pn_announce_data_is_valid / pn_stamp_cost_from_app_data, and the
+        // announce handler's int() of slot 5 when slot 7 is absent.
+        for (data, valid, cost, handled) in [
+            (
+                "97c201c30a0a93cb4030666666666666031280",
+                true,
+                Some(16.4),
+                Some(16.0),
+            ),
+            (
+                "98c201c30a0a931103138093cb4030400000000000cb4008000000000000cb4032800000000000",
+                true,
+                Some(16.25),
+                Some(16.25),
+            ),
+            (
+                "98c201c30a0a931103138093cb4030400000000000a178cb4032800000000000",
+                false,
+                None,
+                None,
+            ),
+            (
+                "98c201c30a0a931103138092cb4030400000000000cb4008000000000000",
+                false,
+                None,
+                None,
+            ),
+        ] {
+            let data = hex::decode(data).unwrap();
+            assert_eq!(pn_announce_data_is_valid(&data), valid);
+            assert_eq!(pn_stamp_cost_from_app_data(&data), cost);
+            assert_eq!(parse_pn_announce_data(&data).map(|p| p.stamp_cost), handled);
+        }
+        let exact = hex::decode(
+            "98c201c30a0a931103138093cb4030400000000000cb4008000000000000cb4032800000000000",
+        )
+        .unwrap();
+        let parsed = parse_pn_announce_data(&exact).unwrap();
+        assert_eq!((parsed.stamp_flex, parsed.peering_cost), (3.0, 18.5));
     }
 
     #[test]
@@ -1199,7 +1348,7 @@ mod tests {
         assert!(compression_support_from_app_data(&[0xc1]));
 
         // Our own 1.0.1 emission round-trips as explicitly supported.
-        let own = get_announce_app_data(Some("Alice"), Some(12));
+        let own = get_announce_app_data(Some("Alice"), Some(12.0));
         assert_eq!(
             compression_support_state_from_app_data(&own),
             CompressionSupport::Supported
@@ -1212,9 +1361,9 @@ mod tests {
             true,
             PROPAGATION_LIMIT as u64,
             SYNC_LIMIT as u64,
-            20,
-            3,
-            18,
+            20.0,
+            3.0,
+            18.0,
         );
         data.metadata
             .insert(crate::constants::PN_META_NAME, b"HubNode".to_vec());
@@ -1224,7 +1373,7 @@ mod tests {
 
     #[test]
     fn test_pn_node_state_false() {
-        let data = PropagationNodeAnnounceData::new(false, 256, 10240, 16, 3, 18);
+        let data = PropagationNodeAnnounceData::new(false, 256, 10240, 16.0, 3.0, 18.0);
         let packed = get_propagation_node_app_data(&data);
         let parsed = parse_pn_announce_data(&packed).unwrap();
         assert!(!parsed.node_state);
@@ -1232,7 +1381,7 @@ mod tests {
 
     #[test]
     fn test_pn_empty_metadata() {
-        let data = PropagationNodeAnnounceData::new(true, 256, 10240, 16, 3, 18);
+        let data = PropagationNodeAnnounceData::new(true, 256, 10240, 16.0, 3.0, 18.0);
         let packed = get_propagation_node_app_data(&data);
         let parsed = parse_pn_announce_data(&packed).unwrap();
         assert!(parsed.metadata.is_empty());
@@ -1333,7 +1482,7 @@ mod tests {
     fn test_offer_request_handler_success() {
         let local_identity = [0xAA; 16];
         let peer_hash = [0xCC; 16];
-        let cost = 8;
+        let cost = 8.0;
         let handler = PropagationRequestHandler::new(local_identity);
         let mut node = crate::propagation_node::PropagationNode::new(
             crate::propagation_node::PropagationNodeConfig {
@@ -1351,7 +1500,9 @@ mod tests {
                 &peering_id,
                 cost,
                 crate::constants::STAMP_WORKBLOCK_EXPAND_ROUNDS_PEERING,
+                &crate::stamper::StampControl::default(),
             )
+            .unwrap()
             .unwrap()
             .0
         };

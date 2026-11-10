@@ -163,7 +163,7 @@ pub const TICKET_GRACE: u64 = 5 * 24 * 60 * 60;
 pub const TICKET_RENEW: u64 = 14 * 24 * 60 * 60;
 pub const TICKET_INTERVAL: u64 = 24 * 60 * 60;
 /// Sentinel cost value that always exceeds the maximum PoW cost.
-pub const COST_TICKET: u16 = 0x100;
+pub const COST_TICKET: f64 = 256.0;
 
 pub const MAX_DELIVERY_ATTEMPTS: u32 = 5;
 /// Interval between router job ticks (seconds).
@@ -186,11 +186,11 @@ pub const PROPAGATION_LIMIT: usize = 256;
 pub const DELIVERY_LIMIT: usize = 1000;
 /// PROPAGATION_LIMIT * 40, in KB.
 pub const SYNC_LIMIT: usize = 10240;
-pub const PROPAGATION_COST_MIN: u8 = 13;
-pub const PROPAGATION_COST: u8 = 16;
-pub const PROPAGATION_COST_FLEX: u8 = 3;
-pub const PEERING_COST: u8 = 18;
-pub const MAX_PEERING_COST: u8 = 26;
+pub const PROPAGATION_COST_MIN: f64 = 13.0;
+pub const PROPAGATION_COST: f64 = 16.0;
+pub const PROPAGATION_COST_FLEX: f64 = 3.0;
+pub const PEERING_COST: f64 = 18.0;
+pub const MAX_PEERING_COST: f64 = 26.0;
 pub const MAX_PEERS: usize = 20;
 pub const PN_STAMP_THROTTLE: u64 = 180;
 
@@ -335,7 +335,7 @@ mod tests {
         assert_eq!(TICKET_GRACE, 432_000);
         assert_eq!(TICKET_RENEW, 1_209_600);
         assert_eq!(TICKET_INTERVAL, 86_400);
-        assert_eq!(COST_TICKET, 256);
+        assert_eq!(COST_TICKET, 256.0);
     }
 
     #[test]
@@ -374,8 +374,8 @@ mod tests {
         assert_eq!(P_LINK_MAX_INACTIVITY, 180);
         assert_eq!(NODE_ANNOUNCE_DELAY, 20);
         assert_eq!(SYNC_LIMIT, 10240);
-        assert_eq!(PROPAGATION_COST_MIN, 13);
-        assert_eq!(MAX_PEERING_COST, 26);
+        assert_eq!(PROPAGATION_COST_MIN, 13.0);
+        assert_eq!(MAX_PEERING_COST, 26.0);
         assert_eq!(AUTOPEER_MAXDEPTH, 4);
         assert_eq!(FASTEST_N_RANDOM_POOL, 2);
     }

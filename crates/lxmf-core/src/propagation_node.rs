@@ -26,8 +26,8 @@ pub struct PropagationNodeConfig {
     pub max_message_age: u64,
     /// Messages below this effective stamp value are rejected. Python derives
     /// this from `propagation_stamp_cost - propagation_stamp_cost_flexibility`.
-    pub min_stamp_cost: u8,
-    pub peering_cost: u8,
+    pub min_stamp_cost: f64,
+    pub peering_cost: f64,
     /// Maximum newly admitted image size in bytes, including the 32-byte PN stamp.
     pub max_message_size: usize,
     /// Maximum encoded inbound `/offer` request size in bytes. The default
@@ -42,7 +42,7 @@ impl Default for PropagationNodeConfig {
             max_storage: PROPAGATION_LIMIT * 1024 * 1024,
             max_message_age: MESSAGE_EXPIRY,
             // Disabled by default; set to PROPAGATION_COST for production.
-            min_stamp_cost: 0,
+            min_stamp_cost: 0.0,
             peering_cost: PEERING_COST,
             max_message_size: DELIVERY_LIMIT * BYTES_PER_KILOBYTE,
             max_offer_size: SYNC_LIMIT * BYTES_PER_KILOBYTE,
@@ -390,10 +390,10 @@ pub fn read_planned_messages(
 pub struct ValidatedOpaquePropagationBlob {
     bytes: bytes::Bytes,
     transient_id: PropagationTransientId,
-    stamp_value: u8,
+    stamp_value: f64,
 }
 impl ValidatedOpaquePropagationBlob {
-    pub fn validate(bytes: bytes::Bytes, minimum_stamp_cost: u8) -> Option<Self> {
+    pub fn validate(bytes: bytes::Bytes, minimum_stamp_cost: f64) -> Option<Self> {
         if bytes.len() < DESTINATION_LENGTH + 1 + 32
             || bytes.len() > rns_protocol::resource::MAX_RESOURCE_SIZE
         {
@@ -404,8 +404,8 @@ impl ValidatedOpaquePropagationBlob {
         let transient_id = rns_crypto::sha::full_hash(body);
         let workblock =
             crate::stamper::stamp_workblock(&transient_id, STAMP_WORKBLOCK_EXPAND_ROUNDS_PN);
-        let stamp_value = crate::stamper::stamp_value(&workblock, stamp).min(255) as u8;
-        (stamp_value >= minimum_stamp_cost).then_some(Self {
+        let stamp_value = crate::stamper::stamp_value(&workblock, stamp);
+        crate::stamper::stamp_valid(stamp, minimum_stamp_cost, &workblock).then_some(Self {
             bytes,
             transient_id,
             stamp_value,
@@ -414,7 +414,7 @@ impl ValidatedOpaquePropagationBlob {
     pub fn transient_id(&self) -> PropagationTransientId {
         self.transient_id
     }
-    pub fn stamp_value(&self) -> u8 {
+    pub fn stamp_value(&self) -> f64 {
         self.stamp_value
     }
 }
@@ -531,7 +531,7 @@ pub(crate) struct SyncOfferCandidateSnapshot {
     transient_id: PropagationTransientId,
     weight: f64,
     size: usize,
-    stamp_value: u8,
+    stamp_value: f64,
 }
 
 /// Cheap, owned view captured while the shared node lock is held. Expensive
@@ -698,11 +698,11 @@ impl PropagationNode {
         self.storage_path.is_some()
     }
 
-    pub fn min_stamp_cost(&self) -> u8 {
+    pub fn min_stamp_cost(&self) -> f64 {
         self.config.min_stamp_cost
     }
 
-    pub fn set_min_stamp_cost(&mut self, cost: u8) {
+    pub fn set_min_stamp_cost(&mut self, cost: f64) {
         self.config.min_stamp_cost = cost;
     }
 
@@ -903,7 +903,7 @@ impl PropagationNode {
         &mut self,
         lxmf_data: &[u8],
         stamp_data: &[u8; 32],
-        stamp_value: u8,
+        stamp_value: f64,
     ) -> Option<PropagationStoreWritePlan> {
         let mut bytes = Vec::with_capacity(lxmf_data.len().checked_add(32)?);
         if lxmf_data.len().checked_add(32)? > self.config.max_message_size {
@@ -948,7 +948,7 @@ impl PropagationNode {
             .filter_map(|w| w.upgrade())
             .fold(0usize, |n, r| n.saturating_add(r.size));
         if !self.is_durable()
-            || blob.stamp_value < self.config.min_stamp_cost
+            || !crate::stamper::value_meets(blob.stamp_value, self.config.min_stamp_cost)
             || blob.bytes.len() > self.config.max_message_size
         {
             return PropagationAdmission::Rejected;
@@ -994,7 +994,7 @@ impl PropagationNode {
         &mut self,
         lxmf_data: &[u8],
         stamp_data: &[u8; 32],
-        stamp_value: u8,
+        stamp_value: f64,
     ) -> bool {
         let Some(plan) =
             self.plan_accept_stamped_propagated_blob(lxmf_data, stamp_data, stamp_value)
@@ -1111,10 +1111,10 @@ impl PropagationNode {
     pub fn create_offer(
         &self,
         _peer_hash: [u8; 16],
-        peer_min_stamp_cost: Option<u8>,
+        peer_min_stamp_cost: Option<f64>,
     ) -> Vec<PropagationTransientId> {
         match peer_min_stamp_cost {
-            Some(min_cost) if min_cost > 0 => self
+            Some(min_cost) if min_cost > 0.0 => self
                 .store
                 .entries()
                 .filter(|e| self.eligible(&e.transient_id) && e.stamp_value >= min_cost)
@@ -1765,7 +1765,7 @@ pub(crate) mod tests {
     pub(crate) struct OpaqueFixture {
         pub(crate) data: Vec<u8>,
         pub(crate) stamp: [u8; 32],
-        pub(crate) value: u8,
+        pub(crate) value: f64,
         pub(crate) transient_id: Option<[u8; 32]>,
         pub(crate) hash: Option<[u8; 32]>,
         pub(crate) timestamp: f64,
@@ -1775,7 +1775,7 @@ pub(crate) mod tests {
             self.transient_id.unwrap()
         }
     }
-    pub(crate) fn fixture_stamp(data: &[u8], cost: u8) -> ([u8; 32], u32) {
+    pub(crate) fn fixture_stamp(data: &[u8], cost: u8) -> ([u8; 32], f64) {
         let id = rns_crypto::sha::full_hash(data);
         let block = crate::stamper::stamp_workblock(
             &id,
@@ -1787,7 +1787,7 @@ pub(crate) mod tests {
             let mut stamp = [0; 32];
             stamp[..8].copy_from_slice(&counter.to_be_bytes());
             let value = crate::stamper::stamp_value(&block, &stamp);
-            if value == u32::from(cost) {
+            if value.floor() == f64::from(cost) {
                 return (stamp, value);
             }
         }
@@ -1809,7 +1809,7 @@ pub(crate) mod tests {
         OpaqueFixture {
             data,
             stamp,
-            value: value.min(255) as u8,
+            value,
             transient_id: Some(transient_id),
             hash: Some(transient_id),
             timestamp: crate::now_f64(),
@@ -1859,7 +1859,7 @@ pub(crate) mod tests {
         }
         pub(crate) fn accept_blob_fixture(&mut self, data: &[u8], cost: u8) -> bool {
             let (stamp, value) = fixture_stamp(data, cost);
-            self.accept_stamped_propagated_blob(data, &stamp, value.min(255) as u8)
+            self.accept_stamped_propagated_blob(data, &stamp, value)
         }
     }
 
@@ -1871,7 +1871,7 @@ pub(crate) mod tests {
         node: &mut PropagationNode,
         transient_id: PropagationTransientId,
         size: usize,
-        stamp_value: u8,
+        stamp_value: f64,
     ) {
         let entry =
             PropagationEntry::new(transient_id, transient_id, [0xDD; 16], size, stamp_value);
@@ -1882,7 +1882,7 @@ pub(crate) mod tests {
         vec![byte; 32]
     }
 
-    fn peering_key(local_identity: &[u8; 16], remote_identity: &[u8; 16], cost: u8) -> [u8; 32] {
+    fn peering_key(local_identity: &[u8; 16], remote_identity: &[u8; 16], cost: f64) -> [u8; 32] {
         let mut peering_id = Vec::with_capacity(32);
         peering_id.extend_from_slice(local_identity);
         peering_id.extend_from_slice(remote_identity);
@@ -1890,7 +1890,9 @@ pub(crate) mod tests {
             &peering_id,
             cost,
             crate::constants::STAMP_WORKBLOCK_EXPAND_ROUNDS_PEERING,
+            &crate::stamper::StampControl::default(),
         )
+        .unwrap()
         .unwrap()
         .0
     }
@@ -2029,7 +2031,7 @@ pub(crate) mod tests {
 
         let mut duplicate = message.data.clone();
         duplicate.extend_from_slice(&message.stamp);
-        let blob = ValidatedOpaquePropagationBlob::validate(duplicate.into(), 0).unwrap();
+        let blob = ValidatedOpaquePropagationBlob::validate(duplicate.into(), 0.0).unwrap();
         let PropagationAdmission::CommittedDuplicate(check) = node.plan_opaque_admission(blob)
         else {
             panic!("previous admission retains duplicate acknowledgement authority");
@@ -2073,7 +2075,7 @@ pub(crate) mod tests {
     #[test]
     fn test_reject_no_hash() {
         let mut node = durable_test_node(PropagationNodeConfig::default(), [0xAA; 16]);
-        assert!(!node.accept_stamped_propagated_blob(&[0; 16], &[0; 32], 0));
+        assert!(!node.accept_stamped_propagated_blob(&[0; 16], &[0; 32], 0.0));
         assert_eq!(node.message_count(), 0);
     }
 
@@ -2128,15 +2130,15 @@ pub(crate) mod tests {
     #[test]
     fn authoritative_offer_policy_combines_all_filters_and_real_key() {
         let mut node = durable_test_node(PropagationNodeConfig::default(), [0xAA; 16]);
-        insert_offer_entry(&mut node, tid(0x01), 100, 20); // handled
-        insert_offer_entry(&mut node, tid(0x02), 100, 12); // low stamp
-        insert_offer_entry(&mut node, tid(0x03), 100, 13); // accepted
-        insert_offer_entry(&mut node, tid(0x04), 985, 20); // 1001 B with overhead
-        insert_offer_entry(&mut node, tid(0x05), 984, 13); // exact 1000 B
+        insert_offer_entry(&mut node, tid(0x01), 100, 20.0); // handled
+        insert_offer_entry(&mut node, tid(0x02), 100, 12.0); // low stamp
+        insert_offer_entry(&mut node, tid(0x03), 100, 13.0); // accepted
+        insert_offer_entry(&mut node, tid(0x04), 985, 20.0); // 1001 B with overhead
+        insert_offer_entry(&mut node, tid(0x05), 984, 13.0); // exact 1000 B
 
         let mut policy = OutboundOfferPolicy::unrestricted([0xBB; 16]);
         policy.handled_messages.insert(tid(0x01));
-        policy.minimum_stamp_cost = 13;
+        policy.minimum_stamp_cost = 13.0;
         policy.propagation_transfer_limit = Some(1.0);
         policy.propagation_sync_limit = Some(10.0);
         policy.peering_key = vec![0x77; 32];
@@ -2157,8 +2159,8 @@ pub(crate) mod tests {
     #[test]
     fn offer_cumulative_limit_is_decimal_and_excludes_exact_boundary() {
         let mut node = durable_test_node(PropagationNodeConfig::default(), [0xAA; 16]);
-        insert_offer_entry(&mut node, tid(0x01), 50, 0);
-        insert_offer_entry(&mut node, tid(0x02), 50, 0);
+        insert_offer_entry(&mut node, tid(0x01), 50, 0.0);
+        insert_offer_entry(&mut node, tid(0x02), 50, 0.0);
         let mut policy = OutboundOfferPolicy::unrestricted([0xBB; 16]);
         // 24 initial + (50 + 16) + (50 + 16) = 156 bytes. The second
         // candidate is excluded because upstream uses next_size >= limit.
@@ -2172,12 +2174,12 @@ pub(crate) mod tests {
     #[test]
     fn prepared_offer_distinguishes_terminal_filters_from_cumulative_deferral() {
         let mut node = durable_test_node(PropagationNodeConfig::default(), [0xAA; 16]);
-        insert_offer_entry(&mut node, tid(0x01), 10, 9); // terminal low stamp
-        insert_offer_entry(&mut node, tid(0x02), 100, 20); // selected
-        insert_offer_entry(&mut node, tid(0x03), 100, 20); // cumulative deferred
-        insert_offer_entry(&mut node, tid(0x04), 1000, 20); // terminal oversize
+        insert_offer_entry(&mut node, tid(0x01), 10, 9.0); // terminal low stamp
+        insert_offer_entry(&mut node, tid(0x02), 100, 20.0); // selected
+        insert_offer_entry(&mut node, tid(0x03), 100, 20.0); // cumulative deferred
+        insert_offer_entry(&mut node, tid(0x04), 1000, 20.0); // terminal oversize
         let mut policy = OutboundOfferPolicy::unrestricted([0xBB; 16]);
-        policy.minimum_stamp_cost = 10;
+        policy.minimum_stamp_cost = 10.0;
         policy.propagation_transfer_limit = Some(0.5);
         policy.propagation_sync_limit = Some(0.2);
 
@@ -2194,8 +2196,8 @@ pub(crate) mod tests {
     #[test]
     fn all_cumulatively_deferred_candidates_exhaust_unchanged_generation() {
         let mut node = durable_test_node(PropagationNodeConfig::default(), [0xAA; 16]);
-        insert_offer_entry(&mut node, tid(0x01), 50, 20);
-        insert_offer_entry(&mut node, tid(0x02), 50, 20);
+        insert_offer_entry(&mut node, tid(0x01), 50, 20.0);
+        insert_offer_entry(&mut node, tid(0x02), 50, 20.0);
         let mut policy = OutboundOfferPolicy::unrestricted([0xBB; 16]);
         // Initial overhead (24) + either transfer (50 + 16) exceeds this
         // generation's peer policy, so a reconnect cannot make progress.
@@ -2242,9 +2244,9 @@ pub(crate) mod tests {
             dir.clone(),
         )
         .unwrap();
-        insert_offer_entry(&mut node, tid(0x01), 50, 0);
-        insert_offer_entry(&mut node, tid(0x02), 50, 0);
-        insert_offer_entry(&mut node, tid(0x03), 50, 0);
+        insert_offer_entry(&mut node, tid(0x01), 50, 0.0);
+        insert_offer_entry(&mut node, tid(0x02), 50, 0.0);
+        insert_offer_entry(&mut node, tid(0x03), 50, 0.0);
 
         let mut persisted = LxmPeer::new([0xBB; 16]);
         persisted.add_handled_message(&tid(0x01));
@@ -2632,11 +2634,11 @@ pub(crate) mod tests {
         let id = message.message_id();
         let object = node.object_paths[&id].clone();
         assert!(object.exists());
-        assert!(object.with_extension("entry").exists());
+        assert!(crate::propagation_store_v2::manifest_path(&object).exists());
         node.tick();
         assert_eq!(node.message_count(), 0);
         assert!(!object.exists());
-        assert!(!object.with_extension("entry").exists());
+        assert!(!crate::propagation_store_v2::manifest_path(&object).exists());
     }
 
     #[test]
@@ -2872,7 +2874,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_handle_offer_request_valid() {
-        let cost = 8;
+        let cost = 8.0;
         let local_identity = [0xAA; 16];
         let remote_identity = [0xBB; 16];
         let config = PropagationNodeConfig {
@@ -2907,7 +2909,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_offer_evaluation_uses_preflight_candidate_identity() {
-        let cost = 8;
+        let cost = 8.0;
         let local_identity = [0xAA; 16];
         let remote_identity = [0xBB; 16];
         let config = PropagationNodeConfig {
@@ -2962,7 +2964,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_handle_offer_request_rejects_wrong_peering_identity_order() {
-        let cost = 8;
+        let cost = 8.0;
         let local_identity = [0xAA; 16];
         let remote_identity = [0xBB; 16];
         let config = PropagationNodeConfig {
@@ -3036,7 +3038,7 @@ pub(crate) mod tests {
     fn test_handle_offer_request_invalid_data() {
         let mut node = durable_test_node(
             PropagationNodeConfig {
-                peering_cost: 0,
+                peering_cost: 0.0,
                 ..Default::default()
             },
             [0xAA; 16],
@@ -3185,20 +3187,17 @@ pub(crate) mod tests {
         let stamp = [0x5A; 32];
         let full_id = rns_crypto::sha::full_hash(&lxmf_data);
 
-        assert!(
-            node.accept_stamped_propagated_blob(
-                &lxmf_data,
-                &stamp,
-                crate::stamper::stamp_value(
-                    &crate::stamper::stamp_workblock(
-                        &rns_crypto::sha::full_hash(&lxmf_data),
-                        STAMP_WORKBLOCK_EXPAND_ROUNDS_PN
-                    ),
-                    &stamp
-                )
-                .min(255) as u8
+        assert!(node.accept_stamped_propagated_blob(
+            &lxmf_data,
+            &stamp,
+            crate::stamper::stamp_value(
+                &crate::stamper::stamp_workblock(
+                    &rns_crypto::sha::full_hash(&lxmf_data),
+                    STAMP_WORKBLOCK_EXPAND_ROUNDS_PN
+                ),
+                &stamp
             )
-        );
+        ));
 
         let peer_results = node.message_get_request(&[full_id]);
         assert_eq!(peer_results.len(), 1);
@@ -3242,20 +3241,17 @@ pub(crate) mod tests {
                 dir.clone(),
             )
             .unwrap();
-            assert!(
-                node.accept_stamped_propagated_blob(
-                    &lxmf_data,
-                    &stamp,
-                    crate::stamper::stamp_value(
-                        &crate::stamper::stamp_workblock(
-                            &rns_crypto::sha::full_hash(&lxmf_data),
-                            STAMP_WORKBLOCK_EXPAND_ROUNDS_PN
-                        ),
-                        &stamp
-                    )
-                    .min(255) as u8
+            assert!(node.accept_stamped_propagated_blob(
+                &lxmf_data,
+                &stamp,
+                crate::stamper::stamp_value(
+                    &crate::stamper::stamp_workblock(
+                        &rns_crypto::sha::full_hash(&lxmf_data),
+                        STAMP_WORKBLOCK_EXPAND_ROUNDS_PN
+                    ),
+                    &stamp
                 )
-            );
+            ));
         }
 
         let mut reloaded = PropagationNode::with_storage(
@@ -3286,7 +3282,7 @@ pub(crate) mod tests {
     #[test]
     fn test_accept_propagated_blob_enforces_min_stamp_cost() {
         let config = PropagationNodeConfig {
-            min_stamp_cost: 8,
+            min_stamp_cost: 8.0,
             ..Default::default()
         };
         let mut node = durable_test_node(config, [0xAA; 16]);
@@ -3375,7 +3371,7 @@ pub(crate) mod tests {
             let id = rns_crypto::sha::full_hash(&blob);
             let mut stored = blob.clone();
             stored.extend_from_slice(&stamp);
-            assert!(node.accept_stamped_propagated_blob(&blob, &stamp, value as u8));
+            assert!(node.accept_stamped_propagated_blob(&blob, &stamp, value));
             let object = node.object_paths[&id].clone();
             assert_eq!(std::fs::read(&object).unwrap(), stored);
             drop(node);
@@ -3385,7 +3381,7 @@ pub(crate) mod tests {
             assert_eq!(node.message_count(), 1);
             assert_eq!(node.total_size(), stored.len());
             assert!(node.store.get(&id).unwrap().stamped);
-            assert!(!node.accept_stamped_propagated_blob(&blob, &stamp, value as u8));
+            assert!(!node.accept_stamped_propagated_blob(&blob, &stamp, value));
             assert!(node.pending_write_ids.is_empty());
             assert_eq!(node.pending_write_bytes, 0);
             let request = crate::encode_value(&Value::Array(vec![
@@ -3686,7 +3682,7 @@ pub(crate) mod tests {
     #[test]
     fn test_stamp_cost_validation_rejects_unstamped() {
         let config = PropagationNodeConfig {
-            min_stamp_cost: 8,
+            min_stamp_cost: 8.0,
             ..Default::default()
         };
         let mut node = durable_test_node(config, [0xAA; 16]);
@@ -3699,7 +3695,7 @@ pub(crate) mod tests {
     #[test]
     fn test_stamp_cost_zero_accepts_all() {
         let config = PropagationNodeConfig {
-            min_stamp_cost: 0,
+            min_stamp_cost: 0.0,
             ..Default::default()
         };
         let mut node = durable_test_node(config, [0xAA; 16]);
@@ -3718,7 +3714,7 @@ pub(crate) mod tests {
             message_hash: [0x11; 32],
             destination_hash: [0xCC; 16],
             stored_at: 1000.0,
-            stamp_value: 20,
+            stamp_value: 20.0,
             size: 100,
             collected: false,
             stamped: false,
@@ -3728,7 +3724,7 @@ pub(crate) mod tests {
             message_hash: [0x22; 32],
             destination_hash: [0xCC; 16],
             stored_at: 1000.0,
-            stamp_value: 5,
+            stamp_value: 5.0,
             size: 100,
             collected: false,
             stamped: false,
@@ -3739,11 +3735,11 @@ pub(crate) mod tests {
         let all = node.create_offer([0xFF; 16], None);
         assert_eq!(all.len(), 2);
 
-        let filtered = node.create_offer([0xFF; 16], Some(10));
+        let filtered = node.create_offer([0xFF; 16], Some(10.0));
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0], tid(0x01));
 
-        let all2 = node.create_offer([0xFF; 16], Some(0));
+        let all2 = node.create_offer([0xFF; 16], Some(0.0));
         assert_eq!(all2.len(), 2);
     }
     #[test]

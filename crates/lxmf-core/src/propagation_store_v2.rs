@@ -121,7 +121,7 @@ pub(crate) struct EntryManifest {
     pub content_hash: [u8; 32],
     pub destination: [u8; 16],
     pub size: usize,
-    pub stamp_value: u8,
+    pub stamp_value: f64,
     pub stored_at: f64,
     pub stamped: bool,
     pub origin: OpaqueIngress,
@@ -168,10 +168,13 @@ impl EntryManifest {
             )
             && (self.origin == OpaqueIngress::TrustedRecovery || self.stamped)
     }
+    /// Relay object name. Integer values keep the form older stores wrote.
     pub(crate) fn filename(&self) -> String {
         format!(
-            "{}_{}",
-            self.entry().filename(),
+            "{}_{:.0}_{}_{}",
+            hex::encode(self.transient_id),
+            self.stored_at,
+            self.stamp_value,
             hex::encode(self.admission_id)
         )
     }
@@ -456,7 +459,8 @@ mod tests {
         );
         let tid = rns_crypto::sha::full_hash(&data);
         data.extend_from_slice(&[0; 32]);
-        let mut entry = crate::propagation::PropagationEntry::new(tid, tid, [2; 16], data.len(), 0);
+        let mut entry =
+            crate::propagation::PropagationEntry::new(tid, tid, [2; 16], data.len(), 0.0);
         entry.stamped = true;
         let meta = EntryManifest::from_entry(&entry, &data);
         let object = root.join("objects").join(meta.filename());

@@ -79,7 +79,7 @@ pub(crate) fn evaluate<F>(
     request_data: &[u8],
     local_identity_hash: &[u8; 16],
     remote_identity_hash: &[u8; 16],
-    peering_cost: u8,
+    peering_cost: f64,
     max_offer_size: usize,
     contains: F,
 ) -> Result<PnOfferEvaluation, PnOfferEvaluationError>
@@ -100,14 +100,14 @@ pub(crate) fn evaluate_decoded<F>(
     offer: DecodedOffer,
     local_identity_hash: &[u8; 16],
     remote_identity_hash: &[u8; 16],
-    peering_cost: u8,
+    peering_cost: f64,
     mut contains: F,
 ) -> Result<PnOfferEvaluation, PnOfferEvaluationError>
 where
     F: FnMut(&PropagationTransientId) -> bool,
 {
     let peering_key_valid = match offer.peering_key {
-        DecodedPeeringKey::Empty => peering_cost == 0,
+        DecodedPeeringKey::Empty => peering_cost == 0.0,
         DecodedPeeringKey::Key(key) => {
             let mut peering_id = [0u8; 32];
             peering_id[..16].copy_from_slice(local_identity_hash);
@@ -241,7 +241,7 @@ mod tests {
 
         for request in malformed {
             assert_eq!(
-                evaluate(&request, &[1; 16], &[2; 16], 0, 1024, |_| false),
+                evaluate(&request, &[1; 16], &[2; 16], 0.0, 1024, |_| false),
                 Err(PnOfferEvaluationError::InvalidData)
             );
         }
@@ -249,7 +249,7 @@ mod tests {
         let mut trailing = encode_offer(Value::Binary(vec![]), Value::Array(vec![]));
         trailing.push(0xc0);
         assert_eq!(
-            evaluate(&trailing, &[1; 16], &[2; 16], 0, 1024, |_| false),
+            evaluate(&trailing, &[1; 16], &[2; 16], 0.0, 1024, |_| false),
             Err(PnOfferEvaluationError::InvalidData)
         );
     }
@@ -258,7 +258,7 @@ mod tests {
     fn decode_rejects_requests_over_the_bounded_sync_budget() {
         let request = vec![0xc0; 65];
         assert_eq!(
-            evaluate(&request, &[1; 16], &[2; 16], 0, 64, |_| false),
+            evaluate(&request, &[1; 16], &[2; 16], 0.0, 64, |_| false),
             Err(PnOfferEvaluationError::InvalidData)
         );
     }
@@ -271,7 +271,7 @@ mod tests {
         rmp::encode::write_array_len(&mut request, u32::MAX).unwrap();
 
         assert_eq!(
-            evaluate(&request, &[1; 16], &[2; 16], 0, usize::MAX, |_| false),
+            evaluate(&request, &[1; 16], &[2; 16], 0.0, usize::MAX, |_| false),
             Err(PnOfferEvaluationError::InvalidData)
         );
     }
@@ -283,11 +283,11 @@ mod tests {
             Value::Array(vec![Value::Binary(id(3).to_vec())]),
         );
         assert_eq!(
-            evaluate(&request, &[1; 16], &[2; 16], 0, 1024, |_| false),
+            evaluate(&request, &[1; 16], &[2; 16], 0.0, 1024, |_| false),
             Ok(PnOfferEvaluation::WantAll)
         );
         assert_eq!(
-            evaluate(&request, &[1; 16], &[2; 16], 1, 1024, |_| false),
+            evaluate(&request, &[1; 16], &[2; 16], 1.0, 1024, |_| false),
             Err(PnOfferEvaluationError::InvalidKey)
         );
     }
@@ -305,7 +305,7 @@ mod tests {
         );
 
         assert_eq!(
-            evaluate(&request, &[1; 16], &[2; 16], 0, 1024, |id| *id == [1; 32]),
+            evaluate(&request, &[1; 16], &[2; 16], 0.0, 1024, |id| *id == [1; 32]),
             Ok(PnOfferEvaluation::WantSome(vec![id(2), id(2), id(3)]))
         );
     }

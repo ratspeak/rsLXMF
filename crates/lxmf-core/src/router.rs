@@ -77,9 +77,9 @@ pub struct RouterConfig {
     pub propagation_limit_kb: usize,
     pub delivery_limit_kb: f64,
     pub sync_limit_kb: usize,
-    pub propagation_stamp_cost: u8,
-    pub propagation_stamp_flex: u8,
-    pub stamp_cost: Option<u8>,
+    pub propagation_stamp_cost: f64,
+    pub propagation_stamp_flex: f64,
+    pub stamp_cost: Option<f64>,
     pub ext: RouterConfigExt,
 }
 
@@ -89,9 +89,9 @@ pub struct RouterConfig {
 #[derive(Debug, Clone)]
 pub struct RouterConfigExt {
     pub autopeer_maxdepth: usize,
-    pub propagation_cost_min: u8,
-    pub peering_cost: u8,
-    pub max_peering_cost: u8,
+    pub propagation_cost_min: f64,
+    pub peering_cost: f64,
+    pub max_peering_cost: f64,
     pub processing_outbound: bool,
     /// Maximum messages advanced per outbound-processing call (`None` = no count limit).
     pub processing_limit: Option<usize>,
@@ -390,19 +390,20 @@ pub struct AutopeerCandidate {
     pub timebase: f64,
     pub transfer_limit: Option<f64>,
     pub sync_limit: Option<f64>,
-    pub stamp_cost: Option<u8>,
-    pub stamp_flexibility: Option<u8>,
-    pub peering_cost: Option<u8>,
+    pub stamp_cost: Option<f64>,
+    pub stamp_flexibility: Option<f64>,
+    pub peering_cost: Option<f64>,
     /// Parsed propagation-node announce metadata. The peer layer applies
     /// deterministic entry/value/aggregate bounds before retaining it.
     pub metadata: Option<std::collections::HashMap<u8, Vec<u8>>>,
     pub hops: Option<u8>,
 }
 
-/// Cached stamp cost for a destination.
+/// Cached stamp cost for a destination; `None` records an announce without
+/// a cost. Integer costs stored by older versions still load.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StampCostEntry {
-    pub cost: u8,
+    pub cost: Option<f64>,
     pub recorded_at: f64,
 }
 
@@ -622,7 +623,7 @@ impl LxmRouter {
                 .map(|t| t.token);
         }
         if message.stamp_cost.is_none() {
-            message.stamp_cost = self.get_stamp_cost(&destination).filter(|v| *v > 0);
+            message.stamp_cost = self.get_stamp_cost(&destination);
         }
         if message.include_ticket
             && message.get_field(FIELD_TICKET).is_none()
@@ -677,7 +678,7 @@ impl LxmRouter {
         }
         if self.config.ext.defer_stamp_generation
             && message.outbound_ticket().is_none()
-            && message.stamp_cost().unwrap_or(0) > 0
+            && message.stamp_cost().is_some()
         {
             self.defer_stamp(message);
             return Ok(());
@@ -708,8 +709,11 @@ impl LxmRouter {
         };
         let destination = message.destination_hash();
         let outbound_ticket = self.get_outbound_ticket(&destination);
-        let current_cost = self.get_stamp_cost(&destination).filter(|cost| *cost > 0);
-        let stamp_cost = stored.stamp_cost_floor().max(current_cost);
+        let current_cost = self.get_stamp_cost(&destination);
+        let stamp_cost = match (stored.stamp_cost_floor(), current_cost) {
+            (Some(floor), Some(current)) => Some(floor.max(current)),
+            (floor, current) => floor.or(current),
+        };
         Ok(SignedLxMessage::restored(
             message,
             outbound_ticket,
@@ -750,41 +754,34 @@ impl LxmRouter {
             return;
         };
         let message = &self.pending_deferred_stamps[&message_hash];
-        let cost = message.stamp_cost().unwrap_or(0);
-        if cost == 0 || message.outbound_ticket().is_some() {
-            if let Some(message) = self.pending_deferred_stamps.remove(&message_hash) {
-                let stamp = message.generate_recipient_stamp();
-                match stamp.and_then(|stamp| message.finalize(stamp)) {
-                    Ok(message) => {
-                        let _ = self.try_send(message);
-                    }
-                    Err(error) => tracing::warn!(%error,"recipient stamp finalization failed"),
-                }
-            }
-            return;
-        }
+        let cost = message.stamp_cost();
         let runtime = tokio::runtime::Handle::try_current()
             .ok()
             .or_else(|| self.runtime_handle.clone());
-        if let Some(runtime) = runtime {
-            let (handle, rx) = stamper::spawn_deferred_stamp_on(
-                &runtime,
-                message_hash,
-                cost,
-                STAMP_WORKBLOCK_EXPAND_ROUNDS,
-            );
-            self.active_deferred_stamp = Some(DeferredStampJob {
-                message_hash,
-                handle,
-                rx,
-            });
-        } else if let Some(message) = self.pending_deferred_stamps.remove(&message_hash) {
-            let stamp = message.generate_recipient_stamp();
-            match stamp.and_then(|stamp| message.finalize(stamp)) {
-                Ok(message) => {
-                    let _ = self.try_send(message);
+        match (cost, runtime) {
+            (Some(cost), Some(runtime)) if message.outbound_ticket().is_none() => {
+                let (handle, rx) = stamper::spawn_deferred_stamp_on(
+                    &runtime,
+                    message_hash,
+                    cost,
+                    STAMP_WORKBLOCK_EXPAND_ROUNDS,
+                );
+                self.active_deferred_stamp = Some(DeferredStampJob {
+                    message_hash,
+                    handle,
+                    rx,
+                });
+            }
+            _ => {
+                if let Some(message) = self.pending_deferred_stamps.remove(&message_hash) {
+                    match message.generate_recipient_stamp() {
+                        Ok(stamp) => self.send_stamped(message, stamp),
+                        Err(error) => {
+                            tracing::error!(%error, "deferred stamp generation did not succeed");
+                            Self::fail_unsent(message.into_unstamped());
+                        }
+                    }
                 }
-                Err(error) => tracing::warn!(%error,"recipient stamp generation failed"),
             }
         }
     }
@@ -793,21 +790,56 @@ impl LxmRouter {
         let Some(mut job) = self.active_deferred_stamp.take() else {
             return;
         };
-        match job.rx.try_recv() {
+        let result = match job.rx.try_recv() {
+            Err(oneshot::error::TryRecvError::Empty) => {
+                self.active_deferred_stamp = Some(job);
+                return;
+            }
+            result => result,
+        };
+        let Some(message) = self.pending_deferred_stamps.remove(&job.message_hash) else {
+            return;
+        };
+        match result {
             Ok(stamper::DeferredStampResult::Success { stamp, .. }) => {
-                if let Some(message) = self.pending_deferred_stamps.remove(&job.message_hash) {
-                    match message.finalize(Some(RecipientStamp::ProofOfWork(stamp))) {
-                        Ok(message) => {
-                            let _ = self.try_send(message);
-                        }
-                        Err(error) => tracing::warn!(%error,"recipient stamp finalization failed"),
-                    }
-                }
+                self.send_stamped(message, Some(RecipientStamp::ProofOfWork(stamp)));
             }
-            Err(oneshot::error::TryRecvError::Empty) => self.active_deferred_stamp = Some(job),
-            _ => {
-                self.pending_deferred_stamps.remove(&job.message_hash);
+            Ok(stamper::DeferredStampResult::Cancelled) => {
+                let mut message = message.into_unstamped();
+                message.state = MessageState::Cancelled;
+                message.notify_failed();
             }
+            Ok(stamper::DeferredStampResult::Failed(error)) => {
+                tracing::error!(%error, "deferred stamp generation did not succeed");
+                Self::fail_unsent(message.into_unstamped());
+            }
+            Err(_) => {
+                tracing::error!("deferred stamp worker ended without a result");
+                Self::fail_unsent(message.into_unstamped());
+            }
+        }
+    }
+
+    fn send_stamped(&mut self, message: SignedLxMessage, stamp: Option<RecipientStamp>) {
+        match message.try_finalize(stamp) {
+            Ok(message) => {
+                let _ = self.try_send(message);
+            }
+            Err(failed) => {
+                let (error, message) = *failed;
+                tracing::error!(%error, "recipient stamp finalization failed");
+                Self::fail_unsent(message);
+            }
+        }
+    }
+
+    /// Python `fail_message` for a message outside the outbound queue.
+    fn fail_unsent(mut message: LxMessage) {
+        message.progress = 0.0;
+        if message.state != MessageState::Rejected {
+            message.mark_failed();
+        } else {
+            message.notify_failed();
         }
     }
 
@@ -1090,6 +1122,7 @@ impl LxmRouter {
 
         let mut msg = self.pending_outbound.remove(pos);
         msg.mark_rejected();
+        msg.notify_failed();
         true
     }
 
@@ -1132,16 +1165,16 @@ impl LxmRouter {
     /// Returns the cached entry unchanged, without an expiry check. Use
     /// [`Self::get_stamp_cost`] to exclude expired entries. Unlike Python's
     /// same-named message-ID lookup, this API takes a destination hash.
-    pub fn get_outbound_lxm_stamp_cost(&self, destination_hash: &[u8; 16]) -> Option<u8> {
+    pub fn get_outbound_lxm_stamp_cost(&self, destination_hash: &[u8; 16]) -> Option<f64> {
         self.outbound_stamp_costs
             .get(destination_hash)
-            .map(|e| e.cost)
+            .and_then(|e| e.cost)
     }
 
     /// Return the recipient stamp cost recorded on a deferred message.
     /// Despite this method's name, it reads only `pending_deferred_stamps` and
     /// does not return the separate propagation-node admission stamp target.
-    pub fn get_outbound_lxm_propagation_stamp_cost(&self, message_hash: &[u8; 32]) -> Option<u8> {
+    pub fn get_outbound_lxm_propagation_stamp_cost(&self, message_hash: &[u8; 32]) -> Option<f64> {
         self.pending_deferred_stamps
             .get(message_hash)
             .and_then(|m| m.stamp_cost())
@@ -1423,7 +1456,7 @@ impl LxmRouter {
         // Python LXMRouter.peer() (LXMRouter.py:1896-1901): a peering cost
         // above our accepted maximum refuses the peering — and breaks an
         // existing one only when that policy announce is not stale.
-        if peering_cost.unwrap_or(0) > self.config.ext.max_peering_cost {
+        if peering_cost.unwrap_or(0.0) > self.config.ext.max_peering_cost {
             if self
                 .peers
                 .get(&destination_hash)
@@ -1503,18 +1536,26 @@ impl LxmRouter {
         self.static_peers.retain(|h| h != destination_hash);
     }
 
-    /// Get a cached outbound stamp cost, or `None` if missing or expired.
-    pub fn get_stamp_cost(&self, destination_hash: &[u8; 16]) -> Option<u8> {
+    /// Get a cached outbound stamp cost, or `None` if missing, expired or
+    /// announced without a cost.
+    pub fn get_stamp_cost(&self, destination_hash: &[u8; 16]) -> Option<f64> {
         let entry = self.outbound_stamp_costs.get(destination_hash)?;
         let now = now_f64();
         if now - entry.recorded_at < STAMP_COST_EXPIRY as f64 {
-            Some(entry.cost)
+            entry.cost
         } else {
             None
         }
     }
 
-    pub fn set_stamp_cost(&mut self, destination_hash: [u8; 16], cost: u8) {
+    pub fn set_stamp_cost(&mut self, destination_hash: [u8; 16], cost: f64) {
+        self.update_stamp_cost(destination_hash, Some(cost));
+    }
+
+    /// Python `update_stamp_cost`: record the cost a destination's latest
+    /// announce carried. `None` keeps an entry that makes later messages
+    /// unstamped until the next announce.
+    pub fn update_stamp_cost(&mut self, destination_hash: [u8; 16], cost: Option<f64>) {
         let now = now_f64();
         self.outbound_stamp_costs.insert(
             destination_hash,
@@ -1599,7 +1640,7 @@ impl LxmRouter {
         self.config.propagation_limit_kb = limit_kb;
     }
 
-    pub fn set_stamp_requirements(&mut self, cost: u8, flex: u8) {
+    pub fn set_stamp_requirements(&mut self, cost: f64, flex: f64) {
         self.config.propagation_stamp_cost = cost;
         self.config.propagation_stamp_flex = flex;
     }
@@ -1640,7 +1681,7 @@ impl LxmRouter {
         &self,
         message_hash: &[u8; 32],
         stamp: &[u8; 32],
-        required_cost: u8,
+        required_cost: f64,
     ) -> bool {
         stamper::validate_stamp(
             message_hash,
@@ -1659,7 +1700,7 @@ impl LxmRouter {
         &self,
         message_id: &[u8; 32],
         stamp: &[u8],
-        required_cost: u8,
+        required_cost: f64,
         destination_hash: &[u8; 16],
     ) -> bool {
         let now = now_f64();
@@ -2359,7 +2400,7 @@ pub struct PeerStats {
     pub last_heard: f64,
     pub sync_transfer_rate: f64,
     pub transfer_limit: Option<f64>,
-    pub stamp_cost: Option<u8>,
+    pub stamp_cost: Option<f64>,
     pub offered: u64,
     pub outgoing: u64,
     pub incoming: u64,
@@ -2373,9 +2414,9 @@ pub struct NodeStats {
     pub delivery_limit: f64,
     pub propagation_limit: usize,
     pub sync_limit: usize,
-    pub stamp_cost: u8,
-    pub stamp_flex: u8,
-    pub peering_cost: u8,
+    pub stamp_cost: f64,
+    pub stamp_flex: f64,
+    pub peering_cost: f64,
     pub message_count: usize,
     pub message_size: usize,
     pub storage_limit: Option<usize>,
@@ -2452,8 +2493,8 @@ mod tests {
         let config = RouterConfig::default();
         assert!(config.autopeer);
         assert_eq!(config.ext.autopeer_maxdepth, 4);
-        assert_eq!(config.ext.propagation_cost_min, 13);
-        assert_eq!(config.ext.max_peering_cost, 26);
+        assert_eq!(config.ext.propagation_cost_min, 13.0);
+        assert_eq!(config.ext.max_peering_cost, 26.0);
         assert!(config.ext.processing_outbound);
         assert!(config.ext.defer_stamp_generation);
         assert!(config.ext.processing_limit.is_none());
@@ -2768,8 +2809,91 @@ mod tests {
 
         assert!(router.get_stamp_cost(&dest).is_none());
 
-        router.set_stamp_cost(dest, 12);
-        assert_eq!(router.get_stamp_cost(&dest), Some(12));
+        router.set_stamp_cost(dest, 12.0);
+        assert_eq!(router.get_stamp_cost(&dest), Some(12.0));
+    }
+
+    #[test]
+    fn announce_without_cost_keeps_an_entry_and_stops_stamping() {
+        let mut router = LxmRouter::new(RouterConfig::default());
+        let dest = [0xAA; 16];
+        router.set_stamp_cost(dest, 8.5);
+        router.update_stamp_cost(dest, None);
+        assert!(router.outbound_stamp_costs.contains_key(&dest));
+        assert_eq!(router.get_stamp_cost(&dest), None);
+        let mut draft =
+            crate::message::LxMessageDraft::new(dest, [0xBB; 16], "", "x", DeliveryMethod::Direct)
+                .unwrap();
+        router.prepare_outbound(&mut draft).unwrap();
+        assert_eq!(draft.stamp_cost, None);
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        router.save_state(tmp.path()).unwrap();
+        let mut restored = LxmRouter::new(RouterConfig::default());
+        restored.load_state(tmp.path()).unwrap();
+        assert!(restored.outbound_stamp_costs[&dest].cost.is_none());
+    }
+
+    #[test]
+    fn integer_stamp_costs_stored_by_older_versions_still_load() {
+        #[derive(serde::Serialize)]
+        struct OldEntry {
+            cost: u8,
+            recorded_at: f64,
+        }
+        let tmp = tempfile::TempDir::new().unwrap();
+        let old = HashMap::from([(
+            [0xAA; 16],
+            OldEntry {
+                cost: 12,
+                recorded_at: now_f64(),
+            },
+        )]);
+        std::fs::write(
+            tmp.path().join(crate::persist::STAMP_COSTS_FILE),
+            rmp_serde::to_vec(&old).unwrap(),
+        )
+        .unwrap();
+        let mut router = LxmRouter::new(RouterConfig::default());
+        router.load_state(tmp.path()).unwrap();
+        assert_eq!(router.get_stamp_cost(&[0xAA; 16]), Some(12.0));
+    }
+
+    #[test]
+    fn deferred_stamp_at_an_impossible_cost_fails_the_message() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = rt.enter();
+        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
+        let mut router = LxmRouter::new(RouterConfig::default());
+        let mut draft = crate::message::LxMessageDraft::new(
+            [0xAA; 16],
+            [0xBB; 16],
+            "",
+            "x",
+            DeliveryMethod::Direct,
+        )
+        .unwrap();
+        draft.stamp_cost = Some(150.0);
+        let failed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = failed.clone();
+        draft.callbacks.on_failed = Some(std::sync::Arc::new(move |m: &LxMessage| {
+            seen.lock().unwrap().push(m.state);
+        }));
+        router.submit_signed(draft.sign(&key).unwrap()).unwrap();
+        for _ in 0..300 {
+            router.process_deferred_stamps();
+            if router.pending_deferred_stamps.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(router.pending_deferred_stamps.is_empty());
+        assert!(router.pending_outbound.is_empty());
+        assert_eq!(*failed.lock().unwrap(), [MessageState::Failed]);
     }
 
     #[test]
@@ -2778,7 +2902,7 @@ mod tests {
         let mut router = LxmRouter::new(RouterConfig::default());
         let dest = [0xAA; 16];
         router.remember_ticket(dest, [0x42; 16], now_f64() + 60.0);
-        router.set_stamp_cost(dest, 16);
+        router.set_stamp_cost(dest, 16.0);
 
         let mut msg = crate::message::LxMessageDraft::new(
             dest,
@@ -2938,7 +3062,7 @@ mod tests {
         let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
         let mut router = LxmRouter::new(RouterConfig::default());
         let dest = [0xAA; 16];
-        router.set_stamp_cost(dest, 1);
+        router.set_stamp_cost(dest, 1.0);
 
         let mut msg = crate::message::LxMessageDraft::new(
             dest,
@@ -2977,7 +3101,7 @@ mod tests {
         assert!(stamper::validate_stamp(
             &queued.message_id(),
             stamp,
-            1,
+            1.0,
             STAMP_WORKBLOCK_EXPAND_ROUNDS
         ));
     }
@@ -2995,7 +3119,7 @@ mod tests {
             "handle captured at construction"
         );
         let dest = [0xAA; 16];
-        router.set_stamp_cost(dest, 1);
+        router.set_stamp_cost(dest, 1.0);
 
         let mut msg = crate::message::LxMessageDraft::new(
             dest,
@@ -3054,7 +3178,7 @@ mod tests {
             DeliveryMethod::Direct,
         )
         .unwrap();
-        msg.stamp_cost = Some(1);
+        msg.stamp_cost = Some(1.0);
         router.prepare_outbound(&mut msg).unwrap();
         let msg = msg.sign(&key).unwrap();
         let id = msg.message_id();
@@ -3068,7 +3192,7 @@ mod tests {
         let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
         let mut router = LxmRouter::new(RouterConfig::default());
         let dest = [0xAA; 16];
-        router.set_stamp_cost(dest, 8);
+        router.set_stamp_cost(dest, 8.0);
 
         let mut msg = crate::message::LxMessageDraft::new(
             dest,
@@ -3157,7 +3281,7 @@ mod tests {
         material.extend_from_slice(&message_id);
         let stamp = rns_crypto::sha::truncated_hash(&material);
 
-        assert!(router.validate_stamp_with_tickets(&message_id, stamp.as_ref(), 16, &dest));
+        assert!(router.validate_stamp_with_tickets(&message_id, stamp.as_ref(), 16.0, &dest));
     }
 
     #[test]
@@ -3319,7 +3443,7 @@ mod tests {
         let transient_a = [0x11; 32];
 
         let mut r1 = LxmRouter::new(RouterConfig::default());
-        r1.set_stamp_cost(dest_a, 8);
+        r1.set_stamp_cost(dest_a, 8.0);
         // Far-future expiry so get_outbound_ticket (which uses wall-clock now) matches.
         r1.remember_ticket(dest_a, [0x01; 16], 4_102_444_800.0);
         r1.propagation_store.mark_locally_delivered(transient_a);
@@ -3333,8 +3457,8 @@ mod tests {
         let mut r2 = LxmRouter::new(RouterConfig::default());
         r2.load_state(tmp.path()).unwrap();
         assert_eq!(
-            r2.outbound_stamp_costs.get(&dest_a).map(|e| e.cost),
-            Some(8)
+            r2.outbound_stamp_costs.get(&dest_a).and_then(|e| e.cost),
+            Some(8.0)
         );
         assert_eq!(r2.get_outbound_ticket(&dest_a), Some([0x01; 16]));
         assert!(r2.propagation_store.is_locally_delivered(&transient_a));
@@ -3351,7 +3475,7 @@ mod tests {
         let transient = [0xB2; 32];
 
         let mut router = LxmRouter::new(RouterConfig::default());
-        router.set_stamp_cost(dest, 8);
+        router.set_stamp_cost(dest, 8.0);
         router.remember_ticket(dest, [0xC3; 16], 4_102_444_800.0);
         router.propagation_store.mark_locally_delivered(transient);
         router.propagation_store.mark_locally_processed(transient);
@@ -3364,7 +3488,7 @@ mod tests {
 
         // Mutating every persisted router dataset after capture must not alter
         // the snapshot that a background persistence task owns.
-        router.set_stamp_cost(dest, 42);
+        router.set_stamp_cost(dest, 42.0);
         router.remember_ticket(dest, [0xD4; 16], 4_102_444_800.0);
         router
             .propagation_store
@@ -3377,7 +3501,7 @@ mod tests {
         router.unpeered_propagation_incoming = 22;
         router.unpeered_propagation_rx_bytes = 23;
 
-        assert_eq!(snapshot.outbound_stamp_costs[&dest].cost, 8);
+        assert_eq!(snapshot.outbound_stamp_costs[&dest].cost, Some(8.0));
         let dir = tempfile::tempdir().unwrap();
         snapshot.tickets.save(dir.path(), None).unwrap();
         let (tickets, _) = crate::persist::load_tickets(dir.path()).unwrap();
@@ -3399,7 +3523,7 @@ mod tests {
 
         let snapshot = {
             let mut router = LxmRouter::new(RouterConfig::default());
-            router.set_stamp_cost(dest, 9);
+            router.set_stamp_cost(dest, 9.0);
             router.remember_ticket(dest, [0xC7; 16], 4_102_444_800.0);
             router.propagation_store.mark_locally_delivered(transient);
             router.propagation_store.mark_locally_processed(transient);
@@ -3414,7 +3538,7 @@ mod tests {
 
         let mut restored = LxmRouter::new(RouterConfig::default());
         restored.load_state(tmp.path()).unwrap();
-        assert_eq!(restored.outbound_stamp_costs[&dest].cost, 9);
+        assert_eq!(restored.outbound_stamp_costs[&dest].cost, Some(9.0));
         assert_eq!(restored.get_outbound_ticket(&dest), Some([0xC7; 16]));
         assert!(restored.propagation_store.is_locally_delivered(&transient));
         assert!(restored.propagation_store.is_locally_processed(&transient));
@@ -3508,9 +3632,9 @@ mod tests {
             10.0,
             Some(1.0),
             Some(2.0),
-            Some(16),
-            Some(3),
-            Some(18),
+            Some(16.0),
+            Some(3.0),
+            Some(18.0),
         );
         peer.mark_offer_generation_processed(5);
         router.add_peer(peer);
@@ -3532,9 +3656,9 @@ mod tests {
             timebase: 11.0,
             transfer_limit: Some(1.0),
             sync_limit: Some(2.0),
-            stamp_cost: Some(12),
-            stamp_flexibility: Some(3),
-            peering_cost: Some(18),
+            stamp_cost: Some(12.0),
+            stamp_flexibility: Some(3.0),
+            peering_cost: Some(18.0),
             metadata: Some(std::collections::HashMap::new()),
             hops: Some(1),
         }));
@@ -3577,11 +3701,16 @@ mod tests {
     fn test_validate_stamp() {
         let router = LxmRouter::new(RouterConfig::default());
         let msg_id = rns_crypto::sha::sha256(b"test message");
-        let stamp =
-            stamper::generate_stamp_limited(&msg_id, 4, STAMP_WORKBLOCK_EXPAND_ROUNDS, 1_000_000);
-        if let Some(stamp) = stamp {
-            assert!(router.validate_stamp(&msg_id, &stamp, 4));
-        }
+        let (stamp, value) = stamper::generate_stamp(
+            &msg_id,
+            4.5,
+            STAMP_WORKBLOCK_EXPAND_ROUNDS,
+            &stamper::StampControl::default(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(router.validate_stamp(&msg_id, &stamp, 4.5));
+        assert!(!router.validate_stamp(&msg_id, &stamp, value + 1.0 / 256.0));
     }
 
     #[test]
@@ -3876,7 +4005,7 @@ mod tests {
         assert!(router.process_outbound().is_empty());
 
         let pn_data = crate::handlers::get_propagation_node_app_data(
-            &crate::handlers::PropagationNodeAnnounceData::new(true, 256, 10240, 16, 3, 18),
+            &crate::handlers::PropagationNodeAnnounceData::new(true, 256, 10240, 16.0, 3.0, 18.0),
         );
         assert_eq!(
             router.trigger_outbound_for_propagation_node_announce(node, &pn_data),
@@ -4258,9 +4387,9 @@ mod tests {
             timebase: 1000.0,
             transfer_limit: Some(256.0),
             sync_limit: Some(10240.0),
-            stamp_cost: Some(16),
-            stamp_flexibility: Some(3),
-            peering_cost: Some(18),
+            stamp_cost: Some(16.0),
+            stamp_flexibility: Some(3.0),
+            peering_cost: Some(18.0),
             metadata: None,
             hops: Some(2),
         }));
@@ -4300,7 +4429,7 @@ mod tests {
         let mut peer = LxmPeer::new(peer_hash);
         peer.is_static = true;
         peer.peering_timebase = 100.0;
-        peer.stamp_cost = Some(8);
+        peer.stamp_cost = Some(8.0);
         router.add_peer(peer);
 
         let candidate = |timebase, stamp_cost| AutopeerCandidate {
@@ -4309,29 +4438,29 @@ mod tests {
             transfer_limit: Some(2.0),
             sync_limit: Some(8.0),
             stamp_cost: Some(stamp_cost),
-            stamp_flexibility: Some(3),
-            peering_cost: Some(18),
+            stamp_flexibility: Some(3.0),
+            peering_cost: Some(18.0),
             metadata: None,
             hops: Some(99),
         };
 
-        assert!(router.autopeer(candidate(101.0, 16)));
+        assert!(router.autopeer(candidate(101.0, 16.0)));
         let refreshed = router.peers.get(&peer_hash).unwrap();
-        assert_eq!(refreshed.stamp_cost, Some(16));
+        assert_eq!(refreshed.stamp_cost, Some(16.0));
         assert_eq!(refreshed.propagation_sync_limit, Some(8.0));
         assert!(refreshed.is_static);
 
-        assert!(!router.autopeer(candidate(100.0, 4)));
-        assert_eq!(router.peers.get(&peer_hash).unwrap().stamp_cost, Some(16));
+        assert!(!router.autopeer(candidate(100.0, 4.0)));
+        assert_eq!(router.peers.get(&peer_hash).unwrap().stamp_cost, Some(16.0));
 
         assert!(!router.autopeer(AutopeerCandidate {
             destination_hash: [0xBB; 16],
             timebase: 101.0,
             transfer_limit: Some(2.0),
             sync_limit: Some(8.0),
-            stamp_cost: Some(16),
-            stamp_flexibility: Some(3),
-            peering_cost: Some(18),
+            stamp_cost: Some(16.0),
+            stamp_flexibility: Some(3.0),
+            peering_cost: Some(18.0),
             metadata: None,
             hops: Some(1),
         }));
@@ -4357,9 +4486,9 @@ mod tests {
             timebase: 101.0,
             transfer_limit: Some(2.0),
             sync_limit: Some(8.0),
-            stamp_cost: Some(16),
-            stamp_flexibility: Some(3),
-            peering_cost: Some(18),
+            stamp_cost: Some(16.0),
+            stamp_flexibility: Some(3.0),
+            peering_cost: Some(18.0),
             metadata: Some(std::collections::HashMap::from([(
                 crate::constants::PN_META_NAME,
                 b"static".to_vec(),
@@ -4393,7 +4522,7 @@ mod tests {
             sync_limit: None,
             stamp_cost: None,
             stamp_flexibility: None,
-            peering_cost: Some(max + 1),
+            peering_cost: Some(max + 1.0),
             metadata: None,
             hops: None,
         }));
@@ -4408,9 +4537,9 @@ mod tests {
             timebase,
             transfer_limit: Some(2.0),
             sync_limit: Some(8.0),
-            stamp_cost: Some(16),
-            stamp_flexibility: Some(3),
-            peering_cost: Some(18),
+            stamp_cost: Some(16.0),
+            stamp_flexibility: Some(3.0),
+            peering_cost: Some(18.0),
             metadata: None,
             hops: Some(hops),
         };
@@ -4450,20 +4579,20 @@ mod tests {
         let mut router = LxmRouter::new(RouterConfig::default());
         let max = router.config.ext.max_peering_cost;
 
-        let candidate = |cost: Option<u8>| AutopeerCandidate {
+        let candidate = |cost: Option<f64>| AutopeerCandidate {
             destination_hash: [0xAA; 16],
             timebase: 1000.0,
             transfer_limit: Some(256.0),
             sync_limit: None,
-            stamp_cost: Some(16),
-            stamp_flexibility: Some(3),
+            stamp_cost: Some(16.0),
+            stamp_flexibility: Some(3.0),
             peering_cost: cost,
             metadata: None,
             hops: Some(2),
         };
 
         // Over-cost announce: refused outright.
-        assert!(!router.autopeer(candidate(Some(max + 1))));
+        assert!(!router.autopeer(candidate(Some(max + 0.25))));
         assert!(router.peers.is_empty());
 
         // At-cost announce: accepted.
@@ -4471,7 +4600,7 @@ mod tests {
         assert_eq!(router.peers.len(), 1);
 
         // Existing peer raising its cost beyond the cap: peering breaks.
-        assert!(!router.autopeer(candidate(Some(max + 1))));
+        assert!(!router.autopeer(candidate(Some(max + 0.25))));
         assert!(router.peers.is_empty(), "over-cost announce must unpeer");
     }
 
@@ -4795,7 +4924,7 @@ mod tests {
         let destination = [0xA7; 16];
         let mut sender = LxmRouter::new(RouterConfig::default());
         sender.remember_ticket(destination, [0x42; 16], now_f64() + 60.0);
-        sender.set_stamp_cost(destination, 8);
+        sender.set_stamp_cost(destination, 8.0);
         let mut draft = resumable_draft(source, "ticketed");
         sender.prepare_outbound(&mut draft).unwrap();
         assert!(draft.outbound_ticket.is_some());
@@ -4813,21 +4942,21 @@ mod tests {
             .restore_signed(&stored, &public_key, DeliveryMethod::Direct)
             .unwrap();
         assert_eq!(restored.outbound_ticket(), None);
-        assert_eq!(restored.stamp_cost(), Some(8));
+        assert_eq!(restored.stamp_cost(), Some(8.0));
         let id = restored.message_id();
         restarted.submit_signed(restored).unwrap();
         assert!(restarted.pending_deferred_stamps.contains_key(&id));
 
-        restarted.set_stamp_cost(destination, 12);
+        restarted.set_stamp_cost(destination, 12.0);
         let raised = restarted
             .restore_signed(&stored, &public_key, DeliveryMethod::Direct)
             .unwrap();
-        assert_eq!(raised.stamp_cost(), Some(12));
-        restarted.set_stamp_cost(destination, 4);
+        assert_eq!(raised.stamp_cost(), Some(12.0));
+        restarted.set_stamp_cost(destination, 4.0);
         let lowered = restarted
             .restore_signed(&stored, &public_key, DeliveryMethod::Direct)
             .unwrap();
-        assert_eq!(lowered.stamp_cost(), Some(8));
+        assert_eq!(lowered.stamp_cost(), Some(8.0));
 
         restarted.remember_ticket(destination, [0x43; 16], now_f64() + 60.0);
         let ticketed = restarted
@@ -4852,7 +4981,7 @@ mod tests {
         assert_eq!(router.pending_outbound.len(), 1);
 
         let mut stamped = resumable_draft(source, "stamped once");
-        stamped.stamp_cost = Some(8);
+        stamped.stamp_cost = Some(8.0);
         router
             .submit_signed(stamped.clone().sign(&key).unwrap())
             .unwrap();
@@ -4892,7 +5021,7 @@ mod tests {
         let mut submitted = Vec::new();
         for n in 0..12 {
             let mut draft = resumable_draft(source, &format!("deferred {n}"));
-            draft.stamp_cost = Some(1);
+            draft.stamp_cost = Some(1.0);
             let signed = draft.sign(&key).unwrap();
             submitted.push(signed.message_id());
             router.submit_signed(signed).unwrap();
