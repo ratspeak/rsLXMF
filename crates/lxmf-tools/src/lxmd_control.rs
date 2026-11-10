@@ -604,7 +604,7 @@ pub fn format_remote_status(
                 _ => "never synced".to_string(),
             };
             let name =
-                lxmf_core::presentation::sanitize_name(map_str(peer, "name").unwrap_or(""), 46);
+                lxmf_core::presentation::sanitize_name_lxmd(map_str(peer, "name").unwrap_or(""));
             let display_name = if name.chars().count() > 45 {
                 format!("{}...", name.chars().take(45).collect::<String>())
             } else {

@@ -5,7 +5,10 @@ use unicode_normalization::UnicodeNormalization;
 /// Maximum retained characters for an advertised LXMF display/node name.
 pub const MAX_ADVERTISED_NAME_CHARS: usize = 128;
 
-/// Normalize and bound an untrusted display name.
+/// Normalize and bound an untrusted display name for presentation.
+///
+/// This is an application display policy; the announce helpers in
+/// [`crate::handlers`] return names unfiltered, as Python LXMF does.
 ///
 /// Applies NFKC normalization and filters control characters, bidi controls,
 /// private-use characters, selected zero-width characters, variation selectors,
@@ -130,6 +133,85 @@ fn is_emoji(codepoint: u32) -> bool {
             | 0x3297
             | 0x3299
             | 0x1F000..=0x1FAFF
+    )
+}
+
+/// Python `str.isspace()`: Unicode White_Space plus U+001C..U+001F.
+pub fn is_python_space(character: char) -> bool {
+    character.is_whitespace() || matches!(character, '\u{1c}'..='\u{1f}')
+}
+
+/// Python `str.strip()` with no arguments.
+pub fn python_strip(text: &str) -> &str {
+    text.trim_matches(is_python_space)
+}
+
+/// The name filter `lxmd --peers` applies (Python `lxmd.sanitize_name`):
+/// NFKC, then keep letters, numbers, punctuation and spacing marks, map
+/// separators to a space, drop the emoji, control and private-use blocks,
+/// collapse whitespace and strip. Truncation is left to the caller.
+pub fn sanitize_name_lxmd(input: &str) -> String {
+    use unicode_general_category::{GeneralCategory as C, get_general_category};
+    let mut kept = String::new();
+    for character in input.nfkc() {
+        let category = get_general_category(character);
+        let mapped = match category {
+            C::SpaceSeparator | C::LineSeparator | C::ParagraphSeparator => ' ',
+            C::UppercaseLetter
+            | C::LowercaseLetter
+            | C::TitlecaseLetter
+            | C::ModifierLetter
+            | C::OtherLetter
+            | C::DecimalNumber
+            | C::LetterNumber
+            | C::OtherNumber
+            | C::ConnectorPunctuation
+            | C::DashPunctuation
+            | C::OpenPunctuation
+            | C::ClosePunctuation
+            | C::InitialPunctuation
+            | C::FinalPunctuation
+            | C::OtherPunctuation
+            | C::SpacingMark => character,
+            _ => continue,
+        };
+        if !is_lxmd_stripped(mapped as u32) {
+            kept.push(mapped);
+        }
+    }
+    let mut output = String::with_capacity(kept.len());
+    for word in kept.split(is_python_space).filter(|w| !w.is_empty()) {
+        if !output.is_empty() {
+            output.push(' ');
+        }
+        output.push_str(word);
+    }
+    output
+}
+
+// STRIP_BLOCKS_RE, STRIP_CONTROL_RE and STRIP_PRIVATE_RE of Python lxmd.
+fn is_lxmd_stripped(codepoint: u32) -> bool {
+    matches!(
+        codepoint,
+        0x1F300..=0x1FAFF
+            | 0x1F1E0..=0x1F1FF
+            | 0x2600..=0x27BF
+            | 0xFE00..=0xFE0F
+            | 0xE0100..=0xE01EF
+            | 0x00..=0x08
+            | 0x0B
+            | 0x0C
+            | 0x0E..=0x1F
+            | 0x7F..=0x9F
+            | 0x200B..=0x200F
+            | 0x202A..=0x202E
+            | 0x2060..=0x206F
+            | 0xFEFF
+            | 0xFFF0..=0xFFF8
+            | 0xD800..=0xDFFF
+            | 0xE000..=0xFAFF
+            | 0xFE10..=0xFE2F
+            | 0xF0000..=0x10FFFF
     )
 }
 

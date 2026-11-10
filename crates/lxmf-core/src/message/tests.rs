@@ -22,12 +22,7 @@ fn payload(fields: &[u8], stamp: Option<&[u8]>) -> Vec<u8> {
 fn wire(payload: &[u8]) -> Vec<u8> {
     let mut signed = vec![1; 16];
     signed.extend_from_slice(&[2; 16]);
-    if let Some(body) = first_four_msgpack_array_body(payload) {
-        signed.push(0x94);
-        signed.extend_from_slice(body);
-    } else {
-        signed.extend_from_slice(payload);
-    }
+    signed.extend_from_slice(&canonical::hashed_payload(payload).unwrap());
     let hash = sha256(&signed);
     signed.extend_from_slice(&hash);
     let mut out = vec![1; 16];
@@ -201,10 +196,7 @@ fn field_id_duplicate_numeric_encodings_rejected() {
         vec![0x82, 1, 0xc0, 0xd1, 0, 1, 0xc0],
         vec![0x82, 0xcf, 0, 0, 0, 0, 0, 0, 0, 1, 0xc0, 0xcc, 1, 0xc0],
     ] {
-        assert!(matches!(
-            LxMessage::unpack(&wire(&payload(&map, None))),
-            Err(MessageError::DuplicateField)
-        ));
+        assert!(LxMessage::unpack(&wire(&payload(&map, None))).is_err());
         let mut dto = vec![0x94, 0xcb];
         dto.extend_from_slice(&0f64.to_be_bytes());
         dto.extend_from_slice(&[0xc4, 0, 0xc4, 0]);
@@ -229,15 +221,20 @@ fn field_id_coherent_replacement_and_binary_is_not_structure() {
     assert_eq!(freeze(d).audio_field().unwrap().unwrap().bytes, &[1, 2]);
 }
 #[test]
-fn field_id_opaque_nested_duplicate_map_is_preserved() {
+fn field_id_nested_duplicate_map_is_rejected() {
     let raw = vec![0x82, 1, 0x01, 0xd1, 0, 1, 0x02];
     let mut d = draft();
-    d.set_msgpack_field(300u64, raw.clone()).unwrap();
-    let m = freeze(d);
-    assert_eq!(m.get_field(300u64).unwrap().encoded(), raw);
-    assert_eq!(
-        LxMessage::unpack(m.wire_bytes()).unwrap().pack().unwrap(),
-        m.wire_bytes()
+    assert!(d.set_msgpack_field(300u64, raw.clone()).is_err());
+    assert!(
+        LxMessage::unpack(&wire(&payload(
+            &[0x81, 0xcd, 1, 44]
+                .iter()
+                .copied()
+                .chain(raw)
+                .collect::<Vec<_>>(),
+            None
+        )))
+        .is_err()
     );
 }
 #[test]
@@ -584,10 +581,17 @@ fn nested_field_duplicate_schema_reader_rejects_ambiguous_keys() {
         vec![0x81, 0xc3, 0],
     ] {
         let mut d = draft();
-        d.set_msgpack_field(300u64, encoded).unwrap();
-        let m = freeze(d);
-        assert!(m.get_field(300u64).unwrap().unique_map().is_err());
-        assert!(m.verify_signature(&key().public_key()));
+        let map = vec![0x81, 0xcd, 1, 44].into_iter().chain(encoded.clone());
+        if encoded[0] == 0x81 {
+            // A single bool key is valid MessagePack; only the schema reader rejects it.
+            d.set_msgpack_field(300u64, encoded).unwrap();
+            let m = freeze(d);
+            assert!(m.get_field(300u64).unwrap().unique_map().is_err());
+            assert!(m.verify_signature(&key().public_key()));
+        } else {
+            assert!(d.set_msgpack_field(300u64, encoded).is_err());
+            assert!(LxMessage::unpack(&wire(&payload(&map.collect::<Vec<_>>(), None))).is_err());
+        }
     }
     let mut d = draft();
     d.set_msgpack_field(300u64, vec![0x82, 0xa1, b'a', 0xc4, 1, 7, 0x01, 0x02])
@@ -844,4 +848,92 @@ fn resumable_form_round_trips_and_rejects_damage() {
             "byte {at} = {value:#x} accepted"
         );
     }
+}
+#[test]
+fn paper_uri_base64_matches_python_urlsafe_b64decode() {
+    let corpus = include_str!("fixtures/python-urlsafe-b64decode.tsv");
+    for line in corpus.lines() {
+        let (input, want) = line.split_once('\t').unwrap();
+        let data = String::from_utf8(hex::decode(input).unwrap()).unwrap() + "==";
+        let got = python_urlsafe_b64decode(&data).ok().map(hex::encode);
+        let want = (want != "error").then(|| want.to_string());
+        assert_eq!(got, want, "input {data:?}");
+    }
+    assert!(python_urlsafe_b64decode("QUJD\u{e9}==").is_err());
+}
+#[test]
+fn paper_uri_accepts_padding_slashes_and_rejects_upper_case_prefix() {
+    let mut m = freeze(draft());
+    m.method = DeliveryMethod::Paper;
+    let uri = m.to_paper_uri(|tail| Ok(tail.to_vec())).unwrap();
+    for variant in [
+        format!("{uri}/"),
+        format!("{uri}=="),
+        uri.replacen("lxm://", "lxm:///", 1),
+    ] {
+        let read = LxMessage::from_paper_uri(&variant, |tail| Ok(tail.to_vec())).unwrap();
+        assert_eq!(read.wire_bytes(), m.wire_bytes(), "{variant}");
+    }
+    // Upstream only strips the lower-case prefix, so "LXM:" stays in the base64 input.
+    let upper = uri.replacen("lxm://", "LXM://", 1);
+    let decoded = LxMessage::from_paper_uri(&upper, |tail| Ok(tail.to_vec()));
+    assert!(decoded.map_or(true, |read| read.wire_bytes() != m.wire_bytes()));
+}
+#[test]
+fn integer_timestamp_is_accepted_and_hashed_as_received() {
+    let mut p = payload(&[0x80], None);
+    p.splice(1..10, [0xce, 0x65, 0x53, 0xf1, 0x00]);
+    let m = LxMessage::unpack(&wire(&p)).unwrap();
+    assert_eq!(m.timestamp(), 1_700_000_000.0);
+    assert!(m.verify_signature(&key().public_key()));
+}
+#[test]
+fn nested_duplicate_map_keys_are_rejected_on_send_and_receive() {
+    let mut d = draft();
+    assert!(
+        d.set_msgpack_field(2u8, vec![0x82, 0x01, 0x01, 0x01, 0x02])
+            .is_err()
+    );
+    assert!(
+        d.set_msgpack_field(2u8, vec![0x81, 0x81, 0x01, 0x01, 0x02])
+            .is_err()
+    );
+    let p = payload(&[0x81, 0x02, 0x82, 0x01, 0x01, 0x01, 0x02], None);
+    assert!(LxMessage::unpack(&wire(&p)).is_err());
+}
+#[test]
+fn msgpack_fields_are_stored_canonically() {
+    let mut d = draft();
+    d.set_msgpack_field(2u8, vec![0x91, 0xca, 0x3f, 0xc0, 0, 0])
+        .unwrap();
+    assert_eq!(
+        d.get_field(2u8),
+        Some(&FieldValue::MessagePack(
+            EncodedFieldValue::new(Bytes::from_static(&[
+                0x91, 0xcb, 0x3f, 0xf8, 0, 0, 0, 0, 0, 0
+            ]))
+            .unwrap()
+        ))
+    );
+}
+#[test]
+fn container_is_a_named_map() {
+    let m = freeze(draft());
+    let value = rmpv::decode::read_value(&mut &m.pack_container().unwrap()[..]).unwrap();
+    let keys: Vec<_> = value
+        .as_map()
+        .unwrap()
+        .iter()
+        .map(|(k, _)| k.as_str().unwrap())
+        .collect();
+    assert_eq!(
+        keys,
+        [
+            "state",
+            "lxmf_bytes",
+            "transport_encrypted",
+            "transport_encryption",
+            "method"
+        ]
+    );
 }

@@ -188,7 +188,7 @@ impl LxMessageDraft {
     ) -> Result<(), MessageError> {
         self.set_field_value(
             id,
-            FieldValue::MessagePack(EncodedFieldValue::new(bytes.into())?),
+            FieldValue::MessagePack(EncodedFieldValue::canonical(bytes.into())?),
         )
     }
     pub fn set_field_value(
@@ -197,6 +197,12 @@ impl LxMessageDraft {
         value: FieldValue,
     ) -> Result<(), MessageError> {
         let id = id.into();
+        let value = match value {
+            FieldValue::MessagePack(v) => FieldValue::MessagePack(EncodedFieldValue::canonical(
+                Bytes::copy_from_slice(v.encoded()),
+            )?),
+            binary => binary,
+        };
         if !self.fields.contains_key(&id) && self.fields.len() >= self.limits.max_top_level_fields {
             return Err(MessageError::TooManyFields);
         }

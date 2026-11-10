@@ -7,7 +7,6 @@
 use std::collections::HashMap;
 
 use crate::constants::*;
-use crate::presentation::{MAX_ADVERTISED_NAME_CHARS, sanitize_name};
 
 /// Announce handler type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,12 +100,12 @@ impl PropagationNodeAnnounceData {
         }
     }
 
+    /// Set the advertised node name unchanged; an empty name is not advertised.
     pub fn set_name(&mut self, name: &str) {
-        let name = sanitize_name(name, MAX_ADVERTISED_NAME_CHARS);
         if name.is_empty() {
             self.metadata.remove(&PN_META_NAME);
         } else {
-            self.metadata.insert(PN_META_NAME, name.into_bytes());
+            self.metadata.insert(PN_META_NAME, name.as_bytes().to_vec());
         }
     }
 }
@@ -144,55 +143,271 @@ pub fn get_propagation_node_app_data(data: &PropagationNodeAnnounceData) -> Vec<
     crate::encode_value(&announce_data)
 }
 
-/// Parse a propagation-node announce array with at least seven elements.
+/// Decode MessagePack with the acceptance rules of Python's umsgpack decoder.
+fn decode_python(data: &[u8]) -> Option<rmpv::Value> {
+    crate::message::canonical::validate_leading(data).ok()?;
+    rmpv::decode::read_value(&mut &data[..]).ok()
+}
+
+/// Python `==` between a decoded value and an integer.
+fn python_equals_int(value: &rmpv::Value, target: i64) -> bool {
+    match value {
+        rmpv::Value::Integer(n) => n.as_i64() == Some(target),
+        rmpv::Value::Boolean(b) => i64::from(*b) == target,
+        rmpv::Value::F32(f) => f64::from(*f) == target as f64,
+        rmpv::Value::F64(f) => *f == target as f64,
+        _ => false,
+    }
+}
+
+/// Python `len()`; `None` where Python raises `TypeError`.
+fn python_len(value: &rmpv::Value) -> Option<usize> {
+    match value {
+        rmpv::Value::Array(items) => Some(items.len()),
+        rmpv::Value::Map(entries) => Some(entries.len()),
+        rmpv::Value::String(text) => text.as_str().map(|t| t.chars().count()),
+        rmpv::Value::Binary(bytes) => Some(bytes.len()),
+        _ => None,
+    }
+}
+
+/// Python `value[index]` for a non-negative integer index.
+fn python_index(value: &rmpv::Value, index: usize) -> Option<rmpv::Value> {
+    match value {
+        rmpv::Value::Array(items) => items.get(index).cloned(),
+        rmpv::Value::Binary(bytes) => bytes.get(index).map(|b| rmpv::Value::from(*b)),
+        rmpv::Value::String(text) => text
+            .as_str()?
+            .chars()
+            .nth(index)
+            .map(|c| rmpv::Value::from(c.to_string())),
+        rmpv::Value::Map(entries) => entries
+            .iter()
+            .rev()
+            .find(|(k, _)| python_equals_int(k, index as i64))
+            .map(|(_, v)| v.clone()),
+        _ => None,
+    }
+}
+
+/// Characters stripped by Python `bytes.strip()` / skipped by `int(bytes)`.
+fn is_ascii_python_space(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0b' | '\x0c')
+}
+
+/// Decimal value of a digit accepted by Python `int(str)` (`Nd` characters).
+fn decimal_digit(c: char, unicode: bool) -> Option<u32> {
+    if let Some(d) = c.to_digit(10) {
+        return Some(d);
+    }
+    if !unicode || c.is_ascii() {
+        return None;
+    }
+    use unicode_general_category::{GeneralCategory, get_general_category};
+    let is_nd = |c: char| get_general_category(c) == GeneralCategory::DecimalNumber;
+    if !is_nd(c) {
+        return None;
+    }
+    // Unicode assigns Nd characters in contiguous runs that start at zero.
+    let mut start = c as u32;
+    while start > 0 && char::from_u32(start - 1).is_some_and(is_nd) {
+        start -= 1;
+    }
+    Some((c as u32 - start) % 10)
+}
+
+/// Text of a str/bytes value with Python's surrounding whitespace removed.
+fn python_numeric_text(value: &rmpv::Value) -> Option<(String, bool)> {
+    match value {
+        rmpv::Value::String(text) => Some((
+            crate::presentation::python_strip(text.as_str()?).to_string(),
+            true,
+        )),
+        rmpv::Value::Binary(bytes) => {
+            let text = std::str::from_utf8(bytes).ok().filter(|t| t.is_ascii())?;
+            Some((text.trim_matches(is_ascii_python_space).to_string(), false))
+        }
+        _ => None,
+    }
+}
+
+/// Digits with single underscores between them, mapped to ASCII.
+fn python_digit_run(text: &str, unicode: bool) -> Option<String> {
+    let mut out = String::new();
+    let mut previous_digit = false;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '_' {
+            let next_digit = chars
+                .peek()
+                .is_some_and(|n| decimal_digit(*n, unicode).is_some());
+            if !previous_digit || !next_digit {
+                return None;
+            }
+            previous_digit = false;
+            continue;
+        }
+        let digit = decimal_digit(c, unicode)?;
+        out.push(char::from_digit(digit, 10).expect("decimal digit"));
+        previous_digit = true;
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// Python `int(value)`; `None` where Python raises. Saturates outside `i128`.
+fn python_int(value: &rmpv::Value) -> Option<i128> {
+    match value {
+        rmpv::Value::Integer(n) => n
+            .as_i64()
+            .map(i128::from)
+            .or_else(|| n.as_u64().map(i128::from)),
+        rmpv::Value::Boolean(b) => Some(i128::from(*b)),
+        rmpv::Value::F32(f) => f.is_finite().then(|| f.trunc() as i128),
+        rmpv::Value::F64(f) => f.is_finite().then(|| f.trunc() as i128),
+        rmpv::Value::String(_) | rmpv::Value::Binary(_) => {
+            let (text, unicode) = python_numeric_text(value)?;
+            let (negative, digits) = match text.strip_prefix('-') {
+                Some(rest) => (true, rest),
+                None => (false, text.strip_prefix('+').unwrap_or(&text)),
+            };
+            let digits = python_digit_run(digits, unicode)?;
+            let magnitude = digits.bytes().fold(0i128, |acc, d| {
+                acc.saturating_mul(10).saturating_add(i128::from(d - b'0'))
+            });
+            Some(if negative { -magnitude } else { magnitude })
+        }
+        _ => None,
+    }
+}
+
+/// Python `float(value)`; `None` where Python raises.
+fn python_float(value: &rmpv::Value) -> Option<f64> {
+    match value {
+        rmpv::Value::Integer(n) => n
+            .as_i64()
+            .map(|i| i as f64)
+            .or_else(|| n.as_u64().map(|u| u as f64)),
+        rmpv::Value::Boolean(b) => Some(f64::from(u8::from(*b))),
+        rmpv::Value::F32(f) => Some(f64::from(*f)),
+        rmpv::Value::F64(f) => Some(*f),
+        rmpv::Value::String(_) | rmpv::Value::Binary(_) => {
+            let (text, unicode) = python_numeric_text(value)?;
+            let body = text.strip_prefix(['+', '-']).unwrap_or(&text);
+            let lower = body.to_ascii_lowercase();
+            if matches!(lower.as_str(), "inf" | "infinity" | "nan") {
+                return text.to_ascii_lowercase().parse::<f64>().ok();
+            }
+            let sign = &text[..text.len() - body.len()];
+            let (mantissa, exponent) = match body.find(['e', 'E']) {
+                Some(at) => (&body[..at], Some(&body[at + 1..])),
+                None => (body, None),
+            };
+            let (whole, fraction) = match mantissa.split_once('.') {
+                Some((w, f)) => (w, Some(f)),
+                None => (mantissa, None),
+            };
+            let run = |part: &str| {
+                if part.is_empty() {
+                    Some(String::new())
+                } else {
+                    python_digit_run(part, unicode)
+                }
+            };
+            let whole = run(whole)?;
+            let fraction = match fraction {
+                Some(part) => Some(run(part)?),
+                None => None,
+            };
+            if whole.is_empty() && fraction.as_deref().is_none_or(str::is_empty) {
+                return None;
+            }
+            let mut normalized = format!("{sign}{whole}");
+            if let Some(fraction) = fraction {
+                normalized.push('.');
+                normalized.push_str(&fraction);
+            }
+            if let Some(exponent) = exponent {
+                let exponent_body = exponent.strip_prefix(['+', '-']).unwrap_or(exponent);
+                let exponent_sign = &exponent[..exponent.len() - exponent_body.len()];
+                normalized.push('e');
+                normalized.push_str(exponent_sign);
+                normalized.push_str(&python_digit_run(exponent_body, unicode)?);
+            }
+            normalized.parse::<f64>().ok()
+        }
+        _ => None,
+    }
+}
+
+/// `Some(state)` when Python's `value == True` or `value == False` holds.
+fn python_bool_state(value: &rmpv::Value) -> Option<bool> {
+    if python_equals_int(value, 1) {
+        Some(true)
+    } else if python_equals_int(value, 0) {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn python_floats(list: &rmpv::Value) -> Option<()> {
+    if !list.is_array() {
+        return None;
+    }
+    for i in 0..3 {
+        python_float(&python_index(list, i)?)?;
+    }
+    Some(())
+}
+
+/// The decoded announce when Python `pn_announce_data_is_valid` accepts it.
+fn valid_pn_announce(data: &[u8]) -> Option<rmpv::Value> {
+    let value = decode_python(data)?;
+    let length = python_len(&value)?;
+    if length < 7 {
+        return None;
+    }
+    python_int(&python_index(&value, 1)?)?;
+    python_bool_state(&python_index(&value, 2)?)?;
+    python_int(&python_index(&value, 3)?)?;
+    python_int(&python_index(&value, 4)?)?;
+    python_floats(&python_index(&value, 5)?)?;
+    if !python_index(&value, 6)?.is_map() {
+        return None;
+    }
+    if length > 7 {
+        python_floats(&python_index(&value, 7)?)?;
+    }
+    Some(value)
+}
+
+/// Python `pn_announce_data_is_valid`, including its `int()`/`float()`
+/// coercions and the transitional slot 7 check.
+pub fn pn_announce_data_is_valid(data: &[u8]) -> bool {
+    valid_pn_announce(data).is_some()
+}
+
+/// Parse propagation-node announce data that [`pn_announce_data_is_valid`] accepts.
 ///
-/// Requires a boolean state, numeric timebase, nonnegative finite limits/costs,
-/// a cost array with at least three values, and a metadata map. Rust casts apply; costs must
-/// fit in `u8` after conversion. The legacy slot is ignored. Only metadata with
-/// `u8` keys and binary values is retained. Extra array elements and trailing
-/// MessagePack bytes are not rejected.
-///
-/// This parser does not authenticate the announce or enforce timebase freshness.
-/// Its coercion and filtering rules differ from Python `pn_announce_data_is_valid`.
+/// Values are extracted with `int()` as the Python announce handler does; it
+/// returns `None` where that handler's conversion raises. Limits below zero
+/// become zero and costs saturate to the `u8` range. Fractional costs in slot
+/// 7 are not read. Only metadata with `u8` keys and binary values is retained.
 pub fn parse_pn_announce_data(data: &[u8]) -> Option<PropagationNodeAnnounceData> {
-    fn nonnegative_u64(value: &rmpv::Value) -> Option<u64> {
-        value
-            .as_u64()
-            .or_else(|| value.as_i64().and_then(|number| number.try_into().ok()))
-            .or_else(|| {
-                value.as_f64().and_then(|number| {
-                    (number.is_finite() && number >= 0.0).then_some(number as u64)
-                })
-            })
-    }
+    let value = valid_pn_announce(data)?;
+    let int_at = |index: usize| python_int(&python_index(&value, index)?);
+    let timebase = int_at(1)?.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64;
+    let node_state = python_bool_state(&python_index(&value, 2)?)?;
+    let limit = |raw: i128| raw.clamp(0, i128::from(u64::MAX)) as u64;
+    let transfer_limit = limit(int_at(3)?);
+    let sync_limit = limit(int_at(4)?);
+    let costs = python_index(&value, 5)?;
+    let cost =
+        |index: usize| python_int(&python_index(&costs, index)?).map(|raw| raw.clamp(0, 255) as u8);
+    let (stamp_cost, stamp_flex, peering_cost) = (cost(0)?, cost(1)?, cost(2)?);
 
-    let value: rmpv::Value = rmpv::decode::read_value(&mut &data[..]).ok()?;
-    let arr = value.as_array()?;
-    if arr.len() < 7 {
-        return None;
-    }
-
-    let timebase = arr[1]
-        .as_i64()
-        .or_else(|| arr[1].as_u64().map(|u| u as i64))
-        .or_else(|| arr[1].as_f64().map(|f| f as i64))?;
-    let node_state = arr[2].as_bool()?;
-    let transfer_limit = nonnegative_u64(&arr[3])?;
-    let sync_limit = nonnegative_u64(&arr[4])?;
-
-    let costs = arr[5].as_array()?;
-    if costs.len() < 3 {
-        return None;
-    }
-    let stamp_cost = u8::try_from(nonnegative_u64(&costs[0])?).ok()?;
-    let stamp_flex = u8::try_from(nonnegative_u64(&costs[1])?).ok()?;
-    let peering_cost = u8::try_from(nonnegative_u64(&costs[2])?).ok()?;
-
-    // Python's `pn_announce_data_is_valid()` requires the metadata element to
-    // be a map. Unknown keys and non-binary values are ignored here because
-    // the typed Rust API can only retain metadata it can represent safely.
     let mut metadata = HashMap::new();
-    for (k, v) in arr[6].as_map()? {
+    for (k, v) in python_index(&value, 6)?.as_map()? {
         if let (Some(key), Some(val)) = (
             k.as_u64().and_then(|number| number.try_into().ok()),
             v.as_slice().map(|s| s.to_vec()),
@@ -214,9 +429,9 @@ pub fn parse_pn_announce_data(data: &[u8]) -> Option<PropagationNodeAnnounceData
     })
 }
 
-/// Extract stamp cost from propagation-node announce data.
+/// Extract the integer stamp cost from propagation-node announce data.
 ///
-/// Uses [`parse_pn_announce_data`] and its numeric conversion rules.
+/// Uses [`parse_pn_announce_data`]; the fractional slot 7 is not read.
 pub fn pn_stamp_cost_from_app_data(data: &[u8]) -> Option<u8> {
     parse_pn_announce_data(data).map(|p| p.stamp_cost)
 }
@@ -226,16 +441,11 @@ pub fn pn_stamp_cost_from_app_data(data: &[u8]) -> Option<u8> {
 /// list advertises [`SF_COMPRESSION`].
 ///
 /// `stamp_cost` must be in `1..=254`; out-of-range or `None` values are encoded as nil.
-///
-/// Names are sanitized and limited to [`MAX_ADVERTISED_NAME_CHARS`] characters.
-/// Python reference: `LXMRouter.get_announce_app_data`.
+/// The name is encoded unchanged, as Python `LXMRouter.get_announce_app_data` does.
 pub fn get_announce_app_data(display_name: Option<&str>, stamp_cost: Option<u8>) -> Vec<u8> {
     use rmpv::Value;
 
-    let name_val = display_name
-        .map(|name| sanitize_name(name, MAX_ADVERTISED_NAME_CHARS))
-        .filter(|name| !name.is_empty())
-        .map_or(Value::Nil, |name| Value::Binary(name.into_bytes()));
+    let name_val = display_name.map_or(Value::Nil, |name| Value::Binary(name.as_bytes().to_vec()));
 
     let cost_val = match stamp_cost {
         Some(cost) if cost > 0 && cost < 255 => Value::from(cost as u64),
@@ -250,67 +460,93 @@ pub fn get_announce_app_data(display_name: Option<&str>, stamp_cost: Option<u8>)
     crate::encode_value(&peer_data)
 }
 
-/// Parse delivery-announce `app_data`, returning `(display_name, stamp_cost)`.
-///
-/// Requires an array with at least two elements; later elements are ignored.
-/// A binary UTF-8 name is sanitized and bounded. Unsigned stamp costs are cast
-/// to `u8`, retaining the low byte; this does not apply the encoder's `1..=254`
-/// filter. Original raw-text announce names are not parsed by this helper.
+/// First byte of the MessagePack delivery-announce format (fixarray or array16);
+/// anything else is the original raw-name format.
+fn is_announce_array_marker(byte: u8) -> bool {
+    matches!(byte, 0x90..=0x9f | 0xdc)
+}
+
+/// The decoded list of MessagePack-format delivery-announce data.
+fn announce_list(data: &[u8]) -> Option<Vec<rmpv::Value>> {
+    match decode_python(data)? {
+        rmpv::Value::Array(items) => Some(items),
+        _ => None,
+    }
+}
+
+/// Parse delivery-announce `app_data`, returning `(display_name, stamp_cost)`
+/// as [`display_name_from_app_data`] and [`stamp_cost_from_app_data`] return them.
+/// Returns `None` for empty data.
 pub fn parse_announce_app_data(data: &[u8]) -> Option<(Option<String>, Option<u8>)> {
-    let value: rmpv::Value = rmpv::decode::read_value(&mut &data[..]).ok()?;
-    let arr = value.as_array()?;
-    if arr.len() < 2 {
+    if data.is_empty() {
         return None;
     }
-
-    let display_name = arr[0]
-        .as_slice()
-        .and_then(|b| String::from_utf8(b.to_vec()).ok())
-        .map(|name| sanitize_name(&name, MAX_ADVERTISED_NAME_CHARS))
-        .filter(|name| !name.is_empty());
-
-    let stamp_cost = arr[1].as_u64().map(|c| c as u8);
-
-    Some((display_name, stamp_cost))
+    Some((
+        display_name_from_app_data(data),
+        stamp_cost_from_app_data(data),
+    ))
 }
 
-/// Extract just the display name from delivery-announce `app_data`.
-///
-/// Uses [`parse_announce_app_data`], including its name sanitization and array-only format.
+/// Python `display_name_from_app_data`: the raw name with NUL characters and
+/// surrounding whitespace removed. Original-format data is decoded as UTF-8.
+/// The name is not filtered for display; see [`crate::presentation::sanitize_name`].
 pub fn display_name_from_app_data(data: &[u8]) -> Option<String> {
-    parse_announce_app_data(data).and_then(|(name, _)| name)
+    let first = *data.first()?;
+    if !is_announce_array_marker(first) {
+        return std::str::from_utf8(data).ok().map(str::to_string);
+    }
+    let items = announce_list(data)?;
+    // A str element has no .decode() in Python and yields None.
+    let rmpv::Value::Binary(bytes) = items.first()? else {
+        return None;
+    };
+    let name = std::str::from_utf8(bytes).ok()?;
+    Some(crate::presentation::python_strip(&name.replace('\0', "")).to_string())
 }
 
-/// Extract just the stamp cost from delivery-announce `app_data`.
-///
-/// Uses [`parse_announce_app_data`], including its unsigned-to-`u8` cast.
+/// Python `stamp_cost_from_app_data`: element 3 when it is an integer, else
+/// element 1, as a `u8` when representable. A fractional element 3 is not
+/// read; element 1 carries its ceiling.
 pub fn stamp_cost_from_app_data(data: &[u8]) -> Option<u8> {
-    parse_announce_app_data(data).and_then(|(_, cost)| cost)
+    if !is_announce_array_marker(*data.first()?) {
+        return None;
+    }
+    let items = announce_list(data)?;
+    if items.len() < 2 {
+        return None;
+    }
+    let cost = match items.get(3) {
+        Some(rmpv::Value::Integer(n)) if items.len() > 3 => n.as_i64(),
+        _ => match &items[1] {
+            rmpv::Value::Integer(n) => n.as_i64(),
+            rmpv::Value::F64(f) if f.fract() == 0.0 => Some(*f as i64),
+            rmpv::Value::F32(f) if f.fract() == 0.0 => Some(*f as i64),
+            _ => None,
+        },
+    };
+    cost.and_then(|c| u8::try_from(c).ok())
 }
 
 /// Parse advertised `SF_COMPRESSION` support in delivery-announce `app_data`.
 ///
-/// Legacy 2-element app_data, malformed data, and missing feature lists are
-/// treated as unknown. A present feature list is authoritative.
+/// Original-format, malformed and list-less data are `Unknown`. A present
+/// feature list is authoritative; members compare with Python `==`, so
+/// `false` and `0.0` count as `SF_COMPRESSION`.
 ///
 /// Related Python helper: `compression_support_from_app_data`.
 pub fn compression_support_state_from_app_data(data: &[u8]) -> CompressionSupport {
-    let Ok(value) = rmpv::decode::read_value(&mut &data[..]) else {
-        return CompressionSupport::Unknown;
-    };
-    let Some(arr) = value.as_array() else {
-        return CompressionSupport::Unknown;
-    };
-    if arr.len() < 3 {
+    if !data.first().is_some_and(|b| is_announce_array_marker(*b)) {
         return CompressionSupport::Unknown;
     }
-    let Some(features) = arr[2].as_array() else {
+    let Some(items) = announce_list(data) else {
         return CompressionSupport::Unknown;
     };
-
+    let Some(rmpv::Value::Array(features)) = items.get(2) else {
+        return CompressionSupport::Unknown;
+    };
     if features
         .iter()
-        .any(|f| f.as_u64() == Some(crate::constants::SF_COMPRESSION as u64))
+        .any(|f| python_equals_int(f, i64::from(crate::constants::SF_COMPRESSION)))
     {
         CompressionSupport::Supported
     } else {
@@ -318,27 +554,23 @@ pub fn compression_support_state_from_app_data(data: &[u8]) -> CompressionSuppor
     }
 }
 
-/// Check whether a peer advertises `SF_COMPRESSION` support in its delivery-announce `app_data`.
-///
-/// Returns true for Supported or Unknown, including empty/malformed input and
-/// missing or non-list feature metadata. Only a present feature list without
-/// `SF_COMPRESSION` returns false. This boolean default differs from Python
-/// helper cases that return `None` or raise a decode error.
+/// Python `compression_support_from_app_data` as a boolean: only a present
+/// feature list without `SF_COMPRESSION` returns false. Empty or undecodable
+/// data, where Python returns `None` or raises, returns true.
 pub fn compression_support_from_app_data(data: &[u8]) -> bool {
     compression_support_state_from_app_data(data) != CompressionSupport::Unsupported
 }
 
-/// Extract the advertised name from propagation-node announce data.
-///
-/// Reads binary [`PN_META_NAME`] metadata, decodes UTF-8, then sanitizes and
-/// bounds the name. Returns `None` if parsing fails or the result is empty.
+/// Python `pn_name_from_app_data`: the raw UTF-8 [`PN_META_NAME`] metadata of
+/// valid propagation-node announce data, not filtered for display.
 pub fn pn_name_from_app_data(data: &[u8]) -> Option<String> {
-    let parsed = parse_pn_announce_data(data)?;
-    let name_bytes = parsed.metadata.get(&crate::constants::PN_META_NAME)?;
-    String::from_utf8(name_bytes.clone())
-        .ok()
-        .map(|name| sanitize_name(&name, MAX_ADVERTISED_NAME_CHARS))
-        .filter(|name| !name.is_empty())
+    let value = valid_pn_announce(data)?;
+    let metadata = python_index(&value, 6)?;
+    let name = python_index(&metadata, usize::from(crate::constants::PN_META_NAME))?;
+    let rmpv::Value::Binary(bytes) = name else {
+        return None;
+    };
+    String::from_utf8(bytes).ok()
 }
 
 /// Outcome of a resource transfer, matching Python `resource_concluded` /
@@ -759,7 +991,7 @@ mod tests {
     }
 
     #[test]
-    fn test_pn_announce_data_rejects_wrapping_policy_values() {
+    fn test_pn_announce_data_clamps_out_of_range_policy_values() {
         use rmpv::Value;
 
         let encode = |transfer_limit: Value, stamp_cost: Value| {
@@ -777,8 +1009,15 @@ mod tests {
             packed
         };
 
-        assert!(parse_pn_announce_data(&encode(Value::from(-1), Value::from(16))).is_none());
-        assert!(parse_pn_announce_data(&encode(Value::from(10240), Value::from(256))).is_none());
+        // Python accepts these (int() succeeds); the typed values are clamped.
+        let negative = parse_pn_announce_data(&encode(Value::from(-1), Value::from(16))).unwrap();
+        assert_eq!(negative.transfer_limit, 0);
+        let large = parse_pn_announce_data(&encode(Value::from(10240), Value::from(256))).unwrap();
+        assert_eq!(large.stamp_cost, 255);
+        // int(nan) raises in the Python announce handler although validity passes.
+        let nan = encode(Value::from(10240), Value::F64(f64::NAN));
+        assert!(pn_announce_data_is_valid(&nan));
+        assert!(parse_pn_announce_data(&nan).is_none());
     }
 
     #[test]
@@ -867,14 +1106,14 @@ mod tests {
     }
 
     #[test]
-    fn test_display_name_from_app_data_sanitizes_untrusted_unicode() {
+    fn test_display_name_from_app_data_returns_raw_unicode() {
         let packed = get_announce_app_data(
             Some("  Ａlice\u{202e}\u{e000}\u{1f680}\nNetwork  "),
             Some(12),
         );
         assert_eq!(
             display_name_from_app_data(&packed),
-            Some("AliceNetwork".to_string())
+            Some("Ａlice\u{202e}\u{e000}\u{1f680}\nNetwork".to_string())
         );
     }
 

@@ -72,6 +72,15 @@ impl EncodedFieldValue {
         }
         Ok(Self(bytes))
     }
+    /// The value as Python LXMF decodes and re-encodes it; fails where
+    /// Python's decoder fails (duplicate or unhashable map keys, invalid UTF-8).
+    pub fn canonical(bytes: Bytes) -> Result<Self, MessageError> {
+        let canonical = super::canonical::canonicalize(&bytes)?;
+        if canonical == bytes.as_ref() {
+            return Ok(Self(bytes));
+        }
+        Ok(Self(canonical.into()))
+    }
     pub fn encoded(&self) -> &[u8] {
         &self.0
     }
@@ -102,7 +111,7 @@ impl<'de> Deserialize<'de> for FieldValue {
         }
         let mut bytes = Vec::new();
         rmpv::encode::write_value(&mut bytes, &value).map_err(serde::de::Error::custom)?;
-        EncodedFieldValue::new(bytes.into())
+        EncodedFieldValue::canonical(bytes.into())
             .map(Self::MessagePack)
             .map_err(serde::de::Error::custom)
     }
@@ -115,8 +124,7 @@ pub struct FieldValueRef<'a> {
 }
 impl<'a> FieldValueRef<'a> {
     /// Borrow exactly one structurally valid value without decoding or copying it.
-    /// Duplicate map keys remain opaque until a recognized schema asks for
-    /// `unique_map`; binary payloads are never interpreted implicitly.
+    /// Binary payloads are never interpreted implicitly.
     pub fn from_encoded(encoded: &'a [u8]) -> Result<Self, MessageError> {
         let mut remaining = encoded;
         skip_msgpack_value(&mut remaining, 0)?;

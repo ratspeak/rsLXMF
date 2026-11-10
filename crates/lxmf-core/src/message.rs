@@ -14,6 +14,7 @@ use std::io::Write;
 use std::ops::{Deref, DerefMut, Range};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+pub(crate) mod canonical;
 mod draft;
 mod field;
 mod resumable;
@@ -309,11 +310,9 @@ impl LxMessage {
     pub fn verify_signature(&self, key: &rns_crypto::ed25519::Ed25519PublicKey) -> bool {
         let mut signed = Vec::with_capacity(self.wire.len() + 32);
         signed.extend_from_slice(&self.wire[..32]);
-        if let Some(body) = first_four_msgpack_array_body(&self.wire[96..]) {
-            signed.push(0x94);
-            signed.extend_from_slice(body);
-        } else {
-            signed.extend_from_slice(&self.wire[96..]);
+        match canonical::hashed_payload(&self.wire[96..]) {
+            Ok(payload) => signed.extend_from_slice(&payload),
+            Err(_) => return false,
         }
         signed.extend_from_slice(&self.message_id);
         key.verify(&signed, &self.signature()).is_ok()
@@ -354,6 +353,7 @@ impl LxMessage {
         if wire.len() < 97 {
             return Err(MessageError::TooShort(wire.len()));
         }
+        canonical::validate_leading(&wire[96..])?;
         let mut input = &wire[96..];
         let count = read_msgpack_array_len(&mut input)?;
         if count < 4 {
@@ -400,7 +400,7 @@ impl LxMessage {
         };
         let destination = wire[..16].try_into().expect("header");
         let source = wire[16..32].try_into().expect("header");
-        let message_id = Self::message_id_from_payload(&destination, &source, &wire[96..]);
+        let message_id = Self::message_id_from_payload(&destination, &source, &wire[96..])?;
         Ok(Self {
             wire,
             indexes: indexes.into(),
@@ -564,17 +564,12 @@ impl LxMessage {
         destination_hash: &[u8; 16],
         source_hash: &[u8; 16],
         payload: &[u8],
-    ) -> [u8; 32] {
+    ) -> Result<[u8; 32], MessageError> {
         let mut hasher = Sha256::new();
         hasher.update(destination_hash);
         hasher.update(source_hash);
-        if let Some(body) = first_four_msgpack_array_body(payload) {
-            hasher.update([0x94]);
-            hasher.update(body);
-        } else {
-            hasher.update(payload);
-        }
-        hasher.finalize().into()
+        hasher.update(canonical::hashed_payload(payload)?);
+        Ok(hasher.finalize().into())
     }
 
     /// Unpack a propagation wrapper `msgpack([timestamp, [lxmf_data, ...]])`, where each entry is
@@ -712,15 +707,18 @@ impl LxMessage {
     }
 
     /// Decode an `lxm://` paper URI and return `(destination_hash, encrypted_data)`.
+    ///
+    /// Follows Python `LXMRouter.ingest_lxm_uri`: the scheme check ignores case,
+    /// every exact `lxm://` and every `/` is removed, and the rest is decoded with
+    /// the lenient rules of `base64.urlsafe_b64decode(data + "==")`.
     pub fn decode_paper_uri(uri: &str) -> Result<([u8; 16], Vec<u8>), MessageError> {
-        use base64::Engine;
-        let data = uri
-            .strip_prefix("lxm://")
-            .ok_or_else(|| MessageError::InvalidUri("missing lxm:// prefix".to_string()))?;
-
-        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(data)
-            .map_err(|e| MessageError::InvalidUri(format!("base64url decode failed: {e}")))?;
+        if !uri.to_lowercase().starts_with("lxm://") {
+            return Err(MessageError::InvalidUri(
+                "missing lxm:// prefix".to_string(),
+            ));
+        }
+        let data = uri.replace("lxm://", "").replace('/', "") + "==";
+        let bytes = python_urlsafe_b64decode(&data)?;
 
         if bytes.len() < LXMF_OVERHEAD {
             return Err(MessageError::TooShort(bytes.len()));
@@ -769,11 +767,8 @@ impl LxMessage {
 
     /// Pack the message into a container for file storage.
     ///
-    /// Writes a five-element MessagePack array in this order:
-    /// `[state, lxmf_bytes, transport_encrypted, transport_encryption, method]`.
-    /// `lxmf_bytes` is binary and `transport_encryption` is a string or nil.
-    /// Python's `packed_container` writes a named-field map; its file reader
-    /// does not accept this Rust array layout.
+    /// Writes the MessagePack map of Python `packed_container`:
+    /// `{state, lxmf_bytes, transport_encrypted, transport_encryption, method}`.
     pub fn pack_container(&self) -> Result<Vec<u8>, MessageError> {
         let container = MessageContainerRef {
             state: self.state as u8,
@@ -782,7 +777,7 @@ impl LxMessage {
             transport_encryption: self.transport_encryption.as_deref(),
             method: self.method as u8,
         };
-        rmp_serde::to_vec(&container).map_err(|e| MessageError::PackFailed(e.to_string()))
+        rmp_serde::to_vec_named(&container).map_err(|e| MessageError::PackFailed(e.to_string()))
     }
 
     /// Decode a container array or a map with matching field names, then parse
@@ -931,6 +926,58 @@ fn parse_propagation_wrapper(
     Ok((timestamp, entries))
 }
 
+/// Python `base64.urlsafe_b64decode` (non-strict `binascii.a2b_base64`):
+/// characters outside the alphabet are skipped, and padding only completes a
+/// trailing partial quantum.
+fn python_urlsafe_b64decode(data: &str) -> Result<Vec<u8>, MessageError> {
+    // A str argument must encode as ASCII before decoding.
+    if !data.is_ascii() {
+        return Err(MessageError::InvalidUri(
+            "non-ASCII base64 data".to_string(),
+        ));
+    }
+    let mut out = Vec::with_capacity(data.len() * 3 / 4);
+    let (mut quad_pos, mut pads, mut left) = (0u8, 0u8, 0u32);
+    for byte in data.bytes() {
+        if byte == b'=' {
+            if quad_pos >= 2 {
+                pads = pads.saturating_add(1);
+            }
+            continue;
+        }
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'-' | b'+' => 62,
+            b'_' | b'/' => 63,
+            _ => continue,
+        };
+        pads = 0;
+        left = (left << 6) | u32::from(value);
+        quad_pos = (quad_pos + 1) % 4;
+        match quad_pos {
+            2 => out.push((left >> 4) as u8),
+            3 => out.push((left >> 2) as u8),
+            0 => out.push(left as u8),
+            _ => {}
+        }
+        left &= match quad_pos {
+            2 => 0x0f,
+            3 => 0x03,
+            1 => 0x3f,
+            _ => 0,
+        };
+    }
+    if quad_pos == 0 || (quad_pos >= 2 && quad_pos + pads >= 4) {
+        Ok(out)
+    } else {
+        Err(MessageError::InvalidUri(
+            "incorrect base64 padding".to_string(),
+        ))
+    }
+}
+
 fn read_msgpack_array_len(input: &mut &[u8]) -> Result<u32, MessageError> {
     let marker = take_msgpack(input, 1)?[0];
     match marker {
@@ -1001,20 +1048,10 @@ fn take_msgpack<'a>(input: &mut &'a [u8], length: usize) -> Result<&'a [u8], Mes
     Ok(value)
 }
 
-fn first_four_msgpack_array_body(payload: &[u8]) -> Option<&[u8]> {
-    let mut input = payload;
-    let count = read_msgpack_array_len(&mut input).ok()?;
-    if count <= 4 {
-        return None;
-    }
-    let body = input;
-    for _ in 0..4 {
-        skip_msgpack_value(&mut input, 0).ok()?;
-    }
-    Some(&body[..body.len() - input.len()])
-}
-
 fn read_msgpack_float(input: &mut &[u8]) -> Result<f64, MessageError> {
+    if matches!(input.first(), Some(0x00..=0x7f | 0xcc..=0xd3 | 0xe0..=0xff)) {
+        return Ok(read_msgpack_integer(input)? as f64);
+    }
     match take_msgpack(input, 1)?[0] {
         0xca => Ok(f64::from(f32::from_bits(u32::from_be_bytes(
             take_msgpack(input, 4)?.try_into().expect("exact length"),
@@ -1023,7 +1060,7 @@ fn read_msgpack_float(input: &mut &[u8]) -> Result<f64, MessageError> {
             take_msgpack(input, 8)?.try_into().expect("exact length"),
         ))),
         _ => Err(MessageError::UnpackFailed(
-            "timestamp is not float".to_string(),
+            "timestamp is not a number".to_string(),
         )),
     }
 }
