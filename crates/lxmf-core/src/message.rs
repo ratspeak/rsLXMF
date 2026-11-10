@@ -48,6 +48,11 @@ fn bounded_lossy_text(bytes: &[u8]) -> Cow<'_, str> {
 }
 
 pub type MessageCallback = Arc<dyn Fn(&LxMessage) + Send + Sync>;
+fn run_isolated_callback(callback: &MessageCallback, message: &LxMessage, kind: &str) {
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback(message))).is_err() {
+        tracing::error!(callback = kind, "an external message callback panicked");
+    }
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AudioField<'a> {
     pub mode: u8,
@@ -84,6 +89,13 @@ pub struct MessageMetadata {
     pub progress: f64,
     pub auto_compress: bool,
     pub callbacks: MessageCallbacks,
+    /// Retry state owned by the outbound router; never persisted.
+    pub awaiting_path: bool,
+    pub sent_on_path: bool,
+    pub sent_on_slow_path: bool,
+    pub path_request_retried: bool,
+    pub max_delivery_attempts: Option<u32>,
+    pub receipt_timeout: Option<f64>,
 }
 impl Default for MessageMetadata {
     fn default() -> Self {
@@ -103,6 +115,12 @@ impl Default for MessageMetadata {
             progress: 0.,
             auto_compress: true,
             callbacks: MessageCallbacks::default(),
+            awaiting_path: false,
+            sent_on_path: false,
+            sent_on_slow_path: false,
+            path_request_retried: false,
+            max_delivery_attempts: None,
+            receipt_timeout: None,
         }
     }
 }
@@ -479,18 +497,20 @@ impl LxMessage {
     }
 
     /// Invoke the delivery callback, if registered. Every call invokes it again;
-    /// the caller must prevent duplicate notifications when required.
+    /// the caller must prevent duplicate notifications when required. A
+    /// panicking callback is logged and contained.
     pub fn notify_delivered(&self) {
         if let Some(ref cb) = self.callbacks.on_delivered {
-            cb(self);
+            run_isolated_callback(cb, self, "delivery");
         }
     }
 
     /// Invoke the failure callback, if registered. Every call invokes it again;
-    /// the caller must prevent duplicate notifications when required.
+    /// the caller must prevent duplicate notifications when required. A
+    /// panicking callback is logged and contained.
     pub fn notify_failed(&self) {
         if let Some(ref cb) = self.callbacks.on_failed {
-            cb(self);
+            run_isolated_callback(cb, self, "failed");
         }
     }
 
@@ -654,7 +674,11 @@ impl LxMessage {
         self.state = MessageState::Rejected;
     }
 
+    /// Mark the message delivered; repeated calls notify only once.
     pub fn mark_delivered(&mut self) {
+        if self.state == MessageState::Delivered {
+            return;
+        }
         self.state = MessageState::Delivered;
         self.notify_delivered();
     }

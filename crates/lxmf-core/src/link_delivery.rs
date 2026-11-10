@@ -146,7 +146,7 @@ impl LinkDeliveryStartOptions {
             timing,
             packed_override: Some(packed_payload),
             auto_compress,
-            reusable: false,
+            reusable: true,
         }
     }
 }
@@ -389,9 +389,10 @@ pub struct PendingDelivery {
     packet_awaiting_dispatch: bool,
     pretransfer_identify_staged: bool,
     endpoint_release_queued: bool,
-    /// Keep successful Direct links open for additional messages. Propagation
-    /// deposits currently keep the old one-shot behavior.
+    /// Keep successful links open for additional messages.
     pub reusable: bool,
+    /// Upload link to a propagation node; never identified (LXMRouter.py:3283-3287).
+    propagation_upload: bool,
     /// Whether local Link identification was staged after a successful Direct
     /// delivery. Requires configured identity keys; it is not a peer acknowledgement.
     pub backchannel_identified: bool,
@@ -801,6 +802,18 @@ pub struct DirectLinkSnapshot {
     pub idle_expired: bool,
     pub queued_deliveries: usize,
     pub in_flight_deliveries: usize,
+    /// Whether the Link ever became active.
+    pub link_activated: bool,
+}
+
+impl DirectLinkSnapshot {
+    pub fn link_active(&self) -> bool {
+        self.link_state == LinkState::Active
+    }
+
+    pub fn link_closed(&self) -> bool {
+        self.link_state == LinkState::Closed || self.delivery_state == DeliveryState::Failed
+    }
 }
 
 /// Snapshot of a message currently owned by link delivery.
@@ -884,6 +897,8 @@ pub struct LinkDeliveryManager {
     direct_links: HashMap<[u8; 16], [u8; 16]>,
     /// Reusable upstream-style inbound backchannels keyed by remote LXMF delivery destination hash.
     backchannel_links: HashMap<[u8; 16], [u8; 16]>,
+    /// Reusable propagation upload links keyed by propagation node hash.
+    propagation_links: HashMap<[u8; 16], [u8; 16]>,
     pending: HashMap<[u8; 16], PendingDelivery>,
     backchannel_tx: Option<mpsc::Sender<BackchannelSendCommand>>,
     backchannel_cancellation_aware: bool,
@@ -942,6 +957,7 @@ impl LinkDeliveryManager {
             endpoint_lifecycle_rx,
             direct_links: HashMap::new(),
             backchannel_links: HashMap::new(),
+            propagation_links: HashMap::new(),
             pending: HashMap::new(),
             backchannel_tx: None,
             backchannel_cancellation_aware: false,
@@ -1039,11 +1055,9 @@ impl LinkDeliveryManager {
     /// segments remain immutable. This never enables compression or changes the
     /// propagation-node envelope. New submissions still carry their own policy.
     pub fn disable_pending_direct_compression(&mut self, destination: [u8; 16]) {
-        for delivery in self
-            .pending
-            .values_mut()
-            .filter(|delivery| delivery.reusable && delivery.dest_hash == destination)
-        {
+        for delivery in self.pending.values_mut().filter(|delivery| {
+            delivery.reusable && !delivery.propagation_upload && delivery.dest_hash == destination
+        }) {
             if delivery.transfer.is_none() && delivery.remaining_segments.is_none() {
                 delivery.message.auto_compress = false;
                 delivery.auto_compress = false;
@@ -1226,6 +1240,7 @@ impl LinkDeliveryManager {
                     dest_hash: delivery.dest_hash,
                     message: delivery.message,
                     reason: reason.to_string(),
+                    link_activated: true,
                 });
             }
         }
@@ -1344,6 +1359,20 @@ impl LinkDeliveryManager {
         auto_compress: bool,
         timing: LinkEstablishmentTiming,
     ) -> Result<[u8; 16], LinkDeliveryStartFailure> {
+        if let Some(link_id) = self.propagation_links.get(&dest_hash).copied() {
+            if let Some(delivery) = self
+                .pending
+                .get_mut(&link_id)
+                .filter(|delivery| delivery.link.state != LinkState::Closed)
+            {
+                delivery.queue_delivery(message, Some(packed_payload), auto_compress);
+                if delivery.state == DeliveryState::Idle && delivery.link.is_active() {
+                    let _ = delivery.start_queued_delivery();
+                }
+                return Ok(link_id);
+            }
+            self.propagation_links.remove(&dest_hash);
+        }
         self.start_delivery_inner(
             message,
             dest_hash,
@@ -1642,6 +1671,7 @@ impl LinkDeliveryManager {
             reusable,
         } = options;
         let msg_hash = Some(message.message_id());
+        let packed_override_kind = packed_override.is_some();
         let (mut link, request_data) = Link::new_initiator(dest_hash, hops);
         if link
             .try_extend_establishment_timeout(timing.first_hop_timeout().as_secs_f64())
@@ -1756,6 +1786,7 @@ impl LinkDeliveryManager {
                 pretransfer_identify_staged: false,
                 endpoint_release_queued: false,
                 reusable,
+                propagation_upload: packed_override_kind,
                 backchannel_identified: false,
                 queued: VecDeque::new(),
                 inbound_resources: HashMap::new(),
@@ -1764,7 +1795,9 @@ impl LinkDeliveryManager {
                 inbound_resource_lifecycles: HashMap::new(),
             },
         );
-        if reusable {
+        if packed_override_kind {
+            self.propagation_links.insert(dest_hash, link_id);
+        } else if reusable {
             self.direct_links.insert(dest_hash, link_id);
         }
 
@@ -2417,7 +2450,7 @@ impl LinkDeliveryManager {
         };
         delivery.link.record_inbound();
         delivery.link.record_rx(encrypted_data.len());
-        if !delivery.reusable {
+        if delivery.propagation_upload {
             let mut input = plaintext.as_slice();
             let rejection = rmpv::decode::read_value(&mut input).ok();
             if input.is_empty()
@@ -2479,7 +2512,7 @@ impl LinkDeliveryManager {
         let Some(delivery) = self.pending.get_mut(link_id) else {
             return false;
         };
-        if !delivery.reusable || !delivery.link.is_active() {
+        if !delivery.reusable || delivery.propagation_upload || !delivery.link.is_active() {
             return false;
         }
 
@@ -2670,7 +2703,7 @@ impl LinkDeliveryManager {
         let Some(delivery) = self.pending.get_mut(link_id) else {
             return false;
         };
-        if !delivery.reusable || !delivery.link.is_active() {
+        if !delivery.reusable || delivery.propagation_upload || !delivery.link.is_active() {
             return false;
         }
         delivery.link.record_inbound();
@@ -3046,8 +3079,6 @@ impl LinkDeliveryManager {
                         }
                         // Reusable Direct links follow upstream LXMF and identify
                         // after a successful delivery, not before the transfer.
-                        // One-shot propagation links keep the previous pre-transfer
-                        // identify behavior for compatibility with existing callers.
                         delivery.state = DeliveryState::Transferring;
                         if delivery.message.progress < 0.05 {
                             delivery.message.progress = 0.05;
@@ -3395,7 +3426,9 @@ impl LinkDeliveryManager {
                         resource_id,
                     );
                 }
-                if delivery.reusable {
+                if delivery.propagation_upload {
+                    self.propagation_links.remove(&delivery.dest_hash);
+                } else if delivery.reusable {
                     self.direct_links.remove(&delivery.dest_hash);
                 }
                 let graceful_release = delivery.endpoint_release_queued
@@ -3662,6 +3695,7 @@ impl LinkDeliveryManager {
                     dest_hash: delivery.dest_hash,
                     message: delivery.message,
                     reason,
+                    link_activated: true,
                 });
             }
         }
@@ -4151,6 +4185,7 @@ impl LinkDeliveryManager {
                     dest_hash: delivery.dest_hash,
                     message: delivery.message,
                     reason,
+                    link_activated: true,
                 })
             }
         }
@@ -4376,6 +4411,7 @@ impl LinkDeliveryManager {
                         dest_hash: delivery.dest_hash,
                         message: queued.message,
                         reason: reason.to_string(),
+                        link_activated: delivery.link.activated_at.is_some(),
                     });
                 }
                 break;
@@ -4404,6 +4440,9 @@ impl LinkDeliveryManager {
             }
             if self.direct_links.get(&dest_hash) == Some(&link_id) {
                 self.direct_links.remove(&dest_hash);
+            }
+            if self.propagation_links.get(&dest_hash) == Some(&link_id) {
+                self.propagation_links.remove(&dest_hash);
             }
         }
 
@@ -4460,6 +4499,7 @@ impl LinkDeliveryManager {
                 dest_hash: delivery.dest_hash,
                 message: delivery.message,
                 reason: reason.to_string(),
+                link_activated: true,
             });
         }
 
@@ -4532,6 +4572,9 @@ impl LinkDeliveryManager {
             }
             if self.direct_links.get(&dest_hash) == Some(&link_id) {
                 self.direct_links.remove(&dest_hash);
+            }
+            if self.propagation_links.get(&dest_hash) == Some(&link_id) {
+                self.propagation_links.remove(&dest_hash);
             }
         }
 
@@ -4859,6 +4902,23 @@ impl LinkDeliveryManager {
             idle_expired: direct_link_idle_expired(delivery),
             queued_deliveries: delivery.queued.len(),
             in_flight_deliveries: usize::from(delivery.state != DeliveryState::Idle),
+            link_activated: delivery.link.activated_at.is_some(),
+        })
+    }
+
+    /// Snapshot of the reusable upload Link to a propagation node.
+    pub fn propagation_link_snapshot(&self, node: [u8; 16]) -> Option<DirectLinkSnapshot> {
+        let link_id = *self.propagation_links.get(&node)?;
+        let delivery = self.pending.get(&link_id)?;
+        Some(DirectLinkSnapshot {
+            link_id,
+            dest_hash: node,
+            link_state: delivery.link.state,
+            delivery_state: delivery.state,
+            idle_expired: direct_link_idle_expired(delivery),
+            queued_deliveries: delivery.queued.len(),
+            in_flight_deliveries: usize::from(delivery.state != DeliveryState::Idle),
+            link_activated: delivery.link.activated_at.is_some(),
         })
     }
 
@@ -4897,7 +4957,11 @@ impl LinkDeliveryManager {
     pub fn stats(&self) -> LinkDeliveryStats {
         let mut stats = LinkDeliveryStats {
             sessions: self.pending.len(),
-            direct_sessions: self.pending.values().filter(|d| d.reusable).count(),
+            direct_sessions: self
+                .pending
+                .values()
+                .filter(|d| d.reusable && !d.propagation_upload)
+                .count(),
             one_shot_sessions: self.pending.values().filter(|d| !d.reusable).count(),
             backchannel_sessions: self.backchannel_links.len(),
             pending_backchannel_starts: self
@@ -4944,7 +5008,7 @@ fn delivery_event(
 ) -> LxmfDeliveryEvent {
     LxmfDeliveryEvent {
         kind,
-        method: if delivery.reusable {
+        method: if !delivery.propagation_upload {
             LxmfDeliveryEventMethod::Direct
         } else {
             LxmfDeliveryEventMethod::PropagationDeposit
@@ -5073,6 +5137,7 @@ fn fail_backchannel_start_in_place(
         dest_hash: start.dest_hash,
         message,
         reason,
+        link_activated: true,
     }
 }
 
@@ -5138,6 +5203,7 @@ fn finish_reusable_delivery(
     delivery: &mut PendingDelivery,
 ) {
     if !delivery.backchannel_identified
+        && !delivery.propagation_upload
         && let (Some(pub_key), Some(sign_key)) = (identity_pub, identity_key)
     {
         delivery.backchannel_identified = send_link_identify(
@@ -5227,6 +5293,7 @@ fn push_failed_delivery_and_queue(
         dest_hash: delivery.dest_hash,
         message,
         reason: reason.to_string(),
+        link_activated: delivery.link.activated_at.is_some(),
     });
     fail_queued_deliveries(results, events, link_id, delivery, reason);
 }
@@ -5259,6 +5326,7 @@ fn fail_queued_deliveries(
             dest_hash: delivery.dest_hash,
             message: queued.message,
             reason: reason.to_string(),
+            link_activated: delivery.link.activated_at.is_some(),
         });
     }
 }
@@ -5487,6 +5555,8 @@ pub enum DeliveryResult {
         dest_hash: [u8; 16],
         message: LxMessage,
         reason: String,
+        /// Whether the Link carrying the message had become active.
+        link_activated: bool,
     },
 }
 
@@ -6519,7 +6589,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exact_packed_packet_preserves_rtt_identify_and_payload_order() {
+    async fn exact_packed_packet_sends_rtt_then_payload_without_identify() {
         exact_packet_driver_fixture(false, true).await;
     }
 
@@ -6802,34 +6872,6 @@ mod tests {
             mgr.tick().is_empty(),
             "5ms proof floor must not run before driver admission"
         );
-        if packed {
-            assert_eq!(mgr.pending[&link_id].state, DeliveryState::Identifying);
-            let rtt = driver_rx.recv().await.unwrap();
-            let (header, offset) = rns_wire::header::PacketHeader::unpack(&rtt).unwrap();
-            assert_eq!(header.context, rns_wire::context::PacketContext::Lrrtt);
-            responder.receive_rtt_packet(&rtt[offset..]).unwrap();
-            tx.send(TransportMessage::Tick(TimerTick {
-                timestamp: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs_f64(),
-            }))
-            .await
-            .unwrap();
-            tokio::time::timeout(Duration::from_secs(2), async {
-                loop {
-                    assert!(mgr.tick().is_empty());
-                    if mgr.pending[&link_id].state == DeliveryState::AwaitingProof {
-                        break;
-                    }
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .unwrap();
-            tokio::time::sleep(Duration::from_millis(30)).await;
-            assert!(mgr.tick().is_empty());
-        }
         assert!(mgr.pending[&link_id].packet_awaiting_dispatch);
         assert_eq!(
             mgr.message_timeout_window(message_hash).unwrap().1,
@@ -6841,19 +6883,9 @@ mod tests {
         }
         let rtt = driver_rx.recv().await.unwrap();
         let (header, offset) = rns_wire::header::PacketHeader::unpack(&rtt).unwrap();
-        if packed {
-            assert_eq!(
-                header.context,
-                rns_wire::context::PacketContext::LinkIdentify
-            );
-            assert_eq!(
-                responder.handle_identification(&rtt[offset..]).unwrap(),
-                identity_pub
-            );
-        } else {
-            assert_eq!(header.context, rns_wire::context::PacketContext::Lrrtt);
-            responder.receive_rtt_packet(&rtt[offset..]).unwrap();
-        }
+        // Propagation uploads are never identified, even with identity keys.
+        assert_eq!(header.context, rns_wire::context::PacketContext::Lrrtt);
+        responder.receive_rtt_packet(&rtt[offset..]).unwrap();
         tx.send(TransportMessage::Tick(TimerTick {
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -9112,29 +9144,34 @@ mod tests {
     }
 
     #[test]
-    fn test_packed_delivery_is_one_shot_not_direct_session() {
+    fn packed_deliveries_share_one_propagation_link() {
         let (tx, _rx) = mpsc::channel(64);
         let mut mgr = LinkDeliveryManager::new(tx, None, None);
-        let dest_hash = [0xC1; 16];
-        let msg = crate::message::test_message(
-            [0xAA; 16],
-            [0xBB; 16],
-            "Propagation",
-            "deposit",
-            crate::constants::DeliveryMethod::Propagated,
-        );
+        let node = [0xC1; 16];
+        let message = |content: &str| {
+            crate::message::test_message(
+                [0xAA; 16],
+                [0xBB; 16],
+                "Propagation",
+                content,
+                crate::constants::DeliveryMethod::Propagated,
+            )
+        };
 
-        let link_id = mgr
-            .start_packed_delivery(msg, dest_hash, 1, b"packed propagation".to_vec(), false)
+        let first = mgr
+            .start_packed_delivery(message("one"), node, 1, b"one".to_vec(), false)
+            .unwrap();
+        let second = mgr
+            .start_packed_delivery(message("two"), node, 1, b"two".to_vec(), false)
             .unwrap();
 
-        assert_eq!(mgr.pending_count(), 1);
+        assert_eq!(first, second, "a second upload reuses the pending link");
         assert_eq!(mgr.session_count(), 1);
+        assert_eq!(mgr.pending_count(), 2);
         assert_eq!(mgr.stats().direct_sessions, 0);
-        assert_eq!(mgr.stats().one_shot_sessions, 1);
-        assert!(!mgr.delivery_link_available(&dest_hash));
-        assert!(mgr.direct_link_snapshot(dest_hash).is_none());
-        assert!(!mgr.pending.get(&link_id).unwrap().reusable);
+        assert!(mgr.direct_link_snapshot(node).is_none());
+        let snapshot = mgr.propagation_link_snapshot(node).unwrap();
+        assert_eq!(snapshot.queued_deliveries, 1);
     }
 
     #[test]

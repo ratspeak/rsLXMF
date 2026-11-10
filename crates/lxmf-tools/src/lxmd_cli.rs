@@ -112,8 +112,9 @@ pub struct Args {
     #[arg(long, value_name = "PATH")]
     pub identity: Option<PathBuf>,
 
-    /// Send a single message and exit: `--send <dest_hash> <content>`.
-    #[arg(long, num_args = 1..=2, value_names = ["DEST_HASH", "CONTENT"])]
+    /// Send messages and exit: `--send <dest_hash> <content>...`, one message
+    /// per content, queued together.
+    #[arg(long, num_args = 1.., value_names = ["DEST_HASH", "CONTENT"])]
     pub send: Option<Vec<String>>,
 
     /// Read outgoing `--send` content from a UTF-8 file instead of argv.

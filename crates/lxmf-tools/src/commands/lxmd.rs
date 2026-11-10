@@ -22,8 +22,7 @@ use lxmf_core::admission::{
 };
 use lxmf_core::admission_store::FileAdmissionStore;
 use lxmf_core::constants::{
-    DELIVERY_LINK_COST, DELIVERY_RETRY_WAIT, DeliveryMethod, MAX_DELIVERY_ATTEMPTS,
-    NODE_ANNOUNCE_DELAY, PATH_REQUEST_WAIT, PROPAGATION_LINK_COST,
+    DELIVERY_LINK_COST, DeliveryMethod, NODE_ANNOUNCE_DELAY, PROPAGATION_LINK_COST,
 };
 use lxmf_core::delivery_ratchet::{
     DELIVERY_APP_NAME, DeliveryAnnounceKind, DeliveryRatchetError, DeliveryRatchetState,
@@ -34,7 +33,6 @@ use lxmf_core::inbound_resource::{
 };
 use lxmf_core::link_delivery::{
     BackchannelSendCommand, BackchannelSendError, BackchannelSendReceipt, DeliveryResult,
-    is_retryable_link_delivery_failure,
 };
 use lxmf_core::message::{LxMessage, LxMessageDraft, MessageError};
 use lxmf_core::peer::{LxmPeer, OutboundOfferPolicy};
@@ -45,8 +43,8 @@ use lxmf_core::propagation_send::{
     AdvertisedNodePolicy, MissingPropagationInput, PropagationEnvelope, propagation_readiness,
 };
 use lxmf_core::router::{
-    AutopeerCandidate, DirectDeliveryPlan, DirectDeliveryPlanInput, DirectReusableLinkState,
-    DirectRouteSnapshot, LxmRouter, OutboundAction, plan_direct_delivery,
+    AutopeerCandidate, DirectReusableLinkState, LinkDeliveryPlan, LxmRouter, MediumSnapshot,
+    OutboundAction, OutboundInputs, RouteInfo,
 };
 use lxmf_tools::daemon::{
     DaemonConfig, PythonLxmdConfig, create_router_with_transport, persist_inbound_and_execute,
@@ -287,12 +285,6 @@ struct PnTestTiming {
     queue_ms: f64,
     validation_ms: f64,
     store_ms: f64,
-}
-
-#[derive(Debug)]
-struct PendingOpportunisticDelivery {
-    message: LxMessage,
-    retry_at: f64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1006,14 +998,6 @@ async fn wait_for_online_interface(
     }
 }
 
-fn mark_delivery_attempt(message: &mut LxMessage) -> u32 {
-    let now = now_f64();
-    message.delivery_attempts += 1;
-    message.last_delivery_attempt = now;
-    message.next_delivery_attempt = now + DELIVERY_RETRY_WAIT as f64;
-    message.delivery_attempts
-}
-
 fn queue_path_request(
     transport_tx: &mpsc::Sender<TransportMessage>,
     request_hash: [u8; 16],
@@ -1067,35 +1051,18 @@ fn queue_unknown_propagation_node_path_request(
     true
 }
 
-fn requeue_after_path_request(
-    router: &mut LxmRouter,
-    transport_tx: &mpsc::Sender<TransportMessage>,
-    mut message: LxMessage,
-    request_hash: [u8; 16],
-    reason: &str,
-    increment_attempt: bool,
-) {
-    let now = now_f64();
-    if increment_attempt {
-        message.delivery_attempts += 1;
+fn link_snapshot_state(
+    snapshot: &lxmf_core::link_delivery::DirectLinkSnapshot,
+) -> DirectReusableLinkState {
+    if snapshot.link_closed() {
+        // The failed session reports each carried message as a delivery result.
+        return DirectReusableLinkState::Pending;
     }
-    message.last_delivery_attempt = now;
-    message.next_delivery_attempt = now + PATH_REQUEST_WAIT as f64;
-    queue_path_request(transport_tx, request_hash, false, reason);
-    tracing::warn!(
-        dest = %hex::encode(message.destination_hash()),
-        request_dest = %hex::encode(request_hash),
-        attempts = message.delivery_attempts,
-        reason,
-        "re-queuing LXMF message after path request"
-    );
-    if let Err(error) = router.try_send(message) {
-        tracing::warn!(%error, reason, "failed to re-queue LXMF message");
+    if snapshot.link_active() {
+        DirectReusableLinkState::Active
+    } else {
+        DirectReusableLinkState::Pending
     }
-}
-
-fn link_failure_retryable(reason: &str) -> bool {
-    is_retryable_link_delivery_failure(reason)
 }
 
 /// Python `lxmf_delivery()` receive state: the delivery method, and Curve25519
@@ -1121,20 +1088,6 @@ fn write_propagated_container(
     Ok(path)
 }
 
-fn route_hops_for(route_hops: &HashMap<[u8; 16], u8>, dest_hash: [u8; 16]) -> u8 {
-    route_hops.get(&dest_hash).copied().unwrap_or(1).max(1)
-}
-
-fn direct_route_snapshot(
-    route_hops: &HashMap<[u8; 16], u8>,
-    dest_hash: [u8; 16],
-) -> Option<DirectRouteSnapshot> {
-    route_hops
-        .get(&dest_hash)
-        .copied()
-        .map(|hops| DirectRouteSnapshot::new(dest_hash, hops))
-}
-
 fn direct_reusable_link_state(
     link_delivery: Option<&lxmf_core::link_delivery::LinkDeliveryManager>,
     dest_hash: [u8; 16],
@@ -1142,26 +1095,46 @@ fn direct_reusable_link_state(
     let Some(link_delivery) = link_delivery else {
         return DirectReusableLinkState::None;
     };
-
     if let Some(snapshot) = link_delivery.direct_link_snapshot(dest_hash) {
-        return match snapshot.delivery_state {
-            lxmf_core::link_delivery::DeliveryState::Idle => DirectReusableLinkState::Active,
-            lxmf_core::link_delivery::DeliveryState::Failed => {
-                DirectReusableLinkState::Closed { activated: false }
-            }
-            _ => DirectReusableLinkState::Pending,
-        };
+        return link_snapshot_state(&snapshot);
     }
-
-    if let Some(snapshot) = link_delivery.backchannel_link_snapshot(dest_hash) {
-        if snapshot.queued_deliveries > 0 || snapshot.in_flight_deliveries > 0 {
-            DirectReusableLinkState::Pending
-        } else {
-            DirectReusableLinkState::Active
-        }
+    if link_delivery.backchannel_link_snapshot(dest_hash).is_some() {
+        DirectReusableLinkState::Active
     } else {
         DirectReusableLinkState::None
     }
+}
+
+/// Python `Transport.medium_path_timeout()` for a known bitrate (Transport.py:3550-3553).
+fn medium_path_timeout(lowest_bitrate: u64) -> f64 {
+    let bits = (rns_wire::constants::MTU * 8) as f64;
+    2.0 * (bits / lowest_bitrate.max(rns_runtime::constants::MINIMUM_BITRATE) as f64)
+        + rns_wire::constants::DEFAULT_PER_HOP_TIMEOUT
+}
+
+/// Drop the current path, then request a new one 0.5 s later, as Python's
+/// opportunistic rediscovery does (LXMRouter.py:3127-3133).
+fn queue_path_request_after_drop(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    destination: [u8; 16],
+) {
+    let (response_tx, _response_rx) = oneshot::channel();
+    if let Err(error) = transport_tx.try_send(TransportMessage::Rpc {
+        query: TransportQuery::DropPath { dest: destination },
+        response_tx,
+    }) {
+        tracing::warn!(dest = %hex::encode(destination), %error, "failed to queue path drop");
+    }
+    let transport_tx = transport_tx.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        queue_path_request(
+            &transport_tx,
+            destination,
+            false,
+            "opportunistic path rediscovery",
+        );
+    });
 }
 
 async fn forward_backchannel_receipt(
@@ -1360,43 +1333,45 @@ fn dispatch_opportunistic_packet(
     raw: Vec<u8>,
     destination_hash: [u8; 16],
     destination_public_key: [u8; 64],
-    msg_hash: Option<[u8; 32]>,
+    msg_hash: [u8; 32],
+    timeout: Duration,
 ) -> Result<(), String> {
-    if let Some(msg_hash) = msg_hash {
-        let receipt_permit = transport_tx
-            .try_reserve()
-            .map_err(|error| format!("receipt reservation failed: {error}"))?;
-        let outbound_permit = transport_tx
-            .try_reserve()
-            .map_err(|error| format!("packet reservation failed: {error}"))?;
-        let (full_hash, truncated_hash) =
-            rns_wire::hash::packet_hash_pair(&raw, rns_wire::flags::HeaderType::Header1);
-        receipt_permit.send(TransportMessage::RegisterReceipt {
-            truncated_hash,
-            full_hash,
+    let receipt_permit = transport_tx
+        .try_reserve()
+        .map_err(|error| format!("receipt reservation failed: {error}"))?;
+    let outbound_permit = transport_tx
+        .try_reserve()
+        .map_err(|error| format!("packet reservation failed: {error}"))?;
+    let (full_hash, truncated_hash) =
+        rns_wire::hash::packet_hash_pair(&raw, rns_wire::flags::HeaderType::Header1);
+    receipt_permit.send(TransportMessage::RegisterReceipt {
+        truncated_hash,
+        full_hash,
+        destination_hash,
+        destination_public_key,
+        msg_id: hex::encode(msg_hash),
+        timeout: Some(timeout),
+    });
+    outbound_permit.send(TransportMessage::Outbound(
+        rns_transport::messages::OutboundRequest {
+            raw: Bytes::from(raw),
             destination_hash,
-            destination_public_key,
-            msg_id: hex::encode(msg_hash),
-            timeout: Some(Duration::from_secs(15)),
-        });
-        outbound_permit.send(TransportMessage::Outbound(
-            rns_transport::messages::OutboundRequest {
-                raw: Bytes::from(raw),
-                destination_hash,
-            },
-        ));
-    } else {
-        transport_tx
-            .try_reserve()
-            .map_err(|error| format!("packet reservation failed: {error}"))?
-            .send(TransportMessage::Outbound(
-                rns_transport::messages::OutboundRequest {
-                    raw: Bytes::from(raw),
-                    destination_hash,
-                },
-            ));
-    }
+        },
+    ));
     Ok(())
+}
+
+/// `LXMessage.unpack_from_bytes` signature flags (LXMessage.py:829-842).
+fn classify_signature(
+    msg: &LxMessage,
+    public_key: Option<&[u8; 64]>,
+) -> Option<lxmf_core::constants::UnverifiedReason> {
+    use lxmf_core::constants::UnverifiedReason;
+    match public_key {
+        None => Some(UnverifiedReason::SourceUnknown),
+        Some(key) if msg.verify(key).is_ok() => None,
+        Some(_) => Some(UnverifiedReason::SignatureInvalid),
+    }
 }
 
 fn queue_required_transport(
@@ -1467,13 +1442,9 @@ fn decode_download_payload(
 /// Apply recipient policy before any durable receipt or hook can be created.
 fn validate_download_policy(
     msg: &LxMessage,
-    public_key: Option<[u8; 64]>,
     tickets: &[[u8; 16]],
     cost: f64,
 ) -> Result<(), SuppressionReason> {
-    if public_key.is_some_and(|key| msg.verify(&key).is_err()) {
-        return Err(SuppressionReason::InvalidSignature);
-    }
     if cost > 0.0 {
         let Some(stamp) = msg.recipient_stamp().map(|s| s.as_bytes()) else {
             return Err(SuppressionReason::InvalidStamp);
@@ -1616,7 +1587,8 @@ struct LxmdRunner {
     link_resource_proof_rx: mpsc::Receiver<rns_runtime::link_manager::LinkResourceProof>,
     destination_delivery_proof_rx:
         mpsc::UnboundedReceiver<rns_runtime::link_manager::DestinationDeliveryProof>,
-    opportunistic_in_flight: HashMap<[u8; 32], PendingOpportunisticDelivery>,
+    /// Reticulum's medium view for outbound planning, refreshed per tick.
+    medium: MediumSnapshot,
     backchannel_command_rx: Option<mpsc::Receiver<BackchannelSendCommand>>,
     backchannel_abandon_tx: mpsc::Sender<BackchannelSendReceipt>,
     backchannel_abandon_rx: mpsc::Receiver<BackchannelSendReceipt>,
@@ -1898,16 +1870,6 @@ impl LxmdRunner {
             }
         }
         self.announce_subscriptions.clear();
-    }
-
-    fn queue_router_message(&mut self, message: LxMessage, operation: &'static str) -> bool {
-        match self.router.try_send(message) {
-            Ok(()) => true,
-            Err(error) => {
-                tracing::warn!(%error, operation, "router rejected LXMF message");
-                false
-            }
-        }
     }
 
     fn new(
@@ -2535,7 +2497,7 @@ impl LxmdRunner {
             link_packet_proof_rx,
             link_resource_proof_rx,
             destination_delivery_proof_rx,
-            opportunistic_in_flight: HashMap::new(),
+            medium: MediumSnapshot::default(),
             backchannel_command_rx: None,
             backchannel_abandon_tx,
             backchannel_abandon_rx,
@@ -3345,7 +3307,15 @@ impl LxmdRunner {
                 if let Some(hash) = msg_hash {
                     self.propagation_envelopes.remove(&hash);
                     self.pending_propagation_envelopes.remove(&hash);
-                    let _ = self.router.mark_outbound_delivered(&hash);
+                    let propagated =
+                        self.router.pending_outbound.iter().any(|m| {
+                            m.message_id() == hash && m.method == DeliveryMethod::Propagated
+                        });
+                    if propagated {
+                        self.router.mark_outbound_propagated(&hash);
+                    } else {
+                        self.router.mark_outbound_delivered(&hash);
+                    }
                     tracing::info!(hash = %hex::encode(hash), "link delivery complete");
                 }
             }
@@ -3370,60 +3340,36 @@ impl LxmdRunner {
             DeliveryResult::Failed {
                 msg_hash,
                 dest_hash,
-                message,
                 reason,
+                link_activated,
                 ..
             } => {
                 tracing::warn!(
                     dest = %hex::encode(dest_hash),
                     reason = %reason,
-                    attempts = message.delivery_attempts,
+                    link_activated,
                     "link delivery failed"
                 );
-                let router_owned = msg_hash.is_some_and(|hash| {
-                    self.router
-                        .pending_outbound
-                        .iter()
-                        .any(|pending| pending.message_id() == hash)
-                });
-                if link_failure_retryable(&reason)
-                    && message.delivery_attempts <= MAX_DELIVERY_ATTEMPTS
+                let Some(hash) = msg_hash else {
+                    return;
+                };
+                // A failed transfer returns the message to OUTBOUND and the Link
+                // is gone, as Python's CLOSED link branch handles it.
+                let actions = self.router.outbound_link_closed(
+                    &hash,
+                    link_activated,
+                    &self.medium,
+                    now_f64(),
+                );
+                self.execute_outbound_actions(actions);
+                if !self
+                    .router
+                    .pending_outbound
+                    .iter()
+                    .any(|pending| pending.message_id() == hash)
                 {
-                    if let Some(hash) = msg_hash {
-                        tracing::warn!(
-                            hash = %hex::encode(hash),
-                            "retrying message after link delivery failure"
-                        );
-                    }
-                    if router_owned {
-                        queue_path_request(&self.transport_tx, dest_hash, false, &reason);
-                        if let Some(hash) = msg_hash {
-                            let _ = self
-                                .router
-                                .defer_outbound_for_path_request(&hash, now_f64());
-                        }
-                    } else {
-                        requeue_after_path_request(
-                            &mut self.router,
-                            &self.transport_tx,
-                            message,
-                            dest_hash,
-                            &reason,
-                            false,
-                        );
-                    }
-                } else {
-                    if let Some(hash) = msg_hash {
-                        self.propagation_envelopes.remove(&hash);
-                        self.pending_propagation_envelopes.remove(&hash);
-                        if router_owned {
-                            let _ = self.router.mark_outbound_failed(&hash);
-                        }
-                        tracing::warn!(
-                            hash = %hex::encode(hash),
-                            "message delivery failed"
-                        );
-                    }
+                    self.propagation_envelopes.remove(&hash);
+                    self.pending_propagation_envelopes.remove(&hash);
                     self.last_delivery_failure = Some(reason);
                 }
             }
@@ -3642,12 +3588,10 @@ impl LxmdRunner {
                 tracing::warn!(msg_id = %proof.msg_id, "ignored destination delivery-proof id with invalid length");
                 continue;
             };
-            let Some(pending) = self.opportunistic_in_flight.remove(&message_hash) else {
-                tracing::debug!(msg_id = %proof.msg_id, "delivery proof does not match an in-flight opportunistic message");
+            if !self.router.mark_outbound_delivered(&message_hash) {
+                tracing::debug!(msg_id = %proof.msg_id, "delivery proof does not match a queued opportunistic message");
                 continue;
-            };
-
-            self.router.complete_outbound_message(pending.message);
+            }
             tracing::info!(
                 msg_id = %proof.msg_id,
                 rtt_ms = proof.rtt.map(|rtt| rtt.as_secs_f64() * 1000.0),
@@ -3656,27 +3600,127 @@ impl LxmdRunner {
         }
     }
 
-    fn retry_due_opportunistic_deliveries(&mut self, now: f64) {
-        let due = self
-            .opportunistic_in_flight
+    /// Refresh Reticulum's medium view for the destinations outbound planning
+    /// needs: lowest online bitrate, medium path timeout, routes and first-hop
+    /// timeouts (`LXMRouter.medium_path_timeout`, `destination_round_trip`).
+    async fn refresh_outbound_medium(&mut self) {
+        let mut targets: HashSet<[u8; 16]> = self
+            .router
+            .pending_outbound
             .iter()
-            .filter_map(|(hash, pending)| (pending.retry_at <= now).then_some(*hash))
-            .collect::<Vec<_>>();
-
-        for hash in due {
-            let Some(pending) = self.opportunistic_in_flight.remove(&hash) else {
-                continue;
-            };
-            tracing::debug!(
-                msg_id = %hex::encode(hash),
-                attempts = pending.message.delivery_attempts,
-                "opportunistic delivery still awaiting proof; scheduling retry"
-            );
-            if let Err(error) = self.router.try_send(pending.message) {
-                let reason = format!("failed to schedule opportunistic retry: {error}");
-                tracing::warn!(msg_id = %hex::encode(hash), %reason);
-                self.last_delivery_failure = Some(reason);
+            .map(|message| message.destination_hash())
+            .collect();
+        if let Some(node) = self.router.outbound_propagation_node {
+            targets.insert(node);
+        }
+        let query = |query| {
+            let (response_tx, response_rx) = oneshot::channel();
+            let sent = self
+                .transport_tx
+                .try_send(TransportMessage::Rpc { query, response_tx })
+                .is_ok();
+            async move {
+                if !sent {
+                    return None;
+                }
+                tokio::time::timeout(Duration::from_millis(100), response_rx)
+                    .await
+                    .ok()?
+                    .ok()
             }
+        };
+        if let Some(TransportQueryResponse::InterfaceStats(interfaces)) =
+            query(TransportQuery::GetInterfaceStats).await
+            && let Some(lowest) = interfaces
+                .iter()
+                .filter(|interface| interface.online && interface.bitrate > 0)
+                .map(|interface| interface.bitrate)
+                .min()
+        {
+            // Transport keeps the last lowest bitrate when none qualifies (Transport.py:708).
+            self.medium.lowest_interface_bitrate = Some(lowest);
+        }
+        self.medium.medium_path_timeout = self
+            .medium
+            .lowest_interface_bitrate
+            .map(medium_path_timeout)
+            .unwrap_or(0.0);
+        let mut routes = HashMap::new();
+        if !targets.is_empty()
+            && let Some(TransportQueryResponse::PathTable(entries)) =
+                query(TransportQuery::GetPathTable).await
+        {
+            let now = now_f64();
+            for entry in entries {
+                if entry.expires <= now || !targets.contains(&entry.hash) {
+                    continue;
+                }
+                let first_hop_timeout =
+                    match query(TransportQuery::FirstHopTimeout { dest: entry.hash }).await {
+                        Some(TransportQueryResponse::FloatResult(Some(seconds))) => seconds,
+                        _ => rns_wire::constants::DEFAULT_PER_HOP_TIMEOUT,
+                    };
+                routes.insert(
+                    entry.hash,
+                    RouteInfo {
+                        hops: entry.hops,
+                        first_hop_timeout,
+                    },
+                );
+            }
+        }
+        self.medium.routes = routes;
+    }
+
+    fn outbound_inputs(&self) -> OutboundInputs {
+        let mut inputs = OutboundInputs {
+            medium: self.medium.clone(),
+            ..OutboundInputs::default()
+        };
+        for message in &self.router.pending_outbound {
+            let destination = message.destination_hash();
+            if self
+                .link_delivery
+                .as_ref()
+                .is_some_and(|ld| ld.message_delivery_snapshot(message.message_id()).is_some())
+            {
+                inputs.link_owned.insert(message.message_id());
+            }
+            if self
+                .known_identities
+                .contains_key(&hex::encode(destination))
+            {
+                inputs.identities.insert(destination);
+            }
+            if message.method == DeliveryMethod::Direct {
+                inputs.direct_links.insert(
+                    destination,
+                    direct_reusable_link_state(self.link_delivery.as_ref(), destination),
+                );
+            }
+        }
+        if let Some(node) = self.router.outbound_propagation_node {
+            if self.known_identities.contains_key(&hex::encode(node)) {
+                inputs.identities.insert(node);
+            }
+            inputs.propagation_link = self
+                .link_delivery
+                .as_ref()
+                .and_then(|ld| ld.propagation_link_snapshot(node))
+                .map(|snapshot| link_snapshot_state(&snapshot))
+                .unwrap_or(DirectReusableLinkState::None);
+        }
+        inputs
+    }
+
+    fn run_outbound(&mut self) {
+        let propagation_unready = self.prepare_propagation_envelopes();
+        let mut inputs = self.outbound_inputs();
+        inputs.propagation_unready = propagation_unready;
+        let actions = self.router.process_outbound_with_inputs(&inputs, now_f64());
+        if !actions.is_empty() {
+            self.execute_outbound_actions(actions);
+            self.drain_core_backchannel_send_commands();
         }
     }
 
@@ -3698,7 +3742,6 @@ impl LxmdRunner {
         let now = now_f64();
 
         self.drain_destination_delivery_proofs();
-        self.retry_due_opportunistic_deliveries(now);
         self.forward_destination_retains();
 
         self.drain_control_commands();
@@ -3709,44 +3752,7 @@ impl LxmdRunner {
         self.drain_backchannel_events();
 
         self.router.process_deferred_stamps();
-        // Per-destination plan inputs precomputed for pending Direct messages
-        // only — avoids cloning route_hops/known_identities every tick.
-        let direct_inputs = self
-            .router
-            .pending_outbound
-            .iter()
-            .filter(|message| message.method == DeliveryMethod::Direct)
-            .map(|message| message.destination_hash())
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .map(|dest| {
-                (
-                    dest,
-                    DirectDeliveryPlanInput {
-                        identity_known: self.known_identities.contains_key(&hex::encode(dest)),
-                        route: direct_route_snapshot(&self.route_hops, dest),
-                        reusable_link: direct_reusable_link_state(
-                            self.link_delivery.as_ref(),
-                            dest,
-                        ),
-                    },
-                )
-            })
-            .collect::<HashMap<_, _>>();
-        let actions = self.router.process_outbound_with_direct(|message, _now| {
-            direct_inputs
-                .get(&message.destination_hash())
-                .cloned()
-                .unwrap_or(DirectDeliveryPlanInput {
-                    identity_known: false,
-                    route: None,
-                    reusable_link: DirectReusableLinkState::None,
-                })
-        });
-        if !actions.is_empty() {
-            self.execute_encrypted_actions(actions);
-            self.drain_core_backchannel_send_commands();
-        }
+        self.run_outbound();
         // Advance the router jobloop counters (transient-cache cleaning, store
         // cull, peer rotation at Python cadences). `process_outbound_with_direct`
         // does not drive these.
@@ -3760,6 +3766,9 @@ impl LxmdRunner {
             }
         }
         self.drain_core_backchannel_send_commands();
+        if self.router.take_outbound_kick() {
+            self.run_outbound();
+        }
 
         self.drive_propagation_sync();
 
@@ -4332,27 +4341,14 @@ impl LxmdRunner {
         };
 
         match LxMessage::unpack(&unpack_data) {
-            Ok(mut msg) => {
+            Ok(msg) => {
                 tracing::info!(
                     from = %hex::encode(msg.source_hash()),
                     title = %msg.title_text(),
                     len = msg.content_bytes().len(),
                     "inbound LXMF message via link"
                 );
-                msg.source_blackholed = self.source_blackholed(&msg.source_hash());
-                if msg.source_blackholed {
-                    // LXMRouter.py:1739-1741.
-                    tracing::debug!(
-                        from = %hex::encode(msg.source_hash()),
-                        "Dropping LXM from blackholed identity"
-                    );
-                    return;
-                }
-                if self.should_reject_for_signature(&mut msg) || self.should_reject_for_stamp(&msg)
-                {
-                    return;
-                }
-                self.handle_inbound_message(msg, DeliveryMethod::Direct);
+                self.admit_inbound_message(msg, DeliveryMethod::Direct);
             }
             Err(e) => {
                 tracing::debug!("link data not an LXMF message: {e}");
@@ -4682,7 +4678,11 @@ impl LxmdRunner {
             } else {
                 0.0
             };
-            let disposition = if self.source_blackholed(&msg.source_hash()) {
+            let mut msg = msg;
+            msg.unverified_reason = classify_signature(&msg, public_key.as_ref());
+            let disposition = if self.source_blackholed(&msg.source_hash())
+                || self.router.is_ignored(&msg.source_hash())
+            {
                 DurableDisposition::PolicyDiscard
             } else {
                 DurableDisposition::Committed
@@ -4705,7 +4705,7 @@ impl LxmdRunner {
                                 SuppressionReason::Cancelled,
                             ));
                         }
-                        validate_download_policy(&msg, public_key, &tickets, cost)
+                        validate_download_policy(&msg, &tickets, cost)
                             .map_err(DownloadWorkerError::Rejected)?;
                         DurableAdmissionReceipt::commit(store.prepare(
                             record,
@@ -4963,6 +4963,24 @@ impl LxmdRunner {
             }
         };
 
+        // Python proves every delivery packet before unpacking or gating it
+        // (LXMRouter.py:2262-2263).
+        if let Some(proof_raw) = self.create_delivery_proof(raw) {
+            let trunc = rns_wire::hash::truncated_packet_hash(raw, header.flags.header_type);
+            if !self.queue_runtime_transport(
+                TransportMessage::Outbound(rns_transport::messages::OutboundRequest {
+                    raw: Bytes::from(proof_raw),
+                    destination_hash: trunc,
+                }),
+                "opportunistic delivery proof",
+            ) {
+                tracing::error!(
+                    packet = %hex::encode(trunc),
+                    "could not stage opportunistic delivery proof"
+                );
+            }
+        }
+
         // Python strips the dest hash for opportunistic delivery; direct delivery
         // keeps it. Re-prepend if missing so LxMessage::unpack always sees the
         // [dest_hash][lxm_data] layout.
@@ -4975,7 +4993,7 @@ impl LxmdRunner {
         };
 
         match LxMessage::unpack(&unpack_data) {
-            Ok(mut msg) => {
+            Ok(msg) => {
                 tracing::info!(
                     from = %hex::encode(msg.source_hash()),
                     title = %msg.title_text(),
@@ -4983,40 +5001,7 @@ impl LxmdRunner {
                     "inbound LXMF message received"
                 );
 
-                msg.source_blackholed = self.source_blackholed(&msg.source_hash());
-                if msg.source_blackholed {
-                    // LXMRouter.py:1739-1741.
-                    tracing::debug!(
-                        from = %hex::encode(msg.source_hash()),
-                        "Dropping LXM from blackholed identity"
-                    );
-                    return;
-                }
-
-                // Reject on stamp failure BEFORE sending the delivery proof.
-                if self.should_reject_for_signature(&mut msg) || self.should_reject_for_stamp(&msg)
-                {
-                    return;
-                }
-
-                if let Some(proof_raw) = self.create_delivery_proof(raw) {
-                    let trunc =
-                        rns_wire::hash::truncated_packet_hash(raw, header.flags.header_type);
-                    if !self.queue_runtime_transport(
-                        TransportMessage::Outbound(rns_transport::messages::OutboundRequest {
-                            raw: Bytes::from(proof_raw),
-                            destination_hash: trunc,
-                        }),
-                        "opportunistic delivery proof",
-                    ) {
-                        tracing::error!(
-                            packet = %hex::encode(trunc),
-                            "could not stage opportunistic delivery proof"
-                        );
-                    }
-                }
-
-                self.handle_inbound_message(msg, DeliveryMethod::Opportunistic);
+                self.admit_inbound_message(msg, DeliveryMethod::Opportunistic);
             }
             Err(e) => {
                 tracing::warn!("failed to unpack LXMF message: {e}");
@@ -5024,21 +5009,33 @@ impl LxmdRunner {
         }
     }
 
-    /// Validate a recalled sender signature. Unknown senders remain deliverable
-    /// like Python, but can never teach the router a ticket.
-    fn should_reject_for_signature(&self, msg: &mut LxMessage) -> bool {
-        let Some(public_key) = self.known_identities.get(&hex::encode(msg.source_hash())) else {
-            return false;
-        };
-        if msg.verify(public_key).is_ok() {
-            false
-        } else {
-            tracing::warn!(
+    /// Python `lxmf_delivery` gating (LXMRouter.py:2163-2257): blackholed
+    /// source, ticket learning from a validated signature, stamp, ignored
+    /// source, then delivery. Unknown or invalid signatures are delivered flagged.
+    fn admit_inbound_message(&mut self, mut msg: LxMessage, method: DeliveryMethod) {
+        msg.source_blackholed = self.source_blackholed(&msg.source_hash());
+        if msg.source_blackholed {
+            tracing::debug!(
                 from = %hex::encode(msg.source_hash()),
-                "inbound message rejected: invalid LXMF signature"
+                "Dropping LXM from blackholed identity"
             );
-            true
+            return;
         }
+        let public_key = self
+            .known_identities
+            .get(&hex::encode(msg.source_hash()))
+            .copied();
+        msg.unverified_reason = classify_signature(&msg, public_key.as_ref());
+        if msg.unverified_reason.is_none()
+            && let Some(key) = public_key
+            && let Ok(verified) = msg.verify(&key)
+        {
+            self.router.learn_ticket_from_inbound(&verified);
+        }
+        if self.should_reject_for_stamp(&msg) {
+            return;
+        }
+        self.handle_inbound_message(msg, method);
     }
 
     /// Returns true if the message should be rejected.
@@ -5089,19 +5086,10 @@ impl LxmdRunner {
 
     /// Write a received LXMF message to disk and invoke `on_inbound`.
     fn handle_inbound_message(&mut self, mut msg: LxMessage, method: DeliveryMethod) {
-        // Direct/opportunistic admission has already checked the recipient's
-        // policy. Ticket learning separately requires the source-bound proof;
-        // deliver_inbound deliberately has no authentication authority. Learn
-        // before deduplication so a retry after identity recall can teach its ticket.
-        if let Some(public_key) = self.known_identities.get(&hex::encode(msg.source_hash()))
-            && let Ok(verified) = msg.verify(public_key)
-        {
-            self.router.learn_ticket_from_inbound(&verified);
-        }
         if !self.router.deliver_inbound(&msg, false) {
             tracing::debug!(
                 message = %hex::encode(msg.message_id()),
-                "ignoring already delivered inbound LXMF message"
+                "ignoring inbound LXMF message from an ignored source or already delivered"
             );
             return;
         }
@@ -5149,424 +5137,234 @@ impl LxmdRunner {
         );
     }
 
-    fn execute_encrypted_actions(&mut self, actions: Vec<OutboundAction>) {
-        for action in actions {
-            let (mut message, dest_hash, is_opportunistic, direct_plan) = match action {
-                OutboundAction::DeliverDirect { message, dest_hash } => {
-                    (message, dest_hash, false, None)
-                }
-                OutboundAction::PlanDirect {
-                    message,
-                    dest_hash,
-                    plan,
-                } => (message, dest_hash, false, Some(plan)),
-                OutboundAction::DeliverOpportunistic { message, dest_hash } => {
-                    (message, dest_hash, true, None)
-                }
-                OutboundAction::DeliverPropagated { message, prop_hash } => {
-                    let mut message = message;
-                    let prop_hex = hex::encode(prop_hash);
-                    tracing::info!(
-                        dest = %hex::encode(message.destination_hash()),
-                        prop = %hex::encode(prop_hash),
-                        "routing message via propagation node"
-                    );
-                    match self.pack_message_for_propagation(&message, prop_hash) {
-                        Ok(packed) => {
-                            let attempts = mark_delivery_attempt(&mut message);
-                            if attempts >= MAX_DELIVERY_ATTEMPTS {
-                                tracing::warn!(
-                                    prop = %prop_hex,
-                                    attempts,
-                                    max_attempts = MAX_DELIVERY_ATTEMPTS,
-                                    "propagated delivery attempt budget reached; deferring terminal failure"
-                                );
-                                self.queue_router_message(message, "propagated retry deferral");
-                                continue;
-                            }
-                            let hops = route_hops_for(&self.route_hops, prop_hash);
-                            self.ensure_link_delivery();
-                            if let Some(ref mut ld) = self.link_delivery
-                                && let Err(err) =
-                                    ld.start_packed_delivery(message, prop_hash, hops, packed, true)
-                            {
-                                let reason = err.error.to_string();
-                                tracing::warn!(
-                                    error = %reason,
-                                    prop = %hex::encode(prop_hash),
-                                    "failed to start propagated link delivery"
-                                );
-                                requeue_after_path_request(
-                                    &mut self.router,
-                                    &self.transport_tx,
-                                    *err.message,
-                                    prop_hash,
-                                    &reason,
-                                    false,
-                                );
-                            }
-                        }
-                        Err(PropagationPreparationError::Pending) => {
-                            message.next_delivery_attempt = now_f64() + 0.5;
-                            self.queue_router_message(message, "propagation envelope preparation");
-                        }
-                        Err(PropagationPreparationError::Missing(missing)) => {
-                            let path = if missing == MissingPropagationInput::RecipientIdentity {
-                                message.destination_hash()
-                            } else {
-                                prop_hash
-                            };
-                            requeue_after_path_request(
-                                &mut self.router,
-                                &self.transport_tx,
-                                message,
-                                path,
-                                "propagation readiness incomplete",
-                                true,
-                            );
-                        }
-                        Err(PropagationPreparationError::Invalid(error)) => {
-                            self.last_delivery_failure = Some(error);
-                            message.mark_failed();
-                            self.propagation_envelopes.remove(&message.message_id());
-                        }
-                    }
-                    continue;
-                }
-                OutboundAction::Failed(message) => {
-                    self.propagation_envelopes.remove(&message.message_id());
-                    self.pending_propagation_envelopes
-                        .remove(&message.message_id());
-                    let reason = Some(message.message_id())
-                        .map(|hash| {
-                            format!("delivery attempts exhausted for {}", hex::encode(hash))
-                        })
-                        .unwrap_or_else(|| "delivery attempts exhausted".to_string());
-                    self.last_delivery_failure = Some(reason);
-                    continue;
-                }
-                OutboundAction::Expired(message) => {
-                    self.propagation_envelopes.remove(&message.message_id());
-                    self.pending_propagation_envelopes
-                        .remove(&message.message_id());
-                    let reason = Some(message.message_id())
-                        .map(|hash| {
-                            format!("message {} expired before delivery", hex::encode(hash))
-                        })
-                        .unwrap_or_else(|| "message expired before delivery".to_string());
-                    self.last_delivery_failure = Some(reason);
-                    continue;
-                }
-            };
-
-            let dest_hex = hex::encode(dest_hash);
-            if !is_opportunistic {
-                let router_owned = direct_plan.is_some();
-                let plan = direct_plan.unwrap_or_else(|| {
-                    plan_direct_delivery(
-                        &mut message,
-                        DirectDeliveryPlanInput {
-                            identity_known: self.known_identities.contains_key(&dest_hex),
-                            route: direct_route_snapshot(&self.route_hops, dest_hash),
-                            reusable_link: direct_reusable_link_state(
-                                self.link_delivery.as_ref(),
-                                dest_hash,
-                            ),
-                        },
-                        now_f64(),
-                    )
-                });
-
-                match plan {
-                    DirectDeliveryPlan::RequestPath { drop_existing } => {
-                        self.recall_identity(dest_hash);
+    /// Prepare propagation envelopes for queued propagated messages and return
+    /// those not ready yet. Python generates the propagation stamp before a
+    /// message enters the outbound queue, so these wait outside processing.
+    fn prepare_propagation_envelopes(&mut self) -> HashSet<[u8; 32]> {
+        let mut unready = HashSet::new();
+        let Some(node) = self.router.outbound_propagation_node else {
+            return unready;
+        };
+        let queued: Vec<LxMessage> = self
+            .router
+            .pending_outbound
+            .iter()
+            .filter(|message| {
+                message.method == DeliveryMethod::Propagated
+                    && message.state == lxmf_core::constants::MessageState::Outbound
+            })
+            .cloned()
+            .collect();
+        for message in queued {
+            let id = message.message_id();
+            match self.pack_message_for_propagation(&message, node) {
+                Ok(_) => {}
+                Err(PropagationPreparationError::Missing(
+                    MissingPropagationInput::NodeIdentity | MissingPropagationInput::NodePath,
+                )) => {}
+                Err(PropagationPreparationError::Missing(missing)) => {
+                    let wanted = if missing == MissingPropagationInput::RecipientIdentity {
+                        message.destination_hash()
+                    } else {
+                        node
+                    };
+                    self.recall_identity(wanted);
+                    if self.router.request_path(wanted, &self.medium, now_f64()) {
                         queue_path_request(
                             &self.transport_tx,
-                            dest_hash,
-                            drop_existing,
-                            "direct delivery path request",
-                        );
-                        tracing::warn!(
-                            dest = %dest_hex,
-                            attempts = message.delivery_attempts,
-                            drop_existing,
-                            "direct delivery waiting for path"
-                        );
-                        if !router_owned {
-                            self.queue_router_message(message, "direct path wait");
-                        }
-                    }
-                    DirectDeliveryPlan::DeferTerminalFailure => {
-                        tracing::warn!(
-                            dest = %dest_hex,
-                            attempts = message.delivery_attempts,
-                            max_attempts = MAX_DELIVERY_ATTEMPTS,
-                            "direct delivery attempt budget reached; deferring terminal failure"
-                        );
-                        if !router_owned {
-                            self.queue_router_message(message, "direct terminal deferral");
-                        }
-                    }
-                    DirectDeliveryPlan::WaitForReusableLink => {
-                        tracing::debug!(
-                            dest = %dest_hex,
-                            attempts = message.delivery_attempts,
-                            "direct delivery waiting for reusable Link"
-                        );
-                        if !router_owned {
-                            self.queue_router_message(message, "reusable Link wait");
-                        }
-                    }
-                    DirectDeliveryPlan::UseReusableLink
-                    | DirectDeliveryPlan::StartNewLink { .. } => {
-                        let planned_hops = match plan {
-                            DirectDeliveryPlan::StartNewLink { hops } => hops,
-                            _ => route_hops_for(&self.route_hops, dest_hash),
-                        };
-                        tracing::info!(
-                            dest = %dest_hex,
-                            hops = planned_hops,
-                            plan = ?plan,
-                            "routing Direct LXMF message over link delivery"
-                        );
-                        self.ensure_link_delivery();
-                        if let Some(ref mut ld) = self.link_delivery {
-                            if matches!(plan, DirectDeliveryPlan::UseReusableLink)
-                                && ld.direct_link_snapshot(dest_hash).is_none()
-                                && ld.backchannel_link_snapshot(dest_hash).is_some()
-                            {
-                                match ld.start_backchannel_delivery(message, dest_hash) {
-                                    Ok(_) => {}
-                                    Err(err) => {
-                                        let reason = err.error.to_string();
-                                        let returned_message = *err.message;
-                                        tracing::warn!(
-                                            error = %reason,
-                                            dest = %dest_hex,
-                                            "failed to start daemon backchannel delivery"
-                                        );
-                                        if router_owned {
-                                            queue_path_request(
-                                                &self.transport_tx,
-                                                dest_hash,
-                                                false,
-                                                &reason,
-                                            );
-                                            if let Some(hash) = Some(returned_message.message_id())
-                                            {
-                                                let _ =
-                                                    self.router.defer_outbound_for_path_request(
-                                                        &hash,
-                                                        now_f64(),
-                                                    );
-                                            }
-                                        } else {
-                                            requeue_after_path_request(
-                                                &mut self.router,
-                                                &self.transport_tx,
-                                                returned_message,
-                                                dest_hash,
-                                                &reason,
-                                                false,
-                                            );
-                                        }
-                                    }
-                                }
-                                continue;
-                            }
-
-                            if let Err(err) =
-                                ld.start_delivery_with_report(message, dest_hash, planned_hops)
-                            {
-                                let reason = err.error.to_string();
-                                let returned_message = *err.message;
-                                tracing::warn!(
-                                    error = %reason,
-                                    dest = %dest_hex,
-                                    "failed to start direct link delivery"
-                                );
-                                if router_owned {
-                                    queue_path_request(
-                                        &self.transport_tx,
-                                        dest_hash,
-                                        false,
-                                        &reason,
-                                    );
-                                    if let Some(hash) = Some(returned_message.message_id()) {
-                                        let _ = self
-                                            .router
-                                            .defer_outbound_for_path_request(&hash, now_f64());
-                                    }
-                                } else {
-                                    requeue_after_path_request(
-                                        &mut self.router,
-                                        &self.transport_tx,
-                                        returned_message,
-                                        dest_hash,
-                                        &reason,
-                                        false,
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    DirectDeliveryPlan::Fail => {
-                        tracing::warn!(
-                            dest = %dest_hex,
-                            attempts = message.delivery_attempts,
-                            "direct delivery failed before link delivery"
+                            wanted,
+                            false,
+                            "propagation readiness incomplete",
                         );
                     }
+                    unready.insert(id);
                 }
-                continue;
+                Err(PropagationPreparationError::Pending) => {
+                    unready.insert(id);
+                }
+                Err(PropagationPreparationError::Invalid(error)) => {
+                    self.last_delivery_failure = Some(error);
+                    self.propagation_envelopes.remove(&id);
+                    self.router.mark_outbound_failed(&id);
+                }
             }
+        }
+        unready
+    }
 
-            let destination_public_key = self.known_identities.get(&dest_hex).copied();
-            let mut missing_identity = false;
-            let payload = match message.pack_opportunistic_encrypted(|plaintext| {
-                self.encrypt_for_destination(&dest_hex, plaintext)
-                    .ok_or_else(|| {
-                        missing_identity = true;
-                        lxmf_core::message::MessageError::PackFailed(format!(
-                            "no identity key for destination {dest_hex}"
-                        ))
-                    })
-            }) {
-                Ok(ct) => {
-                    tracing::info!(
-                        dest = %dest_hex,
-                        encrypted_len = ct.len(),
-                        "outbound LXMF: encrypted opportunistic payload"
-                    );
-                    ct
+    fn execute_outbound_actions(&mut self, actions: Vec<OutboundAction>) {
+        for action in actions {
+            match action {
+                OutboundAction::Failed(message) => {
+                    let id = message.message_id();
+                    self.propagation_envelopes.remove(&id);
+                    self.pending_propagation_envelopes.remove(&id);
+                    tracing::warn!(hash = %hex::encode(id), "message delivery failed");
+                    self.last_delivery_failure = Some(format!(
+                        "delivery attempts exhausted for {}",
+                        hex::encode(id)
+                    ));
                 }
-                Err(err) if missing_identity => {
-                    tracing::warn!(
-                        dest = %dest_hex,
-                        attempts = message.delivery_attempts,
-                        error = %err,
-                        "destination key unknown, re-queuing"
-                    );
-                    self.recall_identity(dest_hash);
-                    requeue_after_path_request(
-                        &mut self.router,
-                        &self.transport_tx,
-                        message,
-                        dest_hash,
-                        "opportunistic destination identity unknown",
-                        true,
-                    );
-                    continue;
+                OutboundAction::RequestPath {
+                    destination,
+                    drop_existing,
+                } => {
+                    self.recall_identity(destination);
+                    if drop_existing {
+                        queue_path_request_after_drop(&self.transport_tx, destination);
+                    } else {
+                        queue_path_request(
+                            &self.transport_tx,
+                            destination,
+                            false,
+                            "outbound path request",
+                        );
+                    }
                 }
-                Err(err) => {
-                    tracing::warn!(
-                        dest = %dest_hex,
-                        error = %err,
-                        "failed to pack opportunistic LXMF message"
-                    );
-                    continue;
-                }
-            };
-            let Some(destination_public_key) = destination_public_key else {
-                tracing::error!(
-                    dest = %dest_hex,
-                    "opportunistic encryption succeeded without a retained destination identity"
-                );
-                continue;
-            };
-            let msg_hash = Some(message.message_id());
+                OutboundAction::SendOpportunistic { message } => self.send_opportunistic(message),
+                OutboundAction::DeliverOverLink {
+                    message,
+                    target,
+                    plan,
+                } => self.deliver_over_link(message, target, plan),
+            }
+        }
+    }
 
-            let flags = rns_wire::flags::PacketFlags {
+    fn send_opportunistic(&mut self, message: LxMessage) {
+        let dest_hash = message.destination_hash();
+        let dest_hex = hex::encode(dest_hash);
+        let msg_hash = message.message_id();
+        let Some(destination_public_key) = self.known_identities.get(&dest_hex).copied() else {
+            tracing::warn!(dest = %dest_hex, "destination key unknown, waiting for path");
+            self.recall_identity(dest_hash);
+            let actions = self
+                .router
+                .await_outbound_path(&msg_hash, &self.medium, now_f64());
+            self.execute_outbound_actions(actions);
+            return;
+        };
+        let payload = match message.pack_opportunistic_encrypted(|plaintext| {
+            self.encrypt_for_destination(&dest_hex, plaintext)
+                .ok_or_else(|| MessageError::PackFailed("destination encryption failed".into()))
+        }) {
+            Ok(payload) => payload,
+            Err(error) => {
+                // A raising send() fails the message (LXMRouter.py:3143-3146).
+                tracing::warn!(dest = %dest_hex, %error, "opportunistic LXMF send failed");
+                self.last_delivery_failure = Some(error.to_string());
+                self.router.mark_outbound_failed(&msg_hash);
+                return;
+            }
+        };
+        let header = rns_wire::header::PacketHeader {
+            flags: rns_wire::flags::PacketFlags {
                 header_type: rns_wire::flags::HeaderType::Header1,
                 context_flag: false,
                 transport_type: rns_wire::flags::TransportType::Broadcast,
                 destination_type: rns_wire::flags::DestinationType::Single,
                 packet_type: rns_wire::flags::PacketType::Data,
-            };
-            let header = rns_wire::header::PacketHeader {
-                flags,
-                hops: 0,
-                transport_id: None,
-                destination_hash: dest_hash,
-                context: rns_wire::context::PacketContext::None,
-            };
-            let mut raw = header.pack();
-            raw.extend_from_slice(&payload);
-
-            // Escalate oversize packets to link delivery.
-            if raw.len() > rns_wire::constants::MTU {
-                tracing::info!(
-                    dest = %dest_hex,
-                    packet_len = raw.len(),
-                    "packet exceeds MTU; routing to link delivery"
-                );
-                let attempts = mark_delivery_attempt(&mut message);
-                if attempts >= MAX_DELIVERY_ATTEMPTS {
-                    tracing::warn!(
-                        dest = %dest_hex,
-                        attempts,
-                        max_attempts = MAX_DELIVERY_ATTEMPTS,
-                        "oversized direct delivery attempt budget reached; deferring terminal failure"
-                    );
-                    self.queue_router_message(message, "oversized direct retry deferral");
-                    continue;
-                }
-                let hops = route_hops_for(&self.route_hops, dest_hash);
-                self.ensure_link_delivery();
-                if let Some(ref mut ld) = self.link_delivery
-                    && let Err(err) = ld.start_delivery(message, dest_hash, hops)
-                {
-                    let reason = err.error.to_string();
-                    tracing::warn!(
-                        error = %reason,
-                        dest = %dest_hex,
-                        "failed to start oversized direct link delivery"
-                    );
-                    requeue_after_path_request(
-                        &mut self.router,
-                        &self.transport_tx,
-                        *err.message,
-                        dest_hash,
-                        &reason,
-                        false,
-                    );
-                }
-                continue;
+            },
+            hops: 0,
+            transport_id: None,
+            destination_hash: dest_hash,
+            context: rns_wire::context::PacketContext::None,
+        };
+        let mut raw = header.pack();
+        raw.extend_from_slice(&payload);
+        let timeout = lxmf_core::router::outbound::opportunistic_receipt_timeout(
+            self.medium.route(&dest_hash),
+            message.receipt_timeout,
+        );
+        match dispatch_opportunistic_packet(
+            &self.transport_tx,
+            raw,
+            dest_hash,
+            destination_public_key,
+            msg_hash,
+            timeout,
+        ) {
+            Ok(()) => {
+                tracing::info!(hash = %hex::encode(msg_hash), "message sent; awaiting delivery proof")
             }
+            Err(error) => tracing::warn!(
+                dest = %dest_hex,
+                %error,
+                "transport backpressure deferred opportunistic message"
+            ),
+        }
+    }
 
-            mark_delivery_attempt(&mut message);
-            match dispatch_opportunistic_packet(
-                &self.transport_tx,
-                raw,
-                dest_hash,
-                destination_public_key,
-                msg_hash,
-            ) {
-                Ok(()) => {
-                    if let Some(hash) = msg_hash {
-                        self.opportunistic_in_flight.insert(
-                            hash,
-                            PendingOpportunisticDelivery {
-                                retry_at: message.next_delivery_attempt,
-                                message,
-                            },
-                        );
-                        tracing::info!(hash = %hex::encode(hash), "message sent; awaiting delivery proof");
-                    } else {
-                        tracing::warn!(
-                            dest = %dest_hex,
-                            "opportunistic message has no message id; delivery cannot be tracked"
-                        );
+    fn deliver_over_link(&mut self, message: LxMessage, target: [u8; 16], plan: LinkDeliveryPlan) {
+        let msg_hash = message.message_id();
+        let hops = match plan {
+            LinkDeliveryPlan::StartLink { hops } => hops,
+            LinkDeliveryPlan::UseLink => self
+                .medium
+                .route(&target)
+                .map(|route| route.hops.max(1))
+                .unwrap_or(1),
+        };
+        self.ensure_link_delivery();
+        let propagated = message.method == DeliveryMethod::Propagated;
+        let packed = if propagated {
+            match self.pack_message_for_propagation(&message, target) {
+                Ok(packed) => Some(packed),
+                Err(PropagationPreparationError::Invalid(error)) => {
+                    self.last_delivery_failure = Some(error);
+                    self.router.mark_outbound_failed(&msg_hash);
+                    return;
+                }
+                Err(_) => {
+                    // The envelope went stale since this pass prepared it.
+                    if let Some(queued) = self
+                        .router
+                        .pending_outbound
+                        .iter_mut()
+                        .find(|queued| queued.message_id() == msg_hash)
+                    {
+                        queued.state = lxmf_core::constants::MessageState::Outbound;
                     }
+                    return;
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        dest = %dest_hex,
-                        error = %e,
-                        "transport backpressure deferred opportunistic message"
-                    );
-                    self.queue_router_message(message, "opportunistic transport backpressure");
-                }
+            }
+        } else {
+            None
+        };
+        let Some(ld) = self.link_delivery.as_mut() else {
+            return;
+        };
+        let started = if let Some(packed) = packed {
+            ld.start_packed_delivery(message, target, hops, packed, true)
+                .map(|_| ())
+                .map_err(|failure| failure.error.to_string())
+        } else if plan == LinkDeliveryPlan::UseLink
+            && ld.direct_link_snapshot(target).is_none()
+            && ld.backchannel_link_snapshot(target).is_some()
+        {
+            ld.start_backchannel_delivery(message, target)
+                .map(|_| ())
+                .map_err(|failure| failure.error.to_string())
+        } else {
+            ld.start_delivery_with_report(message, target, hops)
+                .map(|_| ())
+                .map_err(|failure| failure.error.to_string())
+        };
+        match started {
+            Ok(()) => tracing::info!(
+                target = %hex::encode(target),
+                hops,
+                plan = ?plan,
+                propagated,
+                "routing LXMF message over link delivery"
+            ),
+            Err(reason) => {
+                tracing::warn!(target = %hex::encode(target), %reason, "failed to start link delivery");
+                let activated = plan == LinkDeliveryPlan::UseLink;
+                let actions =
+                    self.router
+                        .outbound_link_closed(&msg_hash, activated, &self.medium, now_f64());
+                self.execute_outbound_actions(actions);
             }
         }
     }
@@ -6250,11 +6048,6 @@ pub(crate) async fn main() {
         );
         for destination in ignored {
             runner.router.ignore_destination(destination);
-            if let Some(ref node) = runner.propagation_node
-                && let Ok(mut node) = node.lock()
-            {
-                node.ignore_destination(destination);
-            }
         }
     }
     let allowed = load_hash_list(&config_dir.join("allowed"));
@@ -6293,21 +6086,19 @@ pub(crate) async fn main() {
         runner.run_deferred_start_jobs(daemon_config.announce_at_start);
         'one_shot: {
             let dest_hex = normalize_hash_hex(&send_args[0]);
-            let content = match args.send_file.as_ref() {
+            let contents = match args.send_file.as_ref() {
                 Some(path) => match std::fs::read_to_string(path) {
-                    Ok(content) => content,
+                    Ok(content) => vec![content],
                     Err(e) => {
                         tracing::error!(path = %path.display(), error = %e, "failed to read --send-file");
                         break 'one_shot;
                     }
                 },
-                None => match send_args.get(1) {
-                    Some(content) => content.clone(),
-                    None => {
-                        tracing::error!("--send requires CONTENT unless --send-file is provided");
-                        break 'one_shot;
-                    }
-                },
+                None if send_args.len() > 1 => send_args[1..].to_vec(),
+                None => {
+                    tracing::error!("--send requires CONTENT unless --send-file is provided");
+                    break 'one_shot;
+                }
             };
 
             let dest_hash = match parse_destination_hash(&dest_hex) {
@@ -6351,6 +6142,7 @@ pub(crate) async fn main() {
                     }
                 }
                 runner.refresh_route_hops_from_transport().await;
+                runner.refresh_outbound_medium().await;
                 runner.drain_link_packets();
                 have_key = runner.known_identities.contains_key(&dest_hex);
                 if have_key
@@ -6376,60 +6168,65 @@ pub(crate) async fn main() {
                 );
             }
 
-            let mut msg = match LxMessageDraft::new(
-                dest_hash,
-                runner.lxmf_dest_hash,
-                "",
-                &content,
-                args.send_method.delivery_method(),
-            ) {
-                Ok(value) => value,
-                Err(error) => {
-                    tracing::error!(%error,"invalid message size");
-                    break 'one_shot;
-                }
-            };
-            if let Some(raw) = args.send_fields_json.as_deref() {
-                match parse_send_fields_json(raw) {
-                    Ok(fields) => {
-                        tracing::info!(count = fields.len(), "attaching custom fields to --send");
-                        for (id, value) in fields {
-                            if let Err(error) = msg.set_field(id, value) {
-                                tracing::error!(%error,"invalid --send field");
-                                break 'one_shot;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!("--send-fields-json: {e}");
+            for content in &contents {
+                let mut msg = match LxMessageDraft::new(
+                    dest_hash,
+                    runner.lxmf_dest_hash,
+                    "",
+                    content,
+                    args.send_method.delivery_method(),
+                ) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        tracing::error!(%error,"invalid message size");
                         break 'one_shot;
                     }
+                };
+                if let Some(raw) = args.send_fields_json.as_deref() {
+                    match parse_send_fields_json(raw) {
+                        Ok(fields) => {
+                            tracing::info!(
+                                count = fields.len(),
+                                "attaching custom fields to --send"
+                            );
+                            for (id, value) in fields {
+                                if let Err(error) = msg.set_field(id, value) {
+                                    tracing::error!(%error,"invalid --send field");
+                                    break 'one_shot;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!("--send-fields-json: {e}");
+                            break 'one_shot;
+                        }
+                    }
                 }
-            }
-            msg.include_ticket = true;
-            let prepared = runner.router.prepare_outbound(&mut msg).and_then(|intent| {
-                intent
-                    .persist(&runner.data_dir, &mut msg)
-                    .map_err(|e| lxmf_core::router::TicketPreparationError::Encode(e.to_string()))
-            });
-            if let Err(error) = prepared {
-                tracing::error!(%error,"reply ticket persistence failed");
-                break 'one_shot;
-            }
-            let Some(signing_key) = runner.identity.get_signing_key() else {
-                tracing::error!("identity has no signing key");
-                break 'one_shot;
-            };
-            let signed = match msg.sign(&signing_key) {
-                Ok(value) => value,
-                Err(error) => {
-                    tracing::error!(%error,"failed to sign message");
+                msg.include_ticket = true;
+                let prepared = runner.router.prepare_outbound(&mut msg).and_then(|intent| {
+                    intent.persist(&runner.data_dir, &mut msg).map_err(|e| {
+                        lxmf_core::router::TicketPreparationError::Encode(e.to_string())
+                    })
+                });
+                if let Err(error) = prepared {
+                    tracing::error!(%error,"reply ticket persistence failed");
                     break 'one_shot;
                 }
-            };
-            if let Err(error) = runner.router.submit_signed(signed) {
-                tracing::error!(%error,"failed to queue message");
-                break 'one_shot;
+                let Some(signing_key) = runner.identity.get_signing_key() else {
+                    tracing::error!("identity has no signing key");
+                    break 'one_shot;
+                };
+                let signed = match msg.sign(&signing_key) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        tracing::error!(%error,"failed to sign message");
+                        break 'one_shot;
+                    }
+                };
+                if let Err(error) = runner.router.submit_signed(signed) {
+                    tracing::error!(%error,"failed to queue message");
+                    break 'one_shot;
+                }
             }
 
             // Completion phase: do not confuse queue acceptance with delivery.
@@ -6440,6 +6237,7 @@ pub(crate) async fn main() {
             for _ in 0..args.send_timeout_secs {
                 runner.drain_announce_events();
                 runner.refresh_route_hops_from_transport().await;
+                runner.refresh_outbound_medium().await;
                 runner.drain_link_packets();
                 runner.tick();
                 if sleep_or_shutdown(&shutdown, Duration::from_secs(1)).await {
@@ -6448,10 +6246,7 @@ pub(crate) async fn main() {
                 }
 
                 let stats = runner.router.stats();
-                if stats.pending_outbound == 0
-                    && stats.pending_deferred_stamps == 0
-                    && runner.opportunistic_in_flight.is_empty()
-                {
+                if stats.pending_outbound == 0 && stats.pending_deferred_stamps == 0 {
                     drained = true;
                     break;
                 }
@@ -6477,6 +6272,7 @@ pub(crate) async fn main() {
                 for _ in 0..args.send_timeout_secs {
                     runner.drain_announce_events();
                     runner.refresh_route_hops_from_transport().await;
+                    runner.refresh_outbound_medium().await;
                     runner.drain_link_packets();
                     runner.tick();
                     if sleep_or_shutdown(&shutdown, Duration::from_secs(1)).await {
@@ -6547,6 +6343,7 @@ pub(crate) async fn main() {
             _ = tick_timer.tick() => {
                 runner.drain_announce_events();
                 runner.refresh_route_hops_from_transport().await;
+                runner.refresh_outbound_medium().await;
                 runner.refresh_blackholed_identities_from_transport().await;
                 runner.drain_link_packets();
                 runner.tick();
@@ -7363,8 +7160,15 @@ mod tests {
         let raw = vec![0x44; 64];
         let (tx, mut rx) = mpsc::channel(2);
 
-        dispatch_opportunistic_packet(&tx, raw, destination_hash, public_key, Some(message_hash))
-            .unwrap();
+        dispatch_opportunistic_packet(
+            &tx,
+            raw,
+            destination_hash,
+            public_key,
+            message_hash,
+            Duration::from_secs(12),
+        )
+        .unwrap();
 
         assert!(matches!(
             rx.try_recv().unwrap(),
@@ -7387,8 +7191,15 @@ mod tests {
             .unwrap();
 
         assert!(
-            dispatch_opportunistic_packet(&tx, vec![0; 64], [2; 16], [3; 64], Some([4; 32]))
-                .is_err()
+            dispatch_opportunistic_packet(
+                &tx,
+                vec![0; 64],
+                [2; 16],
+                [3; 64],
+                [4; 32],
+                Duration::from_secs(12)
+            )
+            .is_err()
         );
         assert!(matches!(
             rx.try_recv().unwrap(),
@@ -7719,35 +7530,6 @@ mod tests {
     }
 
     #[test]
-    fn path_request_requeue_sets_path_wait_deadline() {
-        let mut router = LxmRouter::new(Default::default());
-        let (tx, mut rx) = mpsc::channel::<TransportMessage>(4);
-        let dest = [0x22; 16];
-        let source = [0x11; 16];
-        let message = signed_fixture(dest, source, "retry", "hello", DeliveryMethod::Direct);
-        let before = now_f64();
-
-        requeue_after_path_request(&mut router, &tx, message, dest, "test path wait", true);
-
-        assert_eq!(router.pending_outbound.len(), 1);
-        let queued = &router.pending_outbound[0];
-        assert_eq!(queued.delivery_attempts, 1);
-        assert!(queued.last_delivery_attempt >= before);
-        assert!(
-            queued.next_delivery_attempt >= before + PATH_REQUEST_WAIT as f64 - 1.0
-                && queued.next_delivery_attempt <= now_f64() + PATH_REQUEST_WAIT as f64 + 1.0,
-            "path-request retry should wait about {PATH_REQUEST_WAIT}s"
-        );
-
-        match rx.try_recv().expect("path request") {
-            TransportMessage::RequestPath { destination_hash } => {
-                assert_eq!(destination_hash, dest);
-            }
-            other => panic!("expected RequestPath, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn queue_path_request_can_drop_stale_path_before_requesting() {
         let (tx, mut rx) = mpsc::channel::<TransportMessage>(4);
         let dest = [0x24; 16];
@@ -7805,79 +7587,6 @@ mod tests {
         assert_eq!(last, 1234.5);
     }
 
-    #[test]
-    fn path_request_requeue_can_preserve_attempt_count_after_link_start_failure() {
-        let mut router = LxmRouter::new(Default::default());
-        let (tx, _rx) = mpsc::channel::<TransportMessage>(4);
-        let dest = [0x44; 16];
-        let source = [0x33; 16];
-        let mut message = signed_fixture(dest, source, "retry", "hello", DeliveryMethod::Direct);
-        message.delivery_attempts = 3;
-
-        requeue_after_path_request(&mut router, &tx, message, dest, "transport full", false);
-
-        assert_eq!(router.pending_outbound.len(), 1);
-        assert_eq!(router.pending_outbound[0].delivery_attempts, 3);
-        assert!(router.pending_outbound[0].next_delivery_attempt > now_f64());
-    }
-
-    #[test]
-    fn delivery_attempt_uses_delivery_retry_deadline() {
-        let dest = [0x66; 16];
-        let source = [0x55; 16];
-        let mut message = signed_fixture(dest, source, "direct", "hello", DeliveryMethod::Direct);
-        let before = now_f64();
-
-        let attempts = mark_delivery_attempt(&mut message);
-
-        assert_eq!(attempts, 1);
-        assert_eq!(message.delivery_attempts, 1);
-        assert!(message.last_delivery_attempt >= before);
-        assert!(
-            message.next_delivery_attempt >= before + DELIVERY_RETRY_WAIT as f64 - 1.0
-                && message.next_delivery_attempt <= now_f64() + DELIVERY_RETRY_WAIT as f64 + 1.0,
-            "delivery retry should wait about {DELIVERY_RETRY_WAIT}s"
-        );
-    }
-
-    #[test]
-    fn link_failure_retry_policy_matches_pre_establishment_failures() {
-        assert!(link_failure_retryable("link establishment timeout"));
-        assert!(link_failure_retryable("link closed"));
-        assert!(link_failure_retryable("transport full"));
-        assert!(link_failure_retryable("transport closed"));
-        assert!(link_failure_retryable("link is not active"));
-        assert!(link_failure_retryable("link not found"));
-        assert!(!link_failure_retryable("resource transfer failed"));
-    }
-
-    #[test]
-    fn route_hops_for_uses_cached_announce_hops_with_one_hop_floor() {
-        let dest = [0x77; 16];
-        let mut hops = HashMap::new();
-
-        assert_eq!(route_hops_for(&hops, dest), 1);
-
-        hops.insert(dest, 4);
-        assert_eq!(route_hops_for(&hops, dest), 4);
-
-        hops.insert(dest, 0);
-        assert_eq!(route_hops_for(&hops, dest), 1);
-    }
-
-    #[test]
-    fn direct_route_snapshot_uses_cached_announce_hops() {
-        let dest = [0x88; 16];
-        let mut hops = HashMap::new();
-
-        assert!(direct_route_snapshot(&hops, dest).is_none());
-
-        hops.insert(dest, 5);
-        let snapshot = direct_route_snapshot(&hops, dest).expect("route snapshot");
-        assert_eq!(snapshot.destination_hash, dest);
-        assert_eq!(snapshot.hops, 5);
-    }
-
     /// Real encrypted downloads pass the same decode/policy stages as workers;
     /// only validated bytes can create an archive, purge receipt, or hook.
     #[test]
@@ -7929,7 +7638,7 @@ mod tests {
         .unwrap();
         assert_eq!(decoded.wire_bytes(), missing.wire_bytes());
         assert_eq!(
-            validate_download_policy(&decoded, Some(sender.get_public_key()), &[], 8.0),
+            validate_download_policy(&decoded, &[], 8.0),
             Err(SuppressionReason::InvalidStamp)
         );
         assert!(store.haves(recipient.hash, [9; 16], 101).is_empty());
@@ -7939,10 +7648,7 @@ mod tests {
                 .join(format!("{}.lxm", hex::encode(missing.message_id())))
                 .exists()
         );
-        assert_eq!(
-            validate_download_policy(&decoded, Some(sender.get_public_key()), &[], 0.0),
-            Ok(())
-        );
+        assert_eq!(validate_download_policy(&decoded, &[], 0.0), Ok(()));
         assert!(matches!(
             decode_download_payload(
                 missing.wire_bytes(),
@@ -7956,9 +7662,11 @@ mod tests {
         let mut corrupt = missing.wire_bytes().to_vec();
         corrupt[32] ^= 1;
         let corrupt = LxMessage::unpack(&corrupt).unwrap();
+        // An invalid signature is delivered flagged, as lxmf_delivery does.
+        assert_eq!(validate_download_policy(&corrupt, &[], 0.0), Ok(()));
         assert_eq!(
-            validate_download_policy(&corrupt, Some(sender.get_public_key()), &[], 0.0),
-            Err(SuppressionReason::InvalidSignature)
+            classify_signature(&corrupt, Some(&sender.get_public_key())),
+            Some(lxmf_core::constants::UnverifiedReason::SignatureInvalid)
         );
         let ticket = [7u8; 16];
         let mut material = [0u8; 48];
@@ -7978,7 +7686,7 @@ mod tests {
             MessageDecodeLimits::default(),
         )
         .unwrap();
-        validate_download_policy(&accepted, Some(sender.get_public_key()), &[ticket], 8.0).unwrap();
+        validate_download_policy(&accepted, &[ticket], 8.0).unwrap();
         let scope = AdmissionScope {
             identity: recipient.hash,
             node: [9; 16],

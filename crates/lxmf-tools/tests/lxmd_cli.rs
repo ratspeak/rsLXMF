@@ -280,7 +280,7 @@ fn clap_requires_send_argument() {
         "expected Clap usage failure, got:\n{}",
         combined_output(&output)
     );
-    assert!(stderr(&output).contains("a value is required for '--send <DEST_HASH> <CONTENT>'"));
+    assert!(stderr(&output).contains("a value is required for '--send <DEST_HASH> <CONTENT>...'"));
 }
 
 #[test]

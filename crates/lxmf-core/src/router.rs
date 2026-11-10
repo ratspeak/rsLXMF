@@ -28,6 +28,9 @@ use crate::stamper;
 use crate::ticket::{Ticket, TicketStore};
 use crate::types::PropagationTransientId;
 
+pub mod outbound;
+pub use outbound::{MediumSnapshot, RouteInfo, attempt_due, attempt_limit, schedule_attempt};
+
 /// Outstanding inbound admission reservation. Return it to the same router
 /// instance that issued it; its counter is not unique across router instances.
 #[derive(Debug)]
@@ -212,29 +215,7 @@ pub enum TicketPreparationError {
     Encode(String),
 }
 
-/// Current route metadata for an LXMF Direct delivery destination.
-#[derive(Debug, Clone, PartialEq)]
-pub struct DirectRouteSnapshot {
-    pub destination_hash: [u8; 16],
-    pub hops: u8,
-    pub interface_name: Option<String>,
-    pub learned_at: Option<f64>,
-    pub expires_at: Option<f64>,
-}
-
-impl DirectRouteSnapshot {
-    pub fn new(destination_hash: [u8; 16], hops: u8) -> Self {
-        Self {
-            destination_hash,
-            hops: hops.max(1),
-            interface_name: None,
-            learned_at: None,
-            expires_at: None,
-        }
-    }
-}
-
-/// Reusable Direct/backchannel Link state visible to the router-level policy.
+/// Reusable Direct/backchannel or propagation Link state visible to the router.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DirectReusableLinkState {
     None,
@@ -243,99 +224,48 @@ pub enum DirectReusableLinkState {
     Closed { activated: bool },
 }
 
-/// Input snapshot for core Direct-delivery planning.
+/// Link work the router asks the embedder to perform for one message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkDeliveryPlan {
+    /// Send over the established Link to the target.
+    UseLink,
+    /// Establish a new Link to the target carrying this message.
+    StartLink { hops: u8 },
+}
+
+/// Embedder snapshot consumed by [`LxmRouter::process_outbound_with_inputs`].
 #[derive(Debug, Clone, PartialEq)]
-pub struct DirectDeliveryPlanInput {
-    pub identity_known: bool,
-    pub route: Option<DirectRouteSnapshot>,
-    pub reusable_link: DirectReusableLinkState,
+pub struct OutboundInputs {
+    pub medium: MediumSnapshot,
+    /// Destinations, including the propagation node, whose identity is known.
+    pub identities: HashSet<[u8; 16]>,
+    /// Reusable Direct or backchannel Link state per destination; absent means none.
+    pub direct_links: HashMap<[u8; 16], DirectReusableLinkState>,
+    /// State of the reusable Link to the outbound propagation node.
+    pub propagation_link: DirectReusableLinkState,
+    /// Propagated messages whose propagation stamp is still being generated.
+    /// Like Python's deferred stamp queue, they are not processed yet.
+    pub propagation_unready: HashSet<[u8; 32]>,
+    /// Messages a Link delivery already carries, from a `StartLink` plan.
+    pub link_owned: HashSet<[u8; 32]>,
 }
 
-/// Core Direct-delivery policy decision.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DirectDeliveryPlan {
-    UseReusableLink,
-    WaitForReusableLink,
-    StartNewLink { hops: u8 },
-    RequestPath { drop_existing: bool },
-    DeferTerminalFailure,
-    Fail,
+impl Default for OutboundInputs {
+    fn default() -> Self {
+        Self {
+            medium: MediumSnapshot::default(),
+            identities: HashSet::new(),
+            direct_links: HashMap::new(),
+            propagation_link: DirectReusableLinkState::None,
+            propagation_unready: HashSet::new(),
+            link_owned: HashSet::new(),
+        }
+    }
 }
 
-/// Plan a Direct delivery from the caller's identity, route and Link snapshot.
-/// Mutates attempt, timing, progress and message state; the caller performs
-/// path requests and Link operations and reports their outcomes.
-pub fn plan_direct_delivery(
-    message: &mut LxMessage,
-    input: DirectDeliveryPlanInput,
-    now: f64,
-) -> DirectDeliveryPlan {
-    if message.delivery_attempts > MAX_DELIVERY_ATTEMPTS {
-        message.mark_failed();
-        return DirectDeliveryPlan::Fail;
-    }
-
-    match input.reusable_link {
-        DirectReusableLinkState::Active => {
-            if message.progress < 0.05 {
-                message.progress = 0.05;
-            }
-            if message.state != MessageState::Sending {
-                message.mark_sending();
-            }
-            return DirectDeliveryPlan::UseReusableLink;
-        }
-        DirectReusableLinkState::Pending => {
-            return DirectDeliveryPlan::WaitForReusableLink;
-        }
-        DirectReusableLinkState::Closed { .. } => {
-            message.next_delivery_attempt = now + PATH_REQUEST_WAIT as f64;
-            if message.progress < 0.01 {
-                message.progress = 0.01;
-            }
-            return DirectDeliveryPlan::RequestPath {
-                drop_existing: true,
-            };
-        }
-        DirectReusableLinkState::None => {}
-    }
-
-    if !input.identity_known {
-        message.delivery_attempts += 1;
-        message.last_delivery_attempt = now;
-        message.next_delivery_attempt = now + PATH_REQUEST_WAIT as f64;
-        if message.progress < 0.01 {
-            message.progress = 0.01;
-        }
-        return DirectDeliveryPlan::RequestPath {
-            drop_existing: false,
-        };
-    }
-
-    message.delivery_attempts += 1;
-    message.last_delivery_attempt = now;
-    message.next_delivery_attempt = now + DELIVERY_RETRY_WAIT as f64;
-
-    if message.delivery_attempts >= MAX_DELIVERY_ATTEMPTS {
-        return DirectDeliveryPlan::DeferTerminalFailure;
-    }
-
-    if let Some(route) = input.route {
-        if message.progress < 0.03 {
-            message.progress = 0.03;
-        }
-        DirectDeliveryPlan::StartNewLink {
-            hops: route.hops.max(1),
-        }
-    } else {
-        message.next_delivery_attempt = now + PATH_REQUEST_WAIT as f64;
-        if message.progress < 0.01 {
-            message.progress = 0.01;
-        }
-        DirectDeliveryPlan::RequestPath {
-            drop_existing: false,
-        }
-    }
+enum OutboundStep {
+    Removed,
+    Kept { advanced: bool },
 }
 
 /// Router-owned policy and queues. The embedding application serializes access and drives it.
@@ -396,16 +326,14 @@ pub struct LxmRouter {
     next_inbound_reservation: u64,
     /// Destinations of delivered messages not yet taken by the embedder.
     destination_retains: VecDeque<[u8; 16]>,
+    /// Last router path request per destination, for debouncing.
+    path_request_times: HashMap<[u8; 16], f64>,
+    /// A slow-path message concluded; outbound processing should run again.
+    outbound_kick: bool,
 }
 
 /// Delivered destinations a router holds for the embedder to retain.
 const MAX_PENDING_RETAINS: usize = 256;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DirectOutboundHandling {
-    EmitLegacyAction,
-    LeavePending,
-}
 
 /// Callback invoked when a message is delivered locally.
 pub type DeliveryCallback = Box<dyn Fn(&LxMessage) + Send>;
@@ -503,6 +431,8 @@ impl LxmRouter {
             inbound_reservations: HashMap::new(),
             next_inbound_reservation: 0,
             destination_retains: VecDeque::new(),
+            path_request_times: HashMap::new(),
+            outbound_kick: false,
         }
     }
 
@@ -901,16 +831,21 @@ impl LxmRouter {
         self.allowed_control.retain(|h| h != identity_hash);
     }
 
+    /// Drop delivered messages whose source is `dest_hash` (Python
+    /// `ignore_destination`). Propagation storage is unaffected, as in Python.
     pub fn ignore_destination(&mut self, dest_hash: [u8; 16]) {
         if !self.ignored.contains(&dest_hash) {
             self.ignored.push(dest_hash);
         }
-        self.propagation_store.ignore_destination(dest_hash);
     }
 
     pub fn unignore_destination(&mut self, dest_hash: &[u8; 16]) {
         self.ignored.retain(|h| h != dest_hash);
-        self.propagation_store.unignore_destination(dest_hash);
+    }
+
+    /// Whether messages from this source are ignored on delivery.
+    pub fn is_ignored(&self, source_hash: &[u8; 16]) -> bool {
+        self.ignored.contains(source_hash)
     }
 
     /// Mark an outbound destination as PLAIN, as a Python `LXMessage` built
@@ -943,6 +878,11 @@ impl LxmRouter {
     /// Whether sends to `dest_hash` may compress, from its latest announce.
     pub fn compression_supported(&self, dest_hash: &[u8; 16]) -> bool {
         !self.compression_unsupported.contains(dest_hash)
+    }
+
+    /// Python `LXMessage.send` re-reads compression support for its recipient on every send.
+    fn message_compression_supported(&self, i: usize) -> bool {
+        self.compression_supported(&self.pending_outbound[i].destination_hash())
     }
 
     pub fn prioritise(&mut self, identity_hash: [u8; 16], level: u8) {
@@ -1115,7 +1055,8 @@ impl LxmRouter {
     }
 
     /// Mark a pending outbound message delivered and remove it from the
-    /// outbound queue.
+    /// outbound queue. A message that went over a slow path asks for another
+    /// outbound pass ([`Self::take_outbound_kick`]).
     pub fn mark_outbound_delivered(&mut self, message_hash: &[u8; 32]) -> bool {
         let Some(pos) = self
             .pending_outbound
@@ -1126,7 +1067,35 @@ impl LxmRouter {
         };
 
         let msg = self.pending_outbound.remove(pos);
+        self.outbound_kick |= msg.sent_on_slow_path;
         self.complete_outbound_message(msg);
+        true
+    }
+
+    /// Mark a pending propagated message accepted by the propagation node
+    /// (Python `__mark_propagated`) and remove it from the outbound queue.
+    pub fn mark_outbound_propagated(&mut self, message_hash: &[u8; 32]) -> bool {
+        let Some(pos) = self
+            .pending_outbound
+            .iter()
+            .position(|m| &m.message_id() == message_hash)
+        else {
+            return false;
+        };
+        let mut msg = self.pending_outbound.remove(pos);
+        self.outbound_kick |= msg.sent_on_slow_path;
+        let destination = msg.destination_hash();
+        if !self.destination_retains.contains(&destination) {
+            if self.destination_retains.len() == MAX_PENDING_RETAINS {
+                self.destination_retains.pop_front();
+            }
+            self.destination_retains.push_back(destination);
+        }
+        if msg.state != MessageState::Sent {
+            msg.state = MessageState::Sent;
+            msg.progress = 1.0;
+            msg.notify_delivered();
+        }
         true
     }
 
@@ -1163,8 +1132,8 @@ impl LxmRouter {
         self.destination_retains.drain(..).collect()
     }
 
-    /// Mark a pending outbound message failed and remove it from the outbound
-    /// queue.
+    /// Fail a pending outbound message (Python `fail_message`) and remove it
+    /// from the outbound queue.
     pub fn mark_outbound_failed(&mut self, message_hash: &[u8; 32]) -> bool {
         let Some(pos) = self
             .pending_outbound
@@ -1173,9 +1142,7 @@ impl LxmRouter {
         else {
             return false;
         };
-
-        let mut msg = self.pending_outbound.remove(pos);
-        msg.mark_failed();
+        self.fail_pending(pos);
         true
     }
 
@@ -1193,24 +1160,6 @@ impl LxmRouter {
         let mut msg = self.pending_outbound.remove(pos);
         msg.mark_rejected();
         msg.notify_failed();
-        true
-    }
-
-    /// Re-arm a pending outbound message after a path request without adding a
-    /// duplicate queue entry.
-    pub fn defer_outbound_for_path_request(&mut self, message_hash: &[u8; 32], now: f64) -> bool {
-        let Some(msg) = self
-            .pending_outbound
-            .iter_mut()
-            .find(|m| &m.message_id() == message_hash)
-        else {
-            return false;
-        };
-
-        msg.next_delivery_attempt = now + PATH_REQUEST_WAIT as f64;
-        if msg.progress < 0.01 {
-            msg.progress = 0.01;
-        }
         true
     }
 
@@ -1266,7 +1215,8 @@ impl LxmRouter {
     /// effects or record a distinct ciphertext transient ID. Use the reservation
     /// and durable-receipt commit path for application admission.
     pub fn deliver_inbound(&mut self, message: &LxMessage, allow_duplicate: bool) -> bool {
-        if self.ignored.contains(&message.source_hash()) {
+        // LXMRouter.py:2231-2233: ignored sources are dropped before dedup.
+        if self.is_ignored(&message.source_hash()) {
             return false;
         }
         let message_id = message.message_id();
@@ -1678,19 +1628,19 @@ impl LxmRouter {
         self.outbound_propagation_node = destination_hash;
     }
 
-    /// Mark pending messages due after a destination announce.
-    ///
-    /// Python's delivery announce handler sets `next_delivery_attempt = time.time()`
-    /// and triggers outbound processing. Rust tracks the previous attempt time,
-    /// so setting it beyond the retry window makes the message eligible on the
-    /// next scheduler tick.
+    /// Python's delivery announce handler: re-arm Direct and Opportunistic
+    /// messages to the destination that are awaiting a path. Returns how many.
     pub fn trigger_outbound_for_delivery_announce(&mut self, destination_hash: [u8; 16]) -> usize {
         let now = now_f64();
-        let due_now = now - DELIVERY_RETRY_WAIT as f64;
         let mut triggered = 0;
         for message in &mut self.pending_outbound {
-            if message.destination_hash() == destination_hash {
-                message.last_delivery_attempt = due_now;
+            if message.destination_hash() == destination_hash
+                && matches!(
+                    message.method,
+                    DeliveryMethod::Direct | DeliveryMethod::Opportunistic
+                )
+                && message.awaiting_path
+            {
                 message.next_delivery_attempt = now;
                 triggered += 1;
             }
@@ -1698,10 +1648,8 @@ impl LxmRouter {
         triggered
     }
 
-    /// Mark pending propagated messages due after the configured propagation node announces.
-    ///
-    /// Requires the configured destination and app data accepted by
-    /// [`crate::handlers::pn_announce_data_is_valid`] before clearing retry backoff.
+    /// Python's propagation node announce handler: re-arm Propagated messages
+    /// awaiting a path when the configured outbound node announces valid data.
     /// The caller verifies the announce's identity and authenticity.
     pub fn trigger_outbound_for_propagation_node_announce(
         &mut self,
@@ -1716,11 +1664,9 @@ impl LxmRouter {
         }
 
         let now = now_f64();
-        let due_now = now - DELIVERY_RETRY_WAIT as f64;
         let mut triggered = 0;
         for message in &mut self.pending_outbound {
-            if message.method == DeliveryMethod::Propagated {
-                message.last_delivery_attempt = due_now;
+            if message.method == DeliveryMethod::Propagated && message.awaiting_path {
                 message.next_delivery_attempt = now;
                 triggered += 1;
             }
@@ -1953,295 +1899,535 @@ impl LxmRouter {
         }
     }
 
-    /// Move eligible outbound messages into [`OutboundAction`]s, subject to
-    /// retry times and the per-call processing limit. Other messages remain queued.
-    /// The caller owns emitted deliveries, including proof tracking and retries;
-    /// requeue retryable failures through [`Self::try_send`] after updating attempts.
+    /// [`Self::process_outbound_with_inputs`] with no path, identity or Link
+    /// knowledge, for embedders that track none of them.
+    pub fn process_outbound(&mut self) -> Vec<OutboundAction> {
+        self.process_outbound_with_inputs(&OutboundInputs::default(), now_f64())
+    }
+
+    /// Plan outbound work as Python `LXMRouter.process_outbound` does.
+    ///
+    /// Messages stay in `pending_outbound` until the embedder reports a
+    /// terminal outcome ([`Self::mark_outbound_delivered`],
+    /// [`Self::mark_outbound_propagated`], [`Self::mark_outbound_rejected`],
+    /// [`Self::outbound_link_closed`]) or the router fails them. Emitted send
+    /// actions carry a copy of the queued message.
     #[tracing::instrument(
         level = "debug",
-        name = "router.process_outbound",
+        name = "router.process_outbound_with_inputs",
         skip_all,
         fields(pending_count = self.pending_outbound.len()),
     )]
-    pub fn process_outbound(&mut self) -> Vec<OutboundAction> {
-        self.process_outbound_inner(DirectOutboundHandling::EmitLegacyAction)
-    }
-
-    fn process_outbound_without_direct(&mut self) -> Vec<OutboundAction> {
-        self.process_outbound_inner(DirectOutboundHandling::LeavePending)
-    }
-
-    fn process_outbound_inner(
+    pub fn process_outbound_with_inputs(
         &mut self,
-        direct_handling: DirectOutboundHandling,
+        inputs: &OutboundInputs,
+        now: f64,
     ) -> Vec<OutboundAction> {
         if !self.config.ext.processing_outbound {
             return Vec::new();
         }
-
         let mut actions = Vec::new();
-        let mut processed = 0usize;
-
+        let mut links_started = HashSet::new();
+        let mut advanced = 0usize;
         let mut i = 0;
         while i < self.pending_outbound.len() {
             if self
                 .config
                 .ext
                 .processing_limit
-                .is_some_and(|limit| processed >= limit)
+                .is_some_and(|limit| advanced >= limit)
             {
                 break;
             }
-
-            let msg = &self.pending_outbound[i];
-
-            let now = now_f64();
-
-            // Python fails only when delivery_attempts > MAX (outer guard is
-            // `<= MAX`, LXMRouter.py:2597/2671); match that boundary exactly.
-            if msg.delivery_attempts > MAX_DELIVERY_ATTEMPTS {
-                let mut msg = self.pending_outbound.remove(i);
-                msg.mark_failed();
-                actions.push(OutboundAction::Failed(msg));
-                processed += 1;
-                continue;
-            }
-
-            // Python LXMF gates on an absolute `next_delivery_attempt`. Honor an
-            // explicit deadline when set (path request -> now+7s, etc.);
-            // otherwise fall back to the legacy
-            // last_delivery_attempt + DELIVERY_RETRY_WAIT (10s) rule.
-            let due_at = if msg.next_delivery_attempt > 0.0 {
-                msg.next_delivery_attempt
-            } else if msg.last_delivery_attempt > 0.0 {
-                msg.last_delivery_attempt + DELIVERY_RETRY_WAIT as f64
-            } else {
-                0.0
-            };
-            if now < due_at {
-                i += 1;
-                continue;
-            }
-
-            let age = now - msg.timestamp();
-            if age > MESSAGE_EXPIRY as f64 {
-                let mut msg = self.pending_outbound.remove(i);
-                msg.mark_failed();
-                actions.push(OutboundAction::Expired(msg));
-                processed += 1;
-                continue;
-            }
-
-            // State transitions match Python LXMessage.py:476-499:
-            //   Opportunistic -> Sent immediately; the embedding runtime keeps
-            //   receipt ownership until an authenticated packet proof arrives.
-            //   Direct / Propagated -> Sending (multi-step).
-            match msg.method {
-                DeliveryMethod::Direct => {
-                    match direct_handling {
-                        DirectOutboundHandling::EmitLegacyAction => {
-                            let mut msg = self.pending_outbound.remove(i);
-                            msg.mark_sending();
-                            let dest_hash = msg.destination_hash();
-                            msg.auto_compress = self.compression_supported(&dest_hash);
-                            actions.push(OutboundAction::DeliverDirect {
-                                message: msg,
-                                dest_hash,
-                            });
-                            processed += 1;
-                            // The next element has shifted into index i, so do not advance.
-                        }
-                        DirectOutboundHandling::LeavePending => {
-                            i += 1;
-                        }
-                    }
-                }
-                DeliveryMethod::Propagated => {
-                    if let Some(peer_hash) = self.outbound_propagation_node {
-                        let mut msg = self.pending_outbound.remove(i);
-                        msg.mark_sending();
-                        actions.push(OutboundAction::DeliverPropagated {
-                            message: msg,
-                            prop_hash: peer_hash,
-                        });
-                        processed += 1;
-                    } else {
-                        i += 1;
-                    }
-                }
-                DeliveryMethod::Opportunistic => {
-                    let mut msg = self.pending_outbound.remove(i);
-                    msg.mark_sent();
-                    msg.progress = 0.50;
-                    let dest_hash = msg.destination_hash();
-                    msg.auto_compress = self.compression_supported(&dest_hash);
-                    actions.push(OutboundAction::DeliverOpportunistic {
-                        message: msg,
-                        dest_hash,
-                    });
-                    processed += 1;
-                }
-                _ => {
+            match self.plan_outbound(i, inputs, now, &mut links_started, &mut actions) {
+                OutboundStep::Removed => advanced += 1,
+                OutboundStep::Kept { advanced: moved } => {
+                    advanced += usize::from(moved);
                     i += 1;
                 }
             }
         }
-
         actions
     }
 
-    /// Plan Direct deliveries while retaining their originals in the router queue.
-    /// The caller executes plans, reports terminal Link results to the router and
-    /// handles non-Direct actions. This method does not poll a Link manager itself.
-    pub fn process_outbound_with_direct<F>(&mut self, mut direct_input: F) -> Vec<OutboundAction>
-    where
-        F: FnMut(&LxMessage, f64) -> DirectDeliveryPlanInput,
-    {
-        if !self.config.ext.processing_outbound {
-            return Vec::new();
+    fn plan_outbound(
+        &mut self,
+        i: usize,
+        inputs: &OutboundInputs,
+        now: f64,
+        links_started: &mut HashSet<[u8; 16]>,
+        actions: &mut Vec<OutboundAction>,
+    ) -> OutboundStep {
+        let message = &self.pending_outbound[i];
+        match (message.state, message.method) {
+            (MessageState::Delivered, _) | (MessageState::Sent, DeliveryMethod::Propagated) => {
+                self.pending_outbound.remove(i);
+                return OutboundStep::Removed;
+            }
+            (MessageState::Cancelled | MessageState::Rejected, _) => {
+                let message = self.pending_outbound.remove(i);
+                message.notify_failed();
+                return OutboundStep::Removed;
+            }
+            _ => {}
+        }
+        if self.pending_outbound[i].progress < 0.01 {
+            self.pending_outbound[i].progress = 0.01;
+        }
+        match self.pending_outbound[i].method {
+            DeliveryMethod::Opportunistic => self.plan_opportunistic(i, inputs, now, actions),
+            DeliveryMethod::Direct => self.plan_direct(i, inputs, now, links_started, actions),
+            DeliveryMethod::Propagated => {
+                self.plan_propagated(i, inputs, now, links_started, actions)
+            }
+            DeliveryMethod::Paper => OutboundStep::Kept { advanced: false },
+        }
+    }
+
+    fn plan_opportunistic(
+        &mut self,
+        i: usize,
+        inputs: &OutboundInputs,
+        now: f64,
+        actions: &mut Vec<OutboundAction>,
+    ) -> OutboundStep {
+        let medium = &inputs.medium;
+        let destination = self.pending_outbound[i].destination_hash();
+        let has_path = medium.has_path(&destination);
+        let message = &self.pending_outbound[i];
+        // LXMRouter.handle_outbound requests an unknown path before the first attempt.
+        if message.delivery_attempts == 0
+            && message.next_delivery_attempt == 0.0
+            && !message.awaiting_path
+            && !has_path
+        {
+            self.request_path_action(destination, medium, now, actions);
+            schedule_attempt(
+                &mut self.pending_outbound[i],
+                medium.medium_path_timeout,
+                true,
+                now,
+            );
+            return OutboundStep::Kept { advanced: true };
+        }
+        let held = self.slow_path_held(i, Some(destination), medium);
+        let message = &self.pending_outbound[i];
+        let due = attempt_due(message, has_path, now);
+        if held || !due {
+            return OutboundStep::Kept { advanced: false };
+        }
+        if message.delivery_attempts > attempt_limit(message) {
+            actions.push(OutboundAction::Failed(self.fail_pending(i)));
+            return OutboundStep::Removed;
         }
 
-        let mut actions = Vec::new();
-        let mut processed = 0usize;
-        let mut i = 0;
-
-        while i < self.pending_outbound.len() {
-            if self
-                .config
-                .ext
-                .processing_limit
-                .is_some_and(|limit| processed >= limit)
-            {
-                break;
+        self.pending_outbound[i].awaiting_path = false;
+        let attempts = self.pending_outbound[i].delivery_attempts;
+        if attempts >= MAX_PATHLESS_TRIES && !has_path {
+            let message = &mut self.pending_outbound[i];
+            message.delivery_attempts += 1;
+            message.sent_on_path = false;
+            self.request_path_action(destination, medium, now, actions);
+            let message = &mut self.pending_outbound[i];
+            schedule_attempt(message, medium.medium_path_timeout, true, now);
+            message.progress = 0.01;
+        } else if attempts == MAX_PATHLESS_TRIES + 1
+            && has_path
+            && self.pending_outbound[i].sent_on_path
+        {
+            let message = &mut self.pending_outbound[i];
+            message.delivery_attempts += 1;
+            message.sent_on_path = false;
+            message.awaiting_path = true;
+            if !self.path_request_pending(&destination, medium, now) {
+                self.path_request_times.insert(destination, now);
+                actions.push(OutboundAction::RequestPath {
+                    destination,
+                    drop_existing: true,
+                });
             }
+            let message = &mut self.pending_outbound[i];
+            message.next_delivery_attempt = now + medium.path_request_wait();
+            message.progress = 0.01;
+        } else {
+            let slow = slow_path(medium, &destination);
+            let compress = self.compression_supported(&destination);
+            let message = &mut self.pending_outbound[i];
+            message.delivery_attempts += 1;
+            message.sent_on_path = has_path;
+            message.sent_on_slow_path = slow;
+            message.auto_compress = compress;
+            schedule_attempt(
+                message,
+                medium.destination_round_trip(&destination),
+                false,
+                now,
+            );
+            message.state = MessageState::Sent;
+            message.progress = 0.50;
+            actions.push(OutboundAction::SendOpportunistic {
+                message: message.clone(),
+            });
+        }
+        OutboundStep::Kept { advanced: true }
+    }
 
-            let now = now_f64();
+    fn plan_direct(
+        &mut self,
+        i: usize,
+        inputs: &OutboundInputs,
+        now: f64,
+        links_started: &mut HashSet<[u8; 16]>,
+        actions: &mut Vec<OutboundAction>,
+    ) -> OutboundStep {
+        let medium = &inputs.medium;
+        let destination = self.pending_outbound[i].destination_hash();
+        let link = if links_started.contains(&destination) {
+            DirectReusableLinkState::Pending
+        } else {
+            inputs
+                .direct_links
+                .get(&destination)
+                .copied()
+                .unwrap_or(DirectReusableLinkState::None)
+        };
+        let route = medium
+            .route(&destination)
+            .filter(|_| inputs.identities.contains(&destination));
+        let owned = inputs
+            .link_owned
+            .contains(&self.pending_outbound[i].message_id());
+        self.plan_link_delivery(
+            i,
+            destination,
+            link,
+            route,
+            owned,
+            medium,
+            now,
+            actions,
+            || {
+                links_started.insert(destination);
+            },
+        )
+    }
 
-            if self.pending_outbound[i].delivery_attempts > MAX_DELIVERY_ATTEMPTS {
-                let mut msg = self.pending_outbound.remove(i);
-                msg.mark_failed();
-                actions.push(OutboundAction::Failed(msg));
-                processed += 1;
-                continue;
+    fn plan_propagated(
+        &mut self,
+        i: usize,
+        inputs: &OutboundInputs,
+        now: f64,
+        links_started: &mut HashSet<[u8; 16]>,
+        actions: &mut Vec<OutboundAction>,
+    ) -> OutboundStep {
+        let Some(node) = self.outbound_propagation_node else {
+            actions.push(OutboundAction::Failed(self.fail_pending(i)));
+            return OutboundStep::Removed;
+        };
+        if inputs
+            .propagation_unready
+            .contains(&self.pending_outbound[i].message_id())
+        {
+            return OutboundStep::Kept { advanced: false };
+        }
+        let link = if links_started.contains(&node) {
+            DirectReusableLinkState::Pending
+        } else {
+            inputs.propagation_link
+        };
+        let medium = &inputs.medium;
+        let route = medium
+            .route(&node)
+            .filter(|_| inputs.identities.contains(&node));
+        let owned = inputs
+            .link_owned
+            .contains(&self.pending_outbound[i].message_id());
+        self.plan_link_delivery(i, node, link, route, owned, medium, now, actions, || {
+            links_started.insert(node);
+        })
+    }
+
+    /// The shared Direct and Propagated branches of Python `process_outbound`.
+    #[allow(clippy::too_many_arguments)]
+    fn plan_link_delivery(
+        &mut self,
+        i: usize,
+        target: [u8; 16],
+        link: DirectReusableLinkState,
+        route: Option<RouteInfo>,
+        owned: bool,
+        medium: &MediumSnapshot,
+        now: f64,
+        actions: &mut Vec<OutboundAction>,
+        link_started: impl FnOnce(),
+    ) -> OutboundStep {
+        let held = self.slow_path_held(i, Some(target), medium);
+        let has_path = medium.has_path(&target);
+        let message = &self.pending_outbound[i];
+        if held {
+            return OutboundStep::Kept { advanced: false };
+        }
+        if message.delivery_attempts > attempt_limit(message) {
+            if attempt_due(message, has_path, now) {
+                actions.push(OutboundAction::Failed(self.fail_pending(i)));
+                return OutboundStep::Removed;
             }
-
-            let age = now - self.pending_outbound[i].timestamp();
-            if age > MESSAGE_EXPIRY as f64 {
-                let mut msg = self.pending_outbound.remove(i);
-                msg.mark_failed();
-                actions.push(OutboundAction::Expired(msg));
-                processed += 1;
-                continue;
+            return OutboundStep::Kept { advanced: false };
+        }
+        if owned {
+            // The Link was started for this message and sends it once active.
+            if link == DirectReusableLinkState::Active && message.state == MessageState::Outbound {
+                let message = &mut self.pending_outbound[i];
+                message.progress = message.progress.max(0.05);
+                message.state = MessageState::Sending;
+                return OutboundStep::Kept { advanced: true };
             }
-
-            match self.pending_outbound[i].method {
-                DeliveryMethod::Direct => {
-                    let input = direct_input(&self.pending_outbound[i], now);
-                    if input.reusable_link == DirectReusableLinkState::None {
-                        let msg = &self.pending_outbound[i];
-                        let due_at = if msg.next_delivery_attempt > 0.0 {
-                            msg.next_delivery_attempt
-                        } else if msg.last_delivery_attempt > 0.0 {
-                            msg.last_delivery_attempt + DELIVERY_RETRY_WAIT as f64
-                        } else {
-                            0.0
-                        };
-                        if now < due_at {
-                            i += 1;
-                            continue;
-                        }
-                    }
-
-                    if self.pending_outbound[i].state != MessageState::Sending {
-                        self.pending_outbound[i].mark_sending();
-                    }
-                    // Python LXMessage.send re-reads compression support on every send.
-                    let dest_hash = self.pending_outbound[i].destination_hash();
-                    self.pending_outbound[i].auto_compress = self.compression_supported(&dest_hash);
-                    let plan = plan_direct_delivery(&mut self.pending_outbound[i], input, now);
-                    match plan {
-                        DirectDeliveryPlan::Fail => {
-                            let mut msg = self.pending_outbound.remove(i);
-                            msg.mark_failed();
-                            actions.push(OutboundAction::Failed(msg));
-                            processed += 1;
-                            continue;
-                        }
-                        DirectDeliveryPlan::DeferTerminalFailure => {
-                            processed += 1;
-                            i += 1;
-                        }
-                        _ => {
-                            let msg = self.pending_outbound[i].clone();
-                            let dest_hash = msg.destination_hash();
-                            actions.push(OutboundAction::PlanDirect {
-                                message: msg,
-                                dest_hash,
-                                plan,
-                            });
-                            processed += 1;
-                            i += 1;
-                        }
-                    }
+            return OutboundStep::Kept { advanced: false };
+        }
+        match link {
+            DirectReusableLinkState::Active => {
+                if message.state != MessageState::Outbound {
+                    return OutboundStep::Kept { advanced: false };
                 }
-                DeliveryMethod::Propagated => {
-                    let msg = &self.pending_outbound[i];
-                    let due_at = if msg.next_delivery_attempt > 0.0 {
-                        msg.next_delivery_attempt
-                    } else if msg.last_delivery_attempt > 0.0 {
-                        msg.last_delivery_attempt + DELIVERY_RETRY_WAIT as f64
-                    } else {
-                        0.0
-                    };
-                    if now < due_at {
-                        i += 1;
-                        continue;
-                    }
-
-                    if let Some(peer_hash) = self.outbound_propagation_node {
-                        let mut msg = self.pending_outbound.remove(i);
-                        msg.mark_sending();
-                        actions.push(OutboundAction::DeliverPropagated {
-                            message: msg,
-                            prop_hash: peer_hash,
-                        });
-                        processed += 1;
-                    } else {
-                        i += 1;
-                    }
+                let slow = slow_path(medium, &target);
+                let compress = self.message_compression_supported(i);
+                let message = &mut self.pending_outbound[i];
+                if message.progress < 0.05 {
+                    message.progress = 0.05;
                 }
-                DeliveryMethod::Opportunistic => {
-                    let msg = &self.pending_outbound[i];
-                    let due_at = if msg.next_delivery_attempt > 0.0 {
-                        msg.next_delivery_attempt
-                    } else if msg.last_delivery_attempt > 0.0 {
-                        msg.last_delivery_attempt + DELIVERY_RETRY_WAIT as f64
-                    } else {
-                        0.0
-                    };
-                    if now < due_at {
-                        i += 1;
-                        continue;
-                    }
-
-                    let mut msg = self.pending_outbound.remove(i);
-                    msg.mark_sent();
-                    msg.progress = 0.50;
-                    let dest_hash = msg.destination_hash();
-                    msg.auto_compress = self.compression_supported(&dest_hash);
-                    actions.push(OutboundAction::DeliverOpportunistic {
-                        message: msg,
-                        dest_hash,
+                message.sent_on_slow_path = slow;
+                message.auto_compress = compress;
+                message.state = MessageState::Sending;
+                actions.push(OutboundAction::DeliverOverLink {
+                    message: message.clone(),
+                    target,
+                    plan: LinkDeliveryPlan::UseLink,
+                });
+                OutboundStep::Kept { advanced: true }
+            }
+            DirectReusableLinkState::Pending => OutboundStep::Kept { advanced: false },
+            DirectReusableLinkState::Closed { activated } => {
+                self.closed_link(i, target, activated, medium, now, actions);
+                OutboundStep::Kept { advanced: true }
+            }
+            DirectReusableLinkState::None => {
+                if !attempt_due(message, has_path, now) {
+                    return OutboundStep::Kept { advanced: false };
+                }
+                let message = &mut self.pending_outbound[i];
+                message.delivery_attempts += 1;
+                message.awaiting_path = false;
+                schedule_attempt(message, medium.destination_round_trip(&target), false, now);
+                if message.delivery_attempts >= attempt_limit(message) {
+                    actions.push(OutboundAction::Failed(self.fail_pending(i)));
+                    return OutboundStep::Removed;
+                }
+                if let Some(route) = route {
+                    let slow = slow_path(medium, &target);
+                    let compress = self.message_compression_supported(i);
+                    let message = &mut self.pending_outbound[i];
+                    message.progress = 0.03;
+                    message.sent_on_slow_path = slow;
+                    message.auto_compress = compress;
+                    actions.push(OutboundAction::DeliverOverLink {
+                        message: message.clone(),
+                        target,
+                        plan: LinkDeliveryPlan::StartLink {
+                            hops: route.hops.max(1),
+                        },
                     });
-                    processed += 1;
+                    link_started();
+                } else {
+                    self.request_path_action(target, medium, now, actions);
+                    let message = &mut self.pending_outbound[i];
+                    schedule_attempt(message, medium.medium_path_timeout, true, now);
+                    message.progress = 0.01;
                 }
-                DeliveryMethod::Paper => {
-                    i += 1;
-                }
+                OutboundStep::Kept { advanced: true }
             }
         }
+    }
 
+    /// Handle the closed Link a Direct or Propagated message was using, as
+    /// Python's `CLOSED` link branches do: Direct re-requests the path (once
+    /// only if the Link never activated) and never drops it; both reschedule
+    /// only while `attempts + 1 < attempt_limit`.
+    pub fn outbound_link_closed(
+        &mut self,
+        message_hash: &[u8; 32],
+        link_activated: bool,
+        medium: &MediumSnapshot,
+        now: f64,
+    ) -> Vec<OutboundAction> {
+        let mut actions = Vec::new();
+        let Some(i) = self
+            .pending_outbound
+            .iter()
+            .position(|m| &m.message_id() == message_hash)
+        else {
+            return actions;
+        };
+        let target = match self.outbound_target(&self.pending_outbound[i]) {
+            Some(target) if self.pending_outbound[i].method != DeliveryMethod::Opportunistic => {
+                target
+            }
+            _ => return actions,
+        };
+        self.closed_link(i, target, link_activated, medium, now, &mut actions);
         actions
+    }
+
+    fn closed_link(
+        &mut self,
+        i: usize,
+        target: [u8; 16],
+        link_activated: bool,
+        medium: &MediumSnapshot,
+        now: f64,
+        actions: &mut Vec<OutboundAction>,
+    ) {
+        if self.pending_outbound[i].method == DeliveryMethod::Direct {
+            if link_activated {
+                self.request_path_action(target, medium, now, actions);
+            } else if !self.pending_outbound[i].path_request_retried {
+                self.request_path_action(target, medium, now, actions);
+                self.pending_outbound[i].path_request_retried = true;
+            }
+        }
+        let message = &mut self.pending_outbound[i];
+        if message.state != MessageState::Cancelled {
+            message.state = MessageState::Outbound;
+        }
+        if message.delivery_attempts + 1 < attempt_limit(message) {
+            schedule_attempt(message, medium.destination_round_trip(&target), false, now);
+        }
+    }
+
+    /// Wait for a path before the next attempt, as after a path request.
+    pub fn await_outbound_path(
+        &mut self,
+        message_hash: &[u8; 32],
+        medium: &MediumSnapshot,
+        now: f64,
+    ) -> Vec<OutboundAction> {
+        let mut actions = Vec::new();
+        let Some(i) = self
+            .pending_outbound
+            .iter()
+            .position(|m| &m.message_id() == message_hash)
+        else {
+            return actions;
+        };
+        let destination = self.pending_outbound[i].destination_hash();
+        self.request_path_action(destination, medium, now, &mut actions);
+        let message = &mut self.pending_outbound[i];
+        message.state = MessageState::Outbound;
+        schedule_attempt(message, medium.medium_path_timeout, true, now);
+        actions
+    }
+
+    /// Python `LXMRouter.request_path`: returns `false`, without requesting,
+    /// inside the debounce window of an earlier request for the destination.
+    pub fn request_path(
+        &mut self,
+        destination: [u8; 16],
+        medium: &MediumSnapshot,
+        now: f64,
+    ) -> bool {
+        let window = medium.path_request_debounce();
+        if self
+            .path_request_times
+            .get(&destination)
+            .is_some_and(|requested| now - requested < window)
+        {
+            return false;
+        }
+        self.path_request_times
+            .retain(|_, requested| now - *requested < window);
+        self.path_request_times.insert(destination, now);
+        true
+    }
+
+    /// Python `LXMRouter.path_request_pending`.
+    pub fn path_request_pending(
+        &self,
+        destination: &[u8; 16],
+        medium: &MediumSnapshot,
+        now: f64,
+    ) -> bool {
+        self.path_request_times
+            .get(destination)
+            .is_some_and(|requested| now - requested < medium.path_request_wait())
+    }
+
+    fn request_path_action(
+        &mut self,
+        destination: [u8; 16],
+        medium: &MediumSnapshot,
+        now: f64,
+        actions: &mut Vec<OutboundAction>,
+    ) {
+        if self.request_path(destination, medium, now) {
+            actions.push(OutboundAction::RequestPath {
+                destination,
+                drop_existing: false,
+            });
+        }
+    }
+
+    fn outbound_target(&self, message: &LxMessage) -> Option<[u8; 16]> {
+        if message.method == DeliveryMethod::Propagated {
+            self.outbound_propagation_node
+        } else {
+            Some(message.destination_hash())
+        }
+    }
+
+    /// Python `LXMRouter.slow_path_held`.
+    fn slow_path_held(&self, i: usize, target: Option<[u8; 16]>, medium: &MediumSnapshot) -> bool {
+        if self.pending_outbound[i].state != MessageState::Outbound {
+            return false;
+        }
+        if !target.is_some_and(|target| slow_path(medium, &target)) {
+            return false;
+        }
+        let mut ahead = true;
+        for (j, other) in self.pending_outbound.iter().enumerate() {
+            if j == i {
+                ahead = false;
+            } else if matches!(
+                other.state,
+                MessageState::Delivered
+                    | MessageState::Failed
+                    | MessageState::Cancelled
+                    | MessageState::Rejected
+            ) || (other.method == DeliveryMethod::Propagated
+                && other.state == MessageState::Sent)
+            {
+                continue;
+            } else if (ahead && self.outbound_target(other) == target) || slow_path_in_flight(other)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Python `LXMRouter.fail_message` for a queued message.
+    fn fail_pending(&mut self, i: usize) -> LxMessage {
+        let mut message = self.pending_outbound.remove(i);
+        message.progress = 0.0;
+        if message.state != MessageState::Rejected {
+            message.state = MessageState::Failed;
+        }
+        message.notify_failed();
+        message
+    }
+
+    /// Whether a slow-path message concluded since the last call. Python
+    /// re-runs outbound processing at once when that happens.
+    pub fn take_outbound_kick(&mut self) -> bool {
+        std::mem::take(&mut self.outbound_kick)
     }
 
     pub fn cull_stamp_costs(&mut self) {
@@ -2257,11 +2443,8 @@ impl LxmRouter {
         }
     }
 
-    /// Compatibility executor without a destination encryptor. With transport
-    /// configured, Opportunistic actions fail encryption and are requeued.
-    /// Direct/Propagated actions are consumed without delivery; without transport,
-    /// all supplied actions are discarded. Handle delivery actions in the embedder
-    /// or use [`Self::execute_actions_with_encryptor`] for Opportunistic work.
+    /// Compatibility executor without a destination encryptor: every
+    /// opportunistic send fails its message, as a raising `send()` does in Python.
     pub fn execute_actions(&mut self, actions: Vec<OutboundAction>) {
         self.execute_actions_with_encryptor(actions, |dest_hash, _plaintext| {
             Err(MessageError::PackFailed(format!(
@@ -2271,18 +2454,13 @@ impl LxmRouter {
         });
     }
 
-    /// Send single-packet opportunistic actions with caller-supplied
-    /// destination encryption.
+    /// Send opportunistic packets with caller-supplied destination encryption.
     ///
     /// Python encrypts Opportunistic LXMF packet payloads with the recipient
-    /// destination identity before handing bytes to Reticulum. Core cannot
-    /// infer destination keys, so embeddings must provide the encryptor.
-    ///
-    /// This consumes the action list. Direct/Propagated actions are discarded,
-    /// and without a configured transport all actions are discarded. Dispatch
-    /// those methods separately before calling. Successful packet enqueueing does
-    /// not retain a message for delivery-proof tracking; the embedding runtime
-    /// must own that lifecycle when delivery confirmation is required.
+    /// destination identity before handing bytes to Reticulum. An encryption
+    /// failure fails the message. Path requests are sent without dropping the
+    /// current path; Link and failure actions are left to the embedder. Without
+    /// a configured transport nothing is sent.
     pub fn execute_actions_with_encryptor<F>(
         &mut self,
         actions: Vec<OutboundAction>,
@@ -2296,101 +2474,87 @@ impl LxmRouter {
         };
 
         for action in actions {
-            match action {
-                OutboundAction::DeliverOpportunistic {
-                    mut message,
-                    dest_hash,
-                } => {
-                    let plain = self.plain_destinations.contains(&dest_hash);
-                    let payload = if plain {
-                        Ok(message.wire_bytes()[DESTINATION_LENGTH..].to_vec())
-                    } else {
-                        message.pack_opportunistic_encrypted(|plaintext| {
-                            encrypt_fn(dest_hash, plaintext)
-                        })
+            let message = match action {
+                OutboundAction::SendOpportunistic { message } => message,
+                OutboundAction::RequestPath { destination, .. } => {
+                    let _ = transport_tx.try_send(
+                        rns_transport::messages::TransportMessage::RequestPath {
+                            destination_hash: destination,
+                        },
+                    );
+                    continue;
+                }
+                _ => continue,
+            };
+            let dest_hash = message.destination_hash();
+            let message_id = message.message_id();
+            let plain = self.plain_destinations.contains(&dest_hash);
+            let payload = if plain {
+                Ok(message.wire_bytes()[DESTINATION_LENGTH..].to_vec())
+            } else {
+                message.pack_opportunistic_encrypted(|plaintext| encrypt_fn(dest_hash, plaintext))
+            };
+            match payload {
+                Ok(packet_payload) => {
+                    // Python LXMessage.__as_packet strips the destination
+                    // hash before encryption because the RNS packet
+                    // header already carries it.
+                    let flags = rns_wire::flags::PacketFlags {
+                        header_type: rns_wire::flags::HeaderType::Header1,
+                        context_flag: false,
+                        transport_type: rns_wire::flags::TransportType::Broadcast,
+                        destination_type: if plain {
+                            rns_wire::flags::DestinationType::Plain
+                        } else {
+                            rns_wire::flags::DestinationType::Single
+                        },
+                        packet_type: rns_wire::flags::PacketType::Data,
                     };
-                    match payload {
-                        Ok(packet_payload) => {
-                            // Python LXMessage.__as_packet strips the destination
-                            // hash before encryption because the RNS packet
-                            // header already carries it.
-                            let flags = rns_wire::flags::PacketFlags {
-                                header_type: rns_wire::flags::HeaderType::Header1,
-                                context_flag: false,
-                                transport_type: rns_wire::flags::TransportType::Broadcast,
-                                destination_type: if plain {
-                                    rns_wire::flags::DestinationType::Plain
-                                } else {
-                                    rns_wire::flags::DestinationType::Single
-                                },
-                                packet_type: rns_wire::flags::PacketType::Data,
-                            };
-                            let header = rns_wire::header::PacketHeader {
-                                flags,
-                                hops: 0,
-                                transport_id: None,
+                    let header = rns_wire::header::PacketHeader {
+                        flags,
+                        hops: 0,
+                        transport_id: None,
+                        destination_hash: dest_hash,
+                        context: rns_wire::context::PacketContext::None,
+                    };
+                    let mut raw = header.pack();
+                    raw.extend_from_slice(&packet_payload);
+                    if transport_tx
+                        .try_send(rns_transport::messages::TransportMessage::Outbound(
+                            rns_transport::messages::OutboundRequest {
+                                raw: Bytes::from(raw),
                                 destination_hash: dest_hash,
-                                context: rns_wire::context::PacketContext::None,
-                            };
-                            let mut raw = header.pack();
-                            raw.extend_from_slice(&packet_payload);
-
-                            let dispatched = transport_tx
-                                .try_send(rns_transport::messages::TransportMessage::Outbound(
-                                    rns_transport::messages::OutboundRequest {
-                                        raw: Bytes::from(raw),
-                                        destination_hash: dest_hash,
-                                    },
-                                ))
-                                .is_ok();
-                            if dispatched
-                                && matches!(
-                                    message.state,
-                                    MessageState::Sending | MessageState::Sent
-                                )
-                            {
-                                message.mark_sent();
-                                message.progress = 1.0;
-                            } else {
-                                tracing::warn!(
-                                    dest = %hex::encode(dest_hash),
-                                    "transport backpressure deferred opportunistic LXMF delivery"
-                                );
-                                self.pending_outbound.push(message);
-                            }
-                        }
-                        Err(err) => {
-                            tracing::warn!(
-                                dest = %hex::encode(dest_hash),
-                                error = %err,
-                                "cannot execute opportunistic LXMF action; re-queueing"
-                            );
-                            self.pending_outbound.push(message);
-                        }
+                            },
+                        ))
+                        .is_err()
+                    {
+                        tracing::warn!(
+                            dest = %hex::encode(dest_hash),
+                            "transport backpressure deferred opportunistic LXMF delivery"
+                        );
                     }
                 }
-                OutboundAction::DeliverDirect { .. } | OutboundAction::PlanDirect { .. } => {
+                Err(err) => {
                     tracing::warn!(
-                        "Direct LXMF delivery requires LinkDeliveryManager; action left for embedding runtime"
+                        dest = %hex::encode(dest_hash),
+                        error = %err,
+                        "opportunistic LXMF send failed"
                     );
+                    self.mark_outbound_failed(&message_id);
                 }
-                OutboundAction::DeliverPropagated { .. } => {
-                    // Requires a link to a propagation node; handled outside this layer.
-                }
-                OutboundAction::Failed(_) | OutboundAction::Expired(_) => {}
             }
         }
     }
 
     /// Advance deferred stamps and periodic jobs using the compatibility executor.
-    /// Direct messages stay queued; Propagated actions are consumed without delivery,
-    /// and Opportunistic work lacks destination encryption. This is not a complete
-    /// delivery driver; use explicit action processing in an embedding runtime.
+    /// Opportunistic sends fail for lack of destination encryption and Link work
+    /// is not performed. This is not a complete delivery driver; use explicit
+    /// action processing in an embedding runtime.
     pub fn tick(&mut self) {
         self.processing_count += 1;
 
         self.process_deferred_stamps();
-        let actions = self.process_outbound_without_direct();
+        let actions = self.process_outbound();
         if !actions.is_empty() {
             self.execute_actions(actions);
         }
@@ -2399,8 +2563,8 @@ impl LxmRouter {
     }
 
     /// Advance stamps, Opportunistic actions and periodic jobs with destination
-    /// encryption. Direct messages stay queued; Propagated actions are consumed
-    /// without delivery. For other methods or proof tracking, drive actions explicitly.
+    /// encryption. Link work is not performed and no path, identity or Link
+    /// knowledge is used. For those or for proof tracking, drive actions explicitly.
     pub fn tick_with_encryptor<F>(&mut self, encrypt_fn: F)
     where
         F: FnMut([u8; 16], &[u8]) -> Result<Vec<u8>, MessageError>,
@@ -2408,7 +2572,7 @@ impl LxmRouter {
         self.processing_count += 1;
 
         self.process_deferred_stamps();
-        let actions = self.process_outbound_without_direct();
+        let actions = self.process_outbound();
         if !actions.is_empty() {
             self.execute_actions_with_encryptor(actions, encrypt_fn);
         }
@@ -2464,33 +2628,44 @@ impl LxmRouter {
     }
 }
 
-/// Action to take on an outbound message.
+/// Python `LXMRouter.slow_path`.
+fn slow_path(medium: &MediumSnapshot, target: &[u8; 16]) -> bool {
+    medium.destination_round_trip(target) > DELIVERY_RETRY_WAIT as f64
+}
+
+/// Python `LXMRouter.slow_path_in_flight`.
+fn slow_path_in_flight(message: &LxMessage) -> bool {
+    if !message.sent_on_slow_path {
+        return false;
+    }
+    if message.method == DeliveryMethod::Opportunistic {
+        message.state == MessageState::Sent
+    } else {
+        message.state == MessageState::Sending
+    }
+}
+
+/// Work the router asks the embedder to perform.
 #[derive(Debug)]
 pub enum OutboundAction {
-    /// Exhausted delivery attempts.
+    /// The message failed and left the queue; its failure callback has run.
     Failed(LxMessage),
-    /// Exceeded [`MESSAGE_EXPIRY`].
-    Expired(LxMessage),
-    DeliverDirect {
-        message: LxMessage,
-        dest_hash: [u8; 16],
+    /// Request a path, after dropping the current one when `drop_existing`
+    /// (Python waits 0.5 s between the drop and the request).
+    RequestPath {
+        destination: [u8; 16],
+        drop_existing: bool,
     },
-    /// Direct delivery planned without removing the message from
-    /// `pending_outbound`.
-    PlanDirect {
+    /// Send one opportunistic packet. The message stays queued in `Sent`
+    /// state; report its delivery proof with [`LxmRouter::mark_outbound_delivered`].
+    /// Register the packet receipt with at least `message.receipt_timeout`.
+    SendOpportunistic { message: LxMessage },
+    /// Deliver over a Link to `target`, the destination for Direct messages
+    /// or the outbound propagation node for Propagated ones.
+    DeliverOverLink {
         message: LxMessage,
-        dest_hash: [u8; 16],
-        plan: DirectDeliveryPlan,
-    },
-    DeliverPropagated {
-        message: LxMessage,
-        prop_hash: [u8; 16],
-    },
-    /// Opportunistic packet action. Final encryption and packet-size admission
-    /// remain the executor's responsibility.
-    DeliverOpportunistic {
-        message: LxMessage,
-        dest_hash: [u8; 16],
+        target: [u8; 16],
+        plan: LinkDeliveryPlan,
     },
 }
 
@@ -2542,18 +2717,6 @@ pub struct NodeStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn direct_policy_message() -> LxMessage {
-        let message = crate::message::test_message(
-            [0xAA; 16],
-            [0xBB; 16],
-            "Direct",
-            "hello",
-            DeliveryMethod::Direct,
-        );
-        message.compute_hash().unwrap();
-        message
-    }
 
     #[test]
     fn test_router_creation() {
@@ -2612,245 +2775,6 @@ mod tests {
         assert!(config.ext.processing_outbound);
         assert!(config.ext.defer_stamp_generation);
         assert!(config.ext.processing_limit.is_none());
-    }
-
-    #[test]
-    fn test_direct_delivery_plan_starts_link_with_current_path() {
-        let mut msg = direct_policy_message();
-        let dest = msg.destination_hash();
-        let now = 1000.0;
-        let plan = plan_direct_delivery(
-            &mut msg,
-            DirectDeliveryPlanInput {
-                identity_known: true,
-                route: Some(DirectRouteSnapshot::new(dest, 4)),
-                reusable_link: DirectReusableLinkState::None,
-            },
-            now,
-        );
-
-        assert_eq!(plan, DirectDeliveryPlan::StartNewLink { hops: 4 });
-        assert_eq!(msg.delivery_attempts, 1);
-        assert_eq!(msg.last_delivery_attempt, now);
-        assert_eq!(msg.next_delivery_attempt, now + DELIVERY_RETRY_WAIT as f64);
-        assert_eq!(msg.progress, 0.03);
-    }
-
-    #[test]
-    fn test_direct_delivery_plan_requests_path_for_unknown_identity() {
-        let mut msg = direct_policy_message();
-        let now = 1000.0;
-        let plan = plan_direct_delivery(
-            &mut msg,
-            DirectDeliveryPlanInput {
-                identity_known: false,
-                route: None,
-                reusable_link: DirectReusableLinkState::None,
-            },
-            now,
-        );
-
-        assert_eq!(
-            plan,
-            DirectDeliveryPlan::RequestPath {
-                drop_existing: false
-            }
-        );
-        assert_eq!(msg.delivery_attempts, 1);
-        assert_eq!(msg.last_delivery_attempt, now);
-        assert_eq!(msg.next_delivery_attempt, now + PATH_REQUEST_WAIT as f64);
-        assert_eq!(msg.progress, 0.01);
-    }
-
-    #[test]
-    fn test_direct_delivery_plan_reuses_active_link_without_attempt_increment() {
-        let mut msg = direct_policy_message();
-        let plan = plan_direct_delivery(
-            &mut msg,
-            DirectDeliveryPlanInput {
-                identity_known: true,
-                route: None,
-                reusable_link: DirectReusableLinkState::Active,
-            },
-            1000.0,
-        );
-
-        assert_eq!(plan, DirectDeliveryPlan::UseReusableLink);
-        assert_eq!(msg.delivery_attempts, 0);
-        assert_eq!(msg.state, MessageState::Sending);
-        assert_eq!(msg.progress, 0.05);
-    }
-
-    #[test]
-    fn test_direct_delivery_plan_waits_for_pending_link() {
-        let mut msg = direct_policy_message();
-        let dest = msg.destination_hash();
-        let plan = plan_direct_delivery(
-            &mut msg,
-            DirectDeliveryPlanInput {
-                identity_known: true,
-                route: Some(DirectRouteSnapshot::new(dest, 2)),
-                reusable_link: DirectReusableLinkState::Pending,
-            },
-            1000.0,
-        );
-
-        assert_eq!(plan, DirectDeliveryPlan::WaitForReusableLink);
-        assert_eq!(msg.delivery_attempts, 0);
-        assert_eq!(msg.next_delivery_attempt, 0.0);
-    }
-
-    #[test]
-    fn test_direct_delivery_plan_defers_terminal_failure_at_attempt_boundary() {
-        let mut msg = direct_policy_message();
-        let dest = msg.destination_hash();
-        msg.delivery_attempts = MAX_DELIVERY_ATTEMPTS - 1;
-        let now = 1000.0;
-        let plan = plan_direct_delivery(
-            &mut msg,
-            DirectDeliveryPlanInput {
-                identity_known: true,
-                route: Some(DirectRouteSnapshot::new(dest, 1)),
-                reusable_link: DirectReusableLinkState::None,
-            },
-            now,
-        );
-
-        assert_eq!(plan, DirectDeliveryPlan::DeferTerminalFailure);
-        assert_eq!(msg.delivery_attempts, MAX_DELIVERY_ATTEMPTS);
-        assert_eq!(msg.next_delivery_attempt, now + DELIVERY_RETRY_WAIT as f64);
-    }
-
-    #[test]
-    fn test_direct_delivery_plan_requests_rediscovery_for_closed_link() {
-        let mut msg = direct_policy_message();
-        let dest = msg.destination_hash();
-        let now = 1000.0;
-        let plan = plan_direct_delivery(
-            &mut msg,
-            DirectDeliveryPlanInput {
-                identity_known: true,
-                route: Some(DirectRouteSnapshot::new(dest, 3)),
-                reusable_link: DirectReusableLinkState::Closed { activated: false },
-            },
-            now,
-        );
-
-        assert_eq!(
-            plan,
-            DirectDeliveryPlan::RequestPath {
-                drop_existing: true
-            }
-        );
-        assert_eq!(msg.delivery_attempts, 0);
-        assert_eq!(msg.next_delivery_attempt, now + PATH_REQUEST_WAIT as f64);
-        assert_eq!(msg.progress, 0.01);
-    }
-
-    #[test]
-    fn test_direct_delivery_plan_fails_above_max_attempts() {
-        let mut msg = direct_policy_message();
-        let dest = msg.destination_hash();
-        msg.delivery_attempts = MAX_DELIVERY_ATTEMPTS + 1;
-        let plan = plan_direct_delivery(
-            &mut msg,
-            DirectDeliveryPlanInput {
-                identity_known: true,
-                route: Some(DirectRouteSnapshot::new(dest, 1)),
-                reusable_link: DirectReusableLinkState::None,
-            },
-            1000.0,
-        );
-
-        assert_eq!(plan, DirectDeliveryPlan::Fail);
-        assert_eq!(msg.state, MessageState::Failed);
-    }
-
-    #[test]
-    fn test_process_outbound_with_direct_keeps_message_pending() {
-        let mut router = LxmRouter::new(RouterConfig::default());
-        let msg = direct_policy_message();
-        let msg_hash = Some(msg.message_id());
-        let dest = msg.destination_hash();
-        router.try_send(msg).unwrap();
-
-        let actions =
-            router.process_outbound_with_direct(|message, _now| DirectDeliveryPlanInput {
-                identity_known: true,
-                route: Some(DirectRouteSnapshot::new(message.destination_hash(), 4)),
-                reusable_link: DirectReusableLinkState::None,
-            });
-
-        assert_eq!(router.pending_outbound.len(), 1);
-        let pending = &router.pending_outbound[0];
-        assert_eq!(Some(pending.message_id()), msg_hash);
-        assert_eq!(pending.state, MessageState::Sending);
-        assert_eq!(pending.delivery_attempts, 1);
-        assert_eq!(pending.progress, 0.03);
-        match actions.as_slice() {
-            [
-                OutboundAction::PlanDirect {
-                    message,
-                    dest_hash,
-                    plan,
-                },
-            ] => {
-                assert_eq!(*dest_hash, dest);
-                assert_eq!(Some(message.message_id()), msg_hash);
-                assert_eq!(*plan, DirectDeliveryPlan::StartNewLink { hops: 4 });
-            }
-            other => panic!("expected PlanDirect StartNewLink, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_process_outbound_with_direct_polls_pending_link_despite_retry_deadline() {
-        let mut router = LxmRouter::new(RouterConfig::default());
-        let mut msg = direct_policy_message();
-        msg.next_delivery_attempt = now_f64() + 3600.0;
-        let msg_hash = Some(msg.message_id());
-        router.try_send(msg).unwrap();
-
-        let actions =
-            router.process_outbound_with_direct(|_message, _now| DirectDeliveryPlanInput {
-                identity_known: true,
-                route: None,
-                reusable_link: DirectReusableLinkState::Pending,
-            });
-
-        assert_eq!(router.pending_outbound.len(), 1);
-        assert_eq!(Some(router.pending_outbound[0].message_id()), msg_hash);
-        assert_eq!(router.pending_outbound[0].delivery_attempts, 0);
-        match actions.as_slice() {
-            [OutboundAction::PlanDirect { plan, .. }] => {
-                assert_eq!(*plan, DirectDeliveryPlan::WaitForReusableLink);
-            }
-            other => panic!("expected PlanDirect WaitForReusableLink, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_outbound_terminal_helpers_update_pending_queue() {
-        let mut router = LxmRouter::new(RouterConfig::default());
-        let first = direct_policy_message();
-        let first_hash = first.message_id();
-        router.try_send(first).unwrap();
-
-        assert!(router.defer_outbound_for_path_request(&first_hash, 1000.0));
-        assert_eq!(
-            router.pending_outbound[0].next_delivery_attempt,
-            1000.0 + PATH_REQUEST_WAIT as f64
-        );
-        assert_eq!(router.pending_outbound[0].progress, 0.01);
-
-        assert!(router.mark_outbound_delivered(&first_hash));
-        assert!(router.pending_outbound.is_empty());
-
-        let second = direct_policy_message();
-        let second_hash = second.message_id();
-        router.try_send(second).unwrap();
-        assert!(router.mark_outbound_failed(&second_hash));
-        assert!(router.pending_outbound.is_empty());
     }
 
     #[test]
@@ -3912,28 +3836,6 @@ mod tests {
         assert!(router.pending_outbound.is_empty());
     }
 
-    /// At exactly MAX the message is still attempted (dispatched), not failed.
-    #[test]
-    fn test_process_outbound_at_max_attempts_not_failed() {
-        let mut router = LxmRouter::new(RouterConfig::default());
-        let mut msg = crate::message::test_message(
-            [0xAA; 16],
-            [0xBB; 16],
-            "Test",
-            "Content",
-            DeliveryMethod::Direct,
-        );
-        msg.delivery_attempts = MAX_DELIVERY_ATTEMPTS;
-        router.try_send(msg).unwrap();
-
-        let actions = router.process_outbound();
-        assert_eq!(actions.len(), 1);
-        assert!(
-            !matches!(actions[0], OutboundAction::Failed(_)),
-            "at exactly MAX the message is still attempted, not failed"
-        );
-    }
-
     #[test]
     fn test_stats() {
         let router = LxmRouter::new(RouterConfig::default());
@@ -3969,68 +3871,6 @@ mod tests {
     }
 
     #[test]
-    fn test_process_outbound_direct_delivery() {
-        let mut router = LxmRouter::new(RouterConfig::default());
-        let msg = crate::message::test_message(
-            [0xAA; 16],
-            [0xBB; 16],
-            "Direct",
-            "Content",
-            DeliveryMethod::Direct,
-        );
-        router.try_send(msg).unwrap();
-
-        let actions = router.process_outbound();
-        let has_direct = actions
-            .iter()
-            .any(|a| matches!(a, OutboundAction::DeliverDirect { .. }));
-        assert!(has_direct);
-    }
-
-    #[test]
-    fn test_process_outbound_propagated_delivery() {
-        let mut router = LxmRouter::new(RouterConfig::default());
-        let peer_hash = [0x11; 16];
-        let peer = crate::peer::LxmPeer::new(peer_hash);
-        router.add_peer(peer);
-        router.set_outbound_propagation_node(Some(peer_hash));
-
-        let msg = crate::message::test_message(
-            [0xAA; 16],
-            [0xBB; 16],
-            "Propagated",
-            "Content",
-            DeliveryMethod::Propagated,
-        );
-        router.try_send(msg).unwrap();
-
-        let actions = router.process_outbound();
-        let has_propagated = actions
-            .iter()
-            .any(|a| matches!(a, OutboundAction::DeliverPropagated { .. }));
-        assert!(has_propagated);
-    }
-
-    #[test]
-    fn test_process_outbound_opportunistic_delivery() {
-        let mut router = LxmRouter::new(RouterConfig::default());
-        let msg = crate::message::test_message(
-            [0xAA; 16],
-            [0xBB; 16],
-            "Opportunistic",
-            "Content",
-            DeliveryMethod::Opportunistic,
-        );
-        router.try_send(msg).unwrap();
-
-        let actions = router.process_outbound();
-        let has_opportunistic = actions
-            .iter()
-            .any(|a| matches!(a, OutboundAction::DeliverOpportunistic { .. }));
-        assert!(has_opportunistic);
-    }
-
-    #[test]
     fn test_process_outbound_propagated_no_node() {
         let mut router = LxmRouter::new(RouterConfig::default());
         let msg = crate::message::test_message(
@@ -4049,88 +3889,6 @@ mod tests {
             router.pending_outbound.is_empty(),
             "propagated messages without an outbound node fail at queue time"
         );
-    }
-
-    #[test]
-    fn test_delivery_announce_trigger_clears_direct_retry_backoff() {
-        let mut router = LxmRouter::new(RouterConfig::default());
-        let dest = [0xAA; 16];
-        let mut msg = crate::message::test_message(
-            dest,
-            [0xBB; 16],
-            "Direct",
-            "Content",
-            DeliveryMethod::Direct,
-        );
-        msg.delivery_attempts = 1;
-        msg.last_delivery_attempt = now_f64();
-        msg.next_delivery_attempt = now_f64() + PATH_REQUEST_WAIT as f64;
-        router.try_send(msg).unwrap();
-
-        assert!(router.process_outbound().is_empty());
-        assert_eq!(router.trigger_outbound_for_delivery_announce(dest), 1);
-        assert!(matches!(
-            router.process_outbound().as_slice(),
-            [OutboundAction::DeliverDirect { .. }]
-        ));
-    }
-
-    #[test]
-    fn test_delivery_announce_trigger_clears_propagated_recipient_backoff() {
-        let mut router = LxmRouter::new(RouterConfig::default());
-        let dest = [0xAA; 16];
-        let node = [0xCC; 16];
-        router.set_outbound_propagation_node(Some(node));
-        let mut msg = crate::message::test_message(
-            dest,
-            [0xBB; 16],
-            "Propagated",
-            "Content",
-            DeliveryMethod::Propagated,
-        );
-        msg.delivery_attempts = 1;
-        msg.last_delivery_attempt = now_f64();
-        msg.next_delivery_attempt = now_f64() + PATH_REQUEST_WAIT as f64;
-        router.try_send(msg).unwrap();
-
-        assert!(router.process_outbound().is_empty());
-        assert_eq!(router.trigger_outbound_for_delivery_announce(dest), 1);
-        assert!(matches!(
-            router.process_outbound().as_slice(),
-            [OutboundAction::DeliverPropagated { .. }]
-        ));
-    }
-
-    #[test]
-    fn test_propagation_node_announce_trigger_clears_propagated_retry_backoff() {
-        let mut router = LxmRouter::new(RouterConfig::default());
-        let node = [0xCC; 16];
-        router.set_outbound_propagation_node(Some(node));
-        let mut msg = crate::message::test_message(
-            [0xAA; 16],
-            [0xBB; 16],
-            "Propagated",
-            "Content",
-            DeliveryMethod::Propagated,
-        );
-        msg.delivery_attempts = 1;
-        msg.last_delivery_attempt = now_f64();
-        msg.next_delivery_attempt = now_f64() + PATH_REQUEST_WAIT as f64;
-        router.try_send(msg).unwrap();
-
-        assert!(router.process_outbound().is_empty());
-
-        let pn_data = crate::handlers::get_propagation_node_app_data(
-            &crate::handlers::PropagationNodeAnnounceData::new(true, 256, 10240, 16.0, 3.0, 18.0),
-        );
-        assert_eq!(
-            router.trigger_outbound_for_propagation_node_announce(node, &pn_data),
-            1
-        );
-        assert!(matches!(
-            router.process_outbound().as_slice(),
-            [OutboundAction::DeliverPropagated { .. }]
-        ));
     }
 
     #[test]
@@ -4158,44 +3916,6 @@ mod tests {
         );
     }
 
-    /// A queued message older than `MESSAGE_EXPIRY` must be flushed as
-    /// `Expired` on the next `process_outbound`, marked Failed, and not
-    /// held indefinitely. Mirrors Python LXMRouter.process_outbound where
-    /// the age check runs before any delivery attempt.
-    #[test]
-    fn test_process_outbound_expired_message_marked_failed() {
-        let mut router = LxmRouter::new(RouterConfig::default());
-        let mut msg = crate::message::LxMessageDraft::new(
-            [0xAA; 16],
-            [0xBB; 16],
-            "Stale",
-            "Content",
-            DeliveryMethod::Direct,
-        )
-        .unwrap();
-        // Anchor the timestamp comfortably past the expiry window.
-        msg.set_timestamp(now_f64() - (MESSAGE_EXPIRY as f64) - 60.0)
-            .unwrap();
-        let msg = msg
-            .sign(&rns_crypto::ed25519::Ed25519PrivateKey::generate())
-            .unwrap()
-            .finalize(None)
-            .unwrap();
-        router.try_send(msg).unwrap();
-
-        let actions = router.process_outbound();
-        assert_eq!(actions.len(), 1);
-        assert!(
-            matches!(&actions[0], OutboundAction::Expired(m) if m.state == MessageState::Failed),
-            "expired message surfaces as Expired with state=Failed, got {:?}",
-            actions[0]
-        );
-        assert!(
-            router.pending_outbound.is_empty(),
-            "expired message removed from queue"
-        );
-    }
-
     /// A message that has attempted delivery within the last
     /// `DELIVERY_RETRY_WAIT` seconds must be skipped by `process_outbound`
     /// rather than immediately retried. Prevents tight-loop reattempt
@@ -4210,9 +3930,8 @@ mod tests {
             "Content",
             DeliveryMethod::Direct,
         );
-        // Simulate one failed attempt very recently.
         msg.delivery_attempts = 1;
-        msg.last_delivery_attempt = now_f64() - 1.0; // 1 s ago, inside the 10 s window.
+        msg.next_delivery_attempt = now_f64() + 5.0;
         router.try_send(msg).unwrap();
 
         let actions = router.process_outbound();
@@ -4232,7 +3951,7 @@ mod tests {
     /// delivery attempt, but it still needs the same retry backoff to avoid
     /// tight request-path loops.
     #[test]
-    fn test_process_outbound_retry_backoff_uses_last_attempt_timestamp() {
+    fn test_process_outbound_retry_backoff_applies_to_propagated() {
         let mut router = LxmRouter::new(RouterConfig::default());
         let mut msg = crate::message::test_message(
             [0xAA; 16],
@@ -4241,7 +3960,7 @@ mod tests {
             "Content",
             DeliveryMethod::Propagated,
         );
-        msg.last_delivery_attempt = now_f64() - 1.0;
+        msg.next_delivery_attempt = now_f64() + 5.0;
         router.set_outbound_propagation_node(Some([0xCC; 16]));
         router.try_send(msg).unwrap();
 
@@ -4252,37 +3971,6 @@ mod tests {
         );
         assert_eq!(router.pending_outbound.len(), 1);
         assert_eq!(router.pending_outbound[0].delivery_attempts, 0);
-    }
-
-    /// The state machine contract: a Direct message picked up by
-    /// `process_outbound` must be emitted as `DeliverDirect` with the
-    /// message state transitioned to `Sending` before it leaves the queue.
-    /// Complements `test_process_outbound_direct_delivery`, which only
-    /// covers the action variant without asserting on state.
-    #[test]
-    fn test_process_outbound_direct_transitions_to_sending() {
-        let mut router = LxmRouter::new(RouterConfig::default());
-        let msg = crate::message::test_message(
-            [0xAA; 16],
-            [0xBB; 16],
-            "Direct",
-            "Content",
-            DeliveryMethod::Direct,
-        );
-        router.try_send(msg).unwrap();
-
-        let actions = router.process_outbound();
-        assert_eq!(actions.len(), 1);
-        match &actions[0] {
-            OutboundAction::DeliverDirect { message, .. } => {
-                assert_eq!(
-                    message.state,
-                    MessageState::Sending,
-                    "Direct message enters Sending on dequeue"
-                );
-            }
-            other => panic!("expected DeliverDirect, got {:?}", other),
-        }
     }
 
     #[test]
@@ -4304,181 +3992,18 @@ mod tests {
         router.try_send(msg).unwrap();
 
         router.tick_with_encryptor(|_dest, plaintext| Ok(plaintext.to_vec()));
-
-        let received = rx.try_recv();
-        assert!(received.is_ok(), "expected outbound packet from tick()");
-        assert!(
-            router.pending_outbound.is_empty(),
-            "a successful fire-and-forget tick must not requeue the sent packet"
-        );
-    }
-
-    #[test]
-    fn test_execute_actions_no_transport() {
-        let mut router = LxmRouter::new(RouterConfig::default());
-        // No transport set — execute_actions must be a no-op.
-        let actions = vec![OutboundAction::DeliverDirect {
-            message: crate::message::test_message(
-                [0; 16],
-                [0; 16],
-                "t",
-                "c",
-                DeliveryMethod::Direct,
-            ),
-            dest_hash: [0; 16],
-        }];
-        router.execute_actions(actions);
-    }
-
-    #[test]
-    fn test_execute_actions_only_sends_opportunistic_packet_payload_shape() {
-        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
-        let dest_hash = [0xAA; 16];
-        let src_hash = [0xBB; 16];
-
-        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
-        let mut router = LxmRouter::new(RouterConfig::default());
-        router.set_transport(tx);
-
-        let direct = crate::message::LxMessageDraft::new(
-            dest_hash,
-            src_hash,
-            "Direct",
-            "d",
-            DeliveryMethod::Direct,
-        )
-        .unwrap();
-        let direct = direct.sign(&key).unwrap().finalize(None).unwrap();
-
-        let opportunistic = crate::message::LxMessageDraft::new(
-            dest_hash,
-            src_hash,
-            "Opp",
-            "o",
-            DeliveryMethod::Opportunistic,
-        )
-        .unwrap();
-        let opportunistic = opportunistic.sign(&key).unwrap().finalize(None).unwrap();
-        let opportunistic_packed = opportunistic.pack().unwrap();
-
-        router.execute_actions_with_encryptor(
-            vec![
-                OutboundAction::DeliverDirect {
-                    message: direct,
-                    dest_hash,
-                },
-                OutboundAction::DeliverOpportunistic {
-                    message: opportunistic,
-                    dest_hash,
-                },
-            ],
-            |_dest, plaintext| {
-                let mut out = vec![0xEE];
-                out.extend_from_slice(plaintext);
-                Ok(out)
-            },
-        );
-
-        let opportunistic_raw = match rx.try_recv().expect("opportunistic outbound request") {
-            rns_transport::messages::TransportMessage::Outbound(req) => req.raw,
-            other => panic!("expected outbound request, got {other:?}"),
-        };
-        let (_, opportunistic_data_offset) =
-            rns_wire::header::PacketHeader::unpack(&opportunistic_raw).unwrap();
-        assert_eq!(
-            &opportunistic_raw[opportunistic_data_offset..],
-            [&[0xEE], &opportunistic_packed[DESTINATION_LENGTH..]].concat(),
-            "Opportunistic delivery encrypts the LXMF tail after the destination hash"
-        );
-        assert!(
-            rx.try_recv().is_err(),
-            "Direct actions require LinkDeliveryManager and must not be sent as destination packets"
-        );
-    }
-
-    #[test]
-    fn opportunistic_transport_backpressure_requeues_instead_of_dropping() {
-        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
-        let dest_hash = [0xA1; 16];
-        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        tx.try_send(
-            rns_transport::messages::TransportMessage::DeregisterDestination { hash: [0xF0; 16] },
-        )
-        .unwrap();
-        let mut router = LxmRouter::new(RouterConfig::default());
-        router.set_transport(tx);
-        let message = crate::message::LxMessageDraft::new(
-            dest_hash,
-            [0xB1; 16],
-            "defer",
-            "payload",
-            DeliveryMethod::Opportunistic,
-        )
-        .unwrap();
-        let message = message.sign(&key).unwrap().finalize(None).unwrap();
-        let message_hash = Some(message.message_id());
-
-        router.execute_actions_with_encryptor(
-            vec![OutboundAction::DeliverOpportunistic { message, dest_hash }],
-            |_dest, plaintext| Ok(plaintext.to_vec()),
-        );
-
         assert!(matches!(
-            rx.try_recv().unwrap(),
-            rns_transport::messages::TransportMessage::DeregisterDestination { .. }
+            rx.try_recv(),
+            Ok(rns_transport::messages::TransportMessage::RequestPath { .. })
         ));
-        assert_eq!(router.pending_outbound.len(), 1);
-        assert_eq!(
-            Some(router.pending_outbound.first().unwrap().message_id()),
-            message_hash
-        );
-    }
 
-    #[test]
-    fn test_execute_actions_without_encryptor_does_not_send_opportunistic_plaintext() {
-        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
-        let dest_hash = [0xAA; 16];
-        let src_hash = [0xBB; 16];
-
-        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
-        let mut router = LxmRouter::new(RouterConfig::default());
-        router.set_transport(tx);
-
-        let direct = crate::message::LxMessageDraft::new(
-            dest_hash,
-            src_hash,
-            "Direct",
-            "d",
-            DeliveryMethod::Direct,
-        )
-        .unwrap();
-        let direct = direct.sign(&key).unwrap().finalize(None).unwrap();
-
-        let opportunistic = crate::message::LxMessageDraft::new(
-            dest_hash,
-            src_hash,
-            "Opp",
-            "o",
-            DeliveryMethod::Opportunistic,
-        )
-        .unwrap();
-        let opportunistic = opportunistic.sign(&key).unwrap().finalize(None).unwrap();
-
-        router.execute_actions(vec![
-            OutboundAction::DeliverDirect {
-                message: direct,
-                dest_hash,
-            },
-            OutboundAction::DeliverOpportunistic {
-                message: opportunistic,
-                dest_hash,
-            },
-        ]);
-
-        assert!(
-            rx.try_recv().is_err(),
-            "execute_actions without an encryptor must not send raw opportunistic payloads"
-        );
+        router.pending_outbound[0].next_delivery_attempt = 0.0;
+        router.tick_with_encryptor(|_dest, plaintext| Ok(plaintext.to_vec()));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(rns_transport::messages::TransportMessage::Outbound(_))
+        ));
+        assert_eq!(router.pending_outbound[0].state, MessageState::Sent);
     }
 
     #[test]
@@ -4495,6 +4020,7 @@ mod tests {
                 DeliveryMethod::Propagated,
             ))
             .unwrap();
+        router.pending_outbound[0].awaiting_path = true;
         // NaN slot-5 cost: pn_announce_data_is_valid accepts it, the typed parse does not.
         let data = hex::decode(
             "97c2ce6553f100c3cd0100cd280093cb7ff800000000000003128101c407706e206e616d65",
@@ -4526,14 +4052,19 @@ mod tests {
                 DeliveryMethod::Direct,
             ))
             .unwrap();
-        let actions = router.process_outbound_with_direct(|_, _| DirectDeliveryPlanInput {
-            identity_known: true,
-            route: Some(DirectRouteSnapshot::new(dest, 1)),
-            reusable_link: DirectReusableLinkState::None,
-        });
+        let mut inputs = OutboundInputs::default();
+        inputs.identities.insert(dest);
+        inputs.medium.routes.insert(
+            dest,
+            RouteInfo {
+                hops: 1,
+                first_hop_timeout: 6.0,
+            },
+        );
+        let actions = router.process_outbound_with_inputs(&inputs, now_f64());
         assert!(matches!(
             actions.as_slice(),
-            [OutboundAction::PlanDirect { message, .. }] if !message.auto_compress
+            [OutboundAction::DeliverOverLink { message, .. }] if !message.auto_compress
         ));
         router.update_compression_support(dest, None);
         assert!(router.compression_supported(&dest));
@@ -4545,12 +4076,11 @@ mod tests {
         let dest = [0xAA; 16];
 
         router.ignore_destination(dest);
-        assert!(router.ignored.contains(&dest));
-        assert!(router.propagation_store.is_destination_ignored(&dest));
+        assert!(router.is_ignored(&dest));
+        assert!(!router.propagation_store.is_destination_ignored(&dest));
 
         router.unignore_destination(&dest);
-        assert!(!router.ignored.contains(&dest));
-        assert!(!router.propagation_store.is_destination_ignored(&dest));
+        assert!(!router.is_ignored(&dest));
     }
 
     #[test]
@@ -4872,7 +4402,8 @@ mod tests {
 
         let actions = router.process_outbound();
         assert_eq!(actions.len(), 1);
-        assert_eq!(router.pending_outbound.len(), 1);
+        assert_eq!(router.pending_outbound.len(), 2);
+        assert_eq!(router.pending_outbound[1].delivery_attempts, 0);
     }
 
     #[test]
@@ -4902,78 +4433,6 @@ mod tests {
     }
 
     #[test]
-    fn test_direct_message_state_sending() {
-        let mut router = LxmRouter::new(RouterConfig::default());
-        let msg = crate::message::test_message(
-            [0xAA; 16],
-            [0xBB; 16],
-            "Direct",
-            "Content",
-            DeliveryMethod::Direct,
-        );
-        router.try_send(msg).unwrap();
-
-        let actions = router.process_outbound();
-        assert_eq!(actions.len(), 1);
-        match &actions[0] {
-            OutboundAction::DeliverDirect { message, .. } => {
-                assert_eq!(message.state, MessageState::Sending);
-            }
-            _ => panic!("expected DeliverDirect"),
-        }
-    }
-
-    #[test]
-    fn test_propagated_message_state_sending() {
-        let mut router = LxmRouter::new(RouterConfig::default());
-        let peer_hash = [0x11; 16];
-        let peer = crate::peer::LxmPeer::new(peer_hash);
-        router.add_peer(peer);
-        router.set_outbound_propagation_node(Some(peer_hash));
-
-        let msg = crate::message::test_message(
-            [0xAA; 16],
-            [0xBB; 16],
-            "Propagated",
-            "Content",
-            DeliveryMethod::Propagated,
-        );
-        router.try_send(msg).unwrap();
-
-        let actions = router.process_outbound();
-        assert_eq!(actions.len(), 1);
-        match &actions[0] {
-            OutboundAction::DeliverPropagated { message, .. } => {
-                assert_eq!(message.state, MessageState::Sending);
-            }
-            _ => panic!("expected DeliverPropagated"),
-        }
-    }
-
-    #[test]
-    fn test_opportunistic_message_state_sent() {
-        let mut router = LxmRouter::new(RouterConfig::default());
-        let msg = crate::message::test_message(
-            [0xAA; 16],
-            [0xBB; 16],
-            "Opportunistic",
-            "Content",
-            DeliveryMethod::Opportunistic,
-        );
-        router.try_send(msg).unwrap();
-
-        let actions = router.process_outbound();
-        assert_eq!(actions.len(), 1);
-        match &actions[0] {
-            OutboundAction::DeliverOpportunistic { message, .. } => {
-                assert_eq!(message.state, MessageState::Sent);
-                assert_eq!(message.progress, 0.50);
-            }
-            _ => panic!("expected DeliverOpportunistic"),
-        }
-    }
-
-    #[test]
     fn test_direct_message_left_for_link_delivery_after_execute() {
         let mut router = LxmRouter::new(RouterConfig::default());
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
@@ -4993,6 +4452,11 @@ mod tests {
 
         router.tick();
 
+        // Without a known path the router only asks for one (LXMRouter.py:3229-3233).
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(rns_transport::messages::TransportMessage::RequestPath { .. })
+        ));
         assert!(
             rx.try_recv().is_err(),
             "Direct delivery requires LinkDeliveryManager, not router.execute_actions"
