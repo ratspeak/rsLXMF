@@ -1334,3 +1334,54 @@ fn completed_sync_keeps_the_link_and_the_next_sync_reuses_it() {
     let (_, body, _) = peer.request(true);
     assert_eq!(body, Value::Array(vec![Value::Nil, Value::Nil]));
 }
+
+#[test]
+fn response_resource_starts_from_link_facts_with_any_segment_count() {
+    let mut peer = Peer::new();
+    peer.client.received_ids = ids(12);
+    peer.client.send_purge_request();
+    let (id, _, _) = peer.request(true);
+    peer.client.last_inbound_resource = Some((7, Some(1234.0)));
+    let mut sender = OutboundTransfer::new_encrypted(
+        Link::pack_response(&id, &[0x90]).unwrap(),
+        false,
+        Duration::from_millis(10),
+        peer.link.session_keys().unwrap(),
+    )
+    .unwrap();
+    sender.resource.flags.is_response = true;
+    sender.resource.request_id = Some(id.to_vec());
+    let TransferAction::SendAdvertisement(bytes) = sender.tick() else {
+        panic!()
+    };
+    let mut adv = ResourceAdvertisement::unpack(&bytes).unwrap();
+    // Resource.py has no segment limit.
+    adv.flags.split = true;
+    adv.total_segments = 1000;
+    adv.original_hash = [0x72; 32];
+    peer.inject(
+        Context::ResourceAdv,
+        &peer.link.encrypt(&adv.pack()).unwrap(),
+    );
+    assert_eq!(peer.client.state(), PropagationClientState::Receiving);
+    let inbound = &peer.client.inbound_resources[&adv.resource_hash];
+    let link = peer.client.link.as_ref().unwrap();
+    assert_eq!(inbound.establishment_cost, link.establishment_cost);
+    assert_eq!(inbound.resource.window.window, 7);
+    assert_eq!(inbound.previous_eifr, Some(1234.0));
+}
+
+#[test]
+fn link_data_but_not_keepalives_refreshes_last_data() {
+    let mut peer = Peer::new();
+    let past = Instant::now() - Duration::from_secs(60);
+    peer.client.link.as_mut().unwrap().keepalive.last_data = past;
+    peer.inject(
+        Context::Keepalive,
+        &[rns_link::constants::KEEPALIVE_RESPONSE],
+    );
+    assert!(peer.client.link.as_ref().unwrap().no_data_for() >= Duration::from_secs(59));
+    let payload = peer.link.encrypt(b"data").unwrap();
+    peer.inject(Context::None, &payload);
+    assert!(peer.client.link.as_ref().unwrap().no_data_for() < Duration::from_secs(5));
+}

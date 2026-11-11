@@ -22,8 +22,9 @@ use rns_link::handshake::EphemeralKeys;
 use rns_link::link::{CloseReason, Link, LinkAction, LinkState};
 use rns_link::stamp::{LinkRequestStamper, LinkStampPolicy};
 use rns_protocol::resource::{
-    InboundTransfer, LazyMultiSegmentOutbound, MAX_EFFICIENT_SIZE, MAX_RESOURCE_SIZE, MAX_SEGMENTS,
-    MultiSegmentInbound, OutboundResource, OutboundTransfer, ResourceError, TransferAction,
+    InboundLinkFacts, InboundTransfer, LazyMultiSegmentOutbound, MAX_EFFICIENT_SIZE,
+    MAX_RESOURCE_SIZE, MultiSegmentInbound, OutboundResource, OutboundTransfer, ResourceError,
+    TransferAction,
 };
 use rns_protocol::resource_adv::ResourceAdvertisement;
 use rns_transport::link_endpoint_dispatch::{
@@ -407,6 +408,8 @@ pub struct PendingDelivery {
     inbound_split_resources: HashMap<[u8; 32], MultiSegmentInbound>,
     inbound_segment_routing: HashMap<[u8; 32], InboundSegmentRoute>,
     inbound_resource_lifecycles: HashMap<[u8; 32], InboundResourceLifecycle>,
+    /// `Link.last_resource_window` and `last_resource_eifr` (Link.py:1344-1348).
+    last_inbound_resource: Option<(usize, Option<f64>)>,
 }
 
 /// Message payload waiting for an existing Direct link to become active/idle.
@@ -1363,7 +1366,10 @@ impl LinkDeliveryManager {
         hops: u8,
         timing: LinkEstablishmentTiming,
     ) -> Result<DirectLinkStartReport, LinkDeliveryStartFailure> {
-        self.start_direct_delivery(message, dest_hash, hops, timing)
+        let started = self.start_direct_delivery(message, dest_hash, hops, timing);
+        // Keys belong to one Link request (Link.py:313-316); never carry them to a later one.
+        self.prepared_link_keys.remove(&dest_hash);
+        started
     }
 
     /// Start a one-shot Link delivery with a caller-supplied packed payload.
@@ -1409,6 +1415,7 @@ impl LinkDeliveryManager {
                 if delivery.state == DeliveryState::Idle && delivery.link.is_active() {
                     let _ = delivery.start_queued_delivery();
                 }
+                self.prepared_link_keys.remove(&dest_hash);
                 return Ok(link_id);
             }
             self.propagation_links.remove(&dest_hash);
@@ -1844,6 +1851,7 @@ impl LinkDeliveryManager {
                 inbound_split_resources: HashMap::new(),
                 inbound_segment_routing: HashMap::new(),
                 inbound_resource_lifecycles: HashMap::new(),
+                last_inbound_resource: None,
             },
         );
         if packed_override_kind {
@@ -2593,7 +2601,6 @@ impl LinkDeliveryManager {
             adv.resource_hash
         };
         let structurally_valid = adv.total_segments > 0
-            && adv.total_segments <= MAX_SEGMENTS
             && adv.segment_index > 0
             && adv.segment_index <= adv.total_segments
             && !adv.flags.is_request
@@ -2674,7 +2681,7 @@ impl LinkDeliveryManager {
         let copy_len = adv.random_hash.len().min(random_hash.len());
         random_hash[..copy_len].copy_from_slice(&adv.random_hash[..copy_len]);
         let rtt = delivery.link.rtt.unwrap_or(Duration::from_millis(500));
-        let Ok(mut transfer) = InboundTransfer::from_advertisement(
+        let Ok(mut transfer) = InboundTransfer::from_advertisement_with_link(
             adv.num_parts,
             adv.transfer_size,
             adv.data_size,
@@ -2682,7 +2689,12 @@ impl LinkDeliveryManager {
             adv.resource_hash,
             adv.flags,
             map_hashes,
-            rtt,
+            InboundLinkFacts {
+                rtt,
+                establishment_cost: delivery.link.establishment_cost,
+                previous_window: delivery.last_inbound_resource.map(|(window, _)| window),
+                previous_eifr: delivery.last_inbound_resource.and_then(|(_, eifr)| eifr),
+            },
         ) else {
             let _ = dispatch_inbound_resource_action(
                 link_id,
@@ -2823,6 +2835,10 @@ impl LinkDeliveryManager {
                 .get_mut(&resource_hash)
                 .map(|transfer| transfer.complete(Some(&decrypt)))
         };
+        // Link.resource_concluded runs after assembly whatever its outcome (Resource.py:740).
+        if let Some(transfer) = delivery.inbound_resources.get(&resource_hash) {
+            delivery.last_inbound_resource = Some((transfer.resource.window.window, transfer.eifr));
+        }
         let Some(Ok((assembled, proof))) = completion else {
             let _ = dispatch_inbound_resource_action(
                 link_id,
@@ -9714,6 +9730,112 @@ mod tests {
         assert_eq!(admissions.load(Ordering::Relaxed), count);
         assert_eq!(conclusions.load(Ordering::Relaxed), 1);
         assert_eq!(handoffs.load(Ordering::Relaxed), usize::from(owned));
+    }
+
+    #[test]
+    fn prepared_link_keys_do_not_outlive_a_start_that_did_not_use_them() {
+        let (tx, mut rx) = mpsc::channel(128);
+        let mut mgr = LinkDeliveryManager::new(tx, None, None);
+        let responder_key = Ed25519PrivateKey::generate();
+        let sign_key = Ed25519PrivateKey::generate();
+        let dest_hash = [0xEA; 16];
+        let message = |content: &str| {
+            crate::message::LxMessageDraft::new(
+                [0xAA; 16],
+                [0xBB; 16],
+                "Initial",
+                content,
+                crate::constants::DeliveryMethod::Direct,
+            )
+            .unwrap()
+            .sign(&sign_key)
+            .unwrap()
+            .finalize(None)
+            .unwrap()
+        };
+        let _ = establish_active_delivery(
+            &mut mgr,
+            &mut rx,
+            message("first"),
+            &responder_key,
+            dest_hash,
+        );
+        mgr.provide_link_request_keys(dest_hash, EphemeralKeys::generate());
+        let report = mgr
+            .start_delivery_with_report(message("second"), dest_hash, 1)
+            .unwrap();
+        assert_ne!(report.kind, DirectLinkStartKind::NewDirect);
+        assert!(mgr.prepared_link_keys.is_empty());
+    }
+
+    #[test]
+    fn reverse_resource_starts_from_link_facts_with_any_segment_count() {
+        let (tx, mut rx) = mpsc::channel(128);
+        let mut mgr = LinkDeliveryManager::new(tx, None, None);
+        mgr.set_inbound_resource_accept_handler(|_, _| true);
+        let responder_key = Ed25519PrivateKey::generate();
+        let sign_key = Ed25519PrivateKey::generate();
+        let dest_hash = [0xE9; 16];
+        let msg = crate::message::LxMessageDraft::new(
+            [0xAA; 16],
+            [0xBB; 16],
+            "Initial",
+            "establish reusable link",
+            crate::constants::DeliveryMethod::Direct,
+        )
+        .unwrap();
+        let msg = msg.sign(&sign_key).unwrap().finalize(None).unwrap();
+        let (link_id, responder_link) =
+            establish_active_delivery(&mut mgr, &mut rx, msg, &responder_key, dest_hash);
+        assert!(mgr.tick().is_empty());
+        complete_next_link_packet(&mut mgr, &mut rx, link_id, &responder_link, &responder_key);
+        let _ = mgr.tick();
+        while rx.try_recv().is_ok() {}
+        mgr.pending.get_mut(&link_id).unwrap().last_inbound_resource = Some((7, Some(1234.0)));
+
+        let (mut transfer, _) = build_resource_transfer(
+            &responder_link,
+            vec![0x44; 128],
+            false,
+            false,
+            Duration::from_millis(25),
+        )
+        .unwrap();
+        // Resource.py has no segment limit; 1000 segments of 1 MiB are a 1 GB resource.
+        transfer.resource.flags.split = true;
+        transfer.resource.original_hash = Some([0x72; 32]);
+        transfer.resource.segment_index = 1;
+        transfer.resource.total_segments = 1000;
+        let resource_hash = transfer.resource.resource_hash;
+        let TransferAction::SendAdvertisement(advertisement) = transfer.tick() else {
+            unreachable!();
+        };
+        let encrypted = responder_link.encrypt(&advertisement).unwrap();
+        mgr.event_tx
+            .try_send(DestinationEvent::InboundPacket {
+                interface_owner: None,
+                raw: link_data_packet(
+                    link_id,
+                    rns_wire::context::PacketContext::ResourceAdv,
+                    &encrypted,
+                ),
+                interface_id: 0,
+                metrics: Default::default(),
+            })
+            .unwrap();
+        mgr.drain_events(&HashMap::new());
+
+        let delivery = &mgr.pending[&link_id];
+        let inbound = &delivery.inbound_resources[&resource_hash];
+        assert_eq!(inbound.establishment_cost, delivery.link.establishment_cost);
+        assert_eq!(inbound.resource.window.window, 7);
+        assert_eq!(inbound.previous_eifr, Some(1234.0));
+        let request = next_outbound(&mut rx);
+        let (header, _) = rns_wire::header::PacketHeader::unpack(&request).unwrap();
+        assert_eq!(
+            header.context,
+            rns_wire::context::PacketContext::ResourceReq
+        );
     }
 
     #[test]

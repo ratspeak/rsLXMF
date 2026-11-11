@@ -204,13 +204,10 @@ impl PropagationEnvelope {
             .checked_add(11 + bin_header)
             .ok_or_else(|| MessageError::PackFailed("PN wrapper size overflow".into()))?;
         let limit = (node.policy.transfer_limit_kb * 1000.).floor();
-        let resource_limit = rns_protocol::resource::MAX_EFFICIENT_SIZE
-            .checked_mul(rns_protocol::resource::MAX_SEGMENTS)
-            .unwrap_or(0);
-        if packed_len as f64 > limit || packed_len > resource_limit {
+        if packed_len as f64 > limit {
             return Err(MessageError::TooLarge {
                 size: packed_len,
-                limit: (limit as usize).min(resource_limit),
+                limit: limit as usize,
             });
         }
         let mut out = Vec::with_capacity(packed_len);

@@ -33,7 +33,7 @@ use rns_link::handshake::EphemeralKeys;
 use rns_link::link::{CloseReason, Link, LinkAction, LinkState};
 use rns_link::stamp::{LinkRequestStamper, LinkStampPolicy};
 use rns_protocol::resource::{
-    InboundTransfer, MAX_EFFICIENT_SIZE, MAX_RESOURCE_SIZE, MAX_SEGMENTS, MultiSegmentInbound,
+    InboundLinkFacts, InboundTransfer, MAX_EFFICIENT_SIZE, MAX_RESOURCE_SIZE, MultiSegmentInbound,
     OutboundResource, OutboundTransfer, RANDOM_HASH_SIZE, ResourceError, TransferAction,
 };
 use rns_protocol::resource_adv::ResourceAdvertisement;
@@ -265,6 +265,8 @@ pub struct PropagationClient {
     link_stamper: LinkRequestStamper,
     prepared_link_keys: Option<([u8; 16], EphemeralKeys)>,
     mtu_query: Option<oneshot::Receiver<TransportQueryResponse>>,
+    /// `Link.last_resource_window` and `last_resource_eifr` (Link.py:1344-1348).
+    last_inbound_resource: Option<(usize, Option<f64>)>,
     /// Phase 1 response: transient IDs the server has.
     available_messages: Vec<Vec<u8>>,
     /// Messages we already have locally.
@@ -351,6 +353,7 @@ impl PropagationClient {
             link_stamper: LinkRequestStamper::without_recall(LinkStampPolicy::default()),
             prepared_link_keys: None,
             mtu_query: None,
+            last_inbound_resource: None,
             available_messages: Vec::new(),
             local_messages: HashSet::new(),
             local_message_expiry: HashMap::new(),
@@ -1248,8 +1251,17 @@ impl PropagationClient {
                     } else {
                         &[]
                     };
+                    // Link.py:1030; packet proofs reach the Link only as receipts (Transport.py:2997-3036).
+                    let link_receives = header.flags.packet_type
+                        != rns_wire::flags::PacketType::Proof
+                        || header.context == rns_wire::context::PacketContext::ResourcePrf;
                     if let Some(link) = self.link.as_mut() {
                         link.record_inbound();
+                        if link_receives
+                            && header.context != rns_wire::context::PacketContext::Keepalive
+                        {
+                            link.record_inbound_data();
+                        }
                         link.record_rx(data.len());
                     }
 
@@ -1462,7 +1474,6 @@ impl PropagationClient {
             || adv.flags.has_metadata
             || adv.data_size > MAX_RESOURCE_SIZE
             || adv.total_segments == 0
-            || adv.total_segments > MAX_SEGMENTS
             || adv.segment_index == 0
             || adv.segment_index > adv.total_segments
             || (adv.total_segments > 1 && !adv.flags.split)
@@ -1516,14 +1527,6 @@ impl PropagationClient {
         self.status.data_size = Some(self.status.data_size.unwrap_or_default().max(adv.data_size));
 
         if adv.total_segments > 1 {
-            if adv.total_segments > MAX_SEGMENTS
-                || adv.segment_index == 0
-                || adv.segment_index > adv.total_segments
-            {
-                self.fail();
-                return;
-            }
-
             let entry = self
                 .inbound_split_resources
                 .entry(adv.original_hash)
@@ -1551,7 +1554,7 @@ impl PropagationClient {
         let copy_len = adv.random_hash.len().min(random_hash.len());
         random_hash[..copy_len].copy_from_slice(&adv.random_hash[..copy_len]);
 
-        let Ok(mut transfer) = InboundTransfer::from_advertisement(
+        let Ok(mut transfer) = InboundTransfer::from_advertisement_with_link(
             adv.num_parts,
             adv.transfer_size,
             adv.data_size,
@@ -1559,7 +1562,12 @@ impl PropagationClient {
             adv.resource_hash,
             adv.flags,
             map_hashes,
-            rtt,
+            InboundLinkFacts {
+                rtt,
+                establishment_cost: self.link.as_ref().map_or(0, |l| l.establishment_cost),
+                previous_window: self.last_inbound_resource.map(|(window, _)| window),
+                previous_eifr: self.last_inbound_resource.and_then(|(_, eifr)| eifr),
+            },
         ) else {
             self.fail();
             return;
@@ -1776,7 +1784,9 @@ impl PropagationClient {
             .inbound_resources
             .get(&resource_hash)
             .and_then(|transfer| transfer.resource.metadata.clone());
-        self.inbound_resources.remove(&resource_hash);
+        if let Some(transfer) = self.inbound_resources.remove(&resource_hash) {
+            self.last_inbound_resource = Some((transfer.resource.window.window, transfer.eifr));
+        }
         // Transfer duration does not consume the transport-result/intersegment
         // wait. In particular, a healthy slow segment can exceed this timeout.
         if let Some(response) = self
@@ -2956,6 +2966,7 @@ impl PropagationClient {
         self.inbound_resources.clear();
         self.inbound_split_resources.clear();
         self.segment_routing.clear();
+        self.last_inbound_resource = None;
         self.receiving_for = None;
         self.started_at = None;
     }
