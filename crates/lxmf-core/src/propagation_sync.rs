@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use rns_crypto::ed25519::{Ed25519PrivateKey, Ed25519PublicKey};
+use rns_link::handshake::EphemeralKeys;
 use rns_link::link::{CloseReason, Link, LinkAction, LinkState};
 use rns_link::stamp::{LinkRequestStamper, LinkStampPolicy};
 use rns_protocol::resource::{
@@ -186,6 +187,7 @@ pub struct PropagationSyncTask {
     identity_pub: Option<[u8; 64]>,
     identity_key: Option<Ed25519PrivateKey>,
     link_stamper: LinkRequestStamper,
+    prepared_link_keys: Option<([u8; 16], EphemeralKeys)>,
     active_offer_generation: Option<u64>,
     generation_exhausted: bool,
     terminal_result: Option<PeerSyncTerminalResult>,
@@ -245,6 +247,7 @@ impl PropagationSyncTask {
             identity_pub: None,
             identity_key: None,
             link_stamper: LinkRequestStamper::without_recall(LinkStampPolicy::default()),
+            prepared_link_keys: None,
             active_offer_generation: None,
             generation_exhausted: false,
             terminal_result: None,
@@ -312,6 +315,7 @@ impl PropagationSyncTask {
             identity_pub: None,
             identity_key: None,
             link_stamper: LinkRequestStamper::without_recall(LinkStampPolicy::default()),
+            prepared_link_keys: None,
             active_offer_generation: None,
             generation_exhausted: false,
             terminal_result: None,
@@ -373,6 +377,7 @@ impl PropagationSyncTask {
             identity_pub: None,
             identity_key: None,
             link_stamper: LinkRequestStamper::without_recall(LinkStampPolicy::default()),
+            prepared_link_keys: None,
             active_offer_generation: None,
             generation_exhausted: false,
             terminal_result: None,
@@ -438,6 +443,12 @@ impl PropagationSyncTask {
     /// The default stamps only when `always_stamp_lrs` is set.
     pub fn set_link_request_stamper(&mut self, stamper: LinkRequestStamper) {
         self.link_stamper = stamper;
+    }
+
+    /// Open the next Link to `node` with `keys`, such as stamped keys
+    /// generated off the caller's task, instead of the stamper's.
+    pub fn provide_link_request_keys(&mut self, node: [u8; 16], keys: EphemeralKeys) {
+        self.prepared_link_keys = Some((node, keys));
     }
 
     /// Configure the local identity used for Link identification. Production
@@ -1603,7 +1614,16 @@ impl PropagationSyncTask {
         self.active_transfer_ids.clear();
         self.active_offer_generation = None;
         self.generation_exhausted = false;
-        let Ok((link, request_data)) = self.link_stamper.new_initiator(node_hash, 1) else {
+        let initiator = match self.prepared_link_keys.take() {
+            Some((node, keys)) if node == node_hash => Ok(Link::new_initiator_with_keys(
+                node_hash,
+                1,
+                keys,
+                crate::link_delivery::BASE_LINK_MTU,
+            )),
+            _ => self.link_stamper.new_initiator(node_hash, 1),
+        };
+        let Ok((link, request_data)) = initiator else {
             tracing::warn!("propagation sync link request stamp generation failed");
             self.state = SyncTaskState::Failed;
             return false;

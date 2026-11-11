@@ -29,6 +29,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use rns_crypto::ed25519::{Ed25519PrivateKey, Ed25519PublicKey};
+use rns_link::handshake::EphemeralKeys;
 use rns_link::link::{CloseReason, Link, LinkAction, LinkState};
 use rns_link::stamp::{LinkRequestStamper, LinkStampPolicy};
 use rns_protocol::resource::{
@@ -233,6 +234,7 @@ pub struct PropagationClient {
     identity_pub: Option<[u8; 64]>,
     identity_key: Option<Ed25519PrivateKey>,
     link_stamper: LinkRequestStamper,
+    prepared_link_keys: Option<([u8; 16], EphemeralKeys)>,
     /// Phase 1 response: transient IDs the server has.
     available_messages: Vec<Vec<u8>>,
     /// Messages we already have locally.
@@ -315,6 +317,7 @@ impl PropagationClient {
             identity_pub,
             identity_key,
             link_stamper: LinkRequestStamper::without_recall(LinkStampPolicy::default()),
+            prepared_link_keys: None,
             available_messages: Vec::new(),
             local_messages: HashSet::new(),
             local_message_expiry: HashMap::new(),
@@ -361,6 +364,12 @@ impl PropagationClient {
     /// The default stamps only when `always_stamp_lrs` is set.
     pub fn set_link_request_stamper(&mut self, stamper: LinkRequestStamper) {
         self.link_stamper = stamper;
+    }
+
+    /// Open the next Link to `node` with `keys`, such as stamped keys
+    /// generated off the caller's task, instead of the stamper's.
+    pub fn provide_link_request_keys(&mut self, node: [u8; 16], keys: EphemeralKeys) {
+        self.prepared_link_keys = Some((node, keys));
     }
 
     pub fn set_propagation_node(&mut self, dest_hash: [u8; 16]) {
@@ -746,7 +755,16 @@ impl PropagationClient {
     }
 
     fn establish_link(&mut self, node_hash: [u8; 16]) -> bool {
-        let Ok((link, request_data)) = self.link_stamper.new_initiator(node_hash, 1) else {
+        let initiator = match self.prepared_link_keys.take() {
+            Some((node, keys)) if node == node_hash => Ok(Link::new_initiator_with_keys(
+                node_hash,
+                1,
+                keys,
+                crate::link_delivery::BASE_LINK_MTU,
+            )),
+            _ => self.link_stamper.new_initiator(node_hash, 1),
+        };
+        let Ok((link, request_data)) = initiator else {
             tracing::warn!("propagation client link request stamp generation failed");
             return false;
         };

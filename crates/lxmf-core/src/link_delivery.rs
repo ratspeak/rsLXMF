@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use rns_crypto::ed25519::{Ed25519PrivateKey, Ed25519PublicKey};
 use rns_link::constants::ESTABLISHMENT_TIMEOUT_PER_HOP;
+use rns_link::handshake::EphemeralKeys;
 use rns_link::link::{CloseReason, Link, LinkAction, LinkState};
 use rns_link::stamp::{LinkRequestStamper, LinkStampPolicy};
 use rns_protocol::resource::{
@@ -45,6 +46,8 @@ use crate::propagation::hex_encode;
 
 /// Upstream LXMF keeps reusable Direct links open for ten minutes of data
 /// inactivity before tearing them down (`LXMRouter.LINK_MAX_INACTIVITY`).
+/// Links opened with prepared keys signal the base MTU, as the stamper does.
+pub(crate) const BASE_LINK_MTU: u32 = rns_wire::constants::MTU as u32;
 const LINK_MAX_INACTIVITY: Duration = Duration::from_secs(600);
 const BACKCHANNEL_SEND_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const BACKCHANNEL_DELIVERY_TIMEOUT: Duration = Duration::from_secs(360);
@@ -940,6 +943,7 @@ pub struct LinkDeliveryManager {
     delivery_events: VecDeque<LxmfDeliveryEvent>,
     resource_counters: ResourceDispatchCounters,
     link_stamper: LinkRequestStamper,
+    prepared_link_keys: HashMap<[u8; 16], EphemeralKeys>,
 }
 
 impl LinkDeliveryManager {
@@ -989,7 +993,14 @@ impl LinkDeliveryManager {
             delivery_events: VecDeque::new(),
             resource_counters: ResourceDispatchCounters::default(),
             link_stamper: LinkRequestStamper::without_recall(LinkStampPolicy::default()),
+            prepared_link_keys: HashMap::new(),
         }
+    }
+
+    /// Open the next Link to `dest_hash` with `keys`, such as stamped keys
+    /// generated off the caller's task, instead of the stamper's.
+    pub fn provide_link_request_keys(&mut self, dest_hash: [u8; 16], keys: EphemeralKeys) {
+        self.prepared_link_keys.insert(dest_hash, keys);
     }
 
     /// Stamp new link requests with this stamper's policy and announced costs.
@@ -1684,7 +1695,16 @@ impl LinkDeliveryManager {
         } = options;
         let msg_hash = Some(message.message_id());
         let packed_override_kind = packed_override.is_some();
-        let Ok((mut link, request_data)) = self.link_stamper.new_initiator(dest_hash, hops) else {
+        let initiator = match self.prepared_link_keys.remove(&dest_hash) {
+            Some(keys) => Ok(Link::new_initiator_with_keys(
+                dest_hash,
+                hops,
+                keys,
+                BASE_LINK_MTU,
+            )),
+            None => self.link_stamper.new_initiator(dest_hash, hops),
+        };
+        let Ok((mut link, request_data)) = initiator else {
             return Err(LinkDeliveryStartFailure {
                 error: LinkDeliveryStartError::StampFailure,
                 message: Box::new(message),
