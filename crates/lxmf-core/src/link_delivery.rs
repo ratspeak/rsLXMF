@@ -35,7 +35,7 @@ use rns_transport::link_messages::DestinationEvent;
 use rns_transport::messages::{
     InterfaceId, LinkEndpointBindResult, LinkEndpointBinding, LinkEndpointLifecycleEvent,
     LinkEndpointRole, LinkEndpointSendResult, LinkEndpointUnbindResult, OutboundRequest,
-    TransportMessage,
+    TransportMessage, TransportQueryResponse,
 };
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot};
@@ -46,8 +46,6 @@ use crate::propagation::hex_encode;
 
 /// Upstream LXMF keeps reusable Direct links open for ten minutes of data
 /// inactivity before tearing them down (`LXMRouter.LINK_MAX_INACTIVITY`).
-/// Links opened with prepared keys signal the base MTU, as the stamper does.
-pub(crate) const BASE_LINK_MTU: u32 = rns_wire::constants::MTU as u32;
 const LINK_MAX_INACTIVITY: Duration = Duration::from_secs(600);
 const BACKCHANNEL_SEND_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const BACKCHANNEL_DELIVERY_TIMEOUT: Duration = Duration::from_secs(360);
@@ -944,6 +942,7 @@ pub struct LinkDeliveryManager {
     resource_counters: ResourceDispatchCounters,
     link_stamper: LinkRequestStamper,
     prepared_link_keys: HashMap<[u8; 16], EphemeralKeys>,
+    next_hop_hardware_mtus: HashMap<[u8; 16], u32>,
 }
 
 impl LinkDeliveryManager {
@@ -994,6 +993,7 @@ impl LinkDeliveryManager {
             resource_counters: ResourceDispatchCounters::default(),
             link_stamper: LinkRequestStamper::without_recall(LinkStampPolicy::default()),
             prepared_link_keys: HashMap::new(),
+            next_hop_hardware_mtus: HashMap::new(),
         }
     }
 
@@ -1007,6 +1007,23 @@ impl LinkDeliveryManager {
     /// The default stamps only when `always_stamp_lrs` is set.
     pub fn set_link_request_stamper(&mut self, stamper: LinkRequestStamper) {
         self.link_stamper = stamper;
+    }
+
+    /// Record Transport's answer to `GetNextHopHardwareMtu` for `dest_hash`
+    /// (`None` for no answer); the next Link opened to it signals that MTU
+    /// while the stamper's `link_mtu_discovery` is on (Link.py:392-397@1.6.0).
+    pub fn provide_next_hop_hardware_mtu(&mut self, dest_hash: [u8; 16], mtu: Option<u32>) {
+        match mtu.filter(|mtu| *mtu != 0) {
+            Some(mtu) => {
+                if self.next_hop_hardware_mtus.len() >= LINK_PENDING_TRANSPORT_LIMIT {
+                    self.next_hop_hardware_mtus.clear();
+                }
+                self.next_hop_hardware_mtus.insert(dest_hash, mtu);
+            }
+            None => {
+                self.next_hop_hardware_mtus.remove(&dest_hash);
+            }
+        }
     }
 
     /// Register the embedding task's waker for inbound delivery events and
@@ -1695,14 +1712,11 @@ impl LinkDeliveryManager {
         } = options;
         let msg_hash = Some(message.message_id());
         let packed_override_kind = packed_override.is_some();
+        let next_hop_mtu = self.next_hop_hardware_mtus.remove(&dest_hash);
+        let mtu = signalled_link_mtu(&self.link_stamper, next_hop_mtu);
         let initiator = match self.prepared_link_keys.remove(&dest_hash) {
-            Some(keys) => Ok(Link::new_initiator_with_keys(
-                dest_hash,
-                hops,
-                keys,
-                BASE_LINK_MTU,
-            )),
-            None => self.link_stamper.new_initiator(dest_hash, hops),
+            Some(keys) => Ok(Link::new_initiator_with_keys(dest_hash, hops, keys, mtu)),
+            None => self.link_stamper.new_initiator(dest_hash, hops, mtu),
         };
         let Ok((mut link, request_data)) = initiator else {
             return Err(LinkDeliveryStartFailure {
@@ -2684,6 +2698,8 @@ impl LinkDeliveryManager {
             notify_inbound_resource_concluded(concluded_handler.as_ref(), *link_id, resource_id);
             return false;
         };
+        // Receiver timing uses the link's SDU (Resource.py:346-347@1.6.0).
+        transfer.resource.sdu = delivery.link.resource_sdu();
 
         let action = transfer.request_next();
         delivery
@@ -3144,10 +3160,11 @@ impl LinkDeliveryManager {
                             delivery.message.pack()
                         };
                         if let Ok(packed) = packed {
+                            // LXMessage sizes packets by the base Link.MDU, whatever the link MTU.
                             let packet_limit = if delivery.packed_override.is_some() {
-                                delivery.link.mdu.saturating_sub(LXMF_OVERHEAD)
+                                rns_wire::constants::LINK_MDU.saturating_sub(LXMF_OVERHEAD)
                             } else {
-                                delivery.link.mdu
+                                rns_wire::constants::LINK_MDU
                             };
                             if packed.len() <= packet_limit {
                                 // Python LXMessage sends Direct messages that fit in Link.MDU
@@ -3897,7 +3914,7 @@ impl LinkDeliveryManager {
                         if exhausted {
                             delivery.remaining_segments = None;
                         }
-                        delivery.transfer = Some(OutboundTransfer::from_prebuilt(segment, rtt));
+                        delivery.transfer = Some(link_transfer(&delivery.link, segment, rtt));
                         delivery.state = DeliveryState::Transferring;
                     }
                     Ok(Some(None)) | Ok(None) => {
@@ -5551,21 +5568,61 @@ fn build_resource_transfer(
     app_flag: bool,
     rtt: Duration,
 ) -> Result<(OutboundTransfer, Option<LazyMultiSegmentOutbound>), ResourceError> {
+    let sdu = Some(link.resource_sdu());
     if packed.len() <= MAX_EFFICIENT_SIZE {
-        let transfer = match link.session_keys() {
+        let resource = match link.session_keys() {
             Some(keys) => {
-                OutboundTransfer::new_encrypted(packed, auto_compress, rtt, keys.clone())?
+                let encrypt_fn = |plaintext: &[u8]| -> Vec<u8> {
+                    rns_link::encryption::link_encrypt(&keys, plaintext)
+                        .unwrap_or_else(|_| plaintext.to_vec())
+                };
+                OutboundResource::with_options(packed, auto_compress, None, sdu, Some(&encrypt_fn))?
             }
-            None => OutboundTransfer::new(packed, auto_compress, rtt)?,
+            None => OutboundResource::with_options(packed, auto_compress, None, sdu, None)?,
         };
-        return Ok((transfer.with_app_flag(app_flag), None));
+        return Ok((
+            link_transfer(link, resource, rtt).with_app_flag(app_flag),
+            None,
+        ));
     }
 
-    let mut remaining =
-        LazyMultiSegmentOutbound::new(packed, auto_compress)?.with_app_flag(app_flag);
+    let mut remaining = LazyMultiSegmentOutbound::new(packed, auto_compress)?
+        .with_app_flag(app_flag)
+        .with_link_sdu(sdu);
     let first = next_resource_segment(link, &mut remaining)?.ok_or(ResourceError::Incomplete)?;
     let remaining = (remaining.remaining_segments() > 0).then_some(remaining);
-    Ok((OutboundTransfer::from_prebuilt(first, rtt), remaining))
+    Ok((link_transfer(link, first, rtt), remaining))
+}
+
+/// An outbound Resource on `link`: parts sized by the link's SDU and the
+/// advertisement bounded by its MDU (Resource.py:346-347, :542@1.6.0).
+pub(crate) fn link_transfer(
+    link: &Link,
+    resource: OutboundResource,
+    rtt: Duration,
+) -> OutboundTransfer {
+    let mut transfer = OutboundTransfer::from_prebuilt(resource, rtt);
+    transfer.advertisement_mdu = link.mdu;
+    transfer
+}
+
+/// Transport's answer to `GetNextHopHardwareMtu`, if it has arrived; a
+/// missing answer falls back to the base MTU rather than waiting.
+pub(crate) fn answered_hardware_mtu(
+    receiver: &mut oneshot::Receiver<TransportQueryResponse>,
+) -> Option<u32> {
+    match receiver.try_recv() {
+        Ok(TransportQueryResponse::IntResult(mtu)) => u32::try_from(mtu).ok(),
+        _ => None,
+    }
+}
+
+/// The MTU a new link request signals (Link.py:392-397@1.6.0): the next hop's
+/// hardware MTU when discovery is on and Transport reported one, else the base MTU.
+pub(crate) fn signalled_link_mtu(stamper: &LinkRequestStamper, next_hop_mtu: Option<u32>) -> u32 {
+    next_hop_mtu
+        .filter(|mtu| stamper.link_mtu_discovery && *mtu != 0)
+        .unwrap_or(rns_wire::constants::MTU as u32)
 }
 
 fn next_resource_segment(
@@ -6652,6 +6709,45 @@ mod tests {
             .unwrap()
             .finalize(None)
             .unwrap()
+    }
+
+    #[test]
+    fn direct_link_signals_next_hop_mtu_and_sizes_by_base_mdu_and_link_sdu() {
+        let (tx, mut rx) = mpsc::channel(128);
+        let mut mgr = LinkDeliveryManager::new(tx, None, None);
+        let responder_key = Ed25519PrivateKey::generate();
+        let dest = [0x93; 16];
+        mgr.provide_next_hop_hardware_mtu(dest, Some(262_144));
+        let message = crate::message::LxMessageDraft::new(
+            [0xAA; 16],
+            [0xBB; 16],
+            "large",
+            &"x".repeat(600),
+            crate::constants::DeliveryMethod::Direct,
+        )
+        .unwrap()
+        .sign(&Ed25519PrivateKey::generate())
+        .unwrap()
+        .finalize(None)
+        .unwrap();
+        let (link_id, responder) =
+            establish_active_delivery(&mut mgr, &mut rx, message, &responder_key, dest);
+        assert_eq!(responder.mtu, 262_144);
+        let link = &mgr.pending[&link_id].link;
+        assert_eq!(link.mtu, 262_144);
+        let (link_sdu, link_mdu) = (link.resource_sdu(), link.mdu);
+        // 600 bytes fit the link's MDU but not the base Link.MDU, so upstream sends a Resource.
+        assert!(mgr.tick().is_empty());
+        let transfer = mgr.pending[&link_id].transfer.as_ref().expect("Resource");
+        assert_eq!(transfer.resource.sdu, link_sdu);
+        assert_eq!(transfer.advertisement_mdu, link_mdu);
+        assert!(mgr.tick().is_empty());
+        let advertisement = next_outbound(&mut rx);
+        let (header, _) = rns_wire::header::PacketHeader::unpack(&advertisement).unwrap();
+        assert_eq!(
+            header.context,
+            rns_wire::context::PacketContext::ResourceAdv
+        );
     }
 
     #[tokio::test]

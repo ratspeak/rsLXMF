@@ -34,7 +34,7 @@ use rns_link::link::{CloseReason, Link, LinkAction, LinkState};
 use rns_link::stamp::{LinkRequestStamper, LinkStampPolicy};
 use rns_protocol::resource::{
     InboundTransfer, MAX_EFFICIENT_SIZE, MAX_RESOURCE_SIZE, MAX_SEGMENTS, MultiSegmentInbound,
-    OutboundTransfer, RANDOM_HASH_SIZE, ResourceError, TransferAction,
+    OutboundResource, OutboundTransfer, RANDOM_HASH_SIZE, ResourceError, TransferAction,
 };
 use rns_protocol::resource_adv::ResourceAdvertisement;
 use rns_transport::link_messages::DestinationEvent;
@@ -264,6 +264,7 @@ pub struct PropagationClient {
     identity_key: Option<Ed25519PrivateKey>,
     link_stamper: LinkRequestStamper,
     prepared_link_keys: Option<([u8; 16], EphemeralKeys)>,
+    mtu_query: Option<oneshot::Receiver<TransportQueryResponse>>,
     /// Phase 1 response: transient IDs the server has.
     available_messages: Vec<Vec<u8>>,
     /// Messages we already have locally.
@@ -349,6 +350,7 @@ impl PropagationClient {
             identity_key,
             link_stamper: LinkRequestStamper::without_recall(LinkStampPolicy::default()),
             prepared_link_keys: None,
+            mtu_query: None,
             available_messages: Vec::new(),
             local_messages: HashSet::new(),
             local_message_expiry: HashMap::new(),
@@ -699,6 +701,14 @@ impl PropagationClient {
     }
 
     fn query_path(&mut self, node_hash: [u8; 16]) -> bool {
+        // Asked ahead of HasPath, so Transport has answered it once the path is known.
+        let (mtu_tx, mtu_rx) = oneshot::channel();
+        self.mtu_query = self
+            .queue_transport(TransportMessage::Rpc {
+                query: TransportQuery::GetNextHopHardwareMtu { dest: node_hash },
+                response_tx: mtu_tx,
+            })
+            .then_some(mtu_rx);
         let (response_tx, response_rx) = oneshot::channel();
         if !self.queue_transport(TransportMessage::Rpc {
             query: TransportQuery::HasPath { dest: node_hash },
@@ -802,14 +812,16 @@ impl PropagationClient {
     }
 
     fn establish_link(&mut self, node_hash: [u8; 16]) -> bool {
+        let next_hop_mtu = self
+            .mtu_query
+            .take()
+            .and_then(|mut receiver| crate::link_delivery::answered_hardware_mtu(&mut receiver));
+        let mtu = crate::link_delivery::signalled_link_mtu(&self.link_stamper, next_hop_mtu);
         let initiator = match self.prepared_link_keys.take() {
-            Some((node, keys)) if node == node_hash => Ok(Link::new_initiator_with_keys(
-                node_hash,
-                1,
-                keys,
-                crate::link_delivery::BASE_LINK_MTU,
-            )),
-            _ => self.link_stamper.new_initiator(node_hash, 1),
+            Some((node, keys)) if node == node_hash => {
+                Ok(Link::new_initiator_with_keys(node_hash, 1, keys, mtu))
+            }
+            _ => self.link_stamper.new_initiator(node_hash, 1, mtu),
         };
         let Ok((link, request_data)) = initiator else {
             tracing::warn!("propagation client link request stamp generation failed");
@@ -1552,6 +1564,9 @@ impl PropagationClient {
             self.fail();
             return;
         };
+        if let Some(link) = self.link.as_ref() {
+            transfer.resource.sdu = link.resource_sdu();
+        }
 
         self.retire_request_sender();
         let request = self
@@ -2595,16 +2610,26 @@ impl PropagationClient {
                 self.fail();
                 return false;
             };
-            let Ok(mut transfer) = OutboundTransfer::new_encrypted(
+            let encrypt_fn = |plaintext: &[u8]| -> Vec<u8> {
+                rns_link::encryption::link_encrypt(&keys, plaintext)
+                    .unwrap_or_else(|_| plaintext.to_vec())
+            };
+            let Ok(resource) = OutboundResource::with_options(
                 packed.take().unwrap(),
                 true,
-                link.rtt.unwrap_or(Duration::from_millis(500)),
-                keys,
+                None,
+                Some(link.resource_sdu()),
+                Some(&encrypt_fn),
             ) else {
                 link.fail_pending_request(&id);
                 self.fail();
                 return false;
             };
+            let mut transfer = crate::link_delivery::link_transfer(
+                link,
+                resource,
+                link.rtt.unwrap_or(Duration::from_millis(500)),
+            );
             transfer.resource.flags.is_request = true;
             transfer.resource.request_id = Some(id.to_vec());
             link.mark_request_resource_sending(&id);
@@ -3162,12 +3187,60 @@ mod tests {
                 } => {
                     let _ = response_tx.send(TransportQueryResponse::InterfaceStats(Vec::new()));
                 }
+                TransportMessage::Rpc {
+                    query: TransportQuery::GetNextHopHardwareMtu { .. },
+                    response_tx,
+                } => {
+                    let _ = response_tx.send(TransportQueryResponse::IntResult(-1));
+                }
                 TransportMessage::RequestPath { .. } => requested_path = true,
                 TransportMessage::SendLinkRequest { .. } => panic!("link request without a path"),
                 _ => {}
             }
         }
         requested_path
+    }
+
+    fn signalled_mtu(rx: &mut mpsc::Receiver<TransportMessage>) -> u32 {
+        while let Ok(message) = rx.try_recv() {
+            if let TransportMessage::SendLinkRequest { request, .. } = message {
+                let data = &request.raw[rns_wire::constants::HEADER_MINSIZE..];
+                return rns_link::handshake::LinkRequestData::unpack(data)
+                    .unwrap()
+                    .signalling
+                    .mtu;
+            }
+        }
+        panic!("no link request")
+    }
+
+    #[test]
+    fn download_link_signals_the_next_hop_hardware_mtu() {
+        for (discovery, answer, expected) in [
+            (true, 262_144, 262_144),
+            (true, -1, 500),
+            (false, 262_144, 500),
+        ] {
+            let (tx, mut rx) = mpsc::channel(64);
+            let mut client = PropagationClient::new(tx, None, None);
+            let mut stamper = LinkRequestStamper::without_recall(LinkStampPolicy::default());
+            stamper.link_mtu_discovery = discovery;
+            client.set_link_request_stamper(stamper);
+            client.set_propagation_node([0xB7; 16]);
+            assert!(client.start_download());
+            while let Ok(message) = rx.try_recv() {
+                if let TransportMessage::Rpc { query, response_tx } = message {
+                    let _ = response_tx.send(match query {
+                        TransportQuery::GetNextHopHardwareMtu { .. } => {
+                            TransportQueryResponse::IntResult(answer)
+                        }
+                        _ => TransportQueryResponse::BoolResult(true),
+                    });
+                }
+            }
+            client.tick();
+            assert_eq!(signalled_mtu(&mut rx), expected, "discovery {discovery}");
+        }
     }
 
     #[test]
@@ -3240,13 +3313,15 @@ mod tests {
         client.set_propagation_node([0xB2; 16]);
 
         assert!(client.start_download());
-        assert_eq!(client.pending_transport.len(), 1);
+        assert_eq!(client.pending_transport.len(), 2, "MTU and path queries");
         assert!(matches!(
             rx.try_recv().unwrap(),
             TransportMessage::DeregisterDestination { .. }
         ));
-        client.tick();
-        answer_path_query(&mut rx, true);
+        for _ in 0..2 {
+            client.tick();
+            answer_path_query(&mut rx, true);
+        }
         client.tick();
         assert_eq!(client.pending_transport.len(), 1);
         assert!(matches!(

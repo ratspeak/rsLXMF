@@ -23,7 +23,8 @@ use rns_link::handshake::EphemeralKeys;
 use rns_link::link::{CloseReason, Link, LinkAction, LinkState};
 use rns_link::stamp::{LinkRequestStamper, LinkStampPolicy};
 use rns_protocol::resource::{
-    MAX_EFFICIENT_SIZE, MultiSegmentOutbound, OutboundTransfer, ResourceError, TransferAction,
+    MAX_EFFICIENT_SIZE, MultiSegmentOutbound, OutboundResource, OutboundTransfer, ResourceError,
+    TransferAction,
 };
 use rns_transport::link_messages::DestinationEvent;
 use rns_transport::messages::{
@@ -124,29 +125,44 @@ fn prepare_outbound_resource_transfers(
     auto_compress: bool,
     rtt: Duration,
     link_keys: rns_link::key_derivation::LinkKeys,
+    link_sdu: usize,
+    link_mdu: usize,
 ) -> Result<VecDeque<OutboundTransfer>, ResourceError> {
+    // Parts follow the link's SDU and advertisements its MDU (Resource.py:346-347, :542@1.6.0).
+    let encrypt = |plaintext: &[u8]| {
+        rns_link::encryption::link_encrypt(&link_keys, plaintext)
+            .unwrap_or_else(|_| plaintext.to_vec())
+    };
+    let link_transfer = |resource| {
+        let mut transfer = OutboundTransfer::from_prebuilt(resource, rtt);
+        transfer.advertisement_mdu = link_mdu;
+        transfer
+    };
     if payload.len() <= MAX_EFFICIENT_SIZE {
-        return Ok(VecDeque::from([OutboundTransfer::new_encrypted(
+        let resource = OutboundResource::with_options(
             payload,
             auto_compress,
-            rtt,
-            link_keys,
-        )?]));
+            None,
+            Some(link_sdu),
+            Some(&encrypt),
+        )?;
+        return Ok(VecDeque::from([link_transfer(resource)]));
     }
 
     // Reticulum encrypts each logical Resource segment as one assembled blob
     // before chunking it into raw RESOURCE packets. MultiSegmentOutbound also
     // enforces the protocol's MAX_RESOURCE_SIZE / MAX_SEGMENTS bounds.
-    let encrypt = |plaintext: &[u8]| {
-        rns_link::encryption::link_encrypt(&link_keys, plaintext)
-            .unwrap_or_else(|_| plaintext.to_vec())
-    };
-    let resources =
-        MultiSegmentOutbound::with_encrypt(payload, auto_compress, Some(&encrypt))?.segments;
-    Ok(resources
-        .into_iter()
-        .map(|resource| OutboundTransfer::from_prebuilt(resource, rtt))
-        .collect())
+    let resources = MultiSegmentOutbound::with_options(
+        payload,
+        auto_compress,
+        None,
+        None,
+        false,
+        Some(&encrypt),
+        Some(link_sdu),
+    )?
+    .segments;
+    Ok(resources.into_iter().map(link_transfer).collect())
 }
 
 pub struct PropagationSyncTask {
@@ -188,6 +204,7 @@ pub struct PropagationSyncTask {
     identity_key: Option<Ed25519PrivateKey>,
     link_stamper: LinkRequestStamper,
     prepared_link_keys: Option<([u8; 16], EphemeralKeys)>,
+    mtu_query: Option<oneshot::Receiver<TransportQueryResponse>>,
     active_offer_generation: Option<u64>,
     generation_exhausted: bool,
     terminal_result: Option<PeerSyncTerminalResult>,
@@ -248,6 +265,7 @@ impl PropagationSyncTask {
             identity_key: None,
             link_stamper: LinkRequestStamper::without_recall(LinkStampPolicy::default()),
             prepared_link_keys: None,
+            mtu_query: None,
             active_offer_generation: None,
             generation_exhausted: false,
             terminal_result: None,
@@ -316,6 +334,7 @@ impl PropagationSyncTask {
             identity_key: None,
             link_stamper: LinkRequestStamper::without_recall(LinkStampPolicy::default()),
             prepared_link_keys: None,
+            mtu_query: None,
             active_offer_generation: None,
             generation_exhausted: false,
             terminal_result: None,
@@ -378,6 +397,7 @@ impl PropagationSyncTask {
             identity_key: None,
             link_stamper: LinkRequestStamper::without_recall(LinkStampPolicy::default()),
             prepared_link_keys: None,
+            mtu_query: None,
             active_offer_generation: None,
             generation_exhausted: false,
             terminal_result: None,
@@ -1538,6 +1558,14 @@ impl PropagationSyncTask {
     }
 
     fn query_path(&mut self, node_hash: [u8; 16]) -> bool {
+        // Asked ahead of HasPath, so Transport has answered it once the path is known.
+        let (mtu_tx, mtu_rx) = oneshot::channel();
+        self.mtu_query = self
+            .queue_transport(TransportMessage::Rpc {
+                query: TransportQuery::GetNextHopHardwareMtu { dest: node_hash },
+                response_tx: mtu_tx,
+            })
+            .then_some(mtu_rx);
         let (response_tx, response_rx) = oneshot::channel();
         if !self.queue_transport(TransportMessage::Rpc {
             query: TransportQuery::HasPath { dest: node_hash },
@@ -1614,14 +1642,16 @@ impl PropagationSyncTask {
         self.active_transfer_ids.clear();
         self.active_offer_generation = None;
         self.generation_exhausted = false;
+        let next_hop_mtu = self
+            .mtu_query
+            .take()
+            .and_then(|mut receiver| crate::link_delivery::answered_hardware_mtu(&mut receiver));
+        let mtu = crate::link_delivery::signalled_link_mtu(&self.link_stamper, next_hop_mtu);
         let initiator = match self.prepared_link_keys.take() {
-            Some((node, keys)) if node == node_hash => Ok(Link::new_initiator_with_keys(
-                node_hash,
-                1,
-                keys,
-                crate::link_delivery::BASE_LINK_MTU,
-            )),
-            _ => self.link_stamper.new_initiator(node_hash, 1),
+            Some((node, keys)) if node == node_hash => {
+                Ok(Link::new_initiator_with_keys(node_hash, 1, keys, mtu))
+            }
+            _ => self.link_stamper.new_initiator(node_hash, 1, mtu),
         };
         let Ok((link, request_data)) = initiator else {
             tracing::warn!("propagation sync link request stamp generation failed");
@@ -1731,9 +1761,14 @@ impl PropagationSyncTask {
                     return;
                 };
                 let data_size = batch.payload.len() as u64;
-                let Ok(mut transfers) =
-                    prepare_outbound_resource_transfers(batch.payload, true, rtt, link_keys)
-                else {
+                let Ok(mut transfers) = prepare_outbound_resource_transfers(
+                    batch.payload,
+                    true,
+                    rtt,
+                    link_keys,
+                    link.resource_sdu(),
+                    link.mdu,
+                ) else {
                     self.state = SyncTaskState::Failed;
                     return;
                 };
@@ -2167,6 +2202,8 @@ mod tests {
             false,
             Duration::from_millis(500),
             initiator_keys,
+            rns_protocol::resource::SDU,
+            rns_wire::constants::LINK_MDU,
         )
         .unwrap();
         assert_eq!(transfers.len(), 1);
@@ -2279,6 +2316,8 @@ mod tests {
             false,
             Duration::from_millis(500),
             initiator.session_keys().unwrap(),
+            rns_protocol::resource::SDU,
+            rns_wire::constants::LINK_MDU,
         )
         .unwrap();
         let transfer = transfers.pop_front().unwrap();
@@ -2343,6 +2382,8 @@ mod tests {
             false,
             Duration::from_millis(500),
             initiator.session_keys().unwrap(),
+            rns_protocol::resource::SDU,
+            rns_wire::constants::LINK_MDU,
         )
         .unwrap();
         let transfer = transfers.pop_front().unwrap();
@@ -2391,6 +2432,8 @@ mod tests {
             false,
             Duration::from_millis(500),
             initiator.session_keys().unwrap(),
+            rns_protocol::resource::SDU,
+            rns_wire::constants::LINK_MDU,
         )
         .unwrap();
         let transfer = transfers.pop_front().unwrap();
@@ -2444,6 +2487,8 @@ mod tests {
                 false,
                 Duration::from_millis(500),
                 initiator.session_keys().unwrap(),
+                rns_protocol::resource::SDU,
+                rns_wire::constants::LINK_MDU,
             )
             .unwrap();
             let transfer = transfers.pop_front().unwrap();
@@ -2485,6 +2530,8 @@ mod tests {
             false,
             Duration::from_millis(500),
             initiator_keys,
+            rns_protocol::resource::SDU,
+            rns_wire::constants::LINK_MDU,
         )
         .unwrap();
         assert_eq!(transfers.len(), 2);
@@ -2576,6 +2623,12 @@ mod tests {
                     response_tx,
                 } => {
                     let _ = response_tx.send(TransportQueryResponse::BoolResult(has_path));
+                }
+                TransportMessage::Rpc {
+                    query: TransportQuery::GetNextHopHardwareMtu { .. },
+                    response_tx,
+                } => {
+                    let _ = response_tx.send(TransportQueryResponse::IntResult(-1));
                 }
                 TransportMessage::RequestPath { .. } => requested_path = true,
                 TransportMessage::SendLinkRequest { .. } => panic!("link request without a path"),
@@ -2861,10 +2914,11 @@ mod tests {
         let mut task = test_task(tx, [0xAA; 16]);
 
         assert!(task.request_sync_now([0xBB; 16]));
-        assert_eq!(task.pending_transport.len(), 1);
+        assert_eq!(task.pending_transport.len(), 2, "MTU and path queries");
 
         let _blocker = rx.try_recv().unwrap();
         task.tick();
+        answer_sync_path(&mut task, &mut rx, true);
         answer_sync_path(&mut task, &mut rx, true);
         assert!(matches!(
             rx.try_recv().unwrap(),
@@ -2951,6 +3005,8 @@ mod tests {
             false,
             Duration::from_millis(500),
             initiator.session_keys().unwrap(),
+            rns_protocol::resource::SDU,
+            rns_wire::constants::LINK_MDU,
         )
         .unwrap();
         let transfer = transfers.pop_front().unwrap();

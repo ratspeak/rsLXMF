@@ -1666,6 +1666,8 @@ struct LxmdRunner {
         mpsc::UnboundedReceiver<rns_runtime::link_manager::DestinationDeliveryProof>,
     /// Reticulum's medium view for outbound planning, refreshed per tick.
     medium: MediumSnapshot,
+    /// `Transport.next_hop_interface_hw_mtu` per routed outbound target.
+    next_hop_hardware_mtus: HashMap<[u8; 16], u32>,
     backchannel_command_rx: Option<mpsc::Receiver<BackchannelSendCommand>>,
     backchannel_abandon_tx: mpsc::Sender<BackchannelSendReceipt>,
     backchannel_abandon_rx: mpsc::Receiver<BackchannelSendReceipt>,
@@ -2606,6 +2608,7 @@ impl LxmdRunner {
             link_resource_proof_rx,
             destination_delivery_proof_rx,
             medium: MediumSnapshot::default(),
+            next_hop_hardware_mtus: HashMap::new(),
             backchannel_command_rx: None,
             backchannel_abandon_tx,
             backchannel_abandon_rx,
@@ -4096,6 +4099,7 @@ impl LxmdRunner {
             .map(medium_path_timeout)
             .unwrap_or(0.0);
         let mut routes = HashMap::new();
+        let mut hardware_mtus = HashMap::new();
         if !targets.is_empty()
             && let Some(TransportQueryResponse::PathTable(entries)) =
                 query(TransportQuery::GetPathTable).await
@@ -4110,6 +4114,12 @@ impl LxmdRunner {
                         Some(TransportQueryResponse::FloatResult(Some(seconds))) => seconds,
                         _ => rns_wire::constants::DEFAULT_PER_HOP_TIMEOUT,
                     };
+                if let Some(TransportQueryResponse::IntResult(mtu)) =
+                    query(TransportQuery::GetNextHopHardwareMtu { dest: entry.hash }).await
+                    && let Ok(mtu) = u32::try_from(mtu)
+                {
+                    hardware_mtus.insert(entry.hash, mtu);
+                }
                 routes.insert(
                     entry.hash,
                     RouteInfo {
@@ -4120,6 +4130,7 @@ impl LxmdRunner {
             }
         }
         self.medium.routes = routes;
+        self.next_hop_hardware_mtus = hardware_mtus;
     }
 
     fn outbound_inputs(&self) -> OutboundInputs {
@@ -5815,6 +5826,7 @@ impl LxmdRunner {
         let Some(ld) = self.link_delivery.as_mut() else {
             return;
         };
+        ld.provide_next_hop_hardware_mtu(target, self.next_hop_hardware_mtus.get(&target).copied());
         let started = if let Some(packed) = packed {
             ld.start_packed_delivery(message, target, hops, packed, true)
                 .map(|_| ())
