@@ -1019,6 +1019,46 @@ async fn wait_for_online_interface(
     }
 }
 
+/// `lxmd.py` control helpers request a path to the control destination and
+/// wait for it inside the command timeout before opening the link.
+async fn wait_for_control_path(
+    transport_tx: &mpsc::Sender<TransportMessage>,
+    target_identity_hash: [u8; 16],
+    deadline: tokio::time::Instant,
+) -> bool {
+    let dest =
+        Destination::hash_from_name_and_identity(CONTROL_APP_NAME, Some(&target_identity_hash));
+    let has_path = || async {
+        let (response_tx, response_rx) = oneshot::channel();
+        transport_tx
+            .send(TransportMessage::Rpc {
+                query: TransportQuery::HasPath { dest },
+                response_tx,
+            })
+            .await
+            .is_ok()
+            && matches!(
+                response_rx.await,
+                Ok(TransportQueryResponse::BoolResult(true))
+            )
+    };
+    if has_path().await {
+        return true;
+    }
+    let _ = transport_tx
+        .send(TransportMessage::RequestPath {
+            destination_hash: dest,
+        })
+        .await;
+    while tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if has_path().await {
+            return true;
+        }
+    }
+    false
+}
+
 fn queue_path_request(
     transport_tx: &mpsc::Sender<TransportMessage>,
     request_hash: [u8; 16],
@@ -6300,6 +6340,32 @@ pub(crate) async fn main() {
                 }
             }
             None => identity.hash,
+        };
+        let kind = if args.status || args.peers {
+            ControlCommandKind::Status
+        } else if sync_hash.is_some() {
+            ControlCommandKind::Sync
+        } else {
+            ControlCommandKind::Unpeer
+        };
+        let started = tokio::time::Instant::now();
+        // Python adds the timeout to `time.time()`: NaN and infinity never expire.
+        let deadline = Duration::try_from_secs_f64(if timeout.is_nan() {
+            f64::INFINITY
+        } else {
+            timeout.max(0.0)
+        })
+        .ok()
+        .and_then(|limit| started.checked_add(limit))
+        .unwrap_or_else(|| started + Duration::from_secs(u32::MAX as u64));
+        if !wait_for_control_path(&transport_tx, target_identity_hash, deadline).await {
+            println!("{}", kind.timeout_message());
+            std::process::exit(200);
+        }
+        let timeout = if timeout.is_finite() {
+            timeout - started.elapsed().as_secs_f64()
+        } else {
+            timeout
         };
 
         if args.status || args.peers {
