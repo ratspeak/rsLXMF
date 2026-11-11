@@ -1749,6 +1749,9 @@ struct LxmdRunner {
     node_announces_due: VecDeque<f64>,
     startup_node_announce_pending: bool,
     last_propagation_check: f64,
+    /// `wants_download_on_path_available_timeout`: start the download as soon
+    /// as the node becomes known, until this time.
+    download_on_path_until: Option<f64>,
     last_crypto_save: f64,
     checkpoint_task: Option<DaemonCheckpointTask>,
     last_cull: f64,
@@ -2658,6 +2661,7 @@ impl LxmdRunner {
             node_announces_due: VecDeque::new(),
             startup_node_announce_pending: false,
             last_propagation_check: 0.0,
+            download_on_path_until: None,
             last_crypto_save: now,
             checkpoint_task: None,
             last_cull: now,
@@ -4222,6 +4226,9 @@ impl LxmdRunner {
         if self.router.take_outbound_kick() {
             self.run_outbound();
         }
+        if self.router.take_propagation_announce() {
+            self.schedule_node_announce(now_f64());
+        }
 
         self.drive_propagation_sync();
 
@@ -4245,6 +4252,10 @@ impl LxmdRunner {
         let retain_synced_on_node = self.router.retain_node_lxms();
         let mut unknown_propagation_node = None;
         if let Some(ref mut client) = self.propagation_client {
+            // One outbound node serves uploads and downloads, as in LXMRouter.
+            if let Some(node) = self.router.outbound_propagation_node {
+                client.set_propagation_node(node);
+            }
             client.replace_durable_haves(locally_delivered_ids);
             client.set_retain_synced_on_node(retain_synced_on_node);
             client.drain_events(&self.known_identities);
@@ -4254,12 +4265,16 @@ impl LxmdRunner {
             let _ = client.take_suppression_updates();
 
             // Auto-download every 90s
-            if now - self.last_propagation_check > 90.0
+            let path_awaited = self
+                .download_on_path_until
+                .is_some_and(|until| now < until && propagation_node_ready);
+            if (now - self.last_propagation_check > 90.0 || path_awaited)
                 && client.state() == lxmf_core::propagation_client::PropagationClientState::Idle
             {
                 if propagation_node_ready && self.admission_store.is_some() {
                     client.start_download();
                     self.last_propagation_check = now;
+                    self.download_on_path_until = None;
                     tracing::debug!("auto-triggered propagation download");
                 } else if let Some(node) = self.router.outbound_propagation_node
                     && queue_unknown_propagation_node_path_request(
@@ -4269,6 +4284,12 @@ impl LxmdRunner {
                         now,
                     )
                 {
+                    // LXMRouter.request_messages_from_propagation_node path wait.
+                    self.download_on_path_until = Some(
+                        now + lxmf_core::propagation_client::PR_PATH_TIMEOUT
+                            .max(lxmf_core::constants::PATH_REQUEST_WAIT)
+                            as f64,
+                    );
                     unknown_propagation_node = Some(node);
                     tracing::debug!(
                         node = %hex::encode(node),
@@ -4277,13 +4298,7 @@ impl LxmdRunner {
                 }
             }
             let status = client.transfer_status();
-            acknowledge_propagation = matches!(
-                status.state,
-                lxmf_core::propagation_client::PropagationClientState::Complete
-                    | lxmf_core::propagation_client::PropagationClientState::Partial
-                    | lxmf_core::propagation_client::PropagationClientState::NoPath
-                    | lxmf_core::propagation_client::PropagationClientState::Failed
-            );
+            acknowledge_propagation = status.state.is_terminal();
             propagation_status = Some(status);
         }
         if let Some(node) = unknown_propagation_node {

@@ -333,6 +333,7 @@ pub struct LxmRouter {
     path_request_times: HashMap<[u8; 16], f64>,
     /// A slow-path message concluded; outbound processing should run again.
     outbound_kick: bool,
+    propagation_announce_due: bool,
     /// Directory given to [`Self::load_state`]; delivered and processed IDs are
     /// claimed there durably before delivery callbacks run.
     claims_dir: Option<std::path::PathBuf>,
@@ -443,6 +444,7 @@ impl LxmRouter {
             destination_retains: VecDeque::new(),
             path_request_times: HashMap::new(),
             outbound_kick: false,
+            propagation_announce_due: false,
             claims_dir: None,
         }
     }
@@ -1679,6 +1681,19 @@ impl LxmRouter {
 
     pub fn set_propagation_enabled(&mut self, enabled: bool) {
         self.config.propagation_enabled = enabled;
+    }
+
+    /// `LXMRouter.disable_propagation`: stop propagating and re-announce the
+    /// node with `node_state` false. The embedder sends the announce after
+    /// [`Self::take_propagation_announce`], `NODE_ANNOUNCE_DELAY` later.
+    pub fn disable_propagation(&mut self) {
+        self.config.propagation_enabled = false;
+        self.propagation_announce_due = true;
+    }
+
+    /// Whether a propagation node announce was requested since the last call.
+    pub fn take_propagation_announce(&mut self) -> bool {
+        std::mem::take(&mut self.propagation_announce_due)
     }
 
     /// Set the singular outbound propagation node used for `PROPAGATED`
@@ -4424,6 +4439,21 @@ mod tests {
         assert_eq!(peer.state, PeerState::Idle);
         assert_eq!(peer.outgoing, 2);
         assert!(peer.currently_transferring_messages.is_none());
+    }
+
+    #[test]
+    fn disable_propagation_requests_an_announce_with_node_state_false() {
+        let mut router = LxmRouter::new(RouterConfig {
+            propagation_enabled: true,
+            ..Default::default()
+        });
+        assert!(!router.take_propagation_announce());
+        router.disable_propagation();
+        assert!(router.take_propagation_announce());
+        assert!(!router.take_propagation_announce());
+        let data = crate::handlers::parse_pn_announce_data(&router.get_propagation_node_app_data())
+            .unwrap();
+        assert!(!data.node_state);
     }
 
     #[test]

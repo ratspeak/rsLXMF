@@ -76,7 +76,35 @@ pub enum PropagationClientState {
     Complete,
     /// No path to the node arrived within the path timeout.
     NoPath,
+    /// The Link closed before it was established.
+    LinkFailed,
+    /// The Link closed while a request was outstanding.
+    TransferFailed,
+    /// The node answered `ERROR_NO_IDENTITY`.
+    NoIdentityReceived,
+    /// The node answered `ERROR_NO_ACCESS`.
+    NoAccess,
     Failed,
+}
+
+impl PropagationClientState {
+    /// Terminal failure states; the Link is released and a new download may start.
+    pub const fn is_failure(self) -> bool {
+        matches!(
+            self,
+            Self::NoPath
+                | Self::LinkFailed
+                | Self::TransferFailed
+                | Self::NoIdentityReceived
+                | Self::NoAccess
+                | Self::Failed
+        )
+    }
+
+    /// `Complete`, `Partial` or a failure state.
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Complete | Self::Partial) || self.is_failure()
+    }
 }
 
 /// Local admission/backoff status; none of these records authorize purge.
@@ -110,7 +138,7 @@ pub struct PropagationTransferStatus {
     pub state: PropagationClientState,
     pub progress: f64,
     pub data_size: Option<usize>,
-    /// Number of durably accepted decisions, including duplicates/discards.
+    /// Messages in the last `/get` response, as Python's `propagation_transfer_last_result`.
     pub result: Option<usize>,
     pub admission: PropagationAdmissionCounts,
 }
@@ -136,7 +164,8 @@ struct SegmentRoute {
 enum RequestKind {
     List,
     Haves(usize),
-    Get(usize),
+    /// Wanted IDs and haves carried in the single `[wants, haves, limit]` request.
+    Get(usize, usize),
     Purge(usize),
 }
 
@@ -144,7 +173,7 @@ impl RequestKind {
     fn state(self) -> PropagationClientState {
         match self {
             Self::List => PropagationClientState::ListRequested,
-            Self::Get(_) => PropagationClientState::GetRequested,
+            Self::Get(..) => PropagationClientState::GetRequested,
             Self::Haves(_) | Self::Purge(_) => PropagationClientState::PurgeRequested,
         }
     }
@@ -258,6 +287,8 @@ pub struct PropagationClient {
     suppression_revision: u64,
     /// IDs of messages successfully received (drives the Phase 3 purge).
     received_ids: Vec<Vec<u8>>,
+    /// Downloaded IDs that were not accepted locally; purged like Python, never haves.
+    rejected_ids: Vec<Vec<u8>>,
     pending_haves: VecDeque<Vec<u8>>,
     pending_wants: VecDeque<Vec<u8>>,
     request: Option<PendingRequest>,
@@ -337,6 +368,7 @@ impl PropagationClient {
             suppression_dirty: false,
             suppression_revision: 0,
             received_ids: Vec::new(),
+            rejected_ids: Vec::new(),
             pending_haves: VecDeque::new(),
             pending_wants: VecDeque::new(),
             request: None,
@@ -372,8 +404,21 @@ impl PropagationClient {
         self.prepared_link_keys = Some((node, keys));
     }
 
+    /// Select the node to download from. Changing it tears down a Link to the
+    /// previous node, as `LXMRouter.set_outbound_propagation_node` does.
     pub fn set_propagation_node(&mut self, dest_hash: [u8; 16]) {
+        if self.outbound_propagation_node == Some(dest_hash) {
+            return;
+        }
         self.outbound_propagation_node = Some(dest_hash);
+        if self
+            .link
+            .as_ref()
+            .is_some_and(|link| link.destination_hash != dest_hash)
+        {
+            self.link_lost();
+            self.cleanup();
+        }
     }
 
     /// Set the requested server response budget in decimal kB (1000 bytes).
@@ -579,16 +624,15 @@ impl PropagationClient {
     /// Clear a terminal presentation snapshot after the caller has consumed
     /// its result. Active transfers are never reset by acknowledgement.
     pub fn acknowledge_transfer(&mut self) -> bool {
-        if !matches!(
-            self.status.state,
-            PropagationClientState::Complete
-                | PropagationClientState::Partial
-                | PropagationClientState::NoPath
-                | PropagationClientState::Failed
-        ) {
+        if !self.status.state.is_terminal() {
             return false;
         }
-        self.cleanup();
+        // LXMRouter.acknowledge_sync_completion keeps an established Link for reuse.
+        if self.status.state.is_failure() {
+            self.cleanup();
+        } else {
+            self.revoke_admissions();
+        }
         self.status = PropagationTransferStatus::default();
         true
     }
@@ -616,28 +660,31 @@ impl PropagationClient {
             Some(h) => h,
             None => return false,
         };
-        if !matches!(
-            self.status.state,
-            PropagationClientState::Idle
-                | PropagationClientState::Complete
-                | PropagationClientState::Partial
-                | PropagationClientState::NoPath
-                | PropagationClientState::Failed
-        ) {
+        if self.status.state != PropagationClientState::Idle && !self.status.state.is_terminal() {
             return false;
         }
-        if matches!(
-            self.status.state,
-            PropagationClientState::Complete
-                | PropagationClientState::Partial
-                | PropagationClientState::NoPath
-                | PropagationClientState::Failed
-        ) {
+        if self.status.state.is_failure() {
             self.cleanup();
         }
         self.flush_pending_transport();
         if !self.pending_transport.is_empty() {
             return false;
+        }
+        // An active Link to the node is reused: identify, then list again.
+        if self.link.as_ref().is_some_and(|link| {
+            link.state == LinkState::Active && link.destination_hash == node_hash
+        }) && self.request.is_none()
+        {
+            self.reset_cycle();
+            self.status = PropagationTransferStatus {
+                state: PropagationClientState::LinkEstablished,
+                ..PropagationTransferStatus::default()
+            };
+            self.max_messages = max_messages.filter(|limit| *limit > 0);
+            return true;
+        }
+        if self.link.is_some() {
+            self.cleanup();
         }
         // LXMRouter.request_messages_from_propagation_node: link only once a path is known.
         if !self.query_path(node_hash) {
@@ -822,6 +869,11 @@ impl PropagationClient {
         self.endpoint_release_queued = false;
         self.pending_endpoint_bind = None;
         self.started_at = Some(Instant::now());
+        self.reset_cycle();
+        true
+    }
+
+    fn reset_cycle(&mut self) {
         self.identified = false;
         self.available_messages.clear();
         self.received_messages.clear();
@@ -833,13 +885,13 @@ impl PropagationClient {
         self.admission_started = None;
         self.admission_progress = None;
         self.received_ids.clear();
+        self.rejected_ids.clear();
         self.pending_haves.clear();
         self.pending_wants.clear();
         self.unread_bytes = 0;
         self.inbound_resources.clear();
         self.inbound_split_resources.clear();
         self.segment_routing.clear();
-        true
     }
 
     /// Revoke current admissions, drop client-owned downloads and return to idle.
@@ -997,7 +1049,7 @@ impl PropagationClient {
                 });
             match pending.result_rx.try_recv() {
                 Ok(LinkEndpointSendResult::Sent | LinkEndpointSendResult::Queued { .. }) => {
-                    if current && self.status.state != PropagationClientState::Failed {
+                    if current && !self.status.state.is_failure() {
                         match pending.success {
                             EndpointSendSuccess::None => {}
                             EndpointSendSuccess::RequestPacket => {
@@ -1137,7 +1189,7 @@ impl PropagationClient {
         }
 
         for event in events {
-            if self.status.state == PropagationClientState::Failed {
+            if self.status.state.is_failure() {
                 break;
             }
             match event {
@@ -1275,7 +1327,7 @@ impl PropagationClient {
             self.inbound_resources.clear();
             self.inbound_split_resources.clear();
             self.segment_routing.clear();
-            self.fail();
+            self.link_lost();
         }
 
         verified
@@ -1900,6 +1952,9 @@ impl PropagationClient {
 
     /// Phase 1: parse available transient IDs from the server.
     fn handle_list_response(&mut self, response_data: &[u8]) {
+        if self.handle_peer_error(response_data) {
+            return;
+        }
         let ids = match Self::parse_available_message_ids(response_data) {
             Ok(ids) => ids,
             Err(_) => {
@@ -1968,13 +2023,16 @@ impl PropagationClient {
     /// Validate type/count, exact requested TID membership, duplicates and full
     /// byte budget before publishing any item. Payload ranges borrow one owner.
     fn handle_get_response_owned(&mut self, response_data: Bytes) {
-        let count = match self.request.as_ref().map(|request| request.kind) {
-            Some(RequestKind::Get(count)) => count,
+        let (count, haves) = match self.request.as_ref().map(|request| request.kind) {
+            Some(RequestKind::Get(count, haves)) => (count, haves),
             _ => {
                 self.fail();
                 return;
             }
         };
+        if self.handle_peer_error(&response_data) {
+            return;
+        }
         let parsed = (|| {
             let mut cursor = std::io::Cursor::new(response_data.as_ref());
             let n = rmp::decode::read_array_len(&mut cursor).map_err(|_| ())? as usize;
@@ -2017,7 +2075,10 @@ impl PropagationClient {
             return;
         };
         self.finish_request(&[]);
-        self.pending_wants.drain(..count);
+        // LXMRouter.message_get_response: one response ends the sync.
+        self.pending_wants.clear();
+        self.pending_haves.drain(..haves);
+        self.status.result = Some(ranges.len());
         self.admission_generation = self.admission_generation.wrapping_add(1);
         self.current_admission_generation
             .store(self.admission_generation, Ordering::Release);
@@ -2087,7 +2148,6 @@ impl PropagationClient {
                         receipt.record(),
                     ));
                     self.received_ids.push(result.scope.transient_id.to_vec());
-                    self.status.result = Some(self.status.result.unwrap_or(0).saturating_add(1));
                     if self.suppression.get(&receipt.record().scope).is_some() {
                         self.suppression.remove(&receipt.record().scope);
                         self.suppression_dirty = true;
@@ -2095,6 +2155,12 @@ impl PropagationClient {
                     }
                 }
                 DownloadAdmissionOutcome::Rejected(reason) => {
+                    // Python purges every downloaded message, whatever lxmf_propagation
+                    // did (LXMRouter.py:1838-1853). A message that failed for a passing
+                    // local reason stays on the node so the next sync can fetch it again.
+                    if !reason.is_transient() {
+                        self.rejected_ids.push(result.scope.transient_id.to_vec());
+                    }
                     self.admission_failures += 1;
                     self.status.admission.rejected += 1;
                     self.status.admission.retryable += usize::from(reason.is_transient());
@@ -2164,7 +2230,9 @@ impl PropagationClient {
                 self.pending_haves.drain(..count);
             }
             Some(RequestKind::Purge(count)) => {
-                self.received_ids.drain(..count);
+                let accepted = count.min(self.received_ids.len());
+                self.received_ids.drain(..accepted);
+                self.rejected_ids.drain(..count - accepted);
             }
             _ => {}
         }
@@ -2176,7 +2244,7 @@ impl PropagationClient {
         self.poll_link_request();
         self.flush_pending_transport();
         self.poll_endpoint_control();
-        if self.status.state == PropagationClientState::Failed {
+        if self.status.state.is_failure() {
             self.cleanup();
             return;
         }
@@ -2187,8 +2255,8 @@ impl PropagationClient {
             && started.elapsed() > self.timeout
             && self.status.state == PropagationClientState::LinkEstablishing
         {
+            self.link_lost();
             self.cleanup();
-            self.fail();
             return;
         }
 
@@ -2201,7 +2269,8 @@ impl PropagationClient {
                         && response.waiting_since.elapsed() > request.timeout
                 })
         }) {
-            self.fail();
+            // message_get_failed tears the Link down; clean_links then reports it.
+            self.link_lost();
             self.cleanup();
             return;
         }
@@ -2221,13 +2290,13 @@ impl PropagationClient {
                     rns_wire::flags::PacketType::Data,
                     &payload,
                 );
-                self.fail();
+                self.link_lost();
             }
-            Some(LinkAction::Closed(_)) => self.fail(),
+            Some(LinkAction::Closed(_)) => self.link_lost(),
             Some(LinkAction::None) | None => {}
         }
 
-        if self.status.state != PropagationClientState::Failed {
+        if !self.status.state.is_failure() {
             self.drive_outbound_request();
         }
 
@@ -2280,7 +2349,7 @@ impl PropagationClient {
             PropagationClientState::LinkEstablished => {
                 if !self.identified {
                     self.send_identify();
-                    if self.status.state == PropagationClientState::Failed {
+                    if self.status.state.is_failure() {
                         return;
                     }
                     self.identified = true;
@@ -2292,12 +2361,8 @@ impl PropagationClient {
             | PropagationClientState::Receiving
             | PropagationClientState::PurgeRequested
             | PropagationClientState::AwaitingAdmission => {}
-            PropagationClientState::Complete
-            | PropagationClientState::Partial
-            | PropagationClientState::NoPath
-            | PropagationClientState::Failed => {
-                self.cleanup();
-            }
+            state if state.is_failure() => self.cleanup(),
+            _ => {}
         }
     }
 
@@ -2386,24 +2451,24 @@ impl PropagationClient {
         self.send_next_chunk();
     }
 
-    fn chunk_body(&self, ids: &[Vec<u8>], get: bool) -> Vec<u8> {
+    /// `[wants, haves, limit]` when `wants` is given, else the purge body `[None, haves]`.
+    fn chunk_body(&self, wants: Option<&[Vec<u8>]>, haves: &[Vec<u8>]) -> Vec<u8> {
         use rmpv::Value;
-        let ids = Value::Array(ids.iter().cloned().map(Value::Binary).collect());
-        let mut fields = if get {
-            vec![ids, Value::Array(Vec::new())]
-        } else {
-            vec![Value::Nil, ids]
-        };
-        if get && let Some(limit) = self.delivery_limit {
+        let list = |ids: &[Vec<u8>]| Value::Array(ids.iter().cloned().map(Value::Binary).collect());
+        let mut fields = vec![wants.map_or(Value::Nil, list), list(haves)];
+        if wants.is_some()
+            && let Some(limit) = self.delivery_limit
+        {
             fields.push(Value::F64(limit));
         }
         crate::encode_value(&Value::Array(fields))
     }
 
-    /// Fit the complete canonical request, not an assumed ID count. The
-    /// timestamp/path portion is encoded with the same Value types as Link's
-    /// prepare_request; its timestamp value does not change its wire length.
-    fn bounded_chunk(&self, ids: &[Vec<u8>], get: bool) -> (usize, Vec<u8>) {
+    /// Largest prefix of `ids` whose complete canonical request fits one
+    /// Resource segment. The timestamp/path portion is encoded with the same
+    /// Value types as Link's prepare_request; its timestamp value does not
+    /// change its wire length.
+    fn bounded_count(&self, ids: &[Vec<u8>], body: impl Fn(&[Vec<u8>]) -> Vec<u8>) -> usize {
         use rmpv::Value;
         let overhead = crate::encode_value(&Value::Array(vec![
             Value::F64(0.0),
@@ -2420,47 +2485,58 @@ impl PropagationClient {
             .min(MAX_EFFICIENT_SIZE / 32);
         while low < high {
             let count = low + (high - low).div_ceil(2);
-            if self.chunk_body(&ids[..count], get).len() <= MAX_EFFICIENT_SIZE - overhead {
+            if body(&ids[..count]).len() <= MAX_EFFICIENT_SIZE - overhead {
                 low = count;
             } else {
                 high = count - 1;
             }
         }
-        (low, self.chunk_body(&ids[..low], get))
+        low
     }
 
     fn send_next_chunk(&mut self) {
         if self.request.is_some()
             || !self.pending_admissions.is_empty()
-            || self.status.state == PropagationClientState::Failed
+            || self.status.state.is_failure()
         {
             return;
         }
         self.prune_expired_haves(crate::now_f64() as u64);
-        if !self.received_ids.is_empty() {
+        let haves: Vec<_> = self
+            .pending_haves
+            .iter()
+            .take(MAX_EFFICIENT_SIZE / 32)
+            .cloned()
+            .collect();
+        if !self.received_ids.is_empty() || !self.rejected_ids.is_empty() {
             self.send_purge_request();
-        } else if !self.pending_haves.is_empty() {
-            let ids: Vec<_> = self
-                .pending_haves
-                .iter()
-                .take(MAX_EFFICIENT_SIZE / 32)
-                .cloned()
-                .collect();
-            let (count, data) = self.bounded_chunk(&ids, false);
-            self.send_get_path_request(&data, RequestKind::Haves(count));
         } else if self.suppression_dirty || self.suppression_persist_failed {
             self.status.state = PropagationClientState::AwaitingAdmission;
         } else if !self.pending_wants.is_empty() {
-            let ids: Vec<_> = self
+            // LXMRouter.message_list_response sends one `[wants, haves, limit]`.
+            // Haves that cannot share its single segment are purged first.
+            let wants: Vec<_> = self
                 .pending_wants
                 .iter()
                 .take(MAX_EFFICIENT_SIZE / 32)
                 .cloned()
                 .collect();
-            let (count, data) = self.bounded_chunk(&ids, true);
+            let count = self.bounded_count(&wants, |ids| self.chunk_body(Some(ids), &[]));
+            let fit = self.bounded_count(&haves, |ids| self.chunk_body(Some(&wants[..count]), ids));
+            if fit < self.pending_haves.len() {
+                let count = self.bounded_count(&haves, |ids| self.chunk_body(None, ids));
+                let data = self.chunk_body(None, &haves[..count]);
+                self.send_get_path_request(&data, RequestKind::Haves(count));
+                return;
+            }
+            let data = self.chunk_body(Some(&wants[..count]), &haves[..fit]);
             self.status.progress = 0.0;
             self.status.data_size = None;
-            self.send_get_path_request(&data, RequestKind::Get(count));
+            self.send_get_path_request(&data, RequestKind::Get(count, fit));
+        } else if !self.pending_haves.is_empty() {
+            let count = self.bounded_count(&haves, |ids| self.chunk_body(None, ids));
+            let data = self.chunk_body(None, &haves[..count]);
+            self.send_get_path_request(&data, RequestKind::Haves(count));
         } else {
             self.status.state = if self.admission_failures == 0 {
                 PropagationClientState::Complete
@@ -2473,7 +2549,15 @@ impl PropagationClient {
     }
 
     fn send_purge_request(&mut self) {
-        let (count, data) = self.bounded_chunk(&self.received_ids, false);
+        let ids: Vec<_> = self
+            .received_ids
+            .iter()
+            .chain(&self.rejected_ids)
+            .take(MAX_EFFICIENT_SIZE / 32)
+            .cloned()
+            .collect();
+        let count = self.bounded_count(&ids, |ids| self.chunk_body(None, ids));
+        let data = self.chunk_body(None, &ids[..count]);
         self.send_get_path_request(&data, RequestKind::Purge(count));
     }
 
@@ -2577,7 +2661,7 @@ impl PropagationClient {
         } else {
             self.drive_outbound_request();
         }
-        self.status.state != PropagationClientState::Failed
+        !self.status.state.is_failure()
     }
 
     fn drive_outbound_request(&mut self) {
@@ -2656,7 +2740,7 @@ impl PropagationClient {
                 TransferAction::Failed(_) => self.fail(),
                 _ => {}
             }
-            if self.status.state == PropagationClientState::Failed {
+            if self.status.state.is_failure() {
                 break;
             }
         }
@@ -2748,7 +2832,7 @@ impl PropagationClient {
         let payload = data.slice(start + 16..);
         if matches!(
             self.request.as_ref().map(|r| r.kind),
-            Some(RequestKind::Get(_))
+            Some(RequestKind::Get(..))
         ) {
             self.handle_get_response_owned(payload);
         } else {
@@ -2772,6 +2856,51 @@ impl PropagationClient {
         // could accept a completed blocking worker under the old generation.
         self.revoke_admissions();
         self.status.state = PropagationClientState::Failed;
+    }
+
+    /// `LXMRouter.clean_links`: a closed Link before establishment is
+    /// `PR_LINK_FAILED`, during a transfer `PR_TRANSFER_FAILED`.
+    fn link_lost(&mut self) {
+        let state = match self.status.state {
+            PropagationClientState::PathRequested | PropagationClientState::LinkEstablishing => {
+                PropagationClientState::LinkFailed
+            }
+            PropagationClientState::LinkEstablished
+            | PropagationClientState::ListRequested
+            | PropagationClientState::GetRequested
+            | PropagationClientState::Receiving
+            | PropagationClientState::PurgeRequested
+            | PropagationClientState::AwaitingAdmission => PropagationClientState::TransferFailed,
+            state if state.is_failure() => state,
+            state => {
+                // A kept Link closed between syncs: release it without a failure.
+                self.revoke_admissions();
+                self.cleanup();
+                self.status.state = state;
+                return;
+            }
+        };
+        self.revoke_admissions();
+        self.status.state = state;
+    }
+
+    /// `ERROR_NO_IDENTITY` and `ERROR_NO_ACCESS` answers to list and get
+    /// requests end the sync in their own states and tear the Link down.
+    fn handle_peer_error(&mut self, response_data: &[u8]) -> bool {
+        let mut input = response_data;
+        let state = match rmp::decode::read_int::<u64, _>(&mut input) {
+            Ok(code) if input.is_empty() && code == PeerError::NoIdentity as u64 => {
+                PropagationClientState::NoIdentityReceived
+            }
+            Ok(code) if input.is_empty() && code == PeerError::NoAccess as u64 => {
+                PropagationClientState::NoAccess
+            }
+            _ => return false,
+        };
+        self.finish_request(response_data);
+        self.cleanup();
+        self.status.state = state;
+        true
     }
 
     fn cleanup(&mut self) {
@@ -2874,7 +3003,7 @@ mod tests {
             link_id: [1; 16],
             generation: 1,
             id: [2; 16],
-            kind: RequestKind::Get(messages.len()),
+            kind: RequestKind::Get(messages.len(), 0),
             sender_active: false,
             outbound: None,
             response: None,
@@ -3451,7 +3580,7 @@ mod tests {
             rns_crypto::sha::full_hash(&msg1)
         );
         assert_eq!(client.state(), PropagationClientState::AwaitingAdmission);
-        assert_eq!(client.transfer_status().result, None);
+        assert_eq!(client.transfer_status().result, Some(2));
     }
 
     #[test]
@@ -3501,7 +3630,7 @@ mod tests {
             link_id: client.link_id.unwrap(),
             generation: 1,
             id: [0x44; 16],
-            kind: RequestKind::Get(0),
+            kind: RequestKind::Get(0, 0),
             sender_active: false,
             outbound: None,
             response: None,
@@ -3566,7 +3695,7 @@ mod tests {
             link_id: client.link_id.unwrap(),
             generation: 1,
             id: [0x44; 16],
-            kind: RequestKind::Get(0),
+            kind: RequestKind::Get(0, 0),
             sender_active: false,
             outbound: None,
             response: None,
@@ -3623,7 +3752,7 @@ mod tests {
             link_id: client.link_id.unwrap(),
             generation: 1,
             id: [0x44; 16],
-            kind: RequestKind::Get(0),
+            kind: RequestKind::Get(0, 0),
             sender_active: false,
             outbound: None,
             response: None,
@@ -3699,10 +3828,10 @@ mod tests {
         client.timeout = Duration::ZERO;
 
         client.tick();
-        assert_eq!(client.status.state, PropagationClientState::Failed);
+        assert_eq!(client.status.state, PropagationClientState::LinkFailed);
 
         client.tick();
-        assert_eq!(client.status.state, PropagationClientState::Failed);
+        assert_eq!(client.status.state, PropagationClientState::LinkFailed);
         assert!(client.acknowledge_transfer());
         assert_eq!(client.status.state, PropagationClientState::Idle);
     }
@@ -3810,10 +3939,10 @@ mod tests {
             .unwrap();
 
         client.drain_events(&std::collections::HashMap::new());
-        assert_eq!(client.status.state, PropagationClientState::Failed);
+        assert_eq!(client.status.state, PropagationClientState::TransferFailed);
 
         client.tick();
-        assert_eq!(client.status.state, PropagationClientState::Failed);
+        assert_eq!(client.status.state, PropagationClientState::TransferFailed);
         assert!(client.link.is_none());
         let saw_deregister = complete_client_cleanup(&mut client, &mut rx);
         assert!(saw_deregister);

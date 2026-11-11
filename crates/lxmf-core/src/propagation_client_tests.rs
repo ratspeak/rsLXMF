@@ -543,11 +543,11 @@ fn request_resource_progress_is_not_a_fixed_120_second_operation() {
     let request = peer.client.request.as_mut().unwrap();
     request.waiting_since = Some(ago_or_skip!(request.timeout + Duration::from_secs(1)));
     peer.client.tick();
-    assert_eq!(peer.client.state(), PropagationClientState::Failed);
+    assert_eq!(peer.client.state(), PropagationClientState::TransferFailed);
     assert!(peer.client.request.is_none());
     // No late response can resurrect a cleaned-up request.
     peer.response(id, empty(), false);
-    assert_eq!(peer.client.state(), PropagationClientState::Failed);
+    assert_eq!(peer.client.state(), PropagationClientState::TransferFailed);
 }
 
 #[test]
@@ -580,42 +580,37 @@ fn lost_advertisement_retries_same_resource_and_eventually_fails() {
 }
 
 #[test]
-fn oversized_logical_sets_advance_after_empty_and_partial_chunks() {
+fn one_get_request_ends_the_sync_even_when_wants_exceed_one_segment() {
     let mut peer = Peer::new();
     let selected = ids(30_845);
     peer.client.max_messages = Some(30_840);
     peer.client.available_messages = selected.clone();
     peer.client.available_messages.push(selected[0].clone());
     peer.client.send_get_request();
-    let mut consumed = 0;
-    loop {
-        let request = peer.client.request.as_ref().unwrap();
-        let RequestKind::Get(count) = request.kind else {
-            panic!("get chunk expected")
-        };
-        assert!(count <= crate::admission::MAX_DOWNLOAD_ITEMS);
-        assert!(count > 0);
-        if let Some(transfer) = &request.outbound {
-            assert!(transfer.resource.advertisement_data_size <= MAX_EFFICIENT_SIZE);
-        }
-        let id = request.id;
-        if consumed + count < 30_840 {
-            peer.response(id, empty(), false);
-            consumed += count;
-            continue;
-        }
-        assert_eq!(consumed + count, 30_840);
-        peer.response(id, binary_list(&[blob(consumed)]), false);
-        break;
+    let request = peer.client.request.as_ref().unwrap();
+    let RequestKind::Get(count, 0) = request.kind else {
+        panic!("one get request expected")
+    };
+    assert!(count > 0 && count <= crate::admission::MAX_DOWNLOAD_ITEMS);
+    if let Some(transfer) = &request.outbound {
+        assert!(transfer.resource.advertisement_data_size <= MAX_EFFICIENT_SIZE);
     }
-    assert!(peer.client.pending_wants.is_empty());
-    assert!(peer.client.received_ids.is_empty());
+    let (id, data, _) = peer.request(true);
+    assert_eq!(data.as_array().unwrap()[0], binary_list(&selected[..count]));
+    peer.response(id, binary_list(&[blob(0)]), false);
+    assert!(
+        peer.client.pending_wants.is_empty(),
+        "unserved wants wait for the next list"
+    );
     assert_eq!(
         peer.client.state(),
         PropagationClientState::AwaitingAdmission
     );
     peer.accept_downloads();
-    assert_eq!(peer.client.received_ids.len(), 1);
+    assert!(matches!(
+        peer.client.request.as_ref().unwrap().kind,
+        RequestKind::Purge(1)
+    ));
     let id = peer.client.request.as_ref().unwrap().id;
     peer.response(id, empty(), false);
     assert_eq!(peer.client.state(), PropagationClientState::Complete);
@@ -719,22 +714,23 @@ fn every_id_branch_switches_at_real_packet_boundary() {
                     peer.client.send_purge_request();
                 }
             }
-            assert_eq!(
-                peer.client.request.as_ref().unwrap().outbound.is_some(),
-                count > 11
-            );
+            if branch != 2 {
+                assert_eq!(
+                    peer.client.request.as_ref().unwrap().outbound.is_some(),
+                    count > 11
+                );
+            }
             let (id, body, _) = peer.request(true);
             let fields = body.as_array().unwrap();
             assert_eq!(
                 fields[if branch == 0 { 0 } else { 1 }],
                 binary_list(&selected)
             );
-            peer.response(id, empty(), false);
             if branch == 2 {
-                let (id, body, _) = peer.request(true);
-                assert_eq!(body.as_array().unwrap()[0], binary_list(&[vec![0xee; 32]]));
-                peer.response(id, empty(), false);
+                // One `[wants, haves, limit]` request carries both lists.
+                assert_eq!(fields[0], binary_list(&[vec![0xee; 32]]));
             }
+            peer.response(id, empty(), false);
             assert_eq!(peer.client.state(), PropagationClientState::Complete);
         }
     }
@@ -1091,18 +1087,16 @@ fn expired_durable_haves_are_downloaded_instead_of_purged() {
     ]);
     peer.client.available_messages = vec![expired.to_vec(), visible.to_vec()];
     peer.client.send_get_request();
-    let (id, request, _) = peer.request(true);
-    assert_eq!(
-        request,
-        Value::Array(vec![Value::Nil, binary_list(&[visible.to_vec()])])
-    );
-    assert!(!peer.client.local_messages.contains(expired.as_slice()));
-    peer.response(id, empty(), false);
     let (_, request, _) = peer.request(true);
     assert_eq!(
-        request.as_array().unwrap()[0],
-        binary_list(&[expired.to_vec()])
+        request,
+        Value::Array(vec![
+            binary_list(&[expired.to_vec()]),
+            binary_list(&[visible.to_vec()]),
+            Value::F64(1000.0),
+        ])
     );
+    assert!(!peer.client.local_messages.contains(expired.as_slice()));
 }
 
 #[test]
@@ -1244,7 +1238,7 @@ fn stale_suppression_checkpoint_cannot_acknowledge_newer_pruning_or_epochs() {
 }
 
 #[test]
-fn rejected_and_retryable_download_counts_never_become_purge_authority() {
+fn rejected_downloads_never_become_local_haves_and_only_definitive_ones_are_purged() {
     use crate::admission::{DownloadAdmissionOutcome, SuppressionReason};
     let mut peer = Peer::new();
     let messages = blobs(2);
@@ -1272,5 +1266,71 @@ fn rejected_and_retryable_download_counts_never_become_purge_authority() {
     );
     assert!(peer.client.local_messages.is_empty());
     assert!(peer.client.received_ids.is_empty());
-    assert!(peer.rx.is_empty(), "no durable acceptance means no purge");
+    // LXMRouter.message_get_response purges every downloaded message; the one
+    // refused for a passing local reason (a missing key) stays on the node.
+    let (id, body, _) = peer.request(true);
+    assert_eq!(
+        body,
+        Value::Array(vec![Value::Nil, binary_list(&ids(2)[..1])])
+    );
+    peer.response(id, empty(), false);
+    let revision = peer.client.suppression_revision();
+    assert!(peer.client.acknowledge_suppression_persistence(revision));
+    peer.client.poll_admissions();
+    assert_eq!(peer.client.state(), PropagationClientState::Partial);
+    assert_eq!(peer.client.transfer_status().result, Some(2));
+}
+
+#[test]
+fn node_error_codes_end_list_and_get_in_their_own_states() {
+    for (code, state) in [
+        (0xf0, PropagationClientState::NoIdentityReceived),
+        (0xf1, PropagationClientState::NoAccess),
+    ] {
+        for get in [false, true] {
+            let mut peer = Peer::new();
+            if get {
+                peer.client.available_messages = ids(1);
+                peer.client.send_get_request();
+            } else {
+                peer.client.send_list_request();
+            }
+            let (id, _, _) = peer.request(true);
+            peer.response(id, Value::from(code), false);
+            assert_eq!(peer.client.state(), state);
+            assert!(peer.client.link.is_none(), "the Link is torn down");
+            assert!(peer.client.take_downloaded_messages().is_empty());
+            assert!(peer.client.acknowledge_transfer());
+        }
+    }
+}
+
+#[test]
+fn changing_the_node_tears_down_the_link_to_the_previous_one() {
+    let mut peer = Peer::new();
+    peer.client.set_propagation_node([0xe8; 16]);
+    assert!(peer.client.link.is_some(), "same node keeps the Link");
+    peer.client.send_list_request();
+    let _ = peer.request(true);
+    peer.client.set_propagation_node([0xe9; 16]);
+    assert!(peer.client.link.is_none());
+    assert_eq!(peer.client.state(), PropagationClientState::TransferFailed);
+    assert!(peer.client.acknowledge_transfer());
+}
+
+#[test]
+fn completed_sync_keeps_the_link_and_the_next_sync_reuses_it() {
+    let mut peer = Peer::new();
+    peer.client.link.as_mut().unwrap().state = LinkState::Active;
+    peer.client.send_list_request();
+    let (id, _, _) = peer.request(true);
+    peer.response(id, empty(), false);
+    assert_eq!(peer.client.state(), PropagationClientState::Complete);
+    assert!(peer.client.acknowledge_transfer());
+    assert!(peer.client.link.is_some(), "acknowledgement keeps the Link");
+    assert!(peer.client.start_download());
+    assert_eq!(peer.client.state(), PropagationClientState::LinkEstablished);
+    peer.client.tick();
+    let (_, body, _) = peer.request(true);
+    assert_eq!(body, Value::Array(vec![Value::Nil, Value::Nil]));
 }
