@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use rns_crypto::ed25519::{Ed25519PrivateKey, Ed25519PublicKey};
-use rns_link::link::{CloseReason, Link, LinkAction};
+use rns_link::link::{CloseReason, Link, LinkAction, LinkState};
 use rns_link::stamp::{LinkRequestStamper, LinkStampPolicy};
 use rns_protocol::resource::{
     InboundTransfer, MAX_EFFICIENT_SIZE, MAX_RESOURCE_SIZE, MAX_SEGMENTS, MultiSegmentInbound,
@@ -2215,11 +2215,17 @@ impl PropagationClient {
 
         if self.status.state == PropagationClientState::Receiving {
             let mut retry_requests = Vec::new();
+            let mut cancel = None;
+            let mut failed = false;
             for transfer in self.inbound_resources.values_mut() {
                 match transfer.check_timeout() {
                     TransferAction::SendRequest(request) => retry_requests.push(request),
+                    TransferAction::SendCancel(_, hash) => {
+                        cancel = Some(hash);
+                        break;
+                    }
                     TransferAction::Failed(_) => {
-                        self.fail();
+                        failed = true;
                         break;
                     }
                     _ => {}
@@ -2230,6 +2236,23 @@ impl PropagationClient {
                     rns_wire::context::PacketContext::ResourceReq,
                     &request,
                 );
+            }
+            if let Some(hash) = cancel {
+                // Resource.cancel() sends RCL only on an active Link (Resource.py:1133-1139).
+                if self
+                    .link
+                    .as_ref()
+                    .is_some_and(|link| link.state == LinkState::Active)
+                {
+                    self.send_encrypted_resource_control(
+                        rns_wire::context::PacketContext::ResourceRcl,
+                        &hash,
+                    );
+                }
+                failed = true;
+            }
+            if failed {
+                self.fail();
             }
         }
 
@@ -2551,6 +2574,20 @@ impl PropagationClient {
                     rns_wire::context::PacketContext::ResourceAdv,
                     &data,
                 );
+            }
+            Some(TransferAction::SendCancel(_, hash)) => {
+                // Resource.cancel() sends ICL only on an active Link (Resource.py:1124-1132).
+                if self
+                    .link
+                    .as_ref()
+                    .is_some_and(|link| link.state == LinkState::Active)
+                {
+                    self.send_encrypted_resource_control(
+                        rns_wire::context::PacketContext::ResourceIcl,
+                        &hash,
+                    );
+                }
+                self.fail();
             }
             Some(TransferAction::Failed(_)) => self.fail(),
             _ => {}

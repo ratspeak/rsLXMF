@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use rns_crypto::ed25519::{Ed25519PrivateKey, Ed25519PublicKey};
-use rns_link::link::{CloseReason, Link, LinkAction};
+use rns_link::link::{CloseReason, Link, LinkAction, LinkState};
 use rns_link::stamp::{LinkRequestStamper, LinkStampPolicy};
 use rns_protocol::resource::{
     MAX_EFFICIENT_SIZE, MultiSegmentOutbound, OutboundTransfer, ResourceError, TransferAction,
@@ -1774,6 +1774,21 @@ impl PropagationSyncTask {
                     }) {
                         self.fail_active_transfer();
                     }
+                    break;
+                }
+                TransferAction::SendCancel(_, resource_hash) => {
+                    // Resource.cancel() sends ICL only on an active Link (Resource.py:1124-1132).
+                    if self
+                        .link
+                        .as_ref()
+                        .is_some_and(|link| link.state == LinkState::Active)
+                    {
+                        let _ = self.send_resource_packet(
+                            &resource_hash,
+                            rns_wire::context::PacketContext::ResourceIcl,
+                        );
+                    }
+                    self.fail_active_transfer();
                     break;
                 }
                 TransferAction::None => break,

@@ -5940,6 +5940,8 @@ fn drive_inbound_resource_watchdogs(
                 let resource_id = drop_inbound_resource(delivery, resource_hash);
                 notify_inbound_resource_concluded(concluded_handler, *link_id, resource_id);
             }
+            // Resource.cancel() sends RCL only on an active Link (Resource.py:1133-1139).
+            TransferAction::SendCancel(_, _) if delivery.link.state != LinkState::Active => {}
             retry => {
                 if dispatch_inbound_resource_action(
                     link_id,
@@ -6232,7 +6234,12 @@ fn dispatch_action(
             ActionOutcome::Fail(reason)
         }
         TransferAction::SendCancel(cancel_type, resource_hash) => {
-            if let Ok(encrypted) = delivery.link.encrypt(&resource_hash) {
+            // Resource.cancel() sends ICL/RCL only on an active Link (Resource.py:1126, 1134).
+            let active = delivery.link.state == LinkState::Active;
+            if let Some(encrypted) = active
+                .then(|| delivery.link.encrypt(&resource_hash).ok())
+                .flatten()
+            {
                 let context = match cancel_type {
                     rns_protocol::resource::CancelType::Icl => {
                         rns_wire::context::PacketContext::ResourceIcl
