@@ -43,6 +43,8 @@ struct UserDeletedMessage {
 struct Inner {
     journal: PathBuf,
     bodies: PathBuf,
+    /// The only directory journaled bodies may be moved in from.
+    legacy_bodies: Option<PathBuf>,
     committed: HashMap<AdmissionScope, AdmissionCommit>,
     deleted: HashMap<([u8; 16], [u8; 32]), UserDeletedMessage>,
 }
@@ -85,6 +87,24 @@ impl FileAdmissionStore {
     /// Parent is the daemon's already configured state directory. A strict
     /// outside bootstrap receipt witnesses creation of journal/body directories.
     pub fn open(state_dir: &Path, bodies: &Path) -> Result<Self, AdmissionError> {
+        Self::open_inner(state_dir, bodies, None)
+    }
+
+    /// [`Self::open`] for a store whose bodies used to live in `legacy_bodies`:
+    /// a journaled body still there is moved into `bodies`.
+    pub fn open_moving_bodies_from(
+        state_dir: &Path,
+        bodies: &Path,
+        legacy_bodies: &Path,
+    ) -> Result<Self, AdmissionError> {
+        Self::open_inner(state_dir, bodies, Some(legacy_bodies))
+    }
+
+    fn open_inner(
+        state_dir: &Path,
+        bodies: &Path,
+        legacy_bodies: Option<&Path>,
+    ) -> Result<Self, AdmissionError> {
         let journal = state_dir.join("download-admission-v1");
         let parent = state_dir
             .ancestors()
@@ -103,6 +123,7 @@ impl FileAdmissionStore {
         let mut inner = Inner {
             journal,
             bodies: bodies.to_owned(),
+            legacy_bodies: legacy_bodies.map(Path::to_owned),
             committed: HashMap::new(),
             deleted: HashMap::new(),
         };
@@ -265,7 +286,13 @@ impl FileAdmissionStore {
             .committed
             .values()
             .filter(|c| !c.hook_completed)
-            .filter_map(|c| Some((c.intent.hook_event?, c.intent.body_path.clone()?)))
+            .filter_map(|c| {
+                c.intent.body_path.as_ref()?;
+                Some((
+                    c.intent.hook_event?,
+                    inner.body_path(&c.intent.record.message_id),
+                ))
+            })
             .collect()
     }
 
@@ -413,6 +440,9 @@ impl DurableAdmissionBackend for FileAdmissionCommit {
 }
 
 impl Inner {
+    fn body_path(&self, message_id: &[u8; 32]) -> PathBuf {
+        self.bodies.join(format!("{}.lxm", hex::encode(message_id)))
+    }
     fn intent_path(&self, id: &[u8; 32]) -> PathBuf {
         self.journal.join(format!("{}.intent", hex::encode(id)))
     }
@@ -431,11 +461,20 @@ impl Inner {
             return Err(other("message was explicitly deleted"));
         }
         if let Some(path) = &intent.body_path {
-            if path.parent() != Some(self.bodies.as_path())
-                || path.file_name().and_then(|n| n.to_str())
-                    != Some(format!("{}.lxm", hex::encode(intent.record.message_id)).as_str())
+            if path.file_name().and_then(|n| n.to_str())
+                != Some(format!("{}.lxm", hex::encode(intent.record.message_id)).as_str())
             {
                 return Err(other("admission archive path escapes configured inbox"));
+            }
+            // A journal written before the bodies moved names the old directory.
+            let journaled = path;
+            let path = &self.body_path(&intent.record.message_id);
+            if !path.exists()
+                && self.legacy_bodies.is_some()
+                && journaled.parent() == self.legacy_bodies.as_deref()
+                && journaled.exists()
+            {
+                std::fs::rename(journaled, path).map_err(other)?;
             }
             let body = read_bounded(path, rns_protocol::resource::MAX_RESOURCE_SIZE)?;
             if Some(rns_crypto::sha::full_hash(&body)) != intent.record.stored_message_wire_hash {
@@ -605,5 +644,71 @@ mod tests {
             .complete_hook(recovered.pending_hooks()[0].0)
             .unwrap();
         assert!(recovered.pending_hooks().is_empty());
+    }
+
+    /// A store whose one committed body sits in `<temp>/messages`.
+    fn store_with_body_in_inbox() -> (tempfile::TempDir, PathBuf, String, AdmissionScope, Vec<u8>) {
+        let temp = tempfile::tempdir().unwrap();
+        let inbox = temp.path().join("messages");
+        let store = FileAdmissionStore::open(temp.path(), &inbox).unwrap();
+        let message = crate::message::test_message(
+            [1; 16],
+            [2; 16],
+            "",
+            "body",
+            crate::constants::DeliveryMethod::Propagated,
+        );
+        let scope = AdmissionScope {
+            identity: [3; 16],
+            node: [4; 16],
+            transient_id: [5; 32],
+        };
+        let record = AdmissionRecord {
+            scope,
+            message_id: message.message_id(),
+            received_wire_hash: [0; 32],
+            stored_message_wire_hash: None,
+            disposition: DurableDisposition::Committed,
+            committed_at: 100,
+        };
+        DurableAdmissionReceipt::commit(store.prepare(
+            record,
+            Bytes::copy_from_slice(message.wire_bytes()),
+            true,
+        ))
+        .unwrap();
+        drop(store);
+        let name = format!("{}.lxm", hex::encode(message.message_id()));
+        assert!(inbox.join(&name).exists());
+        (temp, inbox, name, scope, message.wire_bytes().to_vec())
+    }
+
+    #[test]
+    fn bodies_journaled_in_the_inbox_move_to_a_new_bodies_directory_on_open() {
+        let (temp, inbox, name, scope, wire) = store_with_body_in_inbox();
+        let bodies = temp.path().join("bodies");
+        let reopened =
+            FileAdmissionStore::open_moving_bodies_from(temp.path(), &bodies, &inbox).unwrap();
+        assert!(!inbox.join(&name).exists());
+        assert_eq!(std::fs::read(bodies.join(&name)).unwrap(), wire);
+        assert_eq!(
+            reopened.haves(scope.identity, scope.node, 101),
+            vec![scope.transient_id.to_vec()]
+        );
+        assert_eq!(reopened.pending_hooks()[0].1, bodies.join(&name));
+    }
+
+    #[test]
+    fn bodies_are_moved_in_only_from_the_named_legacy_directory() {
+        let (temp, inbox, name, _, _) = store_with_body_in_inbox();
+        let bodies = temp.path().join("bodies");
+        let elsewhere = temp.path().join("elsewhere");
+        for _ in [
+            FileAdmissionStore::open(temp.path(), &bodies),
+            FileAdmissionStore::open_moving_bodies_from(temp.path(), &bodies, &elsewhere),
+        ] {
+            assert!(inbox.join(&name).exists());
+            assert!(!bodies.join(&name).exists());
+        }
     }
 }

@@ -362,6 +362,11 @@ fn apply_propagation_store_commit(
         }
         _ => None,
     };
+    // LXMRouter keeps one processed-ID store; stored entries are claimed there at once.
+    let now = now_f64();
+    for (transient_id, _) in &result.committed {
+        router.propagation_store.claim_processed(*transient_id, now);
+    }
     distribution.extend(
         result
             .committed
@@ -984,6 +989,8 @@ fn control_timeout(args: &Args) -> f64 {
     }
 }
 
+const ADMISSION_BODIES_DIR: &str = "download-admission-bodies";
+
 fn now_f64() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1096,11 +1103,16 @@ fn queue_path_request(
 
 fn queue_unknown_propagation_node_path_request(
     transport_tx: &mpsc::Sender<TransportMessage>,
+    router: &mut LxmRouter,
+    medium: &MediumSnapshot,
     node: [u8; 16],
     last_propagation_check: &mut f64,
     now: f64,
 ) -> bool {
     *last_propagation_check = now;
+    if !router.request_path(node, medium, now) {
+        return true;
+    }
     if let Err(e) = transport_tx.try_send(TransportMessage::RequestPath {
         destination_hash: node,
     }) {
@@ -1291,8 +1303,8 @@ fn backchannel_error_from_runtime(
 fn propagation_node_app_data(config: &DaemonConfig) -> Vec<u8> {
     let mut pn_data = lxmf_core::handlers::PropagationNodeAnnounceData::new(
         config.propagation_enabled && !config.from_static_only,
-        config.propagation_limit_kb as u64,
-        config.sync_limit_kb as u64,
+        config.propagation_limit_kb,
+        config.sync_limit_kb,
         config.propagation_stamp_cost,
         config.propagation_stamp_flex,
         config.peering_cost,
@@ -1303,17 +1315,21 @@ fn propagation_node_app_data(config: &DaemonConfig) -> Vec<u8> {
     propagation_announce_app_data(&pn_data)
 }
 
+/// Announce requests the daemon has not served yet. A burst of path requests
+/// past this is dropped; the requester asks again.
+const DELIVERY_ANNOUNCE_BACKLOG: usize = 64;
+
 /// Delivery destination events reach the LinkManager; announce requests go to
 /// the daemon, which owns the delivery ratchets, app data and stamp.
 async fn forward_delivery_events(
     mut events: mpsc::Receiver<DestinationEvent>,
     link_tx: mpsc::Sender<DestinationEvent>,
-    announce_tx: mpsc::UnboundedSender<AnnounceRequest>,
+    announce_tx: mpsc::Sender<AnnounceRequest>,
 ) {
     while let Some(event) = events.recv().await {
         match event {
             DestinationEvent::AnnounceRequested(request) => {
-                let _ = announce_tx.send(request);
+                let _ = announce_tx.try_send(request);
             }
             event => {
                 if link_tx.send(event).await.is_err() {
@@ -1643,6 +1659,8 @@ struct LxmdRunner {
     node_policies: HashMap<[u8; 16], AdvertisedNodePolicy>,
     propagation_envelopes: HashMap<[u8; 32], PropagationEnvelope>,
     pending_propagation_envelopes: HashMap<[u8; 32], PendingPropagationEnvelope>,
+    /// Propagated messages waiting for the node's stamp cost, with their failure deadline.
+    node_cost_deadlines: HashMap<[u8; 32], f64>,
     propagation_preparation_tasks: Vec<tokio::task::JoinHandle<()>>,
     ratchets_dir: PathBuf,
     delivery_ratchets: DeliveryRatchetState,
@@ -1650,6 +1668,8 @@ struct LxmdRunner {
     known_identities: HashMap<String, [u8; 64]>,
     /// Identities asked of Transport's validated announce cache.
     identity_recalls: HashMap<[u8; 16], oneshot::Receiver<TransportQueryResponse>>,
+    /// Outbound destinations whose persisted announce app data was recalled once.
+    compression_recalled: HashSet<[u8; 16]>,
     /// Reaches the shared instance when attached to one.
     control_plane: Option<ReticulumHandle>,
     retain_task: Option<tokio::task::JoinHandle<()>>,
@@ -1699,7 +1719,7 @@ struct LxmdRunner {
     transport_tx: mpsc::Sender<TransportMessage>,
     pending_runtime_transport: VecDeque<TransportMessage>,
     delivery_stamps: DestinationStamps<AnnounceRequest>,
-    delivery_announce_rx: mpsc::UnboundedReceiver<AnnounceRequest>,
+    delivery_announce_rx: mpsc::Receiver<AnnounceRequest>,
     /// Path responses refused because wall time has not advanced past the last announce.
     coalesced_path_responses: VecDeque<AnnounceRequest>,
     control_link_command_tx: Option<mpsc::Sender<rns_runtime::link_manager::LinkManagerCommand>>,
@@ -1776,6 +1796,20 @@ impl LxmdRunner {
         node.merge_processed_ids(self.router.propagation_store.locally_processed_ids());
         for (id, seen) in node.processed_ids() {
             self.router.propagation_store.claim_processed(*id, *seen);
+        }
+    }
+
+    /// A transient ID claimed by local delivery is a duplicate for propagation intake.
+    fn share_processed_claim(&self, transient_id: [u8; 32]) {
+        if let Some(node) = self.propagation_node.as_ref()
+            && let Ok(mut node) = node.lock()
+            && let Some(seen) = self
+                .router
+                .propagation_store
+                .locally_processed_ids()
+                .get(&transient_id)
+        {
+            node.merge_processed_ids([(&transient_id, seen)]);
         }
     }
 
@@ -2120,7 +2154,7 @@ impl LxmdRunner {
             mpsc::unbounded_channel::<rns_runtime::link_manager::DestinationDeliveryProof>();
 
         let (delivery_link_tx, delivery_link_rx) = mpsc::channel(256);
-        let (delivery_announce_tx, delivery_announce_rx) = mpsc::unbounded_channel();
+        let (delivery_announce_tx, delivery_announce_rx) = mpsc::channel(DELIVERY_ANNOUNCE_BACKLOG);
         tokio::spawn(forward_delivery_events(
             delivery_rx,
             delivery_link_tx,
@@ -2213,16 +2247,19 @@ impl LxmdRunner {
                 .iter()
                 .filter_map(|peer| parse_destination_hash(peer).ok())
                 .collect::<Vec<_>>();
-            let pn_config = PropagationNodeConfig {
-                max_storage: config
-                    .message_storage_limit
-                    .unwrap_or(configured_kilobytes_to_bytes(config.propagation_limit_kb)),
-                max_message_size: configured_kilobytes_to_bytes(config.propagation_limit_kb),
-                max_offer_size: configured_kilobytes_to_bytes(config.sync_limit_kb),
-                max_message_age: lxmf_core::constants::MESSAGE_EXPIRY,
-                min_stamp_cost: config.min_accepted_stamp_cost(),
-                peering_cost: config.peering_cost,
-            };
+            let pn_config =
+                PropagationNodeConfig {
+                    max_storage: config.message_storage_limit.unwrap_or(
+                        configured_kilobytes_to_bytes(config.propagation_limit_kb.as_f64()),
+                    ),
+                    max_message_size: configured_kilobytes_to_bytes(
+                        config.propagation_limit_kb.as_f64(),
+                    ),
+                    max_offer_size: configured_kilobytes_to_bytes(config.sync_limit_kb.as_f64()),
+                    max_message_age: lxmf_core::constants::MESSAGE_EXPIRY,
+                    min_stamp_cost: config.min_accepted_stamp_cost(),
+                    peering_cost: config.peering_cost,
+                };
             let prop_storage_path = paths.propagation_store_dir.clone();
             let pn = Arc::new(Mutex::new(PropagationNode::with_storage(
                 pn_config,
@@ -2240,7 +2277,7 @@ impl LxmdRunner {
             let pn_admission = Arc::new(Mutex::new(PnInboundRuntime::new(
                 config.to_inbound_admission_config(),
                 static_peer_hashes,
-                configured_kilobytes_to_bytes(config.sync_limit_kb),
+                configured_kilobytes_to_bytes(config.sync_limit_kb.as_f64()),
             )));
             propagation_admission = Some(pn_admission.clone());
 
@@ -2311,8 +2348,9 @@ impl LxmdRunner {
             let get_access = control_state.clone();
             let get_workers = prop_get_workers.clone();
             let get_served = client_propagation_served_tx.clone();
-            let response_limit = configured_kilobytes_to_bytes(config.propagation_limit_kb)
-                .clamp(1, 64 * 1024 * 1024);
+            let response_limit =
+                configured_kilobytes_to_bytes(config.propagation_limit_kb.as_f64())
+                    .clamp(1, 64 * 1024 * 1024);
             if !prop_link_mgr.register_deferred_request_handler(
                 lxmf_core::constants::MESSAGE_GET_PATH,
                 rns_identity::destination::AllowPolicy::AllowAll,
@@ -2549,8 +2587,13 @@ impl LxmdRunner {
         let messages_dir = paths.messages_dir.clone();
         std::fs::create_dir_all(&messages_dir)?;
 
-        let admission_store = match FileAdmissionStore::open(&paths.router_state_dir, &messages_dir)
-        {
+        // Upstream's messages directory holds only write_to_directory containers
+        // (lxmd.py:302-307@1.3.0); the admission store keeps its raw bodies privately.
+        let admission_store = match FileAdmissionStore::open_moving_bodies_from(
+            &paths.router_state_dir,
+            &paths.router_state_dir.join(ADMISSION_BODIES_DIR),
+            &messages_dir,
+        ) {
             Ok(store) => Some(store),
             Err(error) => {
                 tracing::error!(%error,"durable download storage unavailable; propagation downloads disabled");
@@ -2591,12 +2634,14 @@ impl LxmdRunner {
                 .unwrap_or_default(),
             propagation_envelopes: HashMap::new(),
             pending_propagation_envelopes: HashMap::new(),
+            node_cost_deadlines: HashMap::new(),
             propagation_preparation_tasks: Vec::new(),
             ratchets_dir: paths.ratchets_dir,
             delivery_ratchets,
             received_ratchets,
             known_identities,
             identity_recalls: HashMap::new(),
+            compression_recalled: HashSet::new(),
             control_plane: None,
             retain_task: None,
             route_hops: HashMap::new(),
@@ -2761,7 +2806,7 @@ impl LxmdRunner {
             self.router.set_autopeer(self.config.autopeer);
             self.router.set_max_peers(self.config.max_peers);
             self.router
-                .set_propagation_limit(self.config.propagation_limit_kb);
+                .set_propagation_limit(self.config.propagation_limit_kb.as_f64());
             self.router.set_stamp_requirements(
                 self.config.propagation_stamp_cost,
                 self.config.propagation_stamp_flex,
@@ -3093,9 +3138,6 @@ impl LxmdRunner {
                             "failed to remove persisted propagation peer: {error}"
                         );
                     }
-                    if let Err(e) = self.router.save_state(&self.data_dir) {
-                        tracing::warn!("Failed to save router state after control unpeer: {e}");
-                    }
                     tracing::info!(peer = %hex::encode(peer_hash), "control: unpeered peer");
                 }
             }
@@ -3369,7 +3411,10 @@ impl LxmdRunner {
                         peer = %hex::encode(peer_hash),
                         "no path to peer exists, requesting"
                     );
-                    queue_path_request(&self.transport_tx, *peer_hash, false, "peer sync");
+                    // LXMPeer.sync asks through the debounced LXMRouter.request_path.
+                    if self.router.request_path(*peer_hash, &self.medium, now) {
+                        queue_path_request(&self.transport_tx, *peer_hash, false, "peer sync");
+                    }
                     check.grace_until = Some(now + lxmf_core::constants::PATH_REQUEST_GRACE);
                 }
             } else if check.grace_until.is_some_and(|until| now >= until) {
@@ -3500,8 +3545,8 @@ impl LxmdRunner {
             if self.router.autopeer(AutopeerCandidate {
                 destination_hash: peer_hash,
                 timebase: pn.timebase as f64,
-                transfer_limit: Some(pn.transfer_limit as f64),
-                sync_limit: Some(pn.sync_limit as f64),
+                transfer_limit: Some(pn.transfer_limit.as_f64()),
+                sync_limit: Some(pn.sync_limit.as_f64()),
                 stamp_cost: Some(pn.stamp_cost),
                 stamp_flexibility: Some(pn.stamp_flex),
                 peering_cost: Some(pn.peering_cost),
@@ -3811,7 +3856,7 @@ impl LxmdRunner {
         let mut fresh: HashMap<[u8; 16], u8> = HashMap::with_capacity(entries.len());
         for entry in entries {
             if entry.expires > now {
-                fresh.insert(entry.hash, entry.hops.max(1));
+                fresh.insert(entry.hash, entry.hops);
             }
         }
         self.route_hops = fresh;
@@ -4174,7 +4219,37 @@ impl LxmdRunner {
         inputs
     }
 
+    /// `LXMessage.determine_compression_support` reads the recalled app data, which
+    /// survives restarts in the transport's announce store.
+    fn recall_outbound_app_data(&mut self) {
+        let destinations: Vec<[u8; 16]> = self
+            .router
+            .pending_outbound
+            .iter()
+            .map(|message| message.destination_hash())
+            .filter(|destination| !self.compression_recalled.contains(destination))
+            .collect();
+        for destination in destinations {
+            if self.identity_recalls.contains_key(&destination) {
+                continue;
+            }
+            let (response_tx, response_rx) = oneshot::channel();
+            if self
+                .transport_tx
+                .try_send(TransportMessage::Rpc {
+                    query: TransportQuery::RecallDestination { dest: destination },
+                    response_tx,
+                })
+                .is_ok()
+            {
+                self.compression_recalled.insert(destination);
+                self.identity_recalls.insert(destination, response_rx);
+            }
+        }
+    }
+
     fn run_outbound(&mut self) {
+        self.recall_outbound_app_data();
         let propagation_unready = self.prepare_propagation_envelopes();
         let mut inputs = self.outbound_inputs();
         inputs.propagation_unready = propagation_unready;
@@ -4290,6 +4365,8 @@ impl LxmdRunner {
                 } else if let Some(node) = self.router.outbound_propagation_node
                     && queue_unknown_propagation_node_path_request(
                         &self.transport_tx,
+                        &mut self.router,
+                        &self.medium,
                         node,
                         &mut self.last_propagation_check,
                         now,
@@ -4380,7 +4457,6 @@ impl LxmdRunner {
             }
         }
         if self.checkpoint_task.is_none() && now - self.last_crypto_save > 300.0 {
-            self.merge_processed_ids();
             let checkpoint = DaemonCheckpoint {
                 ratchets: self.ratchets_dir.clone(),
                 received: self.received_ratchets.clone(),
@@ -4435,8 +4511,7 @@ impl LxmdRunner {
                 hops = event.hops,
                 "received announce"
             );
-            self.route_hops
-                .insert(event.destination_hash, event.hops.max(1));
+            self.route_hops.insert(event.destination_hash, event.hops);
 
             if event.name_hash == delivery_name_hash {
                 if let Some(name) = event
@@ -4493,7 +4568,7 @@ impl LxmdRunner {
                     event.destination_hash,
                     AdvertisedNodePolicy {
                         stamp_cost: outbound_cost,
-                        transfer_limit_kb: pn.transfer_limit as f64,
+                        transfer_limit_kb: pn.transfer_limit.as_f64().trunc(),
                         recorded_at: now_f64(),
                     },
                 );
@@ -4519,8 +4594,8 @@ impl LxmdRunner {
                     peer_changed = self.router.autopeer(AutopeerCandidate {
                         destination_hash: event.destination_hash,
                         timebase: pn.timebase as f64,
-                        transfer_limit: Some(pn.transfer_limit as f64),
-                        sync_limit: Some(pn.sync_limit as f64),
+                        transfer_limit: Some(pn.transfer_limit.as_f64().trunc()),
+                        sync_limit: Some(pn.sync_limit.as_f64().trunc()),
                         stamp_cost: Some(pn.stamp_cost),
                         stamp_flexibility: Some(pn.stamp_flex),
                         peering_cost: Some(pn.peering_cost),
@@ -4627,7 +4702,8 @@ impl LxmdRunner {
                 len = plaintext.len(),
                 "received decrypted packet via link"
             );
-            self.handle_link_delivered_data(&plaintext);
+            // A link packet carries its Link ID as the ratchet ID (Link.py:1039@1.6.0).
+            self.handle_link_delivered_data_on(&plaintext, Some(link_id));
         }
 
         while let Ok(packet) = self.prop_link_packet_rx.try_recv() {
@@ -4784,13 +4860,14 @@ impl LxmdRunner {
                     len = completion.data.len(),
                     "resource transfer completed on link"
                 );
-                self.handle_link_delivered_data(&completion.data);
+                // A resource delivery records its Link ID as the ratchet ID (LXMRouter.py:2325-2327).
+                self.handle_link_delivered_data_on(&completion.data, Some(completion.link_id));
             }
             _ => {}
         }
     }
 
-    fn handle_link_delivered_data(&mut self, data: &[u8]) {
+    fn handle_link_delivered_data_on(&mut self, data: &[u8], link_id: Option<[u8; 16]>) {
         if data.is_empty() {
             return;
         }
@@ -4813,7 +4890,12 @@ impl LxmdRunner {
                     len = msg.content_bytes().len(),
                     "inbound LXMF message via link"
                 );
-                self.admit_inbound_message(msg, DeliveryMethod::Direct);
+                self.admit_inbound_message(
+                    msg,
+                    DeliveryMethod::Direct,
+                    link_id.as_ref().map(|id| id.as_slice()),
+                    None,
+                );
             }
             Err(e) => {
                 tracing::debug!("link data not an LXMF message: {e}");
@@ -4837,7 +4919,7 @@ impl LxmdRunner {
     fn spawn_propagation_validation(&self, job: PnValidationJob) {
         let token = job.token();
         let link_id = job.link_id();
-        let max_transfer_bytes = configured_kilobytes_to_bytes(self.config.sync_limit_kb);
+        let max_transfer_bytes = configured_kilobytes_to_bytes(self.config.sync_limit_kb.as_f64());
         let min_cost = self.config.min_accepted_stamp_cost();
         let result_tx = self.prop_validation_tx.clone();
 
@@ -4982,7 +5064,9 @@ impl LxmdRunner {
             data,
             receipt,
             node,
-            max_transfer_bytes: configured_kilobytes_to_bytes(self.config.propagation_limit_kb),
+            max_transfer_bytes: configured_kilobytes_to_bytes(
+                self.config.propagation_limit_kb.as_f64(),
+            ),
             min_cost: self.config.min_accepted_stamp_cost(),
             #[cfg(test)]
             store_delay: self.pn_packet_store_delay,
@@ -5238,6 +5322,7 @@ impl LxmdRunner {
                         &receipt,
                         verified.as_ref(),
                     );
+                    self.share_processed_claim(receipt.record().scope.transient_id);
                     if receipt.record().disposition == DurableDisposition::Committed {
                         self.store_propagated_container(result.message.clone());
                     }
@@ -5433,7 +5518,40 @@ impl LxmdRunner {
         ));
     }
 
-    fn handle_inbound_packet(&mut self, raw: &[u8]) {
+    /// `LXMRouter.delivery_packet` reads the packet's RSSI, SNR and Q from
+    /// Reticulum's per-packet caches (LXMRouter.py:2277-2283@1.3.0).
+    async fn inbound_packet_phy(&self, raw: &[u8]) -> Option<lxmf_core::message::PhyStats> {
+        let (header, _) = rns_wire::header::PacketHeader::unpack(raw).ok()?;
+        let packet_hash = rns_wire::hash::packet_hash(raw, header.flags.header_type);
+        let query = |query| {
+            let (response_tx, response_rx) = oneshot::channel();
+            let sent = self
+                .transport_tx
+                .try_send(TransportMessage::Rpc { query, response_tx })
+                .is_ok();
+            async move {
+                if !sent {
+                    return None;
+                }
+                match tokio::time::timeout(Duration::from_millis(100), response_rx).await {
+                    Ok(Ok(TransportQueryResponse::FloatResult(value))) => value,
+                    _ => None,
+                }
+            }
+        };
+        let (rssi, snr, q) = tokio::join!(
+            query(TransportQuery::GetPacketRssi { packet_hash }),
+            query(TransportQuery::GetPacketSnr { packet_hash }),
+            query(TransportQuery::GetPacketQ { packet_hash }),
+        );
+        (rssi.is_some() || snr.is_some() || q.is_some()).then_some(lxmf_core::message::PhyStats {
+            rssi,
+            snr,
+            q,
+        })
+    }
+
+    fn handle_inbound_packet(&mut self, raw: &[u8], phy: Option<lxmf_core::message::PhyStats>) {
         let (header, rest) = match rns_wire::header::PacketHeader::unpack(raw) {
             Ok(r) => r,
             Err(e) => {
@@ -5447,8 +5565,8 @@ impl LxmdRunner {
             return;
         }
 
-        let plaintext = match self.decrypt_inbound(payload) {
-            Some(pt) => pt,
+        let (plaintext, ratchet_id) = match self.decrypt_inbound(payload) {
+            Some(decrypted) => (decrypted.plaintext, decrypted.ratchet_id),
             None => {
                 tracing::warn!("failed to decrypt inbound packet");
                 return;
@@ -5493,7 +5611,13 @@ impl LxmdRunner {
                     "inbound LXMF message received"
                 );
 
-                self.admit_inbound_message(msg, DeliveryMethod::Opportunistic);
+                // LXMRouter.delivery_packet passes packet.ratchet_id (LXMRouter.py:2285).
+                self.admit_inbound_message(
+                    msg,
+                    DeliveryMethod::Opportunistic,
+                    ratchet_id.as_ref().map(|id| id.as_slice()),
+                    phy,
+                );
             }
             Err(e) => {
                 tracing::warn!("failed to unpack LXMF message: {e}");
@@ -5504,7 +5628,14 @@ impl LxmdRunner {
     /// Python `lxmf_delivery` gating (LXMRouter.py:2163-2257): blackholed
     /// source, ticket learning from a validated signature, stamp, ignored
     /// source, then delivery. Unknown or invalid signatures are delivered flagged.
-    fn admit_inbound_message(&mut self, mut msg: LxMessage, method: DeliveryMethod) {
+    fn admit_inbound_message(
+        &mut self,
+        mut msg: LxMessage,
+        method: DeliveryMethod,
+        ratchet_id: Option<&[u8]>,
+        phy: Option<lxmf_core::message::PhyStats>,
+    ) {
+        msg.record_delivery(None, ratchet_id, None, phy);
         msg.source_blackholed = self.source_blackholed(&msg.source_hash());
         if msg.source_blackholed {
             tracing::debug!(
@@ -5647,10 +5778,37 @@ impl LxmdRunner {
             })
             .cloned()
             .collect();
+        let now = now_f64();
+        let queued_ids: HashSet<[u8; 32]> = queued.iter().map(|m| m.message_id()).collect();
+        self.node_cost_deadlines
+            .retain(|id, _| queued_ids.contains(id));
         for message in queued {
             let id = message.message_id();
-            match self.pack_message_for_propagation(&message, node) {
+            let prepared = self.pack_message_for_propagation(&message, node);
+            if !matches!(
+                prepared,
+                Err(PropagationPreparationError::Missing(
+                    MissingPropagationInput::NodePolicy
+                ))
+            ) {
+                self.node_cost_deadlines.remove(&id);
+            }
+            match prepared {
                 Ok(_) => {}
+                // LXMRouter.get_outbound_propagation_cost waits path_request_wait, then the message fails.
+                Err(PropagationPreparationError::Missing(MissingPropagationInput::NodePolicy))
+                    if self
+                        .node_cost_deadlines
+                        .get(&id)
+                        .is_some_and(|deadline| now >= *deadline) =>
+                {
+                    self.node_cost_deadlines.remove(&id);
+                    self.propagation_envelopes.remove(&id);
+                    self.pending_propagation_envelopes.remove(&id);
+                    self.last_delivery_failure =
+                        Some("propagation node stamp cost unavailable".to_string());
+                    self.router.mark_outbound_failed(&id);
+                }
                 Err(PropagationPreparationError::Missing(
                     MissingPropagationInput::NodeIdentity | MissingPropagationInput::NodePath,
                 )) => {}
@@ -5660,8 +5818,13 @@ impl LxmdRunner {
                     } else {
                         node
                     };
+                    if missing == MissingPropagationInput::NodePolicy {
+                        self.node_cost_deadlines
+                            .entry(id)
+                            .or_insert(now + self.medium.path_request_wait());
+                    }
                     self.recall_identity(wanted);
-                    if self.router.request_path(wanted, &self.medium, now_f64()) {
+                    if self.router.request_path(wanted, &self.medium, now) {
                         queue_path_request(
                             &self.transport_tx,
                             wanted,
@@ -5912,7 +6075,8 @@ impl LxmdRunner {
         let prepared = propagation_readiness(
             prop_hash,
             self.known_identities.contains_key(&hex::encode(prop_hash)),
-            self.route_hops.contains_key(&prop_hash),
+            // LXMRouter checks RNS.Transport.has_path; the medium snapshot is refreshed per tick.
+            self.medium.has_path(&prop_hash),
             self.node_policies.get(&prop_hash).copied(),
             self.known_identities.contains_key(&dest_hex),
             now_f64(),
@@ -6014,7 +6178,10 @@ impl LxmdRunner {
         Err(PropagationPreparationError::Pending)
     }
 
-    fn decrypt_inbound(&self, ciphertext: &[u8]) -> Option<Vec<u8>> {
+    fn decrypt_inbound(
+        &self,
+        ciphertext: &[u8],
+    ) -> Option<rns_identity::identity::DecryptionResult> {
         let prv_keys = self.delivery_ratchets.ring().private_keys();
         let refs: Vec<&[u8; 32]> = prv_keys.iter().collect();
         let ratchets = if refs.is_empty() {
@@ -6022,7 +6189,9 @@ impl LxmdRunner {
         } else {
             Some(refs.as_slice())
         };
-        self.identity.decrypt(ciphertext, ratchets, false).ok()
+        self.identity
+            .decrypt_with_ratchet_id(ciphertext, ratchets, false)
+            .ok()
     }
 
     fn create_delivery_proof(&self, raw_packet: &[u8]) -> Option<Vec<u8>> {
@@ -6255,11 +6424,11 @@ pub(crate) async fn main() {
                     .map_err(std::io::Error::other)?;
                 let config = DaemonConfig::from_config(&source).map_err(std::io::Error::other)?;
                 let policy = RecoveryPolicy {
-                    maximum_store_bytes: config
-                        .message_storage_limit
-                        .unwrap_or(configured_kilobytes_to_bytes(config.propagation_limit_kb)),
+                    maximum_store_bytes: config.message_storage_limit.unwrap_or(
+                        configured_kilobytes_to_bytes(config.propagation_limit_kb.as_f64()),
+                    ),
                     maximum_message_bytes: configured_kilobytes_to_bytes(
-                        config.propagation_limit_kb,
+                        config.propagation_limit_kb.as_f64(),
                     ),
                     minimum_stamp_cost: config.min_accepted_stamp_cost(),
                 };
@@ -6865,7 +7034,8 @@ pub(crate) async fn main() {
                 runner.tick();
             }
             Some(raw) = runner.inbound_raw_rx.recv() => {
-                runner.handle_inbound_packet(&raw);
+                let phy = runner.inbound_packet_phy(&raw).await;
+                runner.handle_inbound_packet(&raw, phy);
             }
             Some(request) = runner.delivery_announce_rx.recv() => {
                 if let Err(error) = runner.request_delivery_announce(request) {
@@ -6875,8 +7045,8 @@ pub(crate) async fn main() {
             outcome = runner.delivery_stamps.recv() => {
                 runner.on_delivery_stamp(outcome);
             }
-            Some((plaintext, _link_id)) = runner.link_packet_rx.recv() => {
-                runner.handle_link_delivered_data(&plaintext);
+            Some((plaintext, link_id)) = runner.link_packet_rx.recv() => {
+                runner.handle_link_delivered_data_on(&plaintext, Some(link_id));
                 runner.drain_link_packets();
             }
             Some(event) = runner.delivery_accounting_rx.recv() => {
@@ -7406,19 +7576,19 @@ mod tests {
 
         // Unknown senders may be delivered, but cannot teach a ticket. An
         // invalid signature under a recalled full identity cannot do so either.
-        runner.handle_link_delivered_data(message.wire_bytes());
+        runner.handle_link_delivered_data_on(message.wire_bytes(), None);
         assert!(runner.router.get_outbound_ticket(&source).is_none());
         runner
             .known_identities
             .insert(hex::encode(source), sender.get_public_key());
         let mut invalid = message.wire_bytes().to_vec();
         invalid[32] ^= 1;
-        runner.handle_link_delivered_data(&invalid);
+        runner.handle_link_delivered_data_on(&invalid, None);
         assert!(runner.router.get_outbound_ticket(&source).is_none());
 
         // The exact duplicate is authenticated after identity recall and must
         // still teach the ticket, without producing another delivery event.
-        runner.handle_link_delivered_data(message.wire_bytes());
+        runner.handle_link_delivered_data_on(message.wire_bytes(), None);
         assert_eq!(runner.router.get_outbound_ticket(&source), Some(token));
         assert_eq!(deliveries.load(std::sync::atomic::Ordering::Relaxed), 1);
         runner.router.save_state(&runner.data_dir).unwrap();
@@ -7474,6 +7644,309 @@ mod tests {
             .unwrap()
             .finalize(None)
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn control_unpeer_leaves_claims_rotated_by_a_running_checkpoint() {
+        let temp = tempfile::tempdir().unwrap();
+        let (tx, _rx) = mpsc::channel::<TransportMessage>(64);
+        initialize_storage_namespace(temp.path()).unwrap();
+        let mut runner = LxmdRunner::new(DaemonConfig::default(), temp.path(), tx, None).unwrap();
+        let data_dir = runner.data_dir.clone();
+        runner.router.load_state(&data_dir).unwrap();
+        let message = signed_fixture(
+            runner.lxmf_dest_hash,
+            [0xCD; 16],
+            "",
+            "claimed",
+            DeliveryMethod::Direct,
+        );
+        assert!(runner.router.deliver_inbound(&message, false));
+        let checkpoint = runner.router.state_snapshot();
+        let saving = data_dir.join(format!(
+            "{}.saving",
+            lxmf_core::persist::DELIVERY_CLAIMS_FILE
+        ));
+        assert!(saving.exists());
+
+        let peer_hash = [0x44; 16];
+        runner
+            .router
+            .peers
+            .insert(peer_hash, LxmPeer::new(peer_hash));
+        let (command_tx, command_rx) = mpsc::unbounded_channel();
+        runner.control_command_rx = command_rx;
+        command_tx.send(ControlCommand::Unpeer(peer_hash)).unwrap();
+        runner.drain_control_commands();
+
+        assert!(!runner.router.peers.contains_key(&peer_hash));
+        // The checkpoint that rotated the claims still owns them until it commits.
+        assert!(saving.exists());
+        checkpoint.save_state(&data_dir).unwrap();
+        assert!(!saving.exists());
+    }
+
+    #[tokio::test]
+    async fn a_directly_connected_peer_keeps_its_zero_hop_distance() {
+        let temp = tempfile::tempdir().unwrap();
+        let (tx, mut rx) = mpsc::channel::<TransportMessage>(64);
+        initialize_storage_namespace(temp.path()).unwrap();
+        let mut runner = LxmdRunner::new(DaemonConfig::default(), temp.path(), tx, None).unwrap();
+        let neighbour = [0x0D; 16];
+        let responder = tokio::spawn(async move {
+            while let Some(message) = rx.recv().await {
+                if let TransportMessage::Rpc {
+                    query: TransportQuery::GetPathTable,
+                    response_tx,
+                } = message
+                {
+                    let entry = rns_transport::messages::PathTableRpcEntry {
+                        hash: neighbour,
+                        timestamp: now_f64(),
+                        via: Some(neighbour),
+                        hops: 0,
+                        expires: now_f64() + 600.0,
+                        value: None,
+                        used: 0.0,
+                        lr_cost: None,
+                        interface: String::new(),
+                        interface_id: 1,
+                        interface_mode: rns_transport::constants::InterfaceMode::Full,
+                        interface_role: Default::default(),
+                    };
+                    let _ = response_tx.send(TransportQueryResponse::PathTable(vec![entry]));
+                    return;
+                }
+            }
+        });
+        runner.refresh_route_hops_from_transport().await;
+        responder.abort();
+        // Transport.hops_to reports the path table's hop count unchanged.
+        assert_eq!(runner.route_hops.get(&neighbour), Some(&0));
+    }
+
+    #[tokio::test]
+    async fn outbound_compression_support_comes_from_recalled_app_data_after_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let (tx, mut rx) = mpsc::channel::<TransportMessage>(64);
+        initialize_storage_namespace(temp.path()).unwrap();
+        let mut runner = LxmdRunner::new(DaemonConfig::default(), temp.path(), tx, None).unwrap();
+        while rx.try_recv().is_ok() {}
+        let recipient = Identity::new();
+        let recipient_hash = [0x7E; 16];
+        let draft = LxMessageDraft::new(
+            recipient_hash,
+            runner.lxmf_dest_hash,
+            "",
+            "after restart",
+            DeliveryMethod::Direct,
+        )
+        .unwrap();
+        runner
+            .router
+            .submit_signed(
+                draft
+                    .sign(&runner.identity.get_signing_key().unwrap())
+                    .unwrap(),
+            )
+            .unwrap();
+        assert!(runner.router.compression_supported(&recipient_hash));
+
+        runner.recall_outbound_app_data();
+        let mut answered = false;
+        while let Ok(message) = rx.try_recv() {
+            if let TransportMessage::Rpc {
+                query: TransportQuery::RecallDestination { dest },
+                response_tx,
+            } = message
+                && dest == recipient_hash
+            {
+                // Announce app data whose feature list lacks SF_COMPRESSION.
+                let entry = rns_transport::messages::RecalledDestinationRpcEntry {
+                    dest_hash: recipient_hash,
+                    public_key: recipient.get_public_key(),
+                    app_data: Some(vec![0x93, 0xc4, 0x01, b'n', 0xc0, 0x90]),
+                    ratchet: None,
+                    hops: 1,
+                    timestamp: now_f64(),
+                };
+                let _ = response_tx.send(TransportQueryResponse::RecalledDestination(Some(entry)));
+                answered = true;
+            }
+        }
+        assert!(
+            answered,
+            "outbound processing recalls the destination's app data"
+        );
+        runner.drain_identity_recalls();
+        assert!(!runner.router.compression_supported(&recipient_hash));
+    }
+
+    #[tokio::test]
+    async fn an_opportunistic_message_records_its_ratchet_and_packet_phy_stats() {
+        let temp = tempfile::tempdir().unwrap();
+        let (tx, mut rx) = mpsc::channel::<TransportMessage>(64);
+        initialize_storage_namespace(temp.path()).unwrap();
+        let mut runner = LxmdRunner::new(DaemonConfig::default(), temp.path(), tx, None).unwrap();
+        if runner
+            .delivery_ratchets
+            .ring()
+            .current_public_key()
+            .is_none()
+        {
+            let _ = runner.create_announce_packet(DeliveryAnnounceKind::Broadcast, None);
+        }
+        let ratchet_pub = runner
+            .delivery_ratchets
+            .ring()
+            .current_public_key()
+            .expect("delivery ratchet");
+        let seen = Arc::new(Mutex::new(None));
+        let observed = Arc::clone(&seen);
+        runner.router.register_delivery_callback(move |message| {
+            *observed.lock().unwrap() = Some((
+                message.ratchet_id.clone(),
+                message.rssi,
+                message.snr,
+                message.q,
+            ));
+        });
+        let message = signed_fixture(
+            runner.lxmf_dest_hash,
+            [0xCE; 16],
+            "",
+            "ratchet",
+            DeliveryMethod::Opportunistic,
+        );
+        let packed = message.pack().unwrap();
+        let ciphertext = runner
+            .identity
+            .encrypt(&packed[16..], Some(&ratchet_pub))
+            .unwrap();
+        let header = rns_wire::header::PacketHeader {
+            flags: rns_wire::flags::PacketFlags {
+                header_type: rns_wire::flags::HeaderType::Header1,
+                context_flag: false,
+                transport_type: rns_wire::flags::TransportType::Broadcast,
+                destination_type: rns_wire::flags::DestinationType::Single,
+                packet_type: rns_wire::flags::PacketType::Data,
+            },
+            hops: 0,
+            transport_id: None,
+            destination_hash: runner.lxmf_dest_hash,
+            context: rns_wire::context::PacketContext::None,
+        };
+        let mut packet = header.pack();
+        packet.extend_from_slice(&ciphertext);
+
+        while rx.try_recv().is_ok() {}
+        let packet_hash =
+            rns_wire::hash::packet_hash(&packet, rns_wire::flags::HeaderType::Header1);
+        let responder = tokio::spawn(async move {
+            while let Some(message) = rx.recv().await {
+                if let TransportMessage::Rpc { query, response_tx } = message {
+                    let value = match query {
+                        TransportQuery::GetPacketRssi { packet_hash: h } if h == packet_hash => {
+                            Some(-91.0)
+                        }
+                        TransportQuery::GetPacketSnr { packet_hash: h } if h == packet_hash => {
+                            Some(4.5)
+                        }
+                        TransportQuery::GetPacketQ { packet_hash: h } if h == packet_hash => None,
+                        _ => continue,
+                    };
+                    let _ = response_tx.send(TransportQueryResponse::FloatResult(value));
+                }
+            }
+        });
+        let phy = runner.inbound_packet_phy(&packet).await;
+        responder.abort();
+        runner.handle_inbound_packet(&packet, phy);
+
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            Some((
+                Some(Identity::ratchet_id(&ratchet_pub).to_vec()),
+                Some(-91.0),
+                Some(4.5),
+                None
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_propagated_message_fails_when_the_node_cost_stays_unknown() {
+        let temp = tempfile::tempdir().unwrap();
+        let (tx, _rx) = mpsc::channel::<TransportMessage>(64);
+        initialize_storage_namespace(temp.path()).unwrap();
+        let mut runner = LxmdRunner::new(DaemonConfig::default(), temp.path(), tx, None).unwrap();
+        let node_hash = [0x5B; 16];
+        let recipient = [0x6C; 16];
+        for hash in [node_hash, recipient] {
+            runner
+                .known_identities
+                .insert(hex::encode(hash), Identity::new().get_public_key());
+        }
+        runner.medium.routes.insert(
+            node_hash,
+            RouteInfo {
+                hops: 1,
+                first_hop_timeout: 6.0,
+            },
+        );
+        runner.router.outbound_propagation_node = Some(node_hash);
+        let draft = LxMessageDraft::new(
+            recipient,
+            runner.lxmf_dest_hash,
+            "",
+            "no node cost",
+            DeliveryMethod::Propagated,
+        )
+        .unwrap();
+        runner
+            .router
+            .submit_signed(
+                draft
+                    .sign(&runner.identity.get_signing_key().unwrap())
+                    .unwrap(),
+            )
+            .unwrap();
+        let id = runner.router.pending_outbound[0].message_id();
+
+        assert!(runner.prepare_propagation_envelopes().contains(&id));
+        assert_eq!(runner.router.pending_outbound.len(), 1);
+        // The path_request_wait deadline passes with no announce carrying the cost.
+        *runner.node_cost_deadlines.get_mut(&id).unwrap() = now_f64() - 1.0;
+        runner.prepare_propagation_envelopes();
+        assert!(runner.router.pending_outbound.is_empty());
+    }
+
+    #[tokio::test]
+    async fn propagated_readiness_needs_a_current_transport_path_to_the_node() {
+        let temp = tempfile::tempdir().unwrap();
+        let (tx, _rx) = mpsc::channel::<TransportMessage>(64);
+        initialize_storage_namespace(temp.path()).unwrap();
+        let mut runner = LxmdRunner::new(DaemonConfig::default(), temp.path(), tx, None).unwrap();
+        let node = Identity::new();
+        let node_hash = [0x5A; 16];
+        runner
+            .known_identities
+            .insert(hex::encode(node_hash), node.get_public_key());
+        // A cached hop count outlives the transport path it was learned from.
+        runner.route_hops.insert(node_hash, 1);
+        let message = signed_fixture(
+            [0x6B; 16],
+            runner.lxmf_dest_hash,
+            "",
+            "propagated",
+            DeliveryMethod::Propagated,
+        );
+        assert!(matches!(
+            runner.pack_message_for_propagation(&message, node_hash),
+            Err(PropagationPreparationError::Missing(
+                MissingPropagationInput::NodePath
+            ))
+        ));
     }
 
     #[tokio::test]
@@ -7713,6 +8186,44 @@ mod tests {
         assert!(!propagation_client_allowed(&restricted, None));
     }
 
+    #[tokio::test]
+    async fn announce_request_bursts_are_bounded_and_do_not_hold_link_events() {
+        let (events_tx, events_rx) = mpsc::channel(16);
+        let (link_tx, mut link_rx) = mpsc::channel(16);
+        let (announce_tx, mut announce_rx) = mpsc::channel(DELIVERY_ANNOUNCE_BACKLOG);
+        let forwarder = tokio::spawn(forward_delivery_events(events_rx, link_tx, announce_tx));
+
+        // Nothing drains the announce backlog while the burst arrives.
+        for tag in 0..(DELIVERY_ANNOUNCE_BACKLOG as u32 * 4) {
+            let mut request = AnnounceRequest::normal(DELIVERY_APP_NAME.to_string());
+            request.path_response = true;
+            request.tag = Some(tag.to_be_bytes().to_vec());
+            events_tx
+                .send(DestinationEvent::AnnounceRequested(request))
+                .await
+                .unwrap();
+        }
+        events_tx
+            .send(DestinationEvent::LinkEstablished { link_id: [7; 16] })
+            .await
+            .unwrap();
+        assert!(matches!(
+            link_rx.recv().await,
+            Some(DestinationEvent::LinkEstablished { link_id }) if link_id == [7; 16]
+        ));
+
+        drop(events_tx);
+        forwarder.await.unwrap();
+        let mut kept = Vec::new();
+        while let Some(request) = announce_rx.recv().await {
+            kept.push(request.tag.unwrap());
+        }
+        // The oldest requests are kept, in order; the overflow is dropped.
+        assert_eq!(kept.len(), DELIVERY_ANNOUNCE_BACKLOG);
+        assert_eq!(kept[0], 0u32.to_be_bytes());
+        assert_eq!(kept[1], 1u32.to_be_bytes());
+    }
+
     #[test]
     fn propagation_accounting_counts_duplicates_and_distributes_only_new_entries() {
         let peer_hash = [0x21; 16];
@@ -7738,6 +8249,7 @@ mod tests {
         assert!(peer.handled_messages.contains(&first_id));
         assert!(peer.handled_messages.contains(&second_id));
         assert_eq!(distribution, vec![(first_id, Some(peer_hash))]);
+        assert!(router.propagation_store.is_locally_processed(&first_id));
 
         apply_propagation_store_commit(
             &mut router,
@@ -7751,6 +8263,40 @@ mod tests {
         );
         assert_eq!(router.client_propagation_messages_received, 2);
         assert_eq!(distribution.last(), Some(&([0x41; 32], None)));
+    }
+
+    #[tokio::test]
+    async fn a_locally_processed_id_is_a_duplicate_for_propagation_intake_at_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let (tx, _rx) = mpsc::channel::<TransportMessage>(64);
+        initialize_storage_namespace(temp.path()).unwrap();
+        let mut runner = LxmdRunner::new(DaemonConfig::default(), temp.path(), tx, None).unwrap();
+        let node = Arc::new(Mutex::new(
+            PropagationNode::with_storage(
+                PropagationNodeConfig::default(),
+                [0xAA; 16],
+                temp.path().join("store"),
+            )
+            .unwrap(),
+        ));
+        runner.propagation_node = Some(Arc::clone(&node));
+        let mut blob = vec![0x42; 16 + 64];
+        let transient_id = rns_crypto::sha::full_hash(&blob);
+        blob.extend_from_slice(&[0; 32]);
+        runner
+            .router
+            .propagation_store
+            .claim_processed(transient_id, now_f64());
+
+        runner.share_processed_claim(transient_id);
+
+        let blob =
+            lxmf_core::propagation_node::ValidatedOpaquePropagationBlob::validate(blob.into(), 0.0)
+                .unwrap();
+        assert!(matches!(
+            node.lock().unwrap().plan_opaque_admission(blob),
+            lxmf_core::propagation_node::PropagationAdmission::AlreadyProcessed
+        ));
     }
 
     #[test]
@@ -8151,8 +8697,16 @@ mod tests {
         let mut last = 0.0;
         let now = 1234.5;
 
+        let mut router = LxmRouter::new(Default::default());
+        let medium = MediumSnapshot::default();
+
         assert!(queue_unknown_propagation_node_path_request(
-            &tx, node, &mut last, now
+            &tx,
+            &mut router,
+            &medium,
+            node,
+            &mut last,
+            now
         ));
         assert_eq!(last, now);
         match rx.try_recv().expect("path request") {
@@ -8161,6 +8715,16 @@ mod tests {
             }
             other => panic!("expected RequestPath, got {other:?}"),
         }
+        // LXMRouter.request_path debounces a repeat inside path_request_wait.
+        assert!(queue_unknown_propagation_node_path_request(
+            &tx,
+            &mut router,
+            &medium,
+            node,
+            &mut last,
+            now + 1.0
+        ));
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
@@ -8175,7 +8739,12 @@ mod tests {
         .expect("fill test channel");
 
         assert!(!queue_unknown_propagation_node_path_request(
-            &tx, node, &mut last, 1234.5
+            &tx,
+            &mut LxmRouter::new(Default::default()),
+            &MediumSnapshot::default(),
+            node,
+            &mut last,
+            1234.5
         ));
         assert_eq!(last, 1234.5);
     }
@@ -8369,8 +8938,8 @@ mod tests {
         let mut packet = header.pack();
         packet.extend_from_slice(&ciphertext);
 
-        runner.handle_inbound_packet(&packet);
-        runner.handle_link_delivered_data(&packed);
+        runner.handle_inbound_packet(&packet, None);
+        runner.handle_link_delivered_data_on(&packed, None);
 
         assert_eq!(deliveries.load(Ordering::Relaxed), 1);
         assert!(runner.router.has_message(&message_id));

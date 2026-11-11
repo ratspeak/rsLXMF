@@ -49,6 +49,43 @@ pub enum CompressionSupport {
     Supported,
 }
 
+/// A per-transfer or per-sync limit as Python holds it: lxmd's built-in defaults
+/// are ints, configured values come from `as_float` (lxmd.py:165-184@1.3.0),
+/// and the announce packs whichever it has (LXMRouter.py:394-395).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PnLimit {
+    Int(u64),
+    Float(f64),
+}
+
+impl PnLimit {
+    pub fn as_f64(self) -> f64 {
+        match self {
+            Self::Int(n) => n as f64,
+            Self::Float(f) => f,
+        }
+    }
+
+    fn to_value(self) -> rmpv::Value {
+        match self {
+            Self::Int(n) => rmpv::Value::from(n),
+            Self::Float(f) => rmpv::Value::F64(f),
+        }
+    }
+}
+
+impl From<u64> for PnLimit {
+    fn from(n: u64) -> Self {
+        Self::Int(n)
+    }
+}
+
+impl From<f64> for PnLimit {
+    fn from(f: f64) -> Self {
+        Self::Float(f)
+    }
+}
+
 /// Parsed propagation-node announce data.
 ///
 /// Wire layout is an 8-element msgpack array:
@@ -69,9 +106,9 @@ pub struct PropagationNodeAnnounceData {
     /// True when the node is actively serving propagation.
     pub node_state: bool,
     /// Per-transfer limit in decimal kilobytes (1 kB = 1000 bytes).
-    pub transfer_limit: u64,
+    pub transfer_limit: PnLimit,
     /// Per-sync limit in decimal kilobytes (1 kB = 1000 bytes).
-    pub sync_limit: u64,
+    pub sync_limit: PnLimit,
     /// Propagation stamp cost, flexibility and peering cost as announced.
     pub stamp_cost: f64,
     pub stamp_flex: f64,
@@ -87,8 +124,8 @@ pub struct PropagationNodeAnnounceData {
 impl PropagationNodeAnnounceData {
     pub fn new(
         node_state: bool,
-        transfer_limit: u64,
-        sync_limit: u64,
+        transfer_limit: impl Into<PnLimit>,
+        sync_limit: impl Into<PnLimit>,
         stamp_cost: f64,
         stamp_flex: f64,
         peering_cost: f64,
@@ -100,8 +137,8 @@ impl PropagationNodeAnnounceData {
                 .unwrap_or_default()
                 .as_secs() as i64,
             node_state,
-            transfer_limit,
-            sync_limit,
+            transfer_limit: transfer_limit.into(),
+            sync_limit: sync_limit.into(),
             stamp_cost,
             stamp_flex,
             peering_cost,
@@ -158,8 +195,8 @@ pub fn get_propagation_node_app_data(data: &PropagationNodeAnnounceData) -> Vec<
         Value::Boolean(false),
         Value::from(data.timebase),
         Value::Boolean(data.node_state),
-        Value::from(data.transfer_limit),
-        Value::from(data.sync_limit),
+        data.transfer_limit.to_value(),
+        data.sync_limit.to_value(),
         ceil_costs,
         metadata,
         stamp_costs,
@@ -414,7 +451,7 @@ pub fn pn_announce_data_is_valid(data: &[u8]) -> bool {
 
 /// Parse propagation-node announce data that [`pn_announce_data_is_valid`] accepts.
 ///
-/// Limits are extracted with `int()` as the Python announce handler does.
+/// Limits keep their wire form ([`PnLimit`]); the announce handler reads them with `int()`.
 /// Costs come from the fractional slot 7 when present, else from `int()` of
 /// slot 5, as the handler takes them. Limits below zero become zero; announces with a
 /// non-finite cost are refused. String [`PN_META_IMPL_NAME`] and
@@ -425,9 +462,18 @@ pub fn parse_pn_announce_data(data: &[u8]) -> Option<PropagationNodeAnnounceData
     let int_at = |index: usize| python_int(&python_index(&value, index)?);
     let timebase = int_at(1)?.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64;
     let node_state = python_bool_state(&python_index(&value, 2)?)?;
-    let limit = |raw: i128| raw.clamp(0, i128::from(u64::MAX)) as u64;
-    let transfer_limit = limit(int_at(3)?);
-    let sync_limit = limit(int_at(4)?);
+    // A float is kept raw, as LXMRouter's sync autopeer reads it (LXMRouter.py:2700).
+    let limit_at = |index: usize| -> Option<PnLimit> {
+        let raw = python_index(&value, index)?;
+        let int = python_int(&raw)?;
+        Some(match raw {
+            rmpv::Value::F32(f) => PnLimit::Float(f64::from(f).max(0.0)),
+            rmpv::Value::F64(f) => PnLimit::Float(f.max(0.0)),
+            _ => PnLimit::Int(int.clamp(0, i128::from(u64::MAX)) as u64),
+        })
+    };
+    let transfer_limit = limit_at(3)?;
+    let sync_limit = limit_at(4)?;
     let ceil_costs = python_index(&value, 5)?;
     for index in 0..3 {
         python_int(&python_index(&ceil_costs, index)?)?;
@@ -1015,8 +1061,11 @@ mod tests {
         let parsed = parse_pn_announce_data(&packed).unwrap();
         assert!(!parsed.legacy);
         assert!(parsed.node_state);
-        assert_eq!(parsed.transfer_limit, PROPAGATION_LIMIT as u64);
-        assert_eq!(parsed.sync_limit, SYNC_LIMIT as u64);
+        assert_eq!(
+            parsed.transfer_limit,
+            PnLimit::Int(PROPAGATION_LIMIT as u64)
+        );
+        assert_eq!(parsed.sync_limit, PnLimit::Int(SYNC_LIMIT as u64));
         assert_eq!(parsed.stamp_cost, PROPAGATION_COST);
         assert_eq!(parsed.stamp_flex, PROPAGATION_COST_FLEX);
         assert_eq!(parsed.peering_cost, PEERING_COST);
@@ -1044,8 +1093,8 @@ mod tests {
 
         let parsed = parse_pn_announce_data(&packed).unwrap();
         assert!(parsed.node_state);
-        assert_eq!(parsed.transfer_limit, 10240);
-        assert_eq!(parsed.sync_limit, 10240);
+        assert_eq!(parsed.transfer_limit, PnLimit::Float(10240.0));
+        assert_eq!(parsed.sync_limit, PnLimit::Float(10240.0));
         assert_eq!(parsed.stamp_cost, 16.0);
     }
 
@@ -1097,7 +1146,7 @@ mod tests {
 
         // Python accepts these (int() succeeds); the typed values are clamped.
         let negative = parse_pn_announce_data(&encode(Value::from(-1), Value::from(16))).unwrap();
-        assert_eq!(negative.transfer_limit, 0);
+        assert_eq!(negative.transfer_limit, PnLimit::Int(0));
         let large = parse_pn_announce_data(&encode(Value::from(10240), Value::from(256))).unwrap();
         assert_eq!(large.stamp_cost, 256.0);
         let fractional =

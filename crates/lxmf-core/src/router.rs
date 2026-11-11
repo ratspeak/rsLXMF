@@ -339,6 +339,16 @@ pub struct LxmRouter {
     claims_dir: Option<std::path::PathBuf>,
 }
 
+/// `RouterConfig` holds limits as f64: a whole number announces as Python's int
+/// default, anything else as the float LXMRouter was given.
+fn router_limit(limit_kb: f64) -> crate::handlers::PnLimit {
+    if limit_kb.fract() == 0.0 && (0.0..=u64::MAX as f64).contains(&limit_kb) {
+        crate::handlers::PnLimit::Int(limit_kb as u64)
+    } else {
+        crate::handlers::PnLimit::Float(limit_kb)
+    }
+}
+
 /// Delivered destinations a router holds for the embedder to retain.
 const MAX_PENDING_RETAINS: usize = 256;
 
@@ -1780,8 +1790,8 @@ impl LxmRouter {
 
         let mut data = crate::handlers::PropagationNodeAnnounceData::new(
             self.config.propagation_enabled && !self.config.ext.from_static_only,
-            self.config.propagation_limit_kb as u64,
-            self.config.sync_limit_kb as u64,
+            router_limit(self.config.propagation_limit_kb),
+            router_limit(self.config.sync_limit_kb),
             self.config.propagation_stamp_cost,
             self.config.propagation_stamp_flex,
             self.config.ext.peering_cost,
