@@ -291,6 +291,7 @@ impl Peer {
                 Some(id.to_vec()),
                 true,
                 Some(&encrypt),
+                None,
             )
             .unwrap()
             .segments
