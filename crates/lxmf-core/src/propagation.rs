@@ -308,6 +308,18 @@ impl PropagationStore {
         &self.locally_processed_ids
     }
 
+    /// Merge a loaded delivered ID, keeping the later timestamp.
+    pub fn restore_locally_delivered(&mut self, id: PropagationTransientId, at: f64) {
+        let entry = self.locally_delivered_ids.entry(id).or_insert(at);
+        *entry = entry.max(at);
+    }
+
+    /// Merge a loaded processed ID, keeping the later timestamp.
+    pub fn restore_locally_processed(&mut self, id: PropagationTransientId, at: f64) {
+        let entry = self.locally_processed_ids.entry(id).or_insert(at);
+        *entry = entry.max(at);
+    }
+
     pub fn replace_locally_delivered(&mut self, ids: HashMap<PropagationTransientId, f64>) {
         self.locally_delivered_ids = ids;
     }

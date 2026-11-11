@@ -6,6 +6,7 @@
 //! * `local_deliveries` — delivered transient IDs and timestamps
 //! * `locally_processed` — processed transient IDs and timestamps
 //! * `node_stats` — propagation-node counters
+//! * `delivery_claims` — delivered/processed IDs appended since the last full save
 //! * `propagation_suppression_v1` — bounded download suppression records
 //! * `propagation_node_policies_v1` — recorded propagation-node policies
 //!
@@ -28,6 +29,116 @@ pub const TICKETS_FILE: &str = "available_tickets";
 pub const LOCAL_DELIVERIES_FILE: &str = "local_deliveries";
 pub const LOCALLY_PROCESSED_FILE: &str = "locally_processed";
 pub const NODE_STATS_FILE: &str = "node_stats";
+/// Append-only delivered/processed claims written before delivery callbacks run.
+pub const DELIVERY_CLAIMS_FILE: &str = "delivery_claims";
+
+const CLAIM_DELIVERED: u8 = 0;
+const CLAIM_PROCESSED: u8 = 1;
+const CLAIM_RECORD_LEN: usize = 1 + 32 + 8;
+
+/// Durably append a claim (`processed = false` for delivered IDs).
+pub fn append_delivery_claim(
+    dir: &Path,
+    id: &PropagationTransientId,
+    processed: bool,
+    at: f64,
+) -> io::Result<()> {
+    use std::io::Write;
+    let mut record = [0u8; CLAIM_RECORD_LEN];
+    record[0] = if processed {
+        CLAIM_PROCESSED
+    } else {
+        CLAIM_DELIVERED
+    };
+    record[1..33].copy_from_slice(id);
+    record[33..].copy_from_slice(&at.to_le_bytes());
+    let mut file = open_claims_for_append(&dir.join(DELIVERY_CLAIMS_FILE), true)?;
+    file.write_all(&record)?;
+    file.sync_data()
+}
+
+/// Open a claims file for appending, first dropping a torn trailing record so
+/// later records stay aligned.
+fn open_claims_for_append(path: &Path, create: bool) -> io::Result<fs::File> {
+    let file = fs::OpenOptions::new()
+        .create(create)
+        .append(true)
+        .open(path)?;
+    let len = file.metadata()?.len();
+    let torn = len % CLAIM_RECORD_LEN as u64;
+    if torn != 0 {
+        file.set_len(len - torn)?;
+    }
+    Ok(file)
+}
+
+/// Read appended claims as (delivered, processed). A torn trailing record is ignored.
+#[allow(clippy::type_complexity)]
+pub fn load_delivery_claims(
+    dir: &Path,
+) -> io::Result<(
+    Vec<(PropagationTransientId, f64)>,
+    Vec<(PropagationTransientId, f64)>,
+)> {
+    let mut records = Vec::new();
+    for path in [claims_saving(dir), dir.join(DELIVERY_CLAIMS_FILE)] {
+        match fs::read(path) {
+            Ok(bytes) => {
+                let whole = bytes.len() - bytes.len() % CLAIM_RECORD_LEN;
+                records.extend_from_slice(&bytes[..whole]);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let (mut delivered, mut processed) = (Vec::new(), Vec::new());
+    for record in records.chunks_exact(CLAIM_RECORD_LEN) {
+        let id: PropagationTransientId = record[1..33].try_into().expect("32 bytes");
+        let at = f64::from_le_bytes(record[33..].try_into().expect("8 bytes"));
+        match record[0] {
+            CLAIM_DELIVERED => delivered.push((id, at)),
+            CLAIM_PROCESSED => processed.push((id, at)),
+            _ => {}
+        }
+    }
+    Ok((delivered, processed))
+}
+
+fn claims_saving(dir: &Path) -> std::path::PathBuf {
+    dir.join(format!("{DELIVERY_CLAIMS_FILE}.saving"))
+}
+
+/// Set the claims appended so far aside for the snapshot being saved; later
+/// claims start a new file. Claims set aside by an unfinished save are kept.
+pub fn rotate_delivery_claims(dir: &Path) -> io::Result<()> {
+    use std::io::Write;
+    let current = dir.join(DELIVERY_CLAIMS_FILE);
+    let saving = claims_saving(dir);
+    if !saving.exists() {
+        return match fs::rename(&current, &saving) {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
+            _ => Ok(()),
+        };
+    }
+    let bytes = match fs::read(&current) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let whole = bytes.len() - bytes.len() % CLAIM_RECORD_LEN;
+    let mut file = open_claims_for_append(&saving, false)?;
+    file.write_all(&bytes[..whole])?;
+    file.sync_data()?;
+    fs::remove_file(current)
+}
+
+/// Drop the claims set aside once the caches holding them are saved.
+pub fn clear_rotated_delivery_claims(dir: &Path) -> io::Result<()> {
+    match fs::remove_file(claims_saving(dir)) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
+        _ => Ok(()),
+    }
+}
 
 /// Counters persisted by Python's `LXMRouter.save_node_stats`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -287,6 +398,20 @@ pub fn load_node_stats(dir: &Path) -> io::Result<PersistedNodeStats> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn claims_after_a_torn_record_stay_readable() {
+        let tmp = TempDir::new().unwrap();
+        append_delivery_claim(tmp.path(), &[1; 32], false, 1.0).unwrap();
+        let path = tmp.path().join(DELIVERY_CLAIMS_FILE);
+        let mut bytes = fs::read(&path).unwrap();
+        bytes.extend_from_slice(&[0xFF; 7]);
+        fs::write(&path, bytes).unwrap();
+        append_delivery_claim(tmp.path(), &[2; 32], true, 2.0).unwrap();
+        let (delivered, processed) = load_delivery_claims(tmp.path()).unwrap();
+        assert_eq!(delivered, vec![([1; 32], 1.0)]);
+        assert_eq!(processed, vec![([2; 32], 2.0)]);
+    }
 
     #[test]
     fn stamp_costs_roundtrip() {

@@ -71,12 +71,25 @@ impl std::fmt::Debug for MessageCallbacks {
             .finish()
     }
 }
+pub const ENCRYPTION_DESCRIPTION_AES: &str = "AES-256";
+pub const ENCRYPTION_DESCRIPTION_EC: &str = "Curve25519";
+pub const ENCRYPTION_DESCRIPTION_UNENCRYPTED: &str = "Unencrypted";
+
+/// Physical-layer readings of the packet or Link a message arrived on.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct PhyStats {
+    pub rssi: Option<f64>,
+    pub snr: Option<f64>,
+    pub q: Option<f64>,
+}
+
 /// Mutable delivery observations; none can change a message's authenticated bytes.
 #[derive(Debug, Clone)]
 pub struct MessageMetadata {
     pub state: MessageState,
     pub method: DeliveryMethod,
-    pub ratchet_id: Option<[u8; 32]>,
+    /// The ratchet ID (10 bytes) or Link ID (16 bytes) the message travelled under.
+    pub ratchet_id: Option<Vec<u8>>,
     pub delivery_attempts: u32,
     pub last_delivery_attempt: f64,
     pub next_delivery_attempt: f64,
@@ -96,6 +109,11 @@ pub struct MessageMetadata {
     pub path_request_retried: bool,
     pub max_delivery_attempts: Option<u32>,
     pub receipt_timeout: Option<f64>,
+    pub rssi: Option<f64>,
+    pub snr: Option<f64>,
+    pub q: Option<f64>,
+    pub stamp_valid: bool,
+    pub stamp_checked: bool,
 }
 impl Default for MessageMetadata {
     fn default() -> Self {
@@ -121,6 +139,11 @@ impl Default for MessageMetadata {
             path_request_retried: false,
             max_delivery_attempts: None,
             receipt_timeout: None,
+            rssi: None,
+            snr: None,
+            q: None,
+            stamp_valid: false,
+            stamp_checked: false,
         }
     }
 }
@@ -659,14 +682,83 @@ impl LxMessage {
         full_hash(lxmf_data)
     }
 
+    /// Python `LXMessage.determine_transport_encryption` for the current method
+    /// and the recipient destination type.
+    pub fn determine_transport_encryption(
+        &mut self,
+        destination_type: rns_wire::flags::DestinationType,
+    ) {
+        use rns_wire::flags::DestinationType;
+        let by_type = match destination_type {
+            DestinationType::Single => (true, ENCRYPTION_DESCRIPTION_EC),
+            DestinationType::Group => (true, ENCRYPTION_DESCRIPTION_AES),
+            _ => (false, ENCRYPTION_DESCRIPTION_UNENCRYPTED),
+        };
+        let (encrypted, description) = match self.method {
+            DeliveryMethod::Direct => (true, ENCRYPTION_DESCRIPTION_EC),
+            DeliveryMethod::Opportunistic | DeliveryMethod::Propagated | DeliveryMethod::Paper => {
+                by_type
+            }
+        };
+        self.transport_encrypted = encrypted;
+        self.transport_encryption = Some(description.to_string());
+    }
+
+    /// Python `lxmf_delivery` receive metadata: a ratchet ID is kept if already
+    /// set, and transport encryption follows the destination type the message
+    /// arrived on (`None` when unknown).
+    pub fn record_delivery(
+        &mut self,
+        destination_type: Option<rns_wire::flags::DestinationType>,
+        ratchet_id: Option<&[u8]>,
+        method: Option<DeliveryMethod>,
+        phy: Option<PhyStats>,
+    ) {
+        use rns_wire::flags::DestinationType;
+        if let Some(id) = ratchet_id.filter(|id| !id.is_empty())
+            && self.ratchet_id.is_none()
+        {
+            self.ratchet_id = Some(id.to_vec());
+        }
+        if let Some(method) = method {
+            self.method = method;
+        }
+        if let Some(phy) = phy {
+            self.rssi = phy.rssi;
+            self.snr = phy.snr;
+            self.q = phy.q;
+        }
+        let (encrypted, description) = match destination_type {
+            Some(DestinationType::Single | DestinationType::Link) => {
+                (true, Some(ENCRYPTION_DESCRIPTION_EC))
+            }
+            Some(DestinationType::Group) => (true, Some(ENCRYPTION_DESCRIPTION_AES)),
+            _ => (false, None),
+        };
+        self.transport_encrypted = encrypted;
+        self.transport_encryption = description.map(str::to_string);
+    }
+
+    /// Record the result of an inbound stamp check against `required_cost`
+    /// (Python `lxmf_delivery`); whether to drop on failure is the caller's policy.
+    pub fn check_stamp(&mut self, required_cost: f64, tickets: Option<&[Vec<u8>]>) -> bool {
+        self.stamp_valid = self.validate_stamp_with_tickets(required_cost, tickets);
+        self.stamp_checked = true;
+        self.stamp_valid
+    }
+
     pub fn cancel(&mut self) {
         if self.state == MessageState::Outbound || self.state == MessageState::Sending {
             self.state = MessageState::Cancelled;
         }
     }
 
+    /// Python `fail_message`: progress resets and a rejected message stays rejected.
     pub fn mark_failed(&mut self) {
-        self.state = MessageState::Failed;
+        self.progress = 0.0;
+        if self.state != MessageState::Rejected {
+            self.state = MessageState::Failed;
+        }
         self.notify_failed();
     }
 
@@ -680,6 +772,7 @@ impl LxMessage {
             return;
         }
         self.state = MessageState::Delivered;
+        self.progress = 1.0;
         self.notify_delivered();
     }
 

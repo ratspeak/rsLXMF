@@ -1089,9 +1089,11 @@ fn link_snapshot_state(
 /// Python `lxmf_delivery()` receive state: the delivery method, and Curve25519
 /// transport encryption for SINGLE and LINK destinations (LXMRouter.py:2174,2218-2226).
 fn mark_received(msg: &mut LxMessage, method: DeliveryMethod) {
-    msg.method = method;
-    msg.transport_encrypted = true;
-    msg.transport_encryption = Some(rns_identity::identity::CURVE.to_string());
+    let destination_type = match method {
+        DeliveryMethod::Direct => rns_wire::flags::DestinationType::Link,
+        _ => rns_wire::flags::DestinationType::Single,
+    };
+    msg.record_delivery(Some(destination_type), None, Some(method), None);
 }
 
 /// Write the stored propagated message as Python's `write_to_directory()` file,
@@ -6218,14 +6220,7 @@ pub(crate) async fn main() {
     }
 
     let shutdown = rns_runtime::lifecycle::ShutdownSignal::new();
-    let shutdown_clone = shutdown.clone();
-
-    tokio::spawn(async move {
-        if let Ok(()) = tokio::signal::ctrl_c().await {
-            tracing::info!("Received shutdown signal");
-            shutdown_clone.trigger();
-        }
-    });
+    let _signal_rx = rns_runtime::lifecycle::install_signal_handlers(shutdown.clone());
 
     let rns_config_dir_str = rns_config_dir.to_string_lossy().to_string();
     let is_foreground = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));

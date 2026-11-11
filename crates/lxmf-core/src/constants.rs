@@ -287,6 +287,8 @@ pub const JOB_LINKS_INTERVAL: u64 = 1;
 pub const JOB_TRANSIENT_INTERVAL: u64 = 60;
 /// Interval (in ticks) for cleaning the message store.
 pub const JOB_STORE_INTERVAL: u64 = 120;
+/// Interval (in ticks) for culling stamp costs and expired tickets.
+pub const JOB_STAMPCOST_INTERVAL: u64 = 120;
 /// Tick interval for cleaning throttled-peer entries, named for Python
 /// peer-sync cadence. Peer synchronization is driven by the embedding runtime.
 pub const JOB_PEERSYNC_INTERVAL: u64 = 6;

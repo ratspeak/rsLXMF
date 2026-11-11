@@ -162,10 +162,15 @@ impl TicketStore {
             return None;
         }
 
-        if let Some(ticket) = self.inbound.iter().find(|ticket| {
-            ticket.destination_hash == destination_hash
-                && ticket.expires - now > TICKET_RENEW as f64
-        }) {
+        if let Some(ticket) = self
+            .inbound
+            .iter()
+            .filter(|ticket| {
+                ticket.destination_hash == destination_hash
+                    && ticket.expires - now > TICKET_RENEW as f64
+            })
+            .max_by(|a, b| a.expires.total_cmp(&b.expires))
+        {
             return Some(ticket.clone());
         }
 

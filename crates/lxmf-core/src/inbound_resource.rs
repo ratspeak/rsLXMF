@@ -161,6 +161,21 @@ impl InboundResourceHandle {
                 .is_ok()
         })
     }
+
+    /// Like [`Self::cancel`], but waits for room in the command channel instead
+    /// of refusing when it is full.
+    pub async fn cancel_wait(&self) -> bool {
+        if self.snapshot().is_closed() {
+            return false;
+        }
+        match &self.cancel_tx {
+            Some(tx) => tx
+                .send(InboundResourceCancelRequest::new(self.key))
+                .await
+                .is_ok(),
+            None => false,
+        }
+    }
 }
 
 struct ActiveInboundResource {
@@ -250,6 +265,22 @@ impl InboundResourceTracker {
             .count()
     }
 
+    /// Request cancellation of every active Resource, waiting for channel room,
+    /// so the count covers all of them as Python's `cancel_all_inbound` does.
+    /// The future owns its handles and does not borrow the tracker.
+    pub fn cancel_all_inbound_wait(
+        &self,
+    ) -> impl std::future::Future<Output = usize> + Send + 'static {
+        let handles = self.inbound_resources();
+        async move {
+            let mut cancelled = 0;
+            for handle in handles {
+                cancelled += usize::from(handle.cancel_wait().await);
+            }
+            cancelled
+        }
+    }
+
     /// Apply one lifecycle update from the embedding runtime.
     pub fn handle_event(&mut self, event: InboundResourceEvent) {
         match event {
@@ -286,6 +317,15 @@ impl InboundResourceTracker {
             return;
         }
 
+        tracing::debug!(
+            "Began {} transfer for LXMF delivery resource {}",
+            if data_size > 0 {
+                pretty_size(data_size)
+            } else {
+                "unknown size".to_string()
+            },
+            hex::encode(key.resource_id)
+        );
         let snapshot = InboundResourceSnapshot {
             key,
             data_size,
@@ -331,6 +371,22 @@ impl InboundResourceTracker {
             self.concluded(key, InboundResourceConclusion::Failed);
         }
     }
+}
+
+/// Python `RNS.prettysize` for byte counts.
+fn pretty_size(size: usize) -> String {
+    let mut num = size as f64;
+    for unit in ["", "K", "M", "G", "T", "P", "E", "Z"] {
+        if num.abs() < 1000.0 {
+            return if unit.is_empty() {
+                format!("{num:.0} B")
+            } else {
+                format!("{num:.2} {unit}B")
+            };
+        }
+        num /= 1000.0;
+    }
+    format!("{num:.2}YB")
 }
 
 #[cfg(test)]

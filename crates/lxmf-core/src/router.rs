@@ -330,6 +330,9 @@ pub struct LxmRouter {
     path_request_times: HashMap<[u8; 16], f64>,
     /// A slow-path message concluded; outbound processing should run again.
     outbound_kick: bool,
+    /// Directory given to [`Self::load_state`]; delivered and processed IDs are
+    /// claimed there durably before delivery callbacks run.
+    claims_dir: Option<std::path::PathBuf>,
 }
 
 /// Delivered destinations a router holds for the embedder to retain.
@@ -373,6 +376,7 @@ pub struct RouterStateSnapshot {
     local_deliveries: HashMap<PropagationTransientId, f64>,
     locally_processed: HashMap<PropagationTransientId, f64>,
     node_stats: crate::persist::PersistedNodeStats,
+    claims_dir: Option<std::path::PathBuf>,
 }
 
 impl RouterStateSnapshot {
@@ -389,6 +393,9 @@ impl RouterStateSnapshot {
         persist::save_local_deliveries(state_dir, &self.local_deliveries)?;
         persist::save_locally_processed(state_dir, &self.locally_processed)?;
         persist::save_node_stats(state_dir, &self.node_stats)?;
+        if self.claims_dir.as_deref() == Some(state_dir) {
+            persist::clear_rotated_delivery_claims(state_dir)?;
+        }
         Ok(())
     }
 }
@@ -433,6 +440,7 @@ impl LxmRouter {
             destination_retains: VecDeque::new(),
             path_request_times: HashMap::new(),
             outbound_kick: false,
+            claims_dir: None,
         }
     }
 
@@ -507,6 +515,14 @@ impl LxmRouter {
         self.inbound_resource_tracker.cancel_all_inbound()
     }
 
+    /// Request cancellation of all active Resources, waiting for adapter queue
+    /// room; the count covers every active Resource (Python `cancel_all_inbound`).
+    pub fn cancel_all_inbound_wait(
+        &self,
+    ) -> impl std::future::Future<Output = usize> + Send + 'static {
+        self.inbound_resource_tracker.cancel_all_inbound_wait()
+    }
+
     /// Queue a message for outbound delivery.
     ///
     /// Opportunistic messages that exceed the single-packet ceiling are
@@ -558,13 +574,17 @@ impl LxmRouter {
                         limit: PLAIN_PACKET_MAX_CONTENT,
                     });
                 }
-                message.transport_encrypted = false;
-                message.transport_encryption = Some("Unencrypted".to_string());
             } else if content_size > ENCRYPTED_PACKET_MAX_CONTENT {
                 message.method = DeliveryMethod::Direct;
             }
         }
 
+        let destination_type = if self.is_plain_destination(&message.destination_hash()) {
+            rns_wire::flags::DestinationType::Plain
+        } else {
+            rns_wire::flags::DestinationType::Single
+        };
+        message.determine_transport_encryption(destination_type);
         message.state = MessageState::Outbound;
         self.pending_outbound.push(message);
         Ok(())
@@ -1021,26 +1041,28 @@ impl LxmRouter {
         self.ticket_store.inbound()
     }
 
-    /// Remove a matching message from the router's outbound or deferred-stamp queue.
-    /// Returns `true` when found, regardless of its prior state. A matching active
-    /// stamp worker receives a cooperative cancellation request. The embedding
-    /// runtime must separately cancel any Link/Resource work it already owns.
+    /// Cancel a message in the router's outbound or deferred-stamp queue
+    /// (Python `cancel_outbound`): it becomes [`MessageState::Cancelled`] whatever
+    /// its prior state, leaves the queue and its failure callback runs. Returns
+    /// `true` when found. A matching active stamp worker receives a cooperative
+    /// cancellation request. The embedding runtime must separately cancel any
+    /// Link/Resource work it already owns.
     pub fn cancel_outbound(&mut self, message_hash: &[u8; 32]) -> bool {
         if let Some(pos) = self
             .pending_outbound
             .iter()
             .position(|m| &m.message_id() == message_hash)
         {
-            let msg = &mut self.pending_outbound[pos];
-            msg.cancel();
-            self.pending_outbound.remove(pos);
+            let mut msg = self.pending_outbound.remove(pos);
+            msg.state = MessageState::Cancelled;
+            msg.notify_failed();
             return true;
         }
 
         if let Some(msg) = self.pending_deferred_stamps.remove(message_hash) {
-            if let Ok(mut message) = msg.finalize(None) {
-                message.cancel();
-            }
+            let mut message = msg.into_unstamped();
+            message.state = MessageState::Cancelled;
+            message.notify_failed();
             let active_matches = self
                 .active_deferred_stamp
                 .as_ref()
@@ -1223,11 +1245,32 @@ impl LxmRouter {
         if !allow_duplicate && self.propagation_store.is_locally_delivered(&message_id) {
             return false;
         }
-        self.propagation_store.mark_locally_delivered(message_id);
+        self.claim_locally_delivered(message_id);
         if let Some(ref callback) = self.delivery_callback {
             callback(message);
         }
         true
+    }
+
+    /// Record a delivered ID, durably first when state is loaded from a directory
+    /// (Python `conditionally_claim_delivered`). A failed write is logged and the
+    /// message still counts as new, as Python's store does.
+    fn claim_locally_delivered(&mut self, id: PropagationTransientId) {
+        self.propagation_store.mark_locally_delivered(id);
+        self.append_claim(&id, false);
+    }
+
+    fn claim_locally_processed(&mut self, id: PropagationTransientId) {
+        self.propagation_store.mark_locally_processed(id);
+        self.append_claim(&id, true);
+    }
+
+    fn append_claim(&self, id: &PropagationTransientId, processed: bool) {
+        if let Some(dir) = &self.claims_dir
+            && let Err(error) = crate::persist::append_delivery_claim(dir, id, processed, now_f64())
+        {
+            tracing::error!(%error, "could not claim transient id in the router state directory");
+        }
     }
 
     /// Reserve a message ID before local disk/DB work. An existing reservation
@@ -1280,15 +1323,12 @@ impl LxmRouter {
         {
             self.learn_ticket_from_inbound(verified);
         }
-        self.propagation_store
-            .mark_locally_delivered(receipt.record().scope.transient_id);
-        self.propagation_store
-            .mark_locally_processed(receipt.record().scope.transient_id);
+        self.claim_locally_delivered(receipt.record().scope.transient_id);
+        self.claim_locally_processed(receipt.record().scope.transient_id);
         let new_message = !self
             .propagation_store
             .is_locally_delivered(&message.message_id());
-        self.propagation_store
-            .mark_locally_delivered(message.message_id());
+        self.claim_locally_delivered(message.message_id());
         if new_message
             && receipt.record().disposition == crate::admission::DurableDisposition::Committed
         {
@@ -1342,14 +1382,14 @@ impl LxmRouter {
         {
             return Ok(PaperIngest::Duplicate);
         }
-        self.propagation_store.mark_locally_processed(transient_id);
+        self.claim_locally_processed(transient_id);
 
         let mut packed = destination_hash.to_vec();
         packed.extend_from_slice(&decrypt_fn(&encrypted)?);
         // Python records the transient id as delivered even when the decrypted
         // bytes do not unpack (LXMRouter.py:2858-2864).
         let unpacked = LxMessage::unpack(&packed);
-        self.propagation_store.mark_locally_delivered(transient_id);
+        self.claim_locally_delivered(transient_id);
         let mut message = unpacked?;
         message.method = DeliveryMethod::Propagated;
         message.representation = DeliveryRepresentation::Paper;
@@ -1388,13 +1428,22 @@ impl LxmRouter {
             .replace_locally_delivered(persist::load_local_deliveries(state_dir)?);
         self.propagation_store
             .replace_locally_processed(persist::load_locally_processed(state_dir)?);
+        let (delivered, processed) = persist::load_delivery_claims(state_dir)?;
+        for (id, at) in delivered {
+            self.propagation_store.restore_locally_delivered(id, at);
+        }
+        for (id, at) in processed {
+            self.propagation_store.restore_locally_processed(id, at);
+        }
+        self.claims_dir = Some(state_dir.to_path_buf());
         let stats = persist::load_node_stats(state_dir)?;
         self.client_propagation_messages_received = stats.client_propagation_messages_received;
         self.client_propagation_messages_served = stats.client_propagation_messages_served;
         self.unpeered_propagation_incoming = stats.unpeered_propagation_incoming;
         self.unpeered_propagation_rx_bytes = stats.unpeered_propagation_rx_bytes;
-        // Python cleans tickets and stamp costs at load (LXMRouter.py:258-284).
+        // Python cleans transient IDs, tickets and stamp costs at load (LXMRouter.py:292-297).
         let now = now_f64();
+        self.propagation_store.clean_transient_caches(now);
         self.ticket_store.cull(now);
         self.outbound_stamp_costs
             .retain(|_, e| now - e.recorded_at < STAMP_COST_EXPIRY as f64);
@@ -1406,7 +1455,13 @@ impl LxmRouter {
     /// release the lock, and perform persistence through
     /// [`RouterStateSnapshot::save_state`].
     pub fn state_snapshot(&self) -> RouterStateSnapshot {
+        let claims_dir = self.claims_dir.as_ref().filter(|dir| {
+            crate::persist::rotate_delivery_claims(dir)
+                .inspect_err(|error| tracing::warn!(%error, "could not rotate delivery claims"))
+                .is_ok()
+        });
         RouterStateSnapshot {
+            claims_dir: claims_dir.cloned(),
             outbound_stamp_costs: self.outbound_stamp_costs.clone(),
             tickets: crate::persist::TicketPersistenceSnapshot::capture(
                 self.ticket_store.snapshot(),
@@ -2619,6 +2674,10 @@ impl LxmRouter {
             && self.config.propagation_enabled
         {
             self.rotate_peers();
+        }
+        if self.processing_count.is_multiple_of(JOB_STAMPCOST_INTERVAL) {
+            self.cull_stamp_costs();
+            self.ticket_store.cull(now_f64());
         }
     }
 
