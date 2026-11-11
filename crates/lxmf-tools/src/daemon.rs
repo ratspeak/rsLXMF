@@ -421,8 +421,8 @@ pub struct DaemonConfig {
     pub sequential_pn_stamp_validation: bool,
     pub static_peers_bypass_sequential: bool,
     pub max_inbound_syncs: usize,
-    pub propagation_limit_kb: usize,
-    pub sync_limit_kb: usize,
+    pub propagation_limit_kb: f64,
+    pub sync_limit_kb: f64,
     pub on_inbound_command: Option<String>,
     pub node_announce_at_start: bool,
     pub node_announce_interval: Option<u64>,
@@ -460,8 +460,8 @@ impl Default for DaemonConfig {
             sequential_pn_stamp_validation: true,
             static_peers_bypass_sequential: true,
             max_inbound_syncs: PN_DEFAULT_MAX_INBOUND_SYNCS,
-            propagation_limit_kb: PROPAGATION_LIMIT,
-            sync_limit_kb: SYNC_LIMIT,
+            propagation_limit_kb: PROPAGATION_LIMIT as f64,
+            sync_limit_kb: SYNC_LIMIT as f64,
             on_inbound_command: None,
             node_announce_at_start: false,
             node_announce_interval: None,
@@ -551,8 +551,8 @@ impl DaemonConfig {
             sequential_pn_stamp_validation: py.sequential_pn_stamp_validation,
             static_peers_bypass_sequential: py.static_peers_bypass_sequential,
             max_inbound_syncs: usize::try_from(py.max_inbound_syncs).unwrap_or(usize::MAX),
-            propagation_limit_kb: kb_to_usize_ceil(py.propagation_transfer_max_accepted_size),
-            sync_limit_kb: kb_to_usize_ceil(py.propagation_sync_max_accepted_size),
+            propagation_limit_kb: py.propagation_transfer_max_accepted_size,
+            sync_limit_kb: py.propagation_sync_max_accepted_size,
             on_inbound_command: py.on_inbound,
             node_announce_at_start: py.node_announce_at_start,
             node_announce_interval: seconds_to_u64(py.node_announce_interval),
@@ -587,10 +587,13 @@ impl DaemonConfig {
                 && get_float(Some(sec), "propagation_transfer_max_accepted_size").is_none()
                 && let Some(limit) = sec.get_uint("propagation_limit")
             {
-                dc.propagation_limit_kb = limit as usize;
+                dc.propagation_limit_kb = limit as f64;
             }
             dc.enforce_stamps = sec.get_bool_or("enforce_stamps", false);
         }
+
+        // LXMRouter raises the per-sync limit to the per-transfer limit.
+        dc.sync_limit_kb = dc.sync_limit_kb.max(dc.propagation_limit_kb);
 
         if let Some(sec) = config.section("control") {
             if !dc.auth_required {
@@ -617,10 +620,6 @@ fn get_float(section: Option<&ConfigSection>, key: &str) -> Option<f64> {
 
 fn seconds_to_u64(value: Option<i64>) -> Option<u64> {
     value.map(|seconds| seconds.max(0) as u64)
-}
-
-fn kb_to_usize_ceil(value: f64) -> usize {
-    value.max(0.0).ceil().max(1.0) as usize
 }
 
 fn megabytes_to_bytes(value: f64) -> Option<usize> {
@@ -853,8 +852,8 @@ mod tests {
             dc.to_inbound_admission_config(),
             PnInboundAdmissionConfig::default()
         );
-        assert_eq!(dc.propagation_limit_kb, 256);
-        assert_eq!(dc.sync_limit_kb, 10_240);
+        assert_eq!(dc.propagation_limit_kb, 256.0);
+        assert_eq!(dc.sync_limit_kb, 10_240.0);
         assert!(!dc.node_announce_at_start);
         assert_eq!(dc.node_announce_interval, None);
         assert_eq!(dc.message_storage_limit, Some(500_000_000));
@@ -983,7 +982,7 @@ propagation_transfer_max_accepted_size = 12
         let dc = DaemonConfig::from_config(&config).unwrap();
 
         assert_eq!(
-            dc.propagation_limit_kb, 256,
+            dc.propagation_limit_kb, 256.0,
             "DaemonConfig should match Python 0.9.6 handling of legacy propagation_transfer_max_accepted_size"
         );
     }
@@ -996,8 +995,8 @@ propagation_transfer_max_accepted_size = 12
         assert_eq!(rc.max_peers, 20);
         assert_eq!(rc.delivery_limit_kb, 1.0);
         assert_eq!(RouterConfig::default().delivery_limit_kb, 1000.0);
-        assert_eq!(rc.propagation_limit_kb, 256);
-        assert_eq!(rc.sync_limit_kb, 10_240);
+        assert_eq!(rc.propagation_limit_kb, 256.0);
+        assert_eq!(rc.sync_limit_kb, 10_240.0);
         assert_eq!(rc.propagation_stamp_cost, 16.0);
         assert_eq!(rc.propagation_stamp_flex, 3.0);
         assert_eq!(rc.ext.autopeer_maxdepth, AUTOPEER_MAXDEPTH);
@@ -1075,8 +1074,8 @@ from_static_only = yes
         assert!(dc.node_announce_at_start);
         assert_eq!(dc.node_announce_interval, Some(120));
         assert_eq!(dc.message_storage_limit, Some(5_000));
-        assert_eq!(dc.propagation_limit_kb, 1);
-        assert_eq!(dc.sync_limit_kb, 1);
+        assert_eq!(dc.propagation_limit_kb, 0.38);
+        assert_eq!(dc.sync_limit_kb, 0.38);
         assert_eq!(dc.propagation_stamp_cost, 13.0);
         assert_eq!(dc.propagation_stamp_flex, 0.0);
         assert_eq!(dc.peering_cost, 0.0);

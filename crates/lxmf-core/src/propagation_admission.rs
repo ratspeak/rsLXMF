@@ -27,7 +27,7 @@ const PROPAGATION_DESTINATION_NAME: &str = "lxmf.propagation";
 pub const PN_DEFAULT_MAX_INBOUND_SYNCS: usize = 3;
 /// Lower bound applied to the configured inbound-sync threshold.
 pub const PN_MIN_MAX_INBOUND_SYNCS: usize = 1;
-/// Duration applied after a known peer submits an invalid-stamp batch.
+/// Default duration applied after a known peer submits an invalid-stamp batch.
 pub const PN_INVALID_STAMP_THROTTLE: Duration = Duration::from_secs(PN_STAMP_THROTTLE);
 
 /// Policy applied to inbound propagation-node offers.
@@ -521,7 +521,7 @@ impl PnInboundAdmission {
         Ok(PnCleanupResult::Removed(PnInboundState::Validating))
     }
 
-    /// Install the standard throttle after invalid stamp validation for a
+    /// Install the configured throttle after invalid stamp validation for a
     /// known peer, including an unsolicited Resource with no offer record.
     ///
     /// `peer_destination_hash` must be the peer's already-derived

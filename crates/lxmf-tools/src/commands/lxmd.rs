@@ -443,8 +443,8 @@ fn accepts_delivery_resource(data_size: usize, limit_kb: f64) -> bool {
     data_size as f64 <= limit_kb * lxmf_core::constants::BYTES_PER_KILOBYTE as f64
 }
 
-fn configured_kilobytes_to_bytes(kilobytes: usize) -> usize {
-    kilobytes.saturating_mul(lxmf_core::constants::BYTES_PER_KILOBYTE)
+fn configured_kilobytes_to_bytes(kilobytes: f64) -> usize {
+    (kilobytes.max(0.0) * lxmf_core::constants::BYTES_PER_KILOBYTE as f64) as usize
 }
 
 fn delivery_resource_event_from_runtime(event: LinkResourceEvent) -> Option<InboundResourceEvent> {
@@ -770,6 +770,8 @@ fn execute_pn_packet_job(job: PnPacketValidationJob) -> PnPacketExecution {
                 }
             }
             Ok(PropagationAdmission::Pending(waiter)) => pending.push(waiter),
+            // Python still proves a packet whose messages were filtered as duplicates.
+            Ok(PropagationAdmission::AlreadyProcessed) => {}
             _ => {
                 result.stored = false;
                 break;
@@ -1758,6 +1760,20 @@ struct LxmdRunner {
 }
 
 impl LxmdRunner {
+    /// LXMF keeps one processed-ID store for local delivery and propagation intake.
+    fn merge_processed_ids(&mut self) {
+        let Some(node) = self.propagation_node.as_ref() else {
+            return;
+        };
+        let Ok(mut node) = node.lock() else {
+            return;
+        };
+        node.merge_processed_ids(self.router.propagation_store.locally_processed_ids());
+        for (id, seen) in node.processed_ids() {
+            self.router.propagation_store.claim_processed(*id, *seen);
+        }
+    }
+
     async fn install_announce_subscriptions(
         &mut self,
         rns_handle: &ReticulumHandle,
@@ -3837,6 +3853,7 @@ impl LxmdRunner {
         let mut peers_to_persist = HashSet::new();
         let mut finished = Vec::new();
         let mut resync = Vec::new();
+        let mut unpeered = Vec::new();
         for (peer_hash, sync) in &mut self.peer_syncs {
             sync.drain_events(&self.known_identities);
             sync.tick();
@@ -3900,6 +3917,9 @@ impl LxmdRunner {
                     peer.currently_transferring_messages = None;
                     peer.next_sync_attempt = now + lxmf_core::constants::PN_STAMP_THROTTLE as f64;
                 }
+                lxmf_core::propagation_sync::PeerSyncTerminalState::NoAccess => {
+                    unpeered.push(result.peer_hash);
+                }
                 lxmf_core::propagation_sync::PeerSyncTerminalState::Failed => {
                     peer.sync_failed();
                 }
@@ -3908,6 +3928,21 @@ impl LxmdRunner {
         }
         for peer_hash in finished {
             self.peer_syncs.remove(&peer_hash);
+        }
+        for peer_hash in unpeered {
+            // LXMRouter.unpeer drops the live peering only.
+            tracing::info!(peer = %hex::encode(peer_hash), "remote denied access, broke peering");
+            self.router.remove_peer(&peer_hash);
+            peers_to_persist.remove(&peer_hash);
+            if let Some(ref node) = self.propagation_node
+                && let Ok(mut node) = node.lock()
+                && let Err(error) = node.delete_peer(&peer_hash)
+            {
+                tracing::warn!(
+                    peer = %hex::encode(peer_hash),
+                    "failed to remove persisted propagation peer: {error}"
+                );
+            }
         }
         // Python resource_concluded(): a persistent peer with messages left syncs again.
         for peer_hash in resync {
@@ -4274,16 +4309,17 @@ impl LxmdRunner {
                 Ok(Err(error)) => {
                     tracing::warn!(%error, "relay maintenance remains pending");
                     self.prop_maintenance_task = None;
-                    self.last_cull = now - 240.0;
+                    self.last_cull = now - 420.0;
                 }
                 Err(oneshot::error::TryRecvError::Closed) => {
                     self.prop_maintenance_task = None;
-                    self.last_cull = now - 240.0;
+                    self.last_cull = now - 420.0;
                 }
                 Err(oneshot::error::TryRecvError::Empty) => {}
             }
         }
-        if self.prop_maintenance_task.is_none() && now - self.last_cull > 300.0 {
+        // JOB_STORE_INTERVAL * PROCESSING_INTERVAL, the cadence of LXMRouter.clean_message_store.
+        if self.prop_maintenance_task.is_none() && now - self.last_cull > 480.0 {
             // Reserve only metadata under the lock. Native durable deletion
             // barriers run on one joined worker, away from receipt dispatch.
             if let Some(ref pn) = self.propagation_node
@@ -4318,6 +4354,7 @@ impl LxmdRunner {
             }
         }
         if self.checkpoint_task.is_none() && now - self.last_crypto_save > 300.0 {
+            self.merge_processed_ids();
             let checkpoint = DaemonCheckpoint {
                 ratchets: self.ratchets_dir.clone(),
                 received: self.received_ratchets.clone(),
@@ -6485,6 +6522,7 @@ pub(crate) async fn main() {
     if let Err(e) = runner.router.load_state(&runner.data_dir) {
         tracing::warn!("Failed to load persisted router state: {e}");
     } else {
+        runner.merge_processed_ids();
         tracing::info!(
             "Loaded persisted router state from {}",
             runner.data_dir.display()
@@ -6946,6 +6984,7 @@ pub(crate) async fn main() {
     // Python exit_handler() saves every peer's synchronisation state.
     runner.flush_peer_distribution_queue();
     runner.save_all_peers();
+    runner.merge_processed_ids();
     if let Err(e) = runner.router.save_state(&runner.data_dir) {
         tracing::warn!("Failed to save router state on shutdown: {e}");
         if one_shot_status.is_some() {
@@ -7963,10 +8002,10 @@ mod tests {
         assert!(accepts_delivery_resource(380, 0.38));
         assert!(!accepts_delivery_resource(381, 0.38));
 
-        assert_eq!(configured_kilobytes_to_bytes(1), 1_000);
-        assert_eq!(configured_kilobytes_to_bytes(256), 256_000);
-        assert_eq!(configured_kilobytes_to_bytes(10_240), 10_240_000);
-        assert_eq!(configured_kilobytes_to_bytes(usize::MAX), usize::MAX);
+        assert_eq!(configured_kilobytes_to_bytes(1.0), 1_000);
+        assert_eq!(configured_kilobytes_to_bytes(0.5), 500);
+        assert_eq!(configured_kilobytes_to_bytes(10_240.0), 10_240_000);
+        assert_eq!(configured_kilobytes_to_bytes(f64::MAX), usize::MAX);
     }
 
     #[tokio::test(flavor = "current_thread")]

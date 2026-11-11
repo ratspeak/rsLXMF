@@ -296,6 +296,22 @@ impl PropagationStore {
             .insert(transient_id, crate::now_f64());
     }
 
+    /// Record `transient_id` as processed unless it already is; the first-seen time is kept.
+    /// Returns false when it was already processed.
+    pub fn claim_processed(&mut self, transient_id: PropagationTransientId, now: f64) -> bool {
+        match self.locally_processed_ids.entry(transient_id) {
+            std::collections::hash_map::Entry::Occupied(_) => false,
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(now);
+                true
+            }
+        }
+    }
+
+    pub(crate) fn unclaim_processed(&mut self, transient_id: &PropagationTransientId) {
+        self.locally_processed_ids.remove(transient_id);
+    }
+
     pub fn is_locally_processed(&self, transient_id: &PropagationTransientId) -> bool {
         self.locally_processed_ids.contains_key(transient_id)
     }

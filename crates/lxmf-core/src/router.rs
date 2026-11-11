@@ -77,9 +77,9 @@ pub struct RouterConfig {
     pub propagation_enabled: bool,
     pub autopeer: bool,
     pub max_peers: usize,
-    pub propagation_limit_kb: usize,
+    pub propagation_limit_kb: f64,
     pub delivery_limit_kb: f64,
-    pub sync_limit_kb: usize,
+    pub sync_limit_kb: f64,
     pub propagation_stamp_cost: f64,
     pub propagation_stamp_flex: f64,
     pub stamp_cost: Option<f64>,
@@ -138,9 +138,9 @@ impl Default for RouterConfig {
             propagation_enabled: false,
             autopeer: AUTOPEER,
             max_peers: MAX_PEERS,
-            propagation_limit_kb: PROPAGATION_LIMIT,
+            propagation_limit_kb: PROPAGATION_LIMIT as f64,
             delivery_limit_kb: DELIVERY_LIMIT as f64,
-            sync_limit_kb: SYNC_LIMIT,
+            sync_limit_kb: SYNC_LIMIT as f64,
             propagation_stamp_cost: PROPAGATION_COST,
             propagation_stamp_flex: PROPAGATION_COST_FLEX,
             stamp_cost: None,
@@ -1613,16 +1613,18 @@ impl LxmRouter {
             return refreshed;
         }
 
-        if !configured_static && !self.config.autopeer {
+        // A static peer is created only at startup; once unpeered, its announces are ignored.
+        if configured_static {
             return false;
         }
-        if !configured_static
-            && hops.is_some_and(|h| h as usize > self.config.ext.autopeer_maxdepth)
-        {
+        if !self.config.autopeer {
+            return false;
+        }
+        if hops.is_some_and(|h| h as usize > self.config.ext.autopeer_maxdepth) {
             return false;
         }
 
-        let mut peer = LxmPeer::from_announce_with_metadata(
+        let peer = LxmPeer::from_announce_with_metadata(
             destination_hash,
             timebase,
             transfer_limit,
@@ -1632,10 +1634,6 @@ impl LxmRouter {
             peering_cost,
             metadata,
         );
-        if configured_static {
-            peer.is_static = true;
-            peer.autopeered = false;
-        }
         self.add_peer(peer)
     }
 
@@ -1745,7 +1743,7 @@ impl LxmRouter {
 
     /// Set the advertised per-transfer propagation limit in decimal kB.
     /// This does not set total storage capacity or update a separate node owner.
-    pub fn set_propagation_limit(&mut self, limit_kb: usize) {
+    pub fn set_propagation_limit(&mut self, limit_kb: f64) {
         self.config.propagation_limit_kb = limit_kb;
     }
 
@@ -2785,8 +2783,8 @@ pub struct PeerStats {
 pub struct NodeStats {
     pub uptime: f64,
     pub delivery_limit: f64,
-    pub propagation_limit: usize,
-    pub sync_limit: usize,
+    pub propagation_limit: f64,
+    pub sync_limit: f64,
     pub stamp_cost: f64,
     pub stamp_flex: f64,
     pub peering_cost: f64,
@@ -4259,20 +4257,13 @@ mod tests {
     }
 
     #[test]
-    fn configured_static_announce_recreates_missing_peer_with_autopeer_disabled() {
+    fn unpeered_static_peer_is_not_recreated_by_its_announce() {
         let peer_hash = [0xA5; 16];
-        let mut router = LxmRouter::new(RouterConfig {
-            autopeer: false,
-            ext: RouterConfigExt {
-                autopeer_maxdepth: 1,
-                ..Default::default()
-            },
-            ..Default::default()
-        });
+        let mut router = LxmRouter::new(RouterConfig::default());
         router.static_peers.push(peer_hash);
         router.remove_peer(&peer_hash);
 
-        assert!(router.autopeer(AutopeerCandidate {
+        assert!(!router.autopeer(AutopeerCandidate {
             destination_hash: peer_hash,
             timebase: 101.0,
             transfer_limit: Some(2.0),
@@ -4280,21 +4271,10 @@ mod tests {
             stamp_cost: Some(16.0),
             stamp_flexibility: Some(3.0),
             peering_cost: Some(18.0),
-            metadata: Some(std::collections::HashMap::from([(
-                crate::constants::PN_META_NAME,
-                b"static".to_vec(),
-            )])),
-            hops: Some(99),
+            metadata: None,
+            hops: Some(1),
         }));
-        let peer = router.peers.get(&peer_hash).unwrap();
-        assert!(peer.is_static);
-        assert!(!peer.autopeered);
-        assert_eq!(
-            peer.metadata
-                .as_ref()
-                .and_then(|metadata| metadata.get(&crate::constants::PN_META_NAME)),
-            Some(&b"static".to_vec())
-        );
+        assert!(!router.peers.contains_key(&peer_hash));
     }
 
     #[test]

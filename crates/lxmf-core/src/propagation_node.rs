@@ -480,6 +480,8 @@ pub enum PropagationAdmission {
     Reserved(Box<PropagationStoreWritePlan>),
     CommittedDuplicate(PropagationDuplicateCheck),
     Pending(PropagationAdmissionWaiter),
+    /// The transient ID was processed before and is no longer stored; nothing is written.
+    AlreadyProcessed,
     Rejected,
 }
 
@@ -672,9 +674,6 @@ pub struct PropagationNode {
     storage_path: Option<PathBuf>,
     object_paths: HashMap<PropagationTransientId, PathBuf>,
     _store_lock: Option<std::fs::File>,
-    /// Transitional pre-1.1 behavior; removed when the daemon-lifetime
-    /// `PnInboundAdmission` becomes the live throttle owner.
-    last_offer_times: HashMap<[u8; 16], f64>,
     /// Monotonic in-process revision of the propagation store. Outbound peer
     /// scheduling and offer-preparation revalidation use this to avoid both
     /// stale offers and repeated scans of an unchanged fully-handled store.
@@ -700,7 +699,6 @@ impl PropagationNode {
             storage_path: None,
             object_paths: HashMap::new(),
             _store_lock: None,
-            last_offer_times: HashMap::new(),
             offer_generation: 0,
             pending_write_ids: HashSet::new(),
             pending_admissions: HashMap::new(),
@@ -776,7 +774,6 @@ impl PropagationNode {
             storage_path: Some(storage_path),
             object_paths: HashMap::new(),
             _store_lock: Some(lock),
-            last_offer_times: HashMap::new(),
             offer_generation: 0,
             pending_write_ids: HashSet::new(),
             pending_admissions: HashMap::new(),
@@ -800,18 +797,7 @@ impl PropagationNode {
         {
             return None;
         }
-        // Python checks the current store size before inserting and permits
-        // the message that crosses the cap; the next admission is rejected
-        // until culling makes room. Include reservations in that current-size
-        // view so concurrent writers cannot all pass the same preflight.
-        let occupied = self
-            .store
-            .total_size()
-            .saturating_add(self.pending_write_bytes);
-        if occupied > self.config.max_storage {
-            return None;
-        }
-
+        // The storage limit is enforced only by maintenance culling, as in Python.
         let (result, _) = tokio::sync::watch::channel(PropagationAdmissionOutcome::Pending);
         let reservation = std::sync::Arc::new(AdmissionReservation {
             content_hash: rns_crypto::sha::full_hash(&data),
@@ -850,6 +836,8 @@ impl PropagationNode {
         self.pending_admissions.remove(transient_id);
         if self.pending_write_ids.remove(transient_id) {
             self.pending_write_bytes = self.pending_write_bytes.saturating_sub(size);
+            // A failed write leaves the message retryable.
+            self.store.unclaim_processed(transient_id);
         }
     }
 
@@ -956,6 +944,9 @@ impl PropagationNode {
         for id in stale {
             self.pending_admissions.remove(&id);
             self.pending_write_ids.remove(&id);
+            if !self.store.contains(&id) {
+                self.store.unclaim_processed(&id);
+            }
         }
         self.pending_write_bytes = self
             .pending_admissions
@@ -992,6 +983,16 @@ impl PropagationNode {
         }
         let mut destination = [0; 16];
         destination.copy_from_slice(&blob.bytes[..16]);
+        if self.store.is_destination_ignored(&destination) {
+            return PropagationAdmission::Rejected;
+        }
+        // LXMRouter.lxmf_propagation claims the transient ID before storing it.
+        if !self
+            .store
+            .claim_processed(blob.transient_id, crate::now_f64())
+        {
+            return PropagationAdmission::AlreadyProcessed;
+        }
         let entry = PropagationEntry::new_stamped(
             blob.transient_id,
             blob.transient_id,
@@ -1084,6 +1085,7 @@ impl PropagationNode {
     pub fn plan_maintenance(&mut self) -> PropagationRetirementPlan {
         self.reap_retired();
         let now = crate::now_f64();
+        self.store.clean_transient_caches(now);
         let cutoff = now - self.config.max_message_age as f64;
         let mut ids = Vec::new();
         let mut remaining = self.store.total_size();
@@ -1188,6 +1190,21 @@ impl PropagationNode {
         self.eligible(transient_id) && self.store.contains(transient_id)
     }
 
+    /// Transient IDs claimed at intake, with their first-seen times.
+    pub fn processed_ids(&self) -> &HashMap<PropagationTransientId, f64> {
+        self.store.locally_processed_ids()
+    }
+
+    /// Add processed IDs recorded elsewhere, keeping existing first-seen times.
+    pub fn merge_processed_ids<'a>(
+        &mut self,
+        ids: impl IntoIterator<Item = (&'a PropagationTransientId, &'a f64)>,
+    ) {
+        for (id, seen) in ids {
+            self.store.claim_processed(*id, *seen);
+        }
+    }
+
     pub fn get_session(&self, peer_hash: &[u8; 16]) -> Option<&SyncSession> {
         self.sync_sessions.get(peer_hash)
     }
@@ -1283,18 +1300,6 @@ impl PropagationNode {
         request_data: &[u8],
         ctx: OfferRequestContext<'_>,
     ) -> Vec<u8> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_secs_f64())
-            .unwrap_or(0.0);
-        if self
-            .last_offer_times
-            .get(&ctx.peer_hash)
-            .is_some_and(|last_time| now - last_time < PN_STAMP_THROTTLE as f64)
-        {
-            return Self::encode_offer_response(&OfferResponse::ErrorThrottled);
-        }
-
         let offer = match crate::propagation_offer::decode(request_data, self.config.max_offer_size)
         {
             Ok(offer) => offer,
@@ -1324,7 +1329,6 @@ impl PropagationNode {
             OfferResponse::ErrorInvalidKey
         };
 
-        self.last_offer_times.insert(ctx.peer_hash, now);
         Self::encode_offer_response(&response)
     }
 
@@ -2124,7 +2128,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_reject_store_full() {
+    fn test_store_over_limit_still_admits() {
         let config = PropagationNodeConfig {
             max_storage: 1,
             ..Default::default()
@@ -2135,7 +2139,8 @@ pub(crate) mod tests {
         assert!(node.accept_fixture(&msg1));
 
         let msg2 = make_signed_message([0xBB; 16], [0xCC; 16], "Test", "msg2");
-        assert!(!node.accept_fixture(&msg2));
+        assert!(node.accept_fixture(&msg2));
+        assert_eq!(node.message_count(), 2);
     }
 
     #[test]
@@ -2492,13 +2497,9 @@ pub(crate) mod tests {
         assert_eq!(node.message_count(), 0);
     }
 
-    /// After a message is culled (expired), the same message resurfacing
-    /// must be accepted again — the node's "seen" memory is the store
-    /// itself, not a separate dedup log. Otherwise a node that culled a
-    /// message and then received it again from another peer would
-    /// silently drop it, breaking store-and-forward semantics.
+    /// A culled message is still in the processed set, so it is not stored again.
     #[test]
-    fn test_reaccept_after_cull() {
+    fn test_culled_message_is_not_readmitted() {
         let config = PropagationNodeConfig {
             max_message_age: 1,
             ..Default::default()
@@ -2508,54 +2509,28 @@ pub(crate) mod tests {
         let mut msg = make_signed_message([0xBB; 16], [0xCC; 16], "Test", "cull then redeliver");
         msg.timestamp = 1000.0;
         assert!(node.accept_fixture(&msg), "first accept");
-        assert_eq!(node.message_count(), 1);
-
+        std::thread::sleep(std::time::Duration::from_millis(1100));
         node.tick();
         assert_eq!(node.message_count(), 0, "culled by tick");
 
-        // Fresh timestamp so the re-delivery isn't itself expired.
-        msg.timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs_f64();
-        assert!(
-            node.accept_fixture(&msg),
-            "same message re-accepted after cull"
-        );
-        assert_eq!(node.message_count(), 1);
+        assert!(!node.accept_fixture(&msg), "culled message filtered");
+        assert_eq!(node.message_count(), 0);
     }
 
-    /// A store that was full and rejecting new messages must recover
-    /// capacity after culling — the reject-store-full path is transient,
-    /// not terminal. Exercises: fill → reject → cull expired → accept.
+    /// The storage limit is enforced by culling the heaviest entries, not at admission.
     #[test]
-    fn test_accept_after_store_full_and_cull() {
-        let config = PropagationNodeConfig {
-            max_storage: 1,
-            max_message_age: 1,
-            ..Default::default()
-        };
-        let mut node = durable_test_node(config, [0xAA; 16]);
-
-        let mut msg1 = make_signed_message([0xBB; 16], [0xCC; 16], "Test", "first");
-        msg1.timestamp = 1000.0; // ancient so tick will cull it
-        assert!(node.accept_fixture(&msg1));
-
-        let msg2 = make_signed_message([0xBB; 16], [0xCC; 16], "Test", "rejected-while-full");
-        assert!(
-            !node.accept_fixture(&msg2),
-            "store full, second message must reject"
-        );
-
+    fn test_cull_trims_store_to_limit() {
+        let mut node = durable_test_node(PropagationNodeConfig::default(), [0xAA; 16]);
+        for body in ["first", "second", "third"] {
+            let msg = make_signed_message([0xBB; 16], [0xCC; 16], "Test", body);
+            assert!(node.accept_fixture(&msg));
+        }
+        let largest = node.store.entries().map(|e| e.size).max().unwrap();
+        node.config.max_storage = node.total_size() - 1;
         node.tick();
-        assert_eq!(node.message_count(), 0, "expired msg culled");
-
-        let msg3 = make_signed_message([0xBB; 16], [0xCC; 16], "Test", "accepted-after-cull");
-        assert!(
-            node.accept_fixture(&msg3),
-            "store has space after cull, next message accepted"
-        );
-        assert_eq!(node.message_count(), 1);
+        assert_eq!(node.message_count(), 2);
+        assert!(node.total_size() <= node.config.max_storage);
+        assert!(node.total_size() + largest > node.config.max_storage);
     }
 
     #[test]
@@ -3122,6 +3097,20 @@ pub(crate) mod tests {
         );
         let response = OfferResponse::from_msgpack(&response_bytes);
         assert_eq!(response, OfferResponse::WantAll);
+
+        // LXMRouter.offer_request has no per-peer offer rate gate.
+        let again = node.handle_offer_request(
+            &valid_request,
+            offer_ctx(
+                [0xBB; 16],
+                true,
+                false,
+                true,
+                Some(&local_identity),
+                Some(&remote_identity),
+            ),
+        );
+        assert_eq!(OfferResponse::from_msgpack(&again), OfferResponse::WantAll);
     }
 
     #[test]

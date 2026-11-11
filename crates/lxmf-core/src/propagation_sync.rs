@@ -57,6 +57,8 @@ pub enum SyncTaskState {
     NoPath,
     /// The peer answered the offer with `ERROR_THROTTLED`.
     Throttled,
+    /// The peer answered the offer with `ERROR_NO_ACCESS`.
+    NoAccess,
     Failed,
 }
 
@@ -65,8 +67,10 @@ pub enum PeerSyncTerminalState {
     Complete,
     /// The path request was not answered; no link was attempted.
     NoPath,
-    /// The peer answered the offer with `ERROR_THROTTLED`.
+    /// The node answered the offer with `ERROR_THROTTLED`.
     Throttled,
+    /// The node answered the offer with `ERROR_NO_ACCESS`.
+    NoAccess,
     Failed,
 }
 
@@ -185,6 +189,7 @@ pub struct PropagationSyncTask {
     active_offer_generation: Option<u64>,
     generation_exhausted: bool,
     terminal_result: Option<PeerSyncTerminalResult>,
+    identify_retried: bool,
     pending_transport: VecDeque<TransportMessage>,
     preserve_pending_on_cleanup: bool,
     offered_count: u64,
@@ -243,6 +248,7 @@ impl PropagationSyncTask {
             active_offer_generation: None,
             generation_exhausted: false,
             terminal_result: None,
+            identify_retried: false,
             pending_transport: VecDeque::new(),
             preserve_pending_on_cleanup: false,
             offered_count: 0,
@@ -309,6 +315,7 @@ impl PropagationSyncTask {
             active_offer_generation: None,
             generation_exhausted: false,
             terminal_result: None,
+            identify_retried: false,
             pending_transport: VecDeque::new(),
             preserve_pending_on_cleanup: false,
             offered_count: 0,
@@ -369,6 +376,7 @@ impl PropagationSyncTask {
             active_offer_generation: None,
             generation_exhausted: false,
             terminal_result: None,
+            identify_retried: false,
             pending_transport: VecDeque::new(),
             preserve_pending_on_cleanup: false,
             offered_count: 0,
@@ -704,6 +712,7 @@ impl PropagationSyncTask {
         self.transfer_wire_size = 0;
         self.transfer_started = None;
         self.link_establishment_rate = None;
+        self.identify_retried = false;
     }
 
     /// Drain inbound events from transport.
@@ -1110,7 +1119,17 @@ impl PropagationSyncTask {
                 self.record_handled_updates(&already_handled);
                 self.prepare_transfer_for_ids(&wanted_ids);
             }
+            // Python identifies again and resends the offer without a bound; retry once per attempt.
+            OfferResponse::ErrorNoIdentity if !self.identify_retried && self.link.is_some() => {
+                self.identify_retried = true;
+                self.state = if self.send_identify() {
+                    SyncTaskState::Offering
+                } else {
+                    SyncTaskState::Failed
+                };
+            }
             OfferResponse::ErrorThrottled => self.state = SyncTaskState::Throttled,
+            OfferResponse::ErrorNoAccess => self.state = SyncTaskState::NoAccess,
             _ => {
                 self.state = SyncTaskState::Failed;
             }
@@ -1197,6 +1216,7 @@ impl PropagationSyncTask {
                 SyncTaskState::Complete
                     | SyncTaskState::NoPath
                     | SyncTaskState::Throttled
+                    | SyncTaskState::NoAccess
                     | SyncTaskState::Failed
             )
         {
@@ -1210,6 +1230,7 @@ impl PropagationSyncTask {
                 | SyncTaskState::Complete
                 | SyncTaskState::NoPath
                 | SyncTaskState::Throttled
+                | SyncTaskState::NoAccess
                 | SyncTaskState::Failed
         ) {
             self.drive_link_watchdog();
@@ -1240,6 +1261,7 @@ impl PropagationSyncTask {
             SyncTaskState::Complete
             | SyncTaskState::NoPath
             | SyncTaskState::Throttled
+            | SyncTaskState::NoAccess
             | SyncTaskState::Failed => {
                 if self.terminal_result.is_none()
                     && let Some(peer_hash) = self.node_dest_hash
@@ -1251,6 +1273,7 @@ impl PropagationSyncTask {
                             SyncTaskState::Complete => PeerSyncTerminalState::Complete,
                             SyncTaskState::NoPath => PeerSyncTerminalState::NoPath,
                             SyncTaskState::Throttled => PeerSyncTerminalState::Throttled,
+                            SyncTaskState::NoAccess => PeerSyncTerminalState::NoAccess,
                             _ => PeerSyncTerminalState::Failed,
                         },
                         offer_generation: complete
@@ -3305,29 +3328,38 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_offer_response_error() {
-        let (tx, _rx) = mpsc::channel(16);
-        let mut task = test_task(tx, [0xAA; 16]);
-        task.set_node([0xBB; 16]);
-        task.state = SyncTaskState::AwaitingResponse;
-
-        task.handle_offer_response(OfferResponse::ErrorNoAccess);
-        assert_eq!(task.state, SyncTaskState::Failed);
-    }
-
-    #[test]
-    fn throttled_offer_response_ends_sync_as_throttled() {
-        let (tx, _rx) = mpsc::channel(16);
-        let mut task = test_task(tx, [0xAA; 16]);
-        task.set_node([0xBB; 16]);
-        task.state = SyncTaskState::AwaitingResponse;
-
-        task.handle_offer_response(OfferResponse::ErrorThrottled);
-        task.tick();
-        assert_eq!(
-            task.take_terminal_peer_result().unwrap().state,
-            PeerSyncTerminalState::Throttled
-        );
+    fn offer_error_responses_reach_the_peer_as_distinct_outcomes() {
+        for (response, expected) in [
+            (
+                OfferResponse::ErrorThrottled,
+                PeerSyncTerminalState::Throttled,
+            ),
+            (
+                OfferResponse::ErrorNoAccess,
+                PeerSyncTerminalState::NoAccess,
+            ),
+            (
+                OfferResponse::ErrorInvalidKey,
+                PeerSyncTerminalState::Failed,
+            ),
+            // Without a live link there is nothing to identify on.
+            (
+                OfferResponse::ErrorNoIdentity,
+                PeerSyncTerminalState::Failed,
+            ),
+        ] {
+            let (tx, _rx) = mpsc::channel(16);
+            let mut task = test_task(tx, [0xAA; 16]);
+            task.set_node([0xBB; 16]);
+            task.state = SyncTaskState::AwaitingResponse;
+            task.handle_offer_response(response.clone());
+            task.tick();
+            assert_eq!(
+                task.take_terminal_peer_result().map(|r| r.state),
+                Some(expected),
+                "{response:?}"
+            );
+        }
     }
 
     #[test]
@@ -3727,6 +3759,29 @@ mod tests {
                 rns_wire::context::PacketContext::Request,
             ]
         );
+
+        // ERROR_NO_IDENTITY: identify again and resend the offer, once per attempt.
+        task.state = SyncTaskState::AwaitingResponse;
+        task.handle_offer_response(OfferResponse::ErrorNoIdentity);
+        assert_eq!(task.state, SyncTaskState::Offering);
+        task.send_offer_request();
+        let mut contexts = Vec::new();
+        while let Ok(message) = rx.try_recv() {
+            if let TransportMessage::SendLinkEndpoint { request, .. } = message {
+                let (header, _) = rns_wire::header::PacketHeader::unpack(&request.raw).unwrap();
+                contexts.push(header.context);
+            }
+        }
+        assert_eq!(
+            contexts,
+            vec![
+                rns_wire::context::PacketContext::LinkIdentify,
+                rns_wire::context::PacketContext::Request,
+            ]
+        );
+        task.state = SyncTaskState::AwaitingResponse;
+        task.handle_offer_response(OfferResponse::ErrorNoIdentity);
+        assert_eq!(task.state, SyncTaskState::Failed);
     }
 
     #[test]

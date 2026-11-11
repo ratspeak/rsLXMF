@@ -182,7 +182,7 @@ fn purge_cannot_report_success_when_its_durable_intent_cannot_be_published() {
     assert!(!reopened.contains(&tid));
 }
 #[test]
-fn purge_is_durable_before_success_and_old_plan_cannot_delete_readmission() {
+fn purge_is_durable_and_purged_message_is_not_readmitted() {
     let dir = tempfile::tempdir().unwrap();
     let old = dir.path().join("store");
     let destination = [2; 16];
@@ -199,19 +199,17 @@ fn purge_is_durable_before_success_and_old_plan_cannot_delete_readmission() {
     assert_eq!(purge.into_response(), encode(&Value::Array(vec![])));
     assert!(!node.contains(&tid));
     assert!(!old_path.exists());
-    let replacement = reserve(&mut node, bytes.clone());
-    assert!(node.commit_store_write(replacement.persist().unwrap()));
-    let new_path = node.plan_message_reads(&[tid]).pop().unwrap().path;
-    assert_ne!(old_path, new_path);
-    // The old plan fails or sees an already completed retirement; it cannot
-    // gain authority over the distinct new admission path.
+    // A purged message stays processed and is filtered on re-upload.
+    assert!(matches!(
+        node.plan_opaque_admission(validated(bytes.clone())),
+        PropagationAdmission::AlreadyProcessed
+    ));
     let _ = stale.into_response();
-    assert!(node.contains(&tid));
-    assert_eq!(std::fs::read(&new_path).unwrap(), bytes);
+    assert!(!node.contains(&tid));
     drop(node);
     let reopened =
         PropagationNode::with_storage(PropagationNodeConfig::default(), [1; 16], old).unwrap();
-    assert!(reopened.contains(&tid));
+    assert!(!reopened.contains(&tid));
 }
 #[test]
 fn foreign_purge_has_no_effect_and_maintenance_publishes_retirement_off_lock() {

@@ -69,6 +69,15 @@ pub async fn query_control(
         .await
 }
 
+/// lxmd limits are integers by default and `as_float` values when configured.
+fn kilobytes_value(kilobytes: f64) -> Value {
+    if kilobytes.fract() == 0.0 && kilobytes.abs() < i64::MAX as f64 {
+        Value::from(kilobytes as i64)
+    } else {
+        Value::F64(kilobytes)
+    }
+}
+
 /// Python adds the timeout to `time.time()`: a negative one has already
 /// expired, and an infinite or NaN one never does.
 fn control_deadline(timeout_secs: f64) -> Duration {
@@ -313,11 +322,11 @@ pub fn encode_router_control_stats(
         ),
         (
             Value::String("propagation_limit".into()),
-            Value::from(router.config.propagation_limit_kb as u64),
+            kilobytes_value(router.config.propagation_limit_kb),
         ),
         (
             Value::String("sync_limit".into()),
-            Value::from(router.config.sync_limit_kb as u64),
+            kilobytes_value(router.config.sync_limit_kb),
         ),
         (
             Value::String("target_stamp_cost".into()),
