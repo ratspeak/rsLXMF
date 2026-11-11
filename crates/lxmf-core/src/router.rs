@@ -108,6 +108,8 @@ pub struct RouterConfigExt {
     /// Name advertised in propagation announce metadata.
     pub name: Option<String>,
     pub from_static_only: bool,
+    /// Seconds a peer stays throttled after sending invalid propagation stamps.
+    pub pn_stamp_throttle: f64,
 }
 
 impl Default for RouterConfigExt {
@@ -125,6 +127,7 @@ impl Default for RouterConfigExt {
             message_storage_limit: None,
             name: None,
             from_static_only: false,
+            pn_stamp_throttle: PN_STAMP_THROTTLE as f64,
         }
     }
 }
@@ -1298,8 +1301,10 @@ impl LxmRouter {
     /// receipt. Records both message and transient IDs; learns a ticket only from
     /// a matching verified message with a committed/duplicate disposition.
     /// Returns whether the new-commit delivery path ran; `false` also covers
-    /// duplicates, discards and mismatched reservations. The caller establishes
-    /// identity/node scope and durable effects before invoking this method.
+    /// duplicates, discards, ignored sources and mismatched reservations. An
+    /// ignored source records only the transient ID, not the message ID. The
+    /// caller establishes identity/node scope and durable effects before
+    /// invoking this method.
     pub fn commit_inbound(
         &mut self,
         reservation: InboundReservation,
@@ -1325,6 +1330,10 @@ impl LxmRouter {
         }
         self.claim_locally_delivered(receipt.record().scope.transient_id);
         self.claim_locally_processed(receipt.record().scope.transient_id);
+        // Python lxmf_delivery drops ignored sources before claiming the message id.
+        if self.is_ignored(&message.source_hash()) {
+            return false;
+        }
         let new_message = !self
             .propagation_store
             .is_locally_delivered(&message.message_id());
@@ -1902,10 +1911,10 @@ impl LxmRouter {
         }
     }
 
-    /// Throttle a peer for [`PN_STAMP_THROTTLE`] seconds.
+    /// Throttle a peer for the configured `pn_stamp_throttle` seconds.
     pub fn throttle_peer(&mut self, peer_hash: [u8; 16]) {
         self.throttled_peers
-            .insert(peer_hash, now_f64() + PN_STAMP_THROTTLE as f64);
+            .insert(peer_hash, now_f64() + self.config.ext.pn_stamp_throttle);
     }
 
     /// Drop idle, non-static peers with the lowest acceptance rates.
@@ -3513,6 +3522,65 @@ mod tests {
         let mut direct = message.clone();
         direct.method = DeliveryMethod::Direct;
         assert!(!router.deliver_inbound(&direct, false));
+    }
+
+    #[test]
+    fn propagated_message_from_ignored_source_records_only_its_transient_id() {
+        use crate::admission::{
+            AdmissionRecord, AdmissionScope, DurableAdmissionReceipt, DurableDisposition,
+        };
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mut router = LxmRouter::new(RouterConfig::default());
+        let deliveries = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&deliveries);
+        router.register_delivery_callback(move |_| {
+            observed.fetch_add(1, Ordering::Relaxed);
+        });
+        let message = crate::message::test_message(
+            [0xAA; 16],
+            [0xBB; 16],
+            "ignored",
+            "message",
+            DeliveryMethod::Propagated,
+        );
+        router.ignore_destination([0xBB; 16]);
+        let temp = tempfile::tempdir().unwrap();
+        let store = crate::admission_store::FileAdmissionStore::open(
+            temp.path(),
+            &temp.path().join("messages"),
+        )
+        .unwrap();
+        let tid = [0x45; 32];
+        let record = AdmissionRecord {
+            scope: AdmissionScope {
+                identity: [1; 16],
+                node: [2; 16],
+                transient_id: tid,
+            },
+            message_id: message.message_id(),
+            received_wire_hash: rns_crypto::sha::full_hash(message.wire_bytes()),
+            stored_message_wire_hash: None,
+            disposition: DurableDisposition::Committed,
+            committed_at: 100,
+        };
+        let reservation = router.reserve_inbound(&message).unwrap();
+        let receipt =
+            DurableAdmissionReceipt::commit(store.prepare(record, message.wire_owned(), false))
+                .unwrap();
+
+        assert!(!router.commit_inbound(reservation, &message, &receipt, None));
+        assert_eq!(deliveries.load(Ordering::Relaxed), 0);
+        assert!(router.has_message(&tid));
+        assert!(router.propagation_store.is_locally_processed(&tid));
+        assert!(!router.has_message(&message.message_id()));
+
+        router.unignore_destination(&[0xBB; 16]);
+        let mut direct = message.clone();
+        direct.method = DeliveryMethod::Direct;
+        assert!(router.deliver_inbound(&direct, false));
+        assert_eq!(deliveries.load(Ordering::Relaxed), 1);
     }
 
     #[test]

@@ -3854,6 +3854,12 @@ impl LxmdRunner {
                     peer.state = lxmf_core::constants::PeerState::Idle;
                     peer.alive = false;
                 }
+                lxmf_core::propagation_sync::PeerSyncTerminalState::Throttled => {
+                    // LXMPeer.offer_response postpones by the class constant, not the configured throttle.
+                    peer.state = lxmf_core::constants::PeerState::Idle;
+                    peer.currently_transferring_messages = None;
+                    peer.next_sync_attempt = now + lxmf_core::constants::PN_STAMP_THROTTLE as f64;
+                }
                 lxmf_core::propagation_sync::PeerSyncTerminalState::Failed => {
                     peer.sync_failed();
                 }

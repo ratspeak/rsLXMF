@@ -1187,6 +1187,7 @@ mod tests {
                 static_sequential: false,
                 max_inbound_syncs: 1,
                 from_static_only: true,
+                ..PnInboundAdmissionConfig::default()
             },
             [peer_destination],
             100,
@@ -1200,6 +1201,7 @@ mod tests {
                 static_sequential: true,
                 max_inbound_syncs: 1,
                 from_static_only: true,
+                ..PnInboundAdmissionConfig::default()
             },
             [peer_destination],
             100,

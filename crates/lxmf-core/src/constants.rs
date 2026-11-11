@@ -203,7 +203,7 @@ pub const PROPAGATION_COST_FLEX: f64 = 3.0;
 pub const PEERING_COST: f64 = 18.0;
 pub const MAX_PEERING_COST: f64 = 26.0;
 pub const MAX_PEERS: usize = 20;
-pub const PN_STAMP_THROTTLE: u64 = 180;
+pub const PN_STAMP_THROTTLE: u64 = 300;
 
 pub const AUTOPEER: bool = true;
 pub const AUTOPEER_MAXDEPTH: usize = 4;

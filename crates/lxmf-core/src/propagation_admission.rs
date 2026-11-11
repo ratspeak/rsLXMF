@@ -46,6 +46,8 @@ pub struct PnInboundAdmissionConfig {
     pub max_inbound_syncs: usize,
     /// Accept propagation offers only from configured static peers.
     pub from_static_only: bool,
+    /// Throttle installed after a known peer submits invalid stamps.
+    pub invalid_stamp_throttle: Duration,
 }
 
 impl Default for PnInboundAdmissionConfig {
@@ -55,6 +57,7 @@ impl Default for PnInboundAdmissionConfig {
             static_sequential: false,
             max_inbound_syncs: PN_DEFAULT_MAX_INBOUND_SYNCS,
             from_static_only: false,
+            invalid_stamp_throttle: PN_INVALID_STAMP_THROTTLE,
         }
     }
 }
@@ -535,7 +538,7 @@ impl PnInboundAdmission {
             return Err(PnThrottleInstallError::UnknownPeerDestination);
         }
 
-        let requested_deadline = now.saturating_add(PN_INVALID_STAMP_THROTTLE);
+        let requested_deadline = now.saturating_add(self.config.invalid_stamp_throttle);
         let deadline = self
             .throttle_deadlines
             .entry(peer_destination_hash)
@@ -684,9 +687,9 @@ mod tests {
                 static_sequential: false,
                 max_inbound_syncs: 3,
                 from_static_only: false,
+                invalid_stamp_throttle: Duration::from_secs(300),
             }
         );
-        assert_eq!(PN_INVALID_STAMP_THROTTLE, Duration::from_secs(180));
 
         let floored = PnInboundAdmission::new(PnInboundAdmissionConfig {
             max_inbound_syncs: 0,
@@ -1469,15 +1472,15 @@ mod tests {
         );
         assert_eq!(
             admission.throttle_deadline(&bad_destination, Duration::from_secs(100)),
-            Some(Duration::from_secs(280))
+            Some(Duration::from_secs(400))
         );
         assert!(matches!(
-            admission.preflight_offer(link(4), Some(bad_identity), Duration::from_millis(279_999),),
+            admission.preflight_offer(link(4), Some(bad_identity), Duration::from_millis(399_999),),
             Err(PnOfferRejection::InvalidStampThrottle)
         ));
 
         // No global or zero-key throttle is created for unrelated peers.
-        let unrelated_now = Duration::from_millis(279_999);
+        let unrelated_now = Duration::from_millis(399_999);
         let unrelated = admission
             .preflight_offer(link(5), Some(identity(5)), unrelated_now)
             .unwrap();
@@ -1487,7 +1490,7 @@ mod tests {
         );
         assert!(!admission.is_peer_throttled(&[0; 16], unrelated_now));
 
-        let deadline = Duration::from_secs(280);
+        let deadline = Duration::from_secs(400);
         let expired = admission
             .preflight_offer(link(6), Some(bad_identity), deadline)
             .unwrap();
@@ -1496,6 +1499,23 @@ mod tests {
             PnOfferAdmission::HaveAll
         );
         assert_eq!(admission.throttle_count(), 0);
+    }
+
+    #[test]
+    fn invalid_stamp_throttle_lasts_the_configured_time() {
+        let throttle = Duration::from_secs(600);
+        let mut admission = PnInboundAdmission::new(PnInboundAdmissionConfig {
+            invalid_stamp_throttle: throttle,
+            ..PnInboundAdmissionConfig::default()
+        });
+        let bad_identity = identity(0xA3);
+        let bad_destination = PnInboundAdmission::peer_destination_hash(&bad_identity);
+        let deadline = admission
+            .install_invalid_stamp_throttle(bad_destination, TEST_NOW)
+            .unwrap();
+        assert_eq!(deadline, TEST_NOW + throttle);
+        assert!(admission.is_peer_throttled(&bad_destination, deadline - Duration::from_secs(1)));
+        assert!(!admission.is_peer_throttled(&bad_destination, deadline));
     }
 
     #[test]

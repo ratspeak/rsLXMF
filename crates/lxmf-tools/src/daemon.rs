@@ -38,6 +38,8 @@ pub struct PythonLxmdConfig {
     pub propagation_stamp_cost_flexibility: f64,
     pub peering_cost: f64,
     pub remote_peering_cost_max: f64,
+    /// Seconds, floored at `PN_STAMP_THROTTLE` as Python does.
+    pub propagation_stamp_throttle: f64,
     pub prioritised_lxmf_destinations: Vec<String>,
     pub control_allowed_identities: Vec<String>,
     pub static_peers: Vec<String>,
@@ -196,8 +198,11 @@ impl PythonLxmdConfig {
             MAX_PEERING_COST,
         )?;
 
-        // Parsed so a malformed value aborts as in Python; the throttle time itself is fixed.
-        get_cost(propagation, "propagation", "propagation_stamp_throttle")?;
+        let propagation_stamp_throttle =
+            get_cost(propagation, "propagation", "propagation_stamp_throttle")?
+                .map_or(PN_STAMP_THROTTLE as f64, |minutes| {
+                    (minutes * 60.0).max(PN_STAMP_THROTTLE as f64)
+                });
         let static_peers = get_list(propagation, "static_peers");
         for peer in &static_peers {
             parse_static_peer(peer)?;
@@ -275,6 +280,7 @@ impl PythonLxmdConfig {
             propagation_stamp_cost_flexibility,
             peering_cost,
             remote_peering_cost_max,
+            propagation_stamp_throttle,
             prioritised_lxmf_destinations: get_list(propagation, "prioritise_destinations"),
             control_allowed_identities: get_list(propagation, "control_allowed"),
             static_peers,
@@ -427,6 +433,8 @@ pub struct DaemonConfig {
     pub enforce_stamps: bool,
     pub message_storage_limit: Option<usize>,
     pub from_static_only: bool,
+    /// Invalid-stamp peer throttle in seconds (`propagation_stamp_throttle`).
+    pub pn_stamp_throttle: f64,
     /// Max accepted inbound delivery transfer size in decimal KB. Python reference:
     /// `delivery_transfer_max_accepted_size` in `lxmd.py`.
     pub delivery_transfer_max_accepted_size: f64,
@@ -464,6 +472,7 @@ impl Default for DaemonConfig {
             enforce_stamps: false,
             message_storage_limit: Some(500_000_000),
             from_static_only: false,
+            pn_stamp_throttle: PN_STAMP_THROTTLE as f64,
             // Current Python LXMF 1.1.0's standalone lxmd defaults
             // direct-delivery Resource admission to 1 decimal KB when the
             // setting is omitted. LXMRouter's library default is separate.
@@ -492,6 +501,7 @@ impl DaemonConfig {
                 message_storage_limit: self.message_storage_limit,
                 name: self.node_name.clone(),
                 from_static_only: self.from_static_only,
+                pn_stamp_throttle: self.pn_stamp_throttle,
                 ..Default::default()
             },
         }
@@ -509,6 +519,8 @@ impl DaemonConfig {
             static_sequential: !self.static_peers_bypass_sequential,
             max_inbound_syncs: self.max_inbound_syncs,
             from_static_only: self.from_static_only,
+            invalid_stamp_throttle: std::time::Duration::try_from_secs_f64(self.pn_stamp_throttle)
+                .unwrap_or(std::time::Duration::MAX),
         }
     }
 
@@ -550,6 +562,7 @@ impl DaemonConfig {
             prioritise_destinations: py.prioritised_lxmf_destinations,
             message_storage_limit: megabytes_to_bytes(py.message_storage_limit),
             from_static_only: py.from_static_only,
+            pn_stamp_throttle: py.propagation_stamp_throttle,
             delivery_transfer_max_accepted_size: py.delivery_transfer_max_accepted_size,
             ..DaemonConfig::default()
         };
@@ -1081,6 +1094,7 @@ from_static_only = yes
                 static_sequential: true,
                 max_inbound_syncs: 5,
                 from_static_only: true,
+                invalid_stamp_throttle: std::time::Duration::from_secs(300),
             }
         );
         assert_eq!(dc.static_peers, ["00112233445566778899aabbccddeeff"]);

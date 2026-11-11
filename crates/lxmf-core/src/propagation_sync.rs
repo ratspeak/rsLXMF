@@ -55,6 +55,8 @@ pub enum SyncTaskState {
     Complete,
     /// No path to the peer arrived within the path request grace.
     NoPath,
+    /// The peer answered the offer with `ERROR_THROTTLED`.
+    Throttled,
     Failed,
 }
 
@@ -63,6 +65,8 @@ pub enum PeerSyncTerminalState {
     Complete,
     /// The path request was not answered; no link was attempted.
     NoPath,
+    /// The peer answered the offer with `ERROR_THROTTLED`.
+    Throttled,
     Failed,
 }
 
@@ -1106,6 +1110,7 @@ impl PropagationSyncTask {
                 self.record_handled_updates(&already_handled);
                 self.prepare_transfer_for_ids(&wanted_ids);
             }
+            OfferResponse::ErrorThrottled => self.state = SyncTaskState::Throttled,
             _ => {
                 self.state = SyncTaskState::Failed;
             }
@@ -1189,7 +1194,10 @@ impl PropagationSyncTask {
         if !self.pending_transport.is_empty()
             && !matches!(
                 self.state,
-                SyncTaskState::Complete | SyncTaskState::NoPath | SyncTaskState::Failed
+                SyncTaskState::Complete
+                    | SyncTaskState::NoPath
+                    | SyncTaskState::Throttled
+                    | SyncTaskState::Failed
             )
         {
             return;
@@ -1201,6 +1209,7 @@ impl PropagationSyncTask {
                 | SyncTaskState::PathRequested
                 | SyncTaskState::Complete
                 | SyncTaskState::NoPath
+                | SyncTaskState::Throttled
                 | SyncTaskState::Failed
         ) {
             self.drive_link_watchdog();
@@ -1228,7 +1237,10 @@ impl PropagationSyncTask {
             SyncTaskState::Transferring => {
                 self.drive_transfers();
             }
-            SyncTaskState::Complete | SyncTaskState::NoPath | SyncTaskState::Failed => {
+            SyncTaskState::Complete
+            | SyncTaskState::NoPath
+            | SyncTaskState::Throttled
+            | SyncTaskState::Failed => {
                 if self.terminal_result.is_none()
                     && let Some(peer_hash) = self.node_dest_hash
                 {
@@ -1238,6 +1250,7 @@ impl PropagationSyncTask {
                         state: match self.state {
                             SyncTaskState::Complete => PeerSyncTerminalState::Complete,
                             SyncTaskState::NoPath => PeerSyncTerminalState::NoPath,
+                            SyncTaskState::Throttled => PeerSyncTerminalState::Throttled,
                             _ => PeerSyncTerminalState::Failed,
                         },
                         offer_generation: complete
@@ -3285,6 +3298,21 @@ mod tests {
 
         task.handle_offer_response(OfferResponse::ErrorNoAccess);
         assert_eq!(task.state, SyncTaskState::Failed);
+    }
+
+    #[test]
+    fn throttled_offer_response_ends_sync_as_throttled() {
+        let (tx, _rx) = mpsc::channel(16);
+        let mut task = test_task(tx, [0xAA; 16]);
+        task.set_node([0xBB; 16]);
+        task.state = SyncTaskState::AwaitingResponse;
+
+        task.handle_offer_response(OfferResponse::ErrorThrottled);
+        task.tick();
+        assert_eq!(
+            task.take_terminal_peer_result().unwrap().state,
+            PeerSyncTerminalState::Throttled
+        );
     }
 
     #[test]
