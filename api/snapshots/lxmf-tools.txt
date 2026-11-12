@@ -1,5 +1,25 @@
 pub mod lxmf_tools
 pub mod lxmf_tools::daemon
+pub use lxmf_tools::daemon::PnLimit
+pub enum lxmf_tools::daemon::DaemonConfigError
+pub lxmf_tools::daemon::DaemonConfigError::CostOutOfRange
+pub lxmf_tools::daemon::DaemonConfigError::CostOutOfRange::key: &'static str
+pub lxmf_tools::daemon::DaemonConfigError::CostOutOfRange::section: &'static str
+pub lxmf_tools::daemon::DaemonConfigError::CostOutOfRange::value: f64
+pub lxmf_tools::daemon::DaemonConfigError::InvalidStaticPeer(alloc::string::String)
+pub lxmf_tools::daemon::DaemonConfigError::NegativeMaxPeers(i64)
+pub lxmf_tools::daemon::DaemonConfigError::NotABoolean
+pub lxmf_tools::daemon::DaemonConfigError::NotABoolean::key: &'static str
+pub lxmf_tools::daemon::DaemonConfigError::NotABoolean::section: &'static str
+pub lxmf_tools::daemon::DaemonConfigError::NotABoolean::value: alloc::string::String
+pub lxmf_tools::daemon::DaemonConfigError::NotANumber
+pub lxmf_tools::daemon::DaemonConfigError::NotANumber::key: &'static str
+pub lxmf_tools::daemon::DaemonConfigError::NotANumber::section: &'static str
+pub lxmf_tools::daemon::DaemonConfigError::NotANumber::value: alloc::string::String
+pub lxmf_tools::daemon::DaemonConfigError::NotAnInteger
+pub lxmf_tools::daemon::DaemonConfigError::NotAnInteger::key: &'static str
+pub lxmf_tools::daemon::DaemonConfigError::NotAnInteger::section: &'static str
+pub lxmf_tools::daemon::DaemonConfigError::NotAnInteger::value: alloc::string::String
 pub struct lxmf_tools::daemon::DaemonConfig
 pub lxmf_tools::daemon::DaemonConfig::announce_at_start: bool
 pub lxmf_tools::daemon::DaemonConfig::announce_interval: core::option::Option<u64>
@@ -12,7 +32,7 @@ pub lxmf_tools::daemon::DaemonConfig::display_name: core::option::Option<alloc::
 pub lxmf_tools::daemon::DaemonConfig::enforce_stamps: bool
 pub lxmf_tools::daemon::DaemonConfig::from_static_only: bool
 pub lxmf_tools::daemon::DaemonConfig::max_inbound_syncs: usize
-pub lxmf_tools::daemon::DaemonConfig::max_peering_cost: u8
+pub lxmf_tools::daemon::DaemonConfig::max_peering_cost: f64
 pub lxmf_tools::daemon::DaemonConfig::max_peers: usize
 pub lxmf_tools::daemon::DaemonConfig::message_storage_limit: core::option::Option<usize>
 pub lxmf_tools::daemon::DaemonConfig::node_announce_at_start: bool
@@ -20,19 +40,21 @@ pub lxmf_tools::daemon::DaemonConfig::node_announce_interval: core::option::Opti
 pub lxmf_tools::daemon::DaemonConfig::node_name: core::option::Option<alloc::string::String>
 pub lxmf_tools::daemon::DaemonConfig::on_inbound_command: core::option::Option<alloc::string::String>
 pub lxmf_tools::daemon::DaemonConfig::outbound_propagation_node: core::option::Option<alloc::string::String>
-pub lxmf_tools::daemon::DaemonConfig::peering_cost: u8
+pub lxmf_tools::daemon::DaemonConfig::peering_cost: f64
+pub lxmf_tools::daemon::DaemonConfig::pn_stamp_throttle: f64
 pub lxmf_tools::daemon::DaemonConfig::prioritise_destinations: alloc::vec::Vec<alloc::string::String>
 pub lxmf_tools::daemon::DaemonConfig::propagation_enabled: bool
-pub lxmf_tools::daemon::DaemonConfig::propagation_limit_kb: usize
-pub lxmf_tools::daemon::DaemonConfig::propagation_stamp_cost: u8
-pub lxmf_tools::daemon::DaemonConfig::propagation_stamp_flex: u8
+pub lxmf_tools::daemon::DaemonConfig::propagation_limit_kb: lxmf_core::handlers::PnLimit
+pub lxmf_tools::daemon::DaemonConfig::propagation_stamp_cost: f64
+pub lxmf_tools::daemon::DaemonConfig::propagation_stamp_flex: f64
 pub lxmf_tools::daemon::DaemonConfig::sequential_pn_stamp_validation: bool
-pub lxmf_tools::daemon::DaemonConfig::stamp_cost: core::option::Option<u8>
+pub lxmf_tools::daemon::DaemonConfig::stamp_cost: core::option::Option<f64>
 pub lxmf_tools::daemon::DaemonConfig::static_peers: alloc::vec::Vec<alloc::string::String>
 pub lxmf_tools::daemon::DaemonConfig::static_peers_bypass_sequential: bool
-pub lxmf_tools::daemon::DaemonConfig::sync_limit_kb: usize
+pub lxmf_tools::daemon::DaemonConfig::sync_limit_kb: lxmf_core::handlers::PnLimit
 impl lxmf_tools::daemon::DaemonConfig
-pub fn lxmf_tools::daemon::DaemonConfig::from_config(&rns_runtime::config::Config) -> Self
+pub fn lxmf_tools::daemon::DaemonConfig::from_config(&rns_runtime::config::Config) -> core::result::Result<Self, lxmf_tools::daemon::DaemonConfigError>
+pub fn lxmf_tools::daemon::DaemonConfig::min_accepted_stamp_cost(&self) -> f64
 pub fn lxmf_tools::daemon::DaemonConfig::to_inbound_admission_config(&self) -> lxmf_core::propagation_admission::PnInboundAdmissionConfig
 pub fn lxmf_tools::daemon::DaemonConfig::to_router_config(&self) -> lxmf_core::router::RouterConfig
 impl core::default::Default for lxmf_tools::daemon::DaemonConfig
@@ -55,20 +77,21 @@ pub lxmf_tools::daemon::PythonLxmdConfig::node_name: core::option::Option<alloc:
 pub lxmf_tools::daemon::PythonLxmdConfig::on_inbound: core::option::Option<alloc::string::String>
 pub lxmf_tools::daemon::PythonLxmdConfig::peer_announce_at_start: bool
 pub lxmf_tools::daemon::PythonLxmdConfig::peer_announce_interval: core::option::Option<i64>
-pub lxmf_tools::daemon::PythonLxmdConfig::peer_stamp_cost: i64
-pub lxmf_tools::daemon::PythonLxmdConfig::peering_cost: i64
+pub lxmf_tools::daemon::PythonLxmdConfig::peer_stamp_cost: f64
+pub lxmf_tools::daemon::PythonLxmdConfig::peering_cost: f64
 pub lxmf_tools::daemon::PythonLxmdConfig::prioritised_lxmf_destinations: alloc::vec::Vec<alloc::string::String>
-pub lxmf_tools::daemon::PythonLxmdConfig::propagation_stamp_cost_flexibility: i64
-pub lxmf_tools::daemon::PythonLxmdConfig::propagation_stamp_cost_target: i64
-pub lxmf_tools::daemon::PythonLxmdConfig::propagation_sync_max_accepted_size: f64
-pub lxmf_tools::daemon::PythonLxmdConfig::propagation_transfer_max_accepted_size: f64
-pub lxmf_tools::daemon::PythonLxmdConfig::remote_peering_cost_max: i64
+pub lxmf_tools::daemon::PythonLxmdConfig::propagation_stamp_cost_flexibility: f64
+pub lxmf_tools::daemon::PythonLxmdConfig::propagation_stamp_cost_target: f64
+pub lxmf_tools::daemon::PythonLxmdConfig::propagation_stamp_throttle: f64
+pub lxmf_tools::daemon::PythonLxmdConfig::propagation_sync_max_accepted_size: lxmf_core::handlers::PnLimit
+pub lxmf_tools::daemon::PythonLxmdConfig::propagation_transfer_max_accepted_size: lxmf_core::handlers::PnLimit
+pub lxmf_tools::daemon::PythonLxmdConfig::remote_peering_cost_max: f64
 pub lxmf_tools::daemon::PythonLxmdConfig::sequential_pn_stamp_validation: bool
 pub lxmf_tools::daemon::PythonLxmdConfig::static_peers: alloc::vec::Vec<alloc::string::String>
 pub lxmf_tools::daemon::PythonLxmdConfig::static_peers_bypass_sequential: bool
 pub lxmf_tools::daemon::PythonLxmdConfig::target_loglevel: core::option::Option<i64>
 impl lxmf_tools::daemon::PythonLxmdConfig
-pub fn lxmf_tools::daemon::PythonLxmdConfig::from_config(&rns_runtime::config::Config) -> Self
+pub fn lxmf_tools::daemon::PythonLxmdConfig::from_config(&rns_runtime::config::Config) -> core::result::Result<Self, lxmf_tools::daemon::DaemonConfigError>
 pub fn lxmf_tools::daemon::create_router(&lxmf_tools::daemon::DaemonConfig) -> lxmf_core::router::LxmRouter
 pub fn lxmf_tools::daemon::create_router_with_transport(&lxmf_tools::daemon::DaemonConfig, tokio::sync::mpsc::bounded::Sender<rns_transport::messages::TransportMessage>) -> lxmf_core::router::LxmRouter
 pub fn lxmf_tools::daemon::execute_on_inbound(&str, &str) -> core::io::error::Result<()>
@@ -106,6 +129,7 @@ pub lxmf_tools::lxmd_cli::Args::sync: core::option::Option<alloc::string::String
 pub lxmf_tools::lxmd_cli::Args::timeout: core::option::Option<f64>
 pub lxmf_tools::lxmd_cli::Args::unpeer: core::option::Option<alloc::string::String>
 pub lxmf_tools::lxmd_cli::Args::verbose: u8
+pub fn lxmf_tools::lxmd_cli::default_config_file_text() -> alloc::string::String
 pub fn lxmf_tools::lxmd_cli::example_config() -> &'static str
 pub fn lxmf_tools::lxmd_cli::load_hash_list(&std::path::Path) -> alloc::vec::Vec<[u8; 16]>
 pub fn lxmf_tools::lxmd_cli::normalize_hash_hex(&str) -> alloc::string::String
@@ -127,9 +151,8 @@ pub const lxmf_tools::lxmd_control::CONTROL_APP_NAME: &str
 pub const lxmf_tools::lxmd_control::PROPAGATION_APP_NAME: &str
 pub fn lxmf_tools::lxmd_control::decode_control_response(&[u8]) -> lxmf_tools::lxmd_control::ControlResponse
 pub fn lxmf_tools::lxmd_control::encode_control_success() -> alloc::vec::Vec<u8>
-pub fn lxmf_tools::lxmd_control::encode_nil_response() -> alloc::vec::Vec<u8>
 pub fn lxmf_tools::lxmd_control::encode_peer_error(lxmf_core::constants::PeerError) -> alloc::vec::Vec<u8>
-pub fn lxmf_tools::lxmd_control::encode_router_control_stats(&lxmf_core::router::LxmRouter, [u8; 16], [u8; 16], core::option::Option<&lxmf_core::propagation_node::PropagationNode>, f64) -> alloc::vec::Vec<u8>
+pub fn lxmf_tools::lxmd_control::encode_router_control_stats(&lxmf_core::router::LxmRouter, [u8; 16], [u8; 16], core::option::Option<&lxmf_core::propagation_node::PropagationNode>, f64, impl core::ops::function::Fn(&[u8; 16]) -> u8) -> alloc::vec::Vec<u8>
 pub fn lxmf_tools::lxmd_control::exit_for_control_response(lxmf_tools::lxmd_control::ControlCommandKind, &lxmf_tools::lxmd_control::ControlResponse) -> bool
 pub fn lxmf_tools::lxmd_control::format_remote_status(&rmpv::Value, bool, bool, f64) -> alloc::string::String
 pub fn lxmf_tools::lxmd_control::peer_error_from_code(u8) -> core::option::Option<lxmf_core::constants::PeerError>
@@ -182,7 +205,7 @@ pub lxmf_tools::lxmd_runtime::LxmdPaths::storage_dir: std::path::PathBuf
 impl lxmf_tools::lxmd_runtime::LxmdPaths
 pub fn lxmf_tools::lxmd_runtime::LxmdPaths::new(impl core::convert::Into<std::path::PathBuf>) -> Self
 pub fn lxmf_tools::lxmd_runtime::LxmdPaths::preferred_identity_path(&self) -> &std::path::Path
-pub fn lxmf_tools::lxmd_runtime::delivery_announce_app_data(core::option::Option<&str>, core::option::Option<u8>) -> alloc::vec::Vec<u8>
+pub fn lxmf_tools::lxmd_runtime::delivery_announce_app_data(core::option::Option<&str>, core::option::Option<f64>) -> alloc::vec::Vec<u8>
 pub fn lxmf_tools::lxmd_runtime::format_local_peers(&[lxmf_tools::lxmd_runtime::LocalPeerView]) -> alloc::string::String
 pub fn lxmf_tools::lxmd_runtime::format_local_status(&lxmf_tools::lxmd_runtime::LocalStatusView) -> alloc::string::String
 pub fn lxmf_tools::lxmd_runtime::preflight_control_command(&std::path::Path, core::option::Option<&std::path::Path>, core::option::Option<&str>, core::option::Option<&str>) -> core::result::Result<lxmf_tools::lxmd_runtime::ControlPreflight, lxmf_tools::lxmd_runtime::ControlPreflightError>

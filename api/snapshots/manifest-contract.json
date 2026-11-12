@@ -226,6 +226,17 @@
           "sourceKind": "registry"
         },
         {
+          "name": "unicode-general-category",
+          "rename": null,
+          "kind": null,
+          "target": null,
+          "requirement": "^0.6",
+          "optional": false,
+          "defaultFeatures": true,
+          "features": [],
+          "sourceKind": "registry"
+        },
+        {
           "name": "unicode-normalization",
           "rename": null,
           "kind": null,
@@ -383,6 +394,17 @@
           "sourceKind": "path"
         },
         {
+          "name": "rns-tools",
+          "rename": null,
+          "kind": null,
+          "target": null,
+          "requirement": "~1.4.0",
+          "optional": false,
+          "defaultFeatures": true,
+          "features": [],
+          "sourceKind": "path"
+        },
+        {
           "name": "rns-transport",
           "rename": null,
           "kind": null,
@@ -416,6 +438,17 @@
           "sourceKind": "registry"
         },
         {
+          "name": "thiserror",
+          "rename": null,
+          "kind": null,
+          "target": null,
+          "requirement": "^2",
+          "optional": false,
+          "defaultFeatures": true,
+          "features": [],
+          "sourceKind": "registry"
+        },
+        {
           "name": "tokio",
           "rename": null,
           "kind": null,
@@ -434,17 +467,6 @@
           "kind": null,
           "target": null,
           "requirement": "^0.1",
-          "optional": false,
-          "defaultFeatures": true,
-          "features": [],
-          "sourceKind": "registry"
-        },
-        {
-          "name": "tracing-subscriber",
-          "rename": null,
-          "kind": null,
-          "target": null,
-          "requirement": "^0.3",
           "optional": false,
           "defaultFeatures": true,
           "features": [],
