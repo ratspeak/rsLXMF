@@ -2361,7 +2361,7 @@ pub(crate) mod tests {
     }
 
     /// T0-1: `/get` ownership gating — a client may only list, download, and
-    /// purge messages addressed to itself (Python LXMRouter.py:1454/1479).
+    /// purge messages addressed to itself (Python LXMRouter.py/1479).
     #[test]
     fn test_get_request_ownership_gating() {
         use rmpv::Value;
@@ -3578,7 +3578,7 @@ pub(crate) mod tests {
     }
 
     /// T2-8b parity: haves are purged before wants resolve (Python
-    /// LXMRouter.py:1451-1462) — an ID in both is purged, not served.
+    /// LXMRouter.py) — an ID in both is purged, not served.
     #[test]
     fn test_get_phase_purges_haves_before_serving_wants() {
         use rmpv::Value;
@@ -3615,7 +3615,7 @@ pub(crate) mod tests {
 
     /// T2-8b parity: transfer limit is kB ×1000 with 24-byte base and 16-byte
     /// per-message overhead, and over-limit entries are skipped rather than
-    /// aborting the serve loop (Python LXMRouter.py:1471-1494).
+    /// aborting the serve loop (Python LXMRouter.py).
     #[test]
     fn test_get_phase_transfer_limit_python_accounting() {
         use rmpv::Value;
@@ -3666,7 +3666,7 @@ pub(crate) mod tests {
     }
 
     /// T2-8b parity: phase-1 listing is sorted smallest message first
-    /// (Python LXMRouter.py:1437-1444).
+    /// (Python LXMRouter.py).
     #[test]
     fn test_get_list_phase_sorted_smallest_first() {
         use rmpv::Value;

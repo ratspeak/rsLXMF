@@ -18,21 +18,21 @@ pub const FIELD_TICKET: u8 = 0x0C;
 pub const FIELD_EVENT: u8 = 0x0D;
 pub const FIELD_RNR_REFS: u8 = 0x0E;
 pub const FIELD_RENDERER: u8 = 0x0F;
-/// Bytes, full `LXMessage` hash. Python reference: LXMF.py:23.
+/// Bytes, full `LXMessage` hash. Python reference: LXMF.py.
 pub const FIELD_REPLY_TO: u8 = 0x30;
-/// Bytes, quoted content in UTF-8 encoding. Python reference: LXMF.py:24.
+/// Bytes, quoted content in UTF-8 encoding. Python reference: LXMF.py.
 pub const FIELD_REPLY_QUOTE: u8 = 0x31;
-/// Dict keyed by [`REACTION_TO`] / [`REACTION_CONTENT`]. Python reference: LXMF.py:25.
+/// Dict keyed by [`REACTION_TO`] / [`REACTION_CONTENT`]. Python reference: LXMF.py.
 pub const FIELD_REACTION: u8 = 0x40;
-/// Dict keyed by [`COMMENT_FOR`]. Python reference: LXMF.py:26.
+/// Dict keyed by [`COMMENT_FOR`]. Python reference: LXMF.py.
 pub const FIELD_COMMENT: u8 = 0x41;
-/// Dict keyed by [`CONTINUATION_OF`]. Python reference: LXMF.py:27.
+/// Dict keyed by [`CONTINUATION_OF`]. Python reference: LXMF.py.
 pub const FIELD_CONTINUATION: u8 = 0x42;
 
 // Unallocated fields between 0x00 and 0x80, both included, should be
 // considered reserved for future extensibility. For experimental and
 // unstable features, it is recommended to use fields above 0xFF.
-// Python reference: LXMF.py:29-32.
+// Python reference: LXMF.py.
 
 pub const FIELD_CUSTOM_TYPE: u8 = 0xFB;
 pub const FIELD_CUSTOM_DATA: u8 = 0xFC;
@@ -69,7 +69,7 @@ pub const RENDERER_BBCODE: u8 = 0x03;
 // Clients choose how to handle reaction content, if at all. While reactions
 // are typically a single unicode emoji or similar, the exact implementation
 // and sanitization is left up to the client. FIELD_REACTION dict keys —
-// Python reference: LXMF.py:104-110.
+// Python reference: LXMF.py.
 /// Bytes, full `LXMessage` hash.
 pub const REACTION_TO: u8 = 0x00;
 /// Bytes, the reaction content in UTF-8 encoding.
@@ -77,13 +77,13 @@ pub const REACTION_CONTENT: u8 = 0x01;
 
 // Comment content is carried as the normal LXM content, so clients that do
 // not support comments display them as normal messages. FIELD_COMMENT dict
-// key — Python reference: LXMF.py:112-118.
+// key — Python reference: LXMF.py.
 /// Bytes, full `LXMessage` hash.
 pub const COMMENT_FOR: u8 = 0x00;
 
 // Continuation content is carried as the normal LXM content, so clients that
 // do not support continuations display them as normal messages.
-// FIELD_CONTINUATION dict key — Python reference: LXMF.py:120-126.
+// FIELD_CONTINUATION dict key — Python reference: LXMF.py.
 /// Bytes, full `LXMessage` hash.
 pub const CONTINUATION_OF: u8 = 0x00;
 
@@ -193,9 +193,9 @@ pub const PROPAGATION_LIMIT: usize = 256;
 pub const DELIVERY_LIMIT: usize = 1000;
 /// PROPAGATION_LIMIT * 40, in KB.
 pub const SYNC_LIMIT: usize = 10240;
-/// Link-request stamp cost announced by delivery destinations (LXMRouter.py:53).
+/// Link-request stamp cost announced by delivery destinations (LXMRouter.py).
 pub const DELIVERY_LINK_COST: f64 = 3.25;
-/// Link-request stamp cost announced by propagation destinations (LXMRouter.py:54).
+/// Link-request stamp cost announced by propagation destinations (LXMRouter.py).
 pub const PROPAGATION_LINK_COST: f64 = 3.25;
 pub const PROPAGATION_COST_MIN: f64 = 13.0;
 pub const PROPAGATION_COST: f64 = 16.0;
@@ -310,7 +310,7 @@ mod tests {
         assert_eq!(LXMF_OVERHEAD, 112);
     }
 
-    /// LXMF 1.2.0 `ENCRYPTED_PACKET_MAX_CONTENT` (LXMessage.py:64-79, 3fc60af).
+    /// LXMF 1.2.0 `ENCRYPTED_PACKET_MAX_CONTENT` (LXMessage.pyfc60af).
     #[test]
     fn encrypted_packet_max_content_is_lxmf_1_2_0s() {
         assert_eq!(ENCRYPTED_PACKET_MAX_CONTENT, 287);
@@ -409,7 +409,7 @@ mod tests {
 
     #[test]
     fn test_field_standards_match_python_101() {
-        // LXMF.py:23-27 field allocations plus dict-key constants (LXMF.py:104-126).
+        // LXMF.py field allocations plus dict-key constants (LXMF.py).
         assert_eq!(FIELD_REPLY_TO, 0x30);
         assert_eq!(FIELD_REPLY_QUOTE, 0x31);
         assert_eq!(FIELD_REACTION, 0x40);

@@ -736,7 +736,7 @@ impl LxmRouter {
     }
 
     /// The oldest deferred message, as Python's insertion-ordered dict yields
-    /// it (LXMRouter.py:2655-2662).
+    /// it (LXMRouter.py).
     fn next_deferred_stamp(&mut self) -> Option<[u8; 32]> {
         while let Some(id) = self.deferred_stamp_order.front() {
             if self.pending_deferred_stamps.contains_key(id) {
@@ -1161,7 +1161,7 @@ impl LxmRouter {
     /// Destinations that received a delivered message since the last call.
     ///
     /// Python's router retains each one's announce data in Reticulum so its
-    /// identity outlives its path (LXMRouter.py:2761). Send each as
+    /// identity outlives its path (LXMRouter.py). Send each as
     /// `TransportQuery::RetainDestination` through the control plane, which
     /// forwards to a shared instance. Up to 256 distinct destinations are kept
     /// in insertion order; a repeat delivery does not refresh an existing entry's position.
@@ -1252,7 +1252,7 @@ impl LxmRouter {
     /// effects or record a distinct ciphertext transient ID. Use the reservation
     /// and durable-receipt commit path for application admission.
     pub fn deliver_inbound(&mut self, message: &LxMessage, allow_duplicate: bool) -> bool {
-        // LXMRouter.py:2231-2233: ignored sources are dropped before dedup.
+        // LXMRouter.py: ignored sources are dropped before dedup.
         if self.is_ignored(&message.source_hash()) {
             return false;
         }
@@ -1408,7 +1408,7 @@ impl LxmRouter {
         let mut packed = destination_hash.to_vec();
         packed.extend_from_slice(&decrypt_fn(&encrypted)?);
         // Python records the transient id as delivered even when the decrypted
-        // bytes do not unpack (LXMRouter.py:2858-2864).
+        // bytes do not unpack (LXMRouter.py).
         let unpacked = LxMessage::unpack(&packed);
         self.claim_locally_delivered(transient_id);
         let mut message = unpacked?;
@@ -1462,7 +1462,7 @@ impl LxmRouter {
         self.client_propagation_messages_served = stats.client_propagation_messages_served;
         self.unpeered_propagation_incoming = stats.unpeered_propagation_incoming;
         self.unpeered_propagation_rx_bytes = stats.unpeered_propagation_rx_bytes;
-        // Python cleans transient IDs, tickets and stamp costs at load (LXMRouter.py:292-297).
+        // Python cleans transient IDs, tickets and stamp costs at load (LXMRouter.py).
         let now = now_f64();
         self.propagation_store.clean_transient_caches(now);
         self.ticket_store.cull(now);
@@ -1578,7 +1578,7 @@ impl LxmRouter {
         } = candidate;
         let configured_static = self.static_peers.contains(&destination_hash);
 
-        // Python LXMRouter.peer() (LXMRouter.py:1896-1901): a peering cost
+        // Python LXMRouter.peer() (LXMRouter.py): a peering cost
         // above our accepted maximum refuses the peering — and breaks an
         // existing one only when that policy announce is not stale.
         if peering_cost.unwrap_or(0.0) > self.config.ext.max_peering_cost {
@@ -3879,7 +3879,7 @@ mod tests {
     }
 
     /// LXMF keeps a message opportunistic only while its content fits
-    /// one encrypted packet, 287 bytes (LXMessage.py:64-79, :402-406).
+    /// one encrypted packet, 287 bytes (LXMessage.py).
     #[test]
     fn opportunistic_content_over_one_packet_falls_back_to_direct() {
         let mut router = LxmRouter::new(RouterConfig::default());
@@ -3926,7 +3926,7 @@ mod tests {
     }
 
     /// Python fails a message only when delivery_attempts > MAX_DELIVERY_ATTEMPTS
-    /// (outer guard is `<= MAX`, LXMRouter.py:2597/2671). Pin that boundary.
+    /// (outer guard is `<= MAX`, LXMRouter.py/2671). Pin that boundary.
     #[test]
     fn test_process_outbound_fails_only_above_max_attempts() {
         let mut router = LxmRouter::new(RouterConfig::default());
@@ -4369,7 +4369,7 @@ mod tests {
 
     /// T0-4: peering cost above `max_peering_cost` refuses peering, and an
     /// existing peering breaks when the peer raises its cost beyond the cap
-    /// (Python LXMRouter.py:1896-1901).
+    /// (Python LXMRouter.py).
     #[test]
     fn test_autopeer_enforces_max_peering_cost() {
         let mut router = LxmRouter::new(RouterConfig::default());
@@ -4559,7 +4559,7 @@ mod tests {
 
         router.tick();
 
-        // Without a known path the router only asks for one (LXMRouter.py:3229-3233).
+        // Without a known path the router only asks for one (LXMRouter.py).
         assert!(matches!(
             rx.try_recv(),
             Ok(rns_transport::messages::TransportMessage::RequestPath { .. })
@@ -4757,7 +4757,7 @@ mod tests {
         assert_eq!(router.pending_outbound.len(), 1);
     }
 
-    /// Python's deferred-stamp dict keeps insertion order (LXMRouter.py:2655-2662).
+    /// Python's deferred-stamp dict keeps insertion order (LXMRouter.py).
     #[test]
     fn deferred_stamps_are_generated_in_submission_order() {
         let (identity, source) = resumable_sender();
@@ -4794,7 +4794,7 @@ mod tests {
     }
 
     /// Python retains a destination's announce data once a message to it is
-    /// delivered (LXMRouter.py:2761).
+    /// delivered (LXMRouter.py).
     #[test]
     fn delivered_messages_ask_to_retain_their_destination() {
         let mut router = LxmRouter::new(RouterConfig::default());

@@ -128,7 +128,7 @@ fn prepare_outbound_resource_transfers(
     link_sdu: usize,
     link_mdu: usize,
 ) -> Result<VecDeque<OutboundTransfer>, ResourceError> {
-    // Parts follow the link's SDU and advertisements its MDU (Resource.py:346-347, :542@1.6.0).
+    // Parts follow the link's SDU and advertisements its MDU (Resource.py).
     let encrypt = |plaintext: &[u8]| {
         rns_link::encryption::link_encrypt(&link_keys, plaintext)
             .unwrap_or_else(|_| plaintext.to_vec())
@@ -859,7 +859,7 @@ impl PropagationSyncTask {
                         }
                         rns_wire::context::PacketContext::ResourcePrf => {
                             // Python Packet.pack() sends PROOF+RESOURCE_PRF as
-                            // plaintext (Packet.py:195-197) on PacketType::Proof.
+                            // plaintext (Packet.py) on PacketType::Proof.
                             // Body = resource_hash(32) || proof(32).
                             let completed = self
                                 .active_transfer
@@ -1101,7 +1101,7 @@ impl PropagationSyncTask {
         }
     }
 
-    /// Python reference: LXMPeer.py:396-439 (offer_response).
+    /// Python reference: LXMPeer.py (offer_response).
     fn handle_offer_response(&mut self, response: OfferResponse) {
         let node_hash = match self.node_dest_hash {
             Some(h) => h,
@@ -1367,7 +1367,7 @@ impl PropagationSyncTask {
         }
     }
 
-    /// Python reference: LXMPeer.py:381-386.
+    /// Python reference: LXMPeer.py.
     fn send_offer_request(&mut self) {
         let node_hash = match self.node_dest_hash {
             Some(h) => h,
@@ -1855,7 +1855,7 @@ impl PropagationSyncTask {
                     break;
                 }
                 TransferAction::SendCancel(_, resource_hash) => {
-                    // Resource.cancel() sends ICL only on an active Link (Resource.py:1124-1132).
+                    // Resource.cancel() sends ICL only on an active Link (Resource.py).
                     if self
                         .link
                         .as_ref()
@@ -2022,7 +2022,7 @@ impl PropagationSyncTask {
         })
     }
 
-    /// Python LXMPeer.py:540-542.
+    /// Python LXMPeer.py.
     fn cleanup_sync(&mut self) {
         self.link_request_result = None;
         self.path_query = None;

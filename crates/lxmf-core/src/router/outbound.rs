@@ -123,8 +123,8 @@ pub fn schedule_attempt(message: &mut LxMessage, round_trip: f64, path_request: 
 }
 
 /// Timeout for an opportunistic delivery receipt: the RNS packet receipt
-/// timeout (Packet.py:429-433), raised to the message's airtime-aware
-/// `receipt_timeout` (LXMessage.py:482). Without a route Reticulum counts
+/// timeout (Packet.py), raised to the message's airtime-aware
+/// `receipt_timeout` (LXMessage.py). Without a route Reticulum counts
 /// `PATHFINDER_M` hops.
 pub fn opportunistic_receipt_timeout(
     route: Option<RouteInfo>,

@@ -394,7 +394,7 @@ pub struct PendingDelivery {
     endpoint_release_queued: bool,
     /// Keep successful links open for additional messages.
     pub reusable: bool,
-    /// Upload link to a propagation node; never identified (LXMRouter.py:3283-3287).
+    /// Upload link to a propagation node; never identified (LXMRouter.py).
     propagation_upload: bool,
     /// Whether local Link identification was staged after a successful Direct
     /// delivery. Requires configured identity keys; it is not a peer acknowledgement.
@@ -408,7 +408,7 @@ pub struct PendingDelivery {
     inbound_split_resources: HashMap<[u8; 32], MultiSegmentInbound>,
     inbound_segment_routing: HashMap<[u8; 32], InboundSegmentRoute>,
     inbound_resource_lifecycles: HashMap<[u8; 32], InboundResourceLifecycle>,
-    /// `Link.last_resource_window` and `last_resource_eifr` (Link.py:1344-1348).
+    /// `Link.last_resource_window` and `last_resource_eifr` (Link.py).
     last_inbound_resource: Option<(usize, Option<f64>)>,
 }
 
@@ -1014,7 +1014,7 @@ impl LinkDeliveryManager {
 
     /// Record Transport's answer to `GetNextHopHardwareMtu` for `dest_hash`
     /// (`None` for no answer); the next Link opened to it signals that MTU
-    /// while the stamper's `link_mtu_discovery` is on (Link.py:392-397@1.6.0).
+    /// while the stamper's `link_mtu_discovery` is on (Link.py).
     pub fn provide_next_hop_hardware_mtu(&mut self, dest_hash: [u8; 16], mtu: Option<u32>) {
         match mtu.filter(|mtu| *mtu != 0) {
             Some(mtu) => {
@@ -1367,7 +1367,7 @@ impl LinkDeliveryManager {
         timing: LinkEstablishmentTiming,
     ) -> Result<DirectLinkStartReport, LinkDeliveryStartFailure> {
         let started = self.start_direct_delivery(message, dest_hash, hops, timing);
-        // Keys belong to one Link request (Link.py:313-316); never carry them to a later one.
+        // Keys belong to one Link request (Link.py); never carry them to a later one.
         self.prepared_link_keys.remove(&dest_hash);
         started
     }
@@ -2214,7 +2214,7 @@ impl LinkDeliveryManager {
                         );
                         continue;
                     }
-                    // Link.py:1030; packet proofs reach the Link only as receipts (Transport.py:2997-3036).
+                    // Link.py; packet proofs reach the Link only as receipts (Transport.py).
                     let link_receives = header.flags.packet_type
                         != rns_wire::flags::PacketType::Proof
                         || header.context == rns_wire::context::PacketContext::ResourcePrf;
@@ -2344,7 +2344,7 @@ impl LinkDeliveryManager {
                             }
                         }
                         rns_wire::context::PacketContext::ResourcePrf => {
-                            // PROOF+RESOURCE_PRF is plaintext on a Proof packet (Packet.py:195-197).
+                            // PROOF+RESOURCE_PRF is plaintext on a Proof packet (Packet.py).
                             // Body = resource_hash(32) || proof(32); pass through without decrypt.
                             self.handle_resource_proof(&link_id, data);
                         }
@@ -2710,7 +2710,7 @@ impl LinkDeliveryManager {
             notify_inbound_resource_concluded(concluded_handler.as_ref(), *link_id, resource_id);
             return false;
         };
-        // Receiver timing uses the link's SDU (Resource.py:346-347@1.6.0).
+        // Receiver timing uses the link's SDU (Resource.py).
         transfer.resource.sdu = delivery.link.resource_sdu();
 
         let action = transfer.request_next();
@@ -2835,7 +2835,7 @@ impl LinkDeliveryManager {
                 .get_mut(&resource_hash)
                 .map(|transfer| transfer.complete(Some(&decrypt)))
         };
-        // Link.resource_concluded runs after assembly whatever its outcome (Resource.py:740).
+        // Link.resource_concluded runs after assembly whatever its outcome (Resource.py).
         if let Some(transfer) = delivery.inbound_resources.get(&resource_hash) {
             delivery.last_inbound_resource = Some((transfer.resource.window.window, transfer.eifr));
         }
@@ -3222,9 +3222,9 @@ impl LinkDeliveryManager {
                             } else {
                                 delivery.message.representation = DeliveryRepresentation::Resource;
                                 // Python's Resource encrypts the blob with link session keys
-                                // BEFORE chunking (Resource.py:424), and resource parts are sent
+                                // BEFORE chunking (Resource.py), and resource parts are sent
                                 // on the wire WITHOUT additional packet-layer encryption
-                                // (Packet.py:201-204).
+                                // (Packet.py).
                                 let rtt = delivery.link.rtt.unwrap_or(Duration::from_millis(500));
                                 let auto_compress = if delivery.packed_override.is_some() {
                                     delivery.auto_compress
@@ -5611,7 +5611,7 @@ fn build_resource_transfer(
 }
 
 /// An outbound Resource on `link`: parts sized by the link's SDU and the
-/// advertisement bounded by its MDU (Resource.py:346-347, :542@1.6.0).
+/// advertisement bounded by its MDU (Resource.py).
 pub(crate) fn link_transfer(
     link: &Link,
     resource: OutboundResource,
@@ -5633,7 +5633,7 @@ pub(crate) fn answered_hardware_mtu(
     }
 }
 
-/// The MTU a new link request signals (Link.py:392-397@1.6.0): the next hop's
+/// The MTU a new link request signals (Link.py): the next hop's
 /// hardware MTU when discovery is on and Transport reported one, else the base MTU.
 pub(crate) fn signalled_link_mtu(stamper: &LinkRequestStamper, next_hop_mtu: Option<u32>) -> u32 {
     next_hop_mtu
@@ -6033,7 +6033,7 @@ fn drive_inbound_resource_watchdogs(
                 let resource_id = drop_inbound_resource(delivery, resource_hash);
                 notify_inbound_resource_concluded(concluded_handler, *link_id, resource_id);
             }
-            // Resource.cancel() sends RCL only on an active Link (Resource.py:1133-1139).
+            // Resource.cancel() sends RCL only on an active Link (Resource.py).
             TransferAction::SendCancel(_, _) if delivery.link.state != LinkState::Active => {}
             retry => {
                 if dispatch_inbound_resource_action(
@@ -6256,7 +6256,7 @@ fn dispatch_action(
         }
         TransferAction::SendPart(_, part_data) => {
             // Parts are already ciphertext (pre-chunk blob encryption). `context=Resource`
-            // packets are not packet-layer encrypted (Packet.py:201-204).
+            // packets are not packet-layer encrypted (Packet.py).
             if let Err(reason) = send(
                 make_header(
                     rns_wire::context::PacketContext::Resource,
@@ -6303,7 +6303,7 @@ fn dispatch_action(
             ActionOutcome::Continue
         }
         TransferAction::SendProof(proof_data) => {
-            // PROOF+RESOURCE_PRF is plaintext on a Proof packet (Packet.py:195-197). Body =
+            // PROOF+RESOURCE_PRF is plaintext on a Proof packet (Packet.py). Body =
             // resource_hash(32) || proof(32).
             if let Err(reason) = send(
                 make_header(
@@ -6327,7 +6327,7 @@ fn dispatch_action(
             ActionOutcome::Fail(reason)
         }
         TransferAction::SendCancel(cancel_type, resource_hash) => {
-            // Resource.cancel() sends ICL/RCL only on an active Link (Resource.py:1126, 1134).
+            // Resource.cancel() sends ICL/RCL only on an active Link (Resource.py).
             let active = delivery.link.state == LinkState::Active;
             if let Some(encrypted) = active
                 .then(|| delivery.link.encrypt(&resource_hash).ok())

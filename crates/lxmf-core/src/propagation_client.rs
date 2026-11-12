@@ -265,7 +265,7 @@ pub struct PropagationClient {
     link_stamper: LinkRequestStamper,
     prepared_link_keys: Option<([u8; 16], EphemeralKeys)>,
     mtu_query: Option<oneshot::Receiver<TransportQueryResponse>>,
-    /// `Link.last_resource_window` and `last_resource_eifr` (Link.py:1344-1348).
+    /// `Link.last_resource_window` and `last_resource_eifr` (Link.py).
     last_inbound_resource: Option<(usize, Option<f64>)>,
     /// Phase 1 response: transient IDs the server has.
     available_messages: Vec<Vec<u8>>,
@@ -1251,7 +1251,7 @@ impl PropagationClient {
                     } else {
                         &[]
                     };
-                    // Link.py:1030; packet proofs reach the Link only as receipts (Transport.py:2997-3036).
+                    // Link.py; packet proofs reach the Link only as receipts (Transport.py).
                     let link_receives = header.flags.packet_type
                         != rns_wire::flags::PacketType::Proof
                         || header.context == rns_wire::context::PacketContext::ResourcePrf;
@@ -2181,7 +2181,7 @@ impl PropagationClient {
                 }
                 DownloadAdmissionOutcome::Rejected(reason) => {
                     // Python purges every downloaded message, whatever lxmf_propagation
-                    // did (LXMRouter.py:1838-1853). A message that failed for a passing
+                    // did (LXMRouter.py). A message that failed for a passing
                     // local reason stays on the node so the next sync can fetch it again.
                     if !reason.is_transient() {
                         self.rejected_ids.push(result.scope.transient_id.to_vec());
@@ -2350,7 +2350,7 @@ impl PropagationClient {
                 );
             }
             if let Some(hash) = cancel {
-                // Resource.cancel() sends RCL only on an active Link (Resource.py:1133-1139).
+                // Resource.cancel() sends RCL only on an active Link (Resource.py).
                 if self
                     .link
                     .as_ref()
@@ -2713,7 +2713,7 @@ impl PropagationClient {
                 );
             }
             Some(TransferAction::SendCancel(_, hash)) => {
-                // Resource.cancel() sends ICL only on an active Link (Resource.py:1124-1132).
+                // Resource.cancel() sends ICL only on an active Link (Resource.py).
                 if self
                     .link
                     .as_ref()

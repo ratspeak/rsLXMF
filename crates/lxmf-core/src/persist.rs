@@ -515,7 +515,7 @@ mod tests {
         write_file_atomic(&path, b"first").unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"first");
 
-        // Replaces existing content (os.replace semantics — LXMessage.py:687).
+        // Replaces existing content (os.replace semantics — LXMessage.py).
         write_file_atomic(&path, b"second").unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"second");
 
@@ -532,7 +532,7 @@ mod tests {
     fn write_file_atomic_cleans_tmp_on_error() {
         let tmp = TempDir::new().unwrap();
         // Destination is a directory: the final rename fails, and the tmp
-        // file must be unlinked (LXMessage.py:691-693).
+        // file must be unlinked (LXMessage.py).
         let dir_path = tmp.path().join("collide");
         fs::create_dir(&dir_path).unwrap();
 

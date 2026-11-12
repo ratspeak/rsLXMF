@@ -1141,7 +1141,7 @@ fn link_snapshot_state(
 }
 
 /// Python `lxmf_delivery()` receive state: the delivery method, and Curve25519
-/// transport encryption for SINGLE and LINK destinations (LXMRouter.py:2174,2218-2226).
+/// transport encryption for SINGLE and LINK destinations (LXMRouter.py).
 fn mark_received(msg: &mut LxMessage, method: DeliveryMethod) {
     let destination_type = match method {
         DeliveryMethod::Direct => rns_wire::flags::DestinationType::Link,
@@ -1182,7 +1182,7 @@ fn direct_reusable_link_state(
     }
 }
 
-/// Python `Transport.medium_path_timeout()` for a known bitrate (Transport.py:3550-3553).
+/// Python `Transport.medium_path_timeout()` for a known bitrate (Transport.py).
 fn medium_path_timeout(lowest_bitrate: u64) -> f64 {
     let bits = (rns_wire::constants::MTU * 8) as f64;
     2.0 * (bits / lowest_bitrate.max(rns_runtime::constants::MINIMUM_BITRATE) as f64)
@@ -1190,7 +1190,7 @@ fn medium_path_timeout(lowest_bitrate: u64) -> f64 {
 }
 
 /// Drop the current path, then request a new one 0.5 s later, as Python's
-/// opportunistic rediscovery does (LXMRouter.py:3127-3133).
+/// opportunistic rediscovery does (LXMRouter.py).
 fn queue_path_request_after_drop(
     transport_tx: &mpsc::Sender<TransportMessage>,
     destination: [u8; 16],
@@ -1367,7 +1367,7 @@ struct PeerPathCheck {
 const JOBS_INTERVAL: u64 = 5;
 
 /// Resolve a destination hash to its identity hash via the learned identity
-/// keys — the lxmd equivalent of `RNS.Identity.recall` (LXMessage.py:776).
+/// keys — the lxmd equivalent of `RNS.Identity.recall` (LXMessage.py).
 /// Identity hash = truncated hash of the 64-byte announce public key.
 fn recall_identity_hash(
     known_identities: &HashMap<String, [u8; 64]>,
@@ -1454,7 +1454,7 @@ fn dispatch_opportunistic_packet(
     Ok(())
 }
 
-/// `LXMessage.unpack_from_bytes` signature flags (LXMessage.py:829-842).
+/// `LXMessage.unpack_from_bytes` signature flags (LXMessage.py).
 fn classify_signature(
     msg: &LxMessage,
     public_key: Option<&[u8; 64]>,
@@ -1675,7 +1675,7 @@ struct LxmdRunner {
     retain_task: Option<tokio::task::JoinHandle<()>>,
     route_hops: HashMap<[u8; 16], u8>,
     /// Transport blackhole table snapshot, refreshed per tick. Used to drop
-    /// inbound LXMs from blackholed identities (LXMRouter.py:1739-1741).
+    /// inbound LXMs from blackholed identities (LXMRouter.py).
     blackholed_identities: HashSet<[u8; 16]>,
     link_delivery: Option<lxmf_core::link_delivery::LinkDeliveryManager>,
     link_command_tx: mpsc::Sender<rns_runtime::link_manager::LinkManagerCommand>,
@@ -1841,7 +1841,7 @@ impl LxmdRunner {
 
     /// Learn the LXMF identities Transport validated before these
     /// subscriptions existed; later ones arrive as announce events. Python's
-    /// LXMF recalls them from `RNS.Identity` (Transport.py:2172).
+    /// LXMF recalls them from `RNS.Identity` (Transport.py).
     async fn learn_validated_identities(&mut self) {
         let (response_tx, response_rx) = oneshot::channel();
         let query = TransportMessage::Rpc {
@@ -1928,7 +1928,7 @@ impl LxmdRunner {
 
     /// Retain delivered destinations in Reticulum, through the shared
     /// instance when attached to one, as Python's router does
-    /// (LXMRouter.py:2761, Reticulum.py:1449-1461).
+    /// (LXMRouter.py, Reticulum.py).
     fn forward_destination_retains(&mut self) {
         let Some(control_plane) = self.control_plane.clone() else {
             return;
@@ -2588,7 +2588,7 @@ impl LxmdRunner {
         std::fs::create_dir_all(&messages_dir)?;
 
         // Upstream's messages directory holds only write_to_directory containers
-        // (lxmd.py:302-307@1.3.0); the admission store keeps its raw bodies privately.
+        // (lxmd.py); the admission store keeps its raw bodies privately.
         let admission_store = match FileAdmissionStore::open_moving_bodies_from(
             &paths.router_state_dir,
             &paths.router_state_dir.join(ADMISSION_BODIES_DIR),
@@ -2915,7 +2915,7 @@ impl LxmdRunner {
         kind: DeliveryAnnounceKind<'_>,
         stamp_ext: Option<&AnnounceStampExt>,
     ) -> Result<Vec<u8>, DeliveryRatchetError> {
-        // Path responses carry the default app data, which LXMRouter.py:431-434 sets only with a display name.
+        // Path responses carry the default app data, which LXMRouter.py sets only with a display name.
         let app_data = match (kind, self.config.display_name.as_deref()) {
             (DeliveryAnnounceKind::PathResponse { .. }, None) => Vec::new(),
             (_, name) => delivery_announce_app_data(name, self.config.stamp_cost),
@@ -3865,7 +3865,7 @@ impl LxmdRunner {
 
     /// Snapshot the transport blackhole table. Ungated: the table is tiny and
     /// the per-tick roundtrip keeps drops close to Python's live
-    /// `Reticulum.is_blackholed` query (LXMessage.py:803-805). Fail-open: on
+    /// `Reticulum.is_blackholed` query (LXMessage.py). Fail-open: on
     /// query failure the previous snapshot stays in effect.
     async fn refresh_blackholed_identities_from_transport(&mut self) {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
@@ -3888,7 +3888,7 @@ impl LxmdRunner {
 
     /// True when the source destination resolves to a blackholed identity.
     /// Unknown identities are never dropped, mirroring Python's recall-gated
-    /// check (LXMessage.py:804 only runs with a recalled source identity).
+    /// check (LXMessage.py only runs with a recalled source identity).
     fn source_blackholed(&self, source_hash: &[u8; 16]) -> bool {
         match recall_identity_hash(&self.known_identities, source_hash) {
             Some(identity_hash) => self.blackholed_identities.contains(&identity_hash),
@@ -4135,7 +4135,7 @@ impl LxmdRunner {
                 .map(|interface| interface.bitrate)
                 .min()
         {
-            // Transport keeps the last lowest bitrate when none qualifies (Transport.py:708).
+            // Transport keeps the last lowest bitrate when none qualifies (Transport.py).
             self.medium.lowest_interface_bitrate = Some(lowest);
         }
         self.medium.medium_path_timeout = self
@@ -4653,7 +4653,7 @@ impl LxmdRunner {
                     "learned propagation-node stamp cost from announce"
                 );
             }
-            // Python triggers on pn_announce_data_is_valid alone (Handlers.py:43-53).
+            // Python triggers on pn_announce_data_is_valid alone (Handlers.py).
             if event.name_hash == propagation_name_hash
                 && let Some(data) = event.app_data.as_deref()
             {
@@ -4702,7 +4702,7 @@ impl LxmdRunner {
                 len = plaintext.len(),
                 "received decrypted packet via link"
             );
-            // A link packet carries its Link ID as the ratchet ID (Link.py:1039@1.6.0).
+            // A link packet carries its Link ID as the ratchet ID (Link.py).
             self.handle_link_delivered_data_on(&plaintext, Some(link_id));
         }
 
@@ -4860,7 +4860,7 @@ impl LxmdRunner {
                     len = completion.data.len(),
                     "resource transfer completed on link"
                 );
-                // A resource delivery records its Link ID as the ratchet ID (LXMRouter.py:2325-2327).
+                // A resource delivery records its Link ID as the ratchet ID (LXMRouter.py).
                 self.handle_link_delivered_data_on(&completion.data, Some(completion.link_id));
             }
             _ => {}
@@ -5519,7 +5519,7 @@ impl LxmdRunner {
     }
 
     /// `LXMRouter.delivery_packet` reads the packet's RSSI, SNR and Q from
-    /// Reticulum's per-packet caches (LXMRouter.py:2277-2283@1.3.0).
+    /// Reticulum's per-packet caches (LXMRouter.py).
     async fn inbound_packet_phy(&self, raw: &[u8]) -> Option<lxmf_core::message::PhyStats> {
         let (header, _) = rns_wire::header::PacketHeader::unpack(raw).ok()?;
         let packet_hash = rns_wire::hash::packet_hash(raw, header.flags.header_type);
@@ -5574,7 +5574,7 @@ impl LxmdRunner {
         };
 
         // Python proves every delivery packet before unpacking or gating it
-        // (LXMRouter.py:2262-2263).
+        // (LXMRouter.py).
         if let Some(proof_raw) = self.create_delivery_proof(raw) {
             let trunc = rns_wire::hash::truncated_packet_hash(raw, header.flags.header_type);
             if !self.queue_runtime_transport(
@@ -5611,7 +5611,7 @@ impl LxmdRunner {
                     "inbound LXMF message received"
                 );
 
-                // LXMRouter.delivery_packet passes packet.ratchet_id (LXMRouter.py:2285).
+                // LXMRouter.delivery_packet passes packet.ratchet_id (LXMRouter.py).
                 self.admit_inbound_message(
                     msg,
                     DeliveryMethod::Opportunistic,
@@ -5625,7 +5625,7 @@ impl LxmdRunner {
         }
     }
 
-    /// Python `lxmf_delivery` gating (LXMRouter.py:2163-2257): blackholed
+    /// Python `lxmf_delivery` gating (LXMRouter.py): blackholed
     /// source, ticket learning from a validated signature, stamp, ignored
     /// source, then delivery. Unknown or invalid signatures are delivered flagged.
     fn admit_inbound_message(
@@ -5726,7 +5726,7 @@ impl LxmdRunner {
         // Pack synchronously (CPU-bound, no IO) and offload the disk write
         // to the blocking pool so a slow disk doesn't stall the lxmd runner
         // task between inbound messages. Atomic tmp+rename write so readers
-        // never see a partial file (LXMessage.py:696-712).
+        // never see a partial file (LXMessage.py).
         mark_received(&mut msg, method);
         match msg.pack_container() {
             Ok(packed) => {
@@ -5905,7 +5905,7 @@ impl LxmdRunner {
         }) {
             Ok(payload) => payload,
             Err(error) => {
-                // A raising send() fails the message (LXMRouter.py:3143-3146).
+                // A raising send() fails the message (LXMRouter.py).
                 tracing::warn!(dest = %dest_hex, %error, "opportunistic LXMF send failed");
                 self.last_delivery_failure = Some(error.to_string());
                 self.router.mark_outbound_failed(&msg_hash);
@@ -7296,8 +7296,8 @@ mod tests {
     }
 
     /// Python's router retains a destination's announce data once a message
-    /// to it is delivered (LXMRouter.py:2761), on the shared instance when
-    /// attached to one (Reticulum.py:1449-1461).
+    /// to it is delivered (LXMRouter.py), on the shared instance when
+    /// attached to one (Reticulum.py).
     #[tokio::test]
     async fn delivered_destinations_are_retained_through_the_control_plane() {
         let temp = tempfile::tempdir().unwrap();
@@ -7352,7 +7352,7 @@ mod tests {
     }
 
     /// Python's LXMF recalls identities that Transport validated before the
-    /// router registered its handlers (Transport.py:2172, Identity.recall).
+    /// router registered its handlers (Transport.py, Identity.recall).
     #[tokio::test]
     async fn identities_validated_before_the_daemon_subscribed_are_learned() {
         let node = Identity::new();
@@ -8614,7 +8614,7 @@ mod tests {
         }
     }
 
-    /// Blackhole gating mirrors LXMessage.py:804: only a recallable source
+    /// Blackhole gating mirrors LXMessage.py: only a recallable source
     /// identity can be matched against the blackhole table; unknown sources
     /// never drop.
     #[test]

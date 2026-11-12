@@ -1,6 +1,6 @@
 //! Stamper for Reticulum interface discovery.
 //!
-//! Upstream's discovery stamper is `RNS.Stamps` (Discovery.py:87,266);
+//! Upstream's discovery stamper is `RNS.Stamps` (Discovery.py);
 //! [`LxmfDiscoveryStamper`] delegates to
 //! `rns_transport::discovery::RnsDiscoveryStamper` for callers that install it.
 use rns_transport::discovery::DiscoveryStamper;

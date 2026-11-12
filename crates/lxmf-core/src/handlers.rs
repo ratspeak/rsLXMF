@@ -50,8 +50,8 @@ pub enum CompressionSupport {
 }
 
 /// A per-transfer or per-sync limit as Python holds it: lxmd's built-in defaults
-/// are ints, configured values come from `as_float` (lxmd.py:165-184@1.3.0),
-/// and the announce packs whichever it has (LXMRouter.py:394-395).
+/// are ints, configured values come from `as_float` (lxmd.py),
+/// and the announce packs whichever it has (LXMRouter.py).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PnLimit {
     Int(u64),
@@ -462,7 +462,7 @@ pub fn parse_pn_announce_data(data: &[u8]) -> Option<PropagationNodeAnnounceData
     let int_at = |index: usize| python_int(&python_index(&value, index)?);
     let timebase = int_at(1)?.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64;
     let node_state = python_bool_state(&python_index(&value, 2)?)?;
-    // A float is kept raw, as LXMRouter's sync autopeer reads it (LXMRouter.py:2700).
+    // A float is kept raw, as LXMRouter's sync autopeer reads it (LXMRouter.py).
     let limit_at = |index: usize| -> Option<PnLimit> {
         let raw = python_index(&value, index)?;
         let int = python_int(&raw)?;
@@ -965,7 +965,7 @@ impl PropagationRequestHandler {
 
     /// Compile propagation-node statistics as msgpack.
     ///
-    /// Python reference: `LXMRouter.compile_stats` — LXMRouter.py:750-817.
+    /// Python reference: `LXMRouter.compile_stats` — LXMRouter.py.
     fn compile_stats(
         &self,
         node: &crate::propagation_node::PropagationNode,
@@ -1364,7 +1364,7 @@ mod tests {
     #[test]
     fn test_compression_support_from_app_data() {
         // Legacy <=0.9.8 2-element app_data: unknown state, fail-open true
-        // (Python returns True for len < 3 — LXMF.py:161).
+        // (Python returns True for len < 3 — LXMF.py).
         let python_098 = {
             use rmpv::Value;
             let arr = Value::Array(vec![Value::Binary(b"Alice".to_vec()), Value::from(12u64)]);
@@ -1426,7 +1426,7 @@ mod tests {
         assert!(!compression_support_from_app_data(&empty_features));
 
         // Malformed data: unknown state, fail-open true (Python treats the
-        // original non-msgpack announce format as supported — LXMF.py:167).
+        // original non-msgpack announce format as supported — LXMF.py).
         assert_eq!(
             compression_support_state_from_app_data(&[0xc1]),
             CompressionSupport::Unknown
