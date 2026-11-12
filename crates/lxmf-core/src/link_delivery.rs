@@ -343,13 +343,14 @@ impl RetainedDeliveryMessage {
         self.image = None;
         self.metadata = crate::message::MessageMetadata::default();
     }
-    fn take(&mut self) -> LxMessage {
-        let mut message = self
-            .image
-            .take()
-            .expect("active delivery owns one immutable payload");
+    fn is_released(&self) -> bool {
+        self.image.is_none()
+    }
+    /// `None` once the payload was released or already taken.
+    fn take(&mut self) -> Option<LxMessage> {
+        let mut message = self.image.take()?;
         message.metadata = std::mem::take(&mut self.metadata);
-        message
+        Some(message)
     }
 }
 
@@ -1197,7 +1198,7 @@ impl LinkDeliveryManager {
         &mut self,
         mut start: PendingBackchannelStart,
         reason: String,
-    ) -> DeliveryResult {
+    ) -> Option<DeliveryResult> {
         let result = fail_backchannel_start_in_place(&mut self.delivery_events, &mut start, reason);
         if start.cancellation_aware {
             start.receiver.close();
@@ -1249,7 +1250,7 @@ impl LinkDeliveryManager {
                     start.closed_reason = Some(reason.to_string());
                     self.pending_backchannel_starts.push(start);
                 } else {
-                    results.push(self.retain_failed_backchannel_start(start, reason.to_string()));
+                    results.extend(self.retain_failed_backchannel_start(start, reason.to_string()));
                 }
             } else {
                 self.pending_backchannel_starts.push(start);
@@ -2519,7 +2520,9 @@ impl LinkDeliveryManager {
         };
         delivery.link.record_inbound();
         delivery.link.record_rx(encrypted_data.len());
-        if delivery.propagation_upload {
+        // A rejection applies to the upload in flight; one that arrives after
+        // the upload settled has nothing to reject.
+        if delivery.propagation_upload && !delivery.message.is_released() {
             let mut input = plaintext.as_slice();
             let rejection = rmpv::decode::read_value(&mut input).ok();
             if input.is_empty()
@@ -3386,21 +3389,24 @@ impl LinkDeliveryManager {
                             .failure_reason
                             .take()
                             .unwrap_or_else(|| "resource rejected".to_string());
-                        self.delivery_events.push_back(delivery_event(
-                            LxmfDeliveryEventKind::Rejected,
-                            *link_id,
-                            delivery,
-                            Some(delivery.message.progress),
-                            Some(reason.clone()),
-                        ));
-                        let message = take_current_delivery_message(delivery);
-                        results.push(DeliveryResult::Rejected {
-                            link_id: *link_id,
-                            msg_hash: delivery.msg_hash,
-                            dest_hash: delivery.dest_hash,
-                            message,
-                            reason,
-                        });
+                        if !delivery.message.is_released() {
+                            self.delivery_events.push_back(delivery_event(
+                                LxmfDeliveryEventKind::Rejected,
+                                *link_id,
+                                delivery,
+                                Some(delivery.message.progress),
+                                Some(reason.clone()),
+                            ));
+                            if let Some(message) = take_current_delivery_message(delivery) {
+                                results.push(DeliveryResult::Rejected {
+                                    link_id: *link_id,
+                                    msg_hash: delivery.msg_hash,
+                                    dest_hash: delivery.dest_hash,
+                                    message,
+                                    reason,
+                                });
+                            }
+                        }
                         if delivery.reusable && delivery.link.state != LinkState::Closed {
                             finish_unsuccessful_reusable_delivery(delivery);
                         } else {
@@ -3587,7 +3593,7 @@ impl LinkDeliveryManager {
                     if let Some(reason) =
                         start.closed_reason.clone().filter(|_| !settlement_observed)
                     {
-                        results.push(fail_backchannel_start(
+                        results.extend(fail_backchannel_start(
                             &mut self.delivery_events,
                             start,
                             reason,
@@ -3596,6 +3602,9 @@ impl LinkDeliveryManager {
                     }
 
                     let link_closed = start.closed_reason.is_some();
+                    if start.message.is_released() {
+                        continue;
+                    }
                     self.delivery_events.push_back(backchannel_delivery_event(
                         BackchannelDeliveryEventInput {
                             kind,
@@ -3613,10 +3622,14 @@ impl LinkDeliveryManager {
                             delivery_state: DeliveryState::AwaitingProof,
                         },
                     ));
+                    // A start with no message left was failed before its receipt arrived.
+                    let Some(message) = start.message.take() else {
+                        continue;
+                    };
                     self.pending_backchannel_deliveries.insert(
                         key,
                         PendingBackchannelDelivery {
-                            message: start.message.take(),
+                            message,
                             dest_hash: start.dest_hash,
                             link_id: start.link_id,
                             representation,
@@ -3657,7 +3670,7 @@ impl LinkDeliveryManager {
                         reason = %reason,
                         "LXMF backchannel send failed"
                     );
-                    results.push(fail_backchannel_start(
+                    results.extend(fail_backchannel_start(
                         &mut self.delivery_events,
                         start,
                         reason,
@@ -3680,7 +3693,7 @@ impl LinkDeliveryManager {
                         start.receiver.close();
                         let raced_receipt = start.receiver.try_recv().ok().and_then(Result::ok);
                         if !start.cancelled {
-                            results.push(fail_backchannel_start_in_place(
+                            results.extend(fail_backchannel_start_in_place(
                                 &mut self.delivery_events,
                                 &mut start,
                                 reason,
@@ -3706,7 +3719,7 @@ impl LinkDeliveryManager {
                         if self.backchannel_links.get(&start.dest_hash) == Some(&start.link_id) {
                             self.backchannel_links.remove(&start.dest_hash);
                         }
-                        results.push(fail_backchannel_start_in_place(
+                        results.extend(fail_backchannel_start_in_place(
                             &mut self.delivery_events,
                             &mut start,
                             reason,
@@ -4538,7 +4551,7 @@ impl LinkDeliveryManager {
         }) {
             let start = self.pending_backchannel_starts.remove(pos);
             self.remove_backchannel_owner(start.dest_hash, start.link_id);
-            results.push(self.retain_failed_backchannel_start(start, reason.to_string()));
+            results.extend(self.retain_failed_backchannel_start(start, reason.to_string()));
             self.prune_early_backchannel_settlement();
             return results;
         }
@@ -5191,15 +5204,20 @@ fn fail_backchannel_start(
     events: &mut VecDeque<LxmfDeliveryEvent>,
     mut start: PendingBackchannelStart,
     reason: String,
-) -> DeliveryResult {
+) -> Option<DeliveryResult> {
     fail_backchannel_start_in_place(events, &mut start, reason)
 }
 
+/// `None` when the start's message is already gone: it was failed before.
 fn fail_backchannel_start_in_place(
     events: &mut VecDeque<LxmfDeliveryEvent>,
     start: &mut PendingBackchannelStart,
     reason: String,
-) -> DeliveryResult {
+) -> Option<DeliveryResult> {
+    start.cancelled = true;
+    if start.message.is_released() {
+        return None;
+    }
     events.push_back(backchannel_delivery_event(BackchannelDeliveryEventInput {
         kind: LxmfDeliveryEventKind::Failed,
         message: &start.message,
@@ -5211,16 +5229,15 @@ fn fail_backchannel_start_in_place(
         link_state: LinkState::Closed,
         delivery_state: DeliveryState::Failed,
     }));
-    let message = start.message.take();
-    start.cancelled = true;
-    DeliveryResult::Failed {
+    let message = start.message.take()?;
+    Some(DeliveryResult::Failed {
         link_id: start.link_id,
         msg_hash: Some(message.message_id()),
         dest_hash: start.dest_hash,
         message,
         reason,
         link_activated: true,
-    }
+    })
 }
 
 fn resource_payload_progress(transfer: &OutboundTransfer, segment_progress: f64) -> f64 {
@@ -5361,29 +5378,33 @@ fn push_failed_delivery_and_queue(
     delivery.transfer = None;
     delivery.remaining_segments = None;
     delivery.packet_proof_hash = None;
-    events.push_back(delivery_event(
-        LxmfDeliveryEventKind::Failed,
-        link_id,
-        delivery,
-        Some(delivery.message.progress),
-        Some(reason.to_string()),
-    ));
-    let message = take_current_delivery_message(delivery);
-    results.push(DeliveryResult::Failed {
-        link_id,
-        msg_hash: delivery.msg_hash,
-        dest_hash: delivery.dest_hash,
-        message,
-        reason: reason.to_string(),
-        link_activated: delivery.link.activated_at.is_some(),
-    });
+    // An idle session's last message already settled; only its queue fails.
+    if !delivery.message.is_released() {
+        events.push_back(delivery_event(
+            LxmfDeliveryEventKind::Failed,
+            link_id,
+            delivery,
+            Some(delivery.message.progress),
+            Some(reason.to_string()),
+        ));
+        if let Some(message) = take_current_delivery_message(delivery) {
+            results.push(DeliveryResult::Failed {
+                link_id,
+                msg_hash: delivery.msg_hash,
+                dest_hash: delivery.dest_hash,
+                message,
+                reason: reason.to_string(),
+                link_activated: delivery.link.activated_at.is_some(),
+            });
+        }
+    }
     fail_queued_deliveries(results, events, link_id, delivery, reason);
 }
 
 /// Move the potentially large attachment-bearing message into its terminal
 /// result. Reusable Link sessions retain only delivery observations until the
 /// next queued message replaces them; no placeholder signed image is created.
-fn take_current_delivery_message(delivery: &mut PendingDelivery) -> LxMessage {
+fn take_current_delivery_message(delivery: &mut PendingDelivery) -> Option<LxMessage> {
     delivery.message.take()
 }
 
@@ -10654,6 +10675,166 @@ mod tests {
             mgr.pending.get(&second).unwrap().state,
             DeliveryState::Failed
         );
+    }
+
+    #[test]
+    fn idle_link_losing_its_interface_closes_without_failing_the_delivered_message() {
+        let (tx, mut rx) = mpsc::channel(128);
+        let mut mgr = LinkDeliveryManager::new(tx, None, None);
+        let peer_key = Ed25519PrivateKey::generate();
+        let first = timing_message("delivered before the interface left");
+        let delivered_hash = first.message_id();
+        let (link_id, peer) =
+            establish_active_delivery(&mut mgr, &mut rx, first, &peer_key, [0x2C; 16]);
+        mgr.pending.get_mut(&link_id).unwrap().link.rtt = Some(Duration::from_secs(1));
+        assert!(mgr.tick().is_empty());
+        let packet = next_outbound(&mut rx);
+        mgr.poll_endpoint_control();
+        let (header, _) = rns_wire::header::PacketHeader::unpack(&packet).unwrap();
+        let proof = peer
+            .prove_packet_with_local_signer(&rns_wire::hash::packet_hash(
+                &packet,
+                header.flags.header_type,
+            ))
+            .unwrap();
+        assert!(mgr.handle_link_packet_proof(&link_id, &proof));
+        assert!(matches!(
+            mgr.tick().as_slice(),
+            [DeliveryResult::Complete { .. }]
+        ));
+        assert_eq!(mgr.pending[&link_id].state, DeliveryState::Idle);
+        mgr.take_delivery_events();
+
+        let interface_id = mgr.pending[&link_id].attached_interface.unwrap();
+        mgr.endpoint_lifecycle_tx
+            .send(LinkEndpointLifecycleEvent {
+                binding: LinkEndpointBinding {
+                    interface_owner: None,
+                    link_id,
+                    interface_id,
+                    role: LinkEndpointRole::Initiator,
+                },
+                reason: rns_transport::messages::LinkEndpointTerminalReason::InterfaceRemoved,
+                dropped_packets: 0,
+            })
+            .unwrap();
+
+        let results = mgr.tick();
+        assert!(
+            !results.iter().any(|result| matches!(
+                result,
+                DeliveryResult::Failed { msg_hash: Some(hash), .. } if *hash == delivered_hash
+            )),
+            "a delivered message never turns failed"
+        );
+        assert!(!mgr.pending.contains_key(&link_id));
+        assert!(
+            mgr.take_delivery_events()
+                .iter()
+                .all(|event| event.kind != LxmfDeliveryEventKind::Failed)
+        );
+    }
+
+    #[test]
+    fn rejected_endpoint_send_on_an_idle_link_closes_without_failing_the_delivered_message() {
+        let (tx, mut rx) = mpsc::channel(128);
+        let mut mgr = LinkDeliveryManager::new(tx, None, None);
+        let peer_key = Ed25519PrivateKey::generate();
+        let first = timing_message("delivered before the send was rejected");
+        let delivered_hash = first.message_id();
+        let (link_id, peer) =
+            establish_active_delivery(&mut mgr, &mut rx, first, &peer_key, [0x2E; 16]);
+        mgr.pending.get_mut(&link_id).unwrap().link.rtt = Some(Duration::from_secs(1));
+        assert!(mgr.tick().is_empty());
+        let packet = next_outbound(&mut rx);
+        mgr.poll_endpoint_control();
+        let (header, _) = rns_wire::header::PacketHeader::unpack(&packet).unwrap();
+        let proof = peer
+            .prove_packet_with_local_signer(&rns_wire::hash::packet_hash(
+                &packet,
+                header.flags.header_type,
+            ))
+            .unwrap();
+        assert!(mgr.handle_link_packet_proof(&link_id, &proof));
+        assert!(matches!(
+            mgr.tick().as_slice(),
+            [DeliveryResult::Complete { .. }]
+        ));
+        assert_eq!(mgr.pending[&link_id].state, DeliveryState::Idle);
+        mgr.take_delivery_events();
+
+        // A later send on the idle link (a keepalive, say) is refused by the endpoint.
+        let (result_tx, result_rx) = oneshot::channel();
+        result_tx.send(LinkEndpointSendResult::NotBound).unwrap();
+        mgr.pending_endpoint_sends.push(PendingEndpointSend {
+            link_id,
+            final_send: false,
+            success: EndpointSendSuccess::None,
+            result_rx: result_rx.into(),
+        });
+
+        let results = mgr.tick();
+        assert!(
+            !results.iter().any(|result| matches!(
+                result,
+                DeliveryResult::Failed { msg_hash: Some(hash), .. } if *hash == delivered_hash
+            )),
+            "a delivered message never turns failed"
+        );
+        assert!(!mgr.pending.contains_key(&link_id));
+        assert!(
+            mgr.take_delivery_events()
+                .iter()
+                .all(|event| event.kind != LxmfDeliveryEventKind::Failed)
+        );
+    }
+
+    #[test]
+    fn stamp_rejection_after_an_upload_settled_is_ignored() {
+        let (tx, mut rx) = mpsc::channel(128);
+        let mut mgr = LinkDeliveryManager::new(tx, None, None);
+        let peer_key = Ed25519PrivateKey::generate();
+        let first = timing_message("uploaded before the rejection");
+        let (link_id, peer) =
+            establish_active_delivery(&mut mgr, &mut rx, first, &peer_key, [0x2D; 16]);
+        mgr.pending.get_mut(&link_id).unwrap().link.rtt = Some(Duration::from_secs(1));
+        assert!(mgr.tick().is_empty());
+        let packet = next_outbound(&mut rx);
+        mgr.poll_endpoint_control();
+        let (header, _) = rns_wire::header::PacketHeader::unpack(&packet).unwrap();
+        let proof = peer
+            .prove_packet_with_local_signer(&rns_wire::hash::packet_hash(
+                &packet,
+                header.flags.header_type,
+            ))
+            .unwrap();
+        assert!(mgr.handle_link_packet_proof(&link_id, &proof));
+        assert!(matches!(
+            mgr.tick().as_slice(),
+            [DeliveryResult::Complete { .. }]
+        ));
+        assert_eq!(mgr.pending[&link_id].state, DeliveryState::Idle);
+        mgr.take_delivery_events();
+        // The node's "invalid stamp" signal, sent on the upload link after the fact.
+        mgr.pending.get_mut(&link_id).unwrap().propagation_upload = true;
+        let mut rejection = Vec::new();
+        rmpv::encode::write_value(
+            &mut rejection,
+            &rmpv::Value::Array(vec![rmpv::Value::from(245)]),
+        )
+        .unwrap();
+        let encrypted = peer.encrypt(&rejection).unwrap();
+        mgr.handle_inbound_link_packet(
+            &link_id,
+            &encrypted,
+            rns_wire::flags::HeaderType::Header1,
+            &encrypted,
+        );
+
+        assert_eq!(mgr.pending[&link_id].state, DeliveryState::Idle);
+        assert!(mgr.tick().is_empty());
+        assert!(mgr.take_delivery_events().is_empty());
+        assert_eq!(mgr.pending[&link_id].state, DeliveryState::Idle);
     }
 
     #[test]
