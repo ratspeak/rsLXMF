@@ -480,7 +480,7 @@ impl Default for DaemonConfig {
             message_storage_limit: Some(500_000_000),
             from_static_only: false,
             pn_stamp_throttle: PN_STAMP_THROTTLE as f64,
-            // Current Python LXMF 1.1.0's standalone lxmd defaults
+            // Python LXMF's standalone lxmd defaults
             // direct-delivery Resource admission to 1 decimal KB when the
             // setting is omitted. LXMRouter's library default is separate.
             delivery_transfer_max_accepted_size: 1.0,

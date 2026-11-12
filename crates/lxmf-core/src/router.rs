@@ -3878,7 +3878,7 @@ mod tests {
         assert_eq!(router.pending_outbound[0].state, MessageState::Outbound);
     }
 
-    /// LXMF 1.2.0 keeps a message opportunistic only while its content fits
+    /// LXMF keeps a message opportunistic only while its content fits
     /// one encrypted packet, 287 bytes (LXMessage.py:64-79, :402-406).
     #[test]
     fn opportunistic_content_over_one_packet_falls_back_to_direct() {
