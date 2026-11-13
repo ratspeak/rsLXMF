@@ -364,9 +364,12 @@ fn apply_propagation_store_commit(
     };
     // LXMRouter keeps one processed-ID store; stored entries are claimed there at once.
     let now = now_f64();
+    let mut claims = Vec::with_capacity(result.committed.len());
     for (transient_id, _) in &result.committed {
         router.propagation_store.claim_processed(*transient_id, now);
+        claims.push((*transient_id, now));
     }
+    router.record_processed_claims(&claims);
     distribution.extend(
         result
             .committed
@@ -1794,9 +1797,17 @@ impl LxmdRunner {
             return;
         };
         node.merge_processed_ids(self.router.propagation_store.locally_processed_ids());
-        for (id, seen) in node.processed_ids() {
+        let claimed_by_node: Vec<_> = node
+            .processed_ids()
+            .iter()
+            .filter(|(id, _)| !self.router.propagation_store.is_locally_processed(id))
+            .map(|(id, seen)| (*id, *seen))
+            .collect();
+        drop(node);
+        for (id, seen) in &claimed_by_node {
             self.router.propagation_store.claim_processed(*id, *seen);
         }
+        self.router.record_processed_claims(&claimed_by_node);
     }
 
     /// A transient ID claimed by local delivery is a duplicate for propagation intake.
@@ -5247,8 +5258,8 @@ impl LxmdRunner {
                 .copied();
             let tickets = self
                 .router
-                .ticket_store
-                .inbound_tokens(&msg.source_hash(), now_f64());
+                .get_inbound_tickets(&msg.source_hash())
+                .unwrap_or_default();
             let cost = if self.config.enforce_stamps {
                 self.config.stamp_cost.unwrap_or(0.0)
             } else {
@@ -6905,13 +6916,8 @@ pub(crate) async fn main() {
                     }
                 }
                 msg.include_ticket = true;
-                let prepared = runner.router.prepare_outbound(&mut msg).and_then(|intent| {
-                    intent.persist(&runner.data_dir, &mut msg).map_err(|e| {
-                        lxmf_core::router::TicketPreparationError::Encode(e.to_string())
-                    })
-                });
-                if let Err(error) = prepared {
-                    tracing::error!(%error,"reply ticket persistence failed");
+                if let Err(error) = runner.router.prepare_outbound(&mut msg) {
+                    tracing::error!(%error, "reply ticket preparation failed");
                     break 'one_shot;
                 }
                 let Some(signing_key) = runner.identity.get_signing_key() else {
@@ -7558,6 +7564,8 @@ mod tests {
         let (tx, _rx) = mpsc::channel(64);
         initialize_storage_namespace(temp.path()).unwrap();
         let mut runner = LxmdRunner::new(DaemonConfig::default(), temp.path(), tx, None).unwrap();
+        let data_dir = runner.data_dir.clone();
+        runner.router.load_state(&data_dir).unwrap();
         let deliveries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let observed = deliveries.clone();
         runner.router.register_delivery_callback(move |_| {
@@ -7659,46 +7667,6 @@ mod tests {
             .unwrap()
             .finalize(None)
             .unwrap()
-    }
-
-    #[tokio::test]
-    async fn control_unpeer_leaves_claims_rotated_by_a_running_checkpoint() {
-        let temp = tempfile::tempdir().unwrap();
-        let (tx, _rx) = mpsc::channel::<TransportMessage>(64);
-        initialize_storage_namespace(temp.path()).unwrap();
-        let mut runner = LxmdRunner::new(DaemonConfig::default(), temp.path(), tx, None).unwrap();
-        let data_dir = runner.data_dir.clone();
-        runner.router.load_state(&data_dir).unwrap();
-        let message = signed_fixture(
-            runner.lxmf_dest_hash,
-            [0xCD; 16],
-            "",
-            "claimed",
-            DeliveryMethod::Direct,
-        );
-        assert!(runner.router.deliver_inbound(&message, false));
-        let checkpoint = runner.router.state_snapshot();
-        let saving = data_dir.join(format!(
-            "{}.saving",
-            lxmf_core::persist::DELIVERY_CLAIMS_FILE
-        ));
-        assert!(saving.exists());
-
-        let peer_hash = [0x44; 16];
-        runner
-            .router
-            .peers
-            .insert(peer_hash, LxmPeer::new(peer_hash));
-        let (command_tx, command_rx) = mpsc::unbounded_channel();
-        runner.control_command_rx = command_rx;
-        command_tx.send(ControlCommand::Unpeer(peer_hash)).unwrap();
-        runner.drain_control_commands();
-
-        assert!(!runner.router.peers.contains_key(&peer_hash));
-        // The checkpoint that rotated the claims still owns them until it commits.
-        assert!(saving.exists());
-        checkpoint.save_state(&data_dir).unwrap();
-        assert!(!saving.exists());
     }
 
     #[tokio::test]

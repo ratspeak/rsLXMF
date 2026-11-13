@@ -88,7 +88,6 @@ pub struct LocalStatusView {
     pub propagation_size: usize,
     pub pending_outbound: usize,
     pub pending_deferred_stamps: usize,
-    pub stamp_costs_cached: usize,
 }
 
 impl LocalStatusView {
@@ -105,7 +104,6 @@ impl LocalStatusView {
             propagation_size: stats.propagation_size,
             pending_outbound: stats.pending_outbound,
             pending_deferred_stamps: stats.pending_deferred_stamps,
-            stamp_costs_cached: stats.stamp_costs_cached,
         }
     }
 }
@@ -118,8 +116,7 @@ pub fn format_local_status(status: &LocalStatusView) -> String {
          Propagation messages: {}\n\
          Propagation storage bytes: {}\n\
          Pending outbound: {}\n\
-         Pending deferred stamps: {}\n\
-         Cached stamp costs: {}\n",
+         Pending deferred stamps: {}\n",
         hex::encode(status.lxmf_dest_hash),
         if status.propagation_enabled {
             "enabled"
@@ -131,7 +128,6 @@ pub fn format_local_status(status: &LocalStatusView) -> String {
         status.propagation_size,
         status.pending_outbound,
         status.pending_deferred_stamps,
-        status.stamp_costs_cached,
     )
 }
 
@@ -427,7 +423,6 @@ mod tests {
             propagation_size: 4096,
             pending_outbound: 4,
             pending_deferred_stamps: 5,
-            stamp_costs_cached: 6,
         };
 
         assert_eq!(
@@ -438,8 +433,7 @@ mod tests {
              Propagation messages: 3\n\
              Propagation storage bytes: 4096\n\
              Pending outbound: 4\n\
-             Pending deferred stamps: 5\n\
-             Cached stamp costs: 6\n"
+             Pending deferred stamps: 5\n"
         );
     }
 

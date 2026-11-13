@@ -19,7 +19,6 @@ pub struct LxMessageDraft {
     pub include_ticket: bool,
     pub outbound_ticket: Option<[u8; 16]>,
     pub stamp_cost: Option<f64>,
-    ticket_barrier: Option<Arc<()>>,
 }
 impl Deref for LxMessageDraft {
     type Target = MessageMetadata;
@@ -100,7 +99,6 @@ impl LxMessageDraft {
             include_ticket: false,
             outbound_ticket: None,
             stamp_cost: None,
-            ticket_barrier: None,
         };
         draft.checked_wire_len()?;
         Ok(draft)
@@ -122,21 +120,6 @@ impl LxMessageDraft {
     }
     pub fn fields(&self) -> &BTreeMap<FieldId, FieldValue> {
         &self.fields
-    }
-    pub(crate) fn mark_ticket_pending(&mut self, owner: Arc<()>) {
-        self.ticket_barrier = Some(owner);
-    }
-    pub(crate) fn release_ticket_barrier(&mut self, owner: &Arc<()>) -> bool {
-        if self
-            .ticket_barrier
-            .as_ref()
-            .is_some_and(|pending| Arc::ptr_eq(pending, owner))
-        {
-            self.ticket_barrier = None;
-            true
-        } else {
-            false
-        }
     }
     pub fn get_field(&self, id: impl Into<FieldId>) -> Option<&FieldValue> {
         self.fields.get(&id.into())
@@ -292,9 +275,6 @@ impl LxMessageDraft {
         F: FnOnce(&[u8]) -> Result<[u8; 64], E>,
         E: std::fmt::Display,
     {
-        if self.ticket_barrier.is_some() {
-            return Err(MessageError::TicketNotCommitted);
-        }
         let size = self.checked_wire_len()?;
         let mut signed = Vec::with_capacity(size);
         signed.extend_from_slice(&self.destination);

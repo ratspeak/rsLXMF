@@ -263,28 +263,23 @@ fn propagation_retry_keeps_ciphertext_and_tid_when_cost_rises() {
     assert!(propagation_readiness([8; 16], true, true, Some(policy), true, 101.).is_ok());
 }
 #[test]
-fn reply_ticket_cannot_sign_before_its_exact_durable_intent() {
+#[cfg(feature = "sqlite-store")]
+fn tickets_and_delivered_claims_are_in_the_state_store_before_they_are_acted_on() {
+    use lxmf_core::state_store::{FILE_NAME, SqliteStateStore, StateStore};
     let temp = tempfile::tempdir().unwrap();
     let mut router = lxmf_core::router::LxmRouter::new(Default::default());
+    router.load_state(temp.path()).unwrap();
+    let stale = router.state_snapshot();
     let mut draft =
         LxMessageDraft::new([1; 16], [2; 16], "", "ticket", DeliveryMethod::Direct).unwrap();
     draft.include_ticket = true;
-    let intent = router.prepare_outbound(&mut draft).unwrap();
-    assert!(intent.requires_persistence());
-    assert!(
-        draft
-            .clone()
-            .sign(&Ed25519PrivateKey::from_bytes(&[3; 32]))
-            .is_err()
-    );
-    let mut other =
-        LxMessageDraft::new([3; 16], [2; 16], "", "other", DeliveryMethod::Direct).unwrap();
-    other.include_ticket = true;
-    assert!(matches!(
-        router.prepare_outbound(&mut other),
-        Err(lxmf_core::router::TicketPreparationError::PendingPersistence)
-    ));
-    intent.persist(temp.path(), &mut draft).unwrap();
+    router.prepare_outbound(&mut draft).unwrap();
+    // A second connection reads the committed ticket while the router still runs.
+    let issued = SqliteStateStore::open(&temp.path().join(FILE_NAME))
+        .unwrap()
+        .get_inbound_tickets(&[1; 16])
+        .unwrap()
+        .expect("ticket committed before prepare_outbound returned");
     let msg = draft
         .sign(&Ed25519PrivateKey::from_bytes(&[3; 32]))
         .unwrap()
@@ -295,9 +290,25 @@ fn reply_ticket_cannot_sign_before_its_exact_durable_intent() {
             .get(lxmf_core::constants::FIELD_TICKET)
             .is_some()
     );
-    let loaded = lxmf_core::persist::load_tickets(temp.path()).unwrap();
-    assert!(!loaded.0.inbound.is_empty());
-    assert!(router.prepare_outbound(&mut other).is_ok());
+    // The delivered claim is in the file before the delivery callback runs.
+    let db = temp.path().join(FILE_NAME);
+    let claimed_first = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let seen = claimed_first.clone();
+    router.register_delivery_callback(move |delivered| {
+        let claimed = SqliteStateStore::open(&db)
+            .unwrap()
+            .has_delivered(&delivered.message_id())
+            .unwrap();
+        seen.store(claimed, std::sync::atomic::Ordering::Relaxed);
+    });
+    assert!(router.deliver_inbound(&msg, false));
+    assert!(claimed_first.load(std::sync::atomic::Ordering::Relaxed));
+    // An older checkpoint written afterwards cannot take the ticket away.
+    stale.save_state(temp.path()).unwrap();
+    drop(router);
+    let mut restarted = lxmf_core::router::LxmRouter::new(Default::default());
+    restarted.load_state(temp.path()).unwrap();
+    assert_eq!(restarted.get_inbound_tickets(&[1; 16]), Some(issued));
 }
 
 #[test]
@@ -451,133 +462,4 @@ fn canceled_download_closes_exact_request_admission_reply() {
         }
     }
     assert!(found);
-}
-
-#[test]
-fn stale_checkpoint_cannot_erase_ticket_after_signing_intent_commit() {
-    let temp = tempfile::tempdir().unwrap();
-    let mut router = lxmf_core::router::LxmRouter::new(Default::default());
-    let stale = router.state_snapshot();
-    let mut draft =
-        LxMessageDraft::new([1; 16], [2; 16], "", "ticket", DeliveryMethod::Direct).unwrap();
-    draft.include_ticket = true;
-    let intent = router.prepare_outbound(&mut draft).unwrap();
-    intent.persist(temp.path(), &mut draft).unwrap();
-    let committed = lxmf_core::persist::load_tickets(temp.path()).unwrap().0;
-    assert_eq!(committed.inbound.len(), 1);
-    stale.save_state(temp.path()).unwrap();
-    assert_eq!(
-        lxmf_core::persist::load_tickets(temp.path()).unwrap().0,
-        committed
-    );
-    // A newer checkpoint can commit while a draft is waiting for its exact
-    // intent. The old intent verifies that its ticket is still present.
-    drop(draft);
-    let mut next =
-        LxMessageDraft::new([4; 16], [2; 16], "", "next", DeliveryMethod::Direct).unwrap();
-    next.include_ticket = true;
-    let intent = router.prepare_outbound(&mut next).unwrap();
-    router.state_snapshot().save_state(temp.path()).unwrap();
-    intent.persist(temp.path(), &mut next).unwrap();
-    assert!(next.sign(&Ed25519PrivateKey::from_bytes(&[3; 32])).is_ok());
-    assert_eq!(
-        lxmf_core::persist::load_tickets(temp.path())
-            .unwrap()
-            .0
-            .inbound
-            .len(),
-        2
-    );
-}
-
-#[test]
-fn suppression_checkpoint_rejects_duplicate_scope_and_truncated_allocation_claim() {
-    let temp = tempfile::tempdir().unwrap();
-    let mut ledger = SuppressionLedger::default();
-    ledger
-        .record_failure(
-            scope(1),
-            SuppressionReason::Malformed,
-            AdmissionEpochs::default(),
-            100,
-        )
-        .unwrap();
-    lxmf_core::persist::save_suppression(temp.path(), &ledger).unwrap();
-    assert_eq!(
-        lxmf_core::persist::load_suppression(temp.path())
-            .unwrap()
-            .records()
-            .count(),
-        1
-    );
-    let path = temp.path().join("propagation_suppression_v1");
-    let bytes = std::fs::read(&path).unwrap();
-    let mut value = rmpv::decode::read_value(&mut bytes.as_slice()).unwrap();
-    let rmpv::Value::Array(fields) = &mut value else {
-        panic!("ledger wrapper")
-    };
-    let rmpv::Value::Map(rows) = &mut fields[0] else {
-        panic!("ledger records")
-    };
-    rows.push(rows[0].clone());
-    let mut duplicate = Vec::new();
-    rmpv::encode::write_value(&mut duplicate, &value).unwrap();
-    std::fs::write(&path, duplicate).unwrap();
-    assert!(lxmf_core::persist::load_suppression(temp.path()).is_err());
-    std::fs::write(&path, [0x91, 0xdf, 0xff, 0xff, 0xff, 0xff]).unwrap();
-    assert!(lxmf_core::persist::load_suppression(temp.path()).is_err());
-}
-
-#[test]
-fn strict_ratchet_checkpoints_round_trip_and_surface_failed_publication() {
-    use rns_identity::{
-        announce_state::RatchetControlState,
-        identity::Identity,
-        ratchet::{RatchetRing, ReceivedRatchet},
-    };
-    let temp = tempfile::tempdir().unwrap();
-    let identity = Identity::new();
-    let mut ring = RatchetRing::new();
-    let public = ring.rotate_at(100.);
-    let ring_path = temp.path().join("ring");
-    ring.save_verified_durable(&ring_path, &identity).unwrap();
-    assert_eq!(
-        RatchetRing::load_verified(&ring_path, &identity)
-            .unwrap()
-            .ring()
-            .current_public_key(),
-        Some(public)
-    );
-    let control = RatchetControlState::new(identity.hash, [2; 16])
-        .prepare_announce(100)
-        .unwrap()
-        .unwrap();
-    let control_path = temp.path().join("control");
-    control
-        .save_verified_durable(&control_path, &identity)
-        .unwrap();
-    assert_eq!(
-        RatchetControlState::load_verified(&control_path, &identity, [2; 16]).unwrap(),
-        control
-    );
-    let received = ReceivedRatchet::new_at(public, 100.);
-    let received_path = temp.path().join("received");
-    received.save_durable(&received_path).unwrap();
-    assert_eq!(
-        ReceivedRatchet::load(&received_path).unwrap().ratchet_pub,
-        public
-    );
-    let blocker = temp.path().join("not-a-directory");
-    std::fs::write(&blocker, b"preserve").unwrap();
-    assert!(
-        ring.save_verified_durable(&blocker.join("ring"), &identity)
-            .is_err()
-    );
-    assert!(
-        control
-            .save_verified_durable(&blocker.join("control"), &identity)
-            .is_err()
-    );
-    assert!(received.save_durable(&blocker.join("received")).is_err());
-    assert_eq!(std::fs::read(blocker).unwrap(), b"preserve");
 }

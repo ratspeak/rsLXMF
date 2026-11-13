@@ -743,6 +743,7 @@ dependencies = [
  "rns-protocol",
  "rns-transport",
  "rns-wire",
+ "rusqlite",
  "serde",
  "sha2",
  "tempfile",

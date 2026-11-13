@@ -26,7 +26,8 @@ use crate::peer::LxmPeer;
 use crate::propagation::PropagationStore;
 use crate::propagation_client::PropagationTransferStatus;
 use crate::stamper;
-use crate::ticket::{Ticket, TicketStore};
+use crate::state_store::{StateStoreError, StateStoreHandle};
+use crate::ticket::Ticket;
 use crate::types::PropagationTransientId;
 
 mod outbound;
@@ -41,35 +42,6 @@ pub use outbound::{
 pub struct InboundReservation {
     message_id: [u8; 32],
     nonce: u64,
-}
-
-/// Persistence barrier for a router-minted reply ticket. Signing the marked
-/// draft remains blocked until this intent establishes that the required ticket
-/// is durable, either in its snapshot or a newer committed ticket snapshot.
-pub struct OutboundTicketIntent {
-    barrier: Option<std::sync::Arc<()>>,
-    snapshot: Option<crate::persist::TicketPersistenceSnapshot>,
-    required_ticket: Option<Ticket>,
-}
-impl OutboundTicketIntent {
-    pub fn requires_persistence(&self) -> bool {
-        self.snapshot.is_some()
-    }
-    pub fn persist(
-        self,
-        state_dir: &std::path::Path,
-        draft: &mut LxMessageDraft,
-    ) -> std::io::Result<()> {
-        if let Some(snapshot) = self.snapshot {
-            snapshot.save(state_dir, self.required_ticket.as_ref())?;
-            if !draft.release_ticket_barrier(self.barrier.as_ref().expect("snapshot barrier")) {
-                return Err(std::io::Error::other(
-                    "reply ticket intent belongs to a different draft",
-                ));
-            }
-        }
-        Ok(())
-    }
 }
 
 /// Router configuration.
@@ -220,8 +192,6 @@ impl std::error::Error for SendError {}
 pub enum TicketPreparationError {
     #[error("reply ticket must be added before the LXMF message is signed")]
     AlreadySigned,
-    #[error("another reply-ticket draft is awaiting durable persistence")]
-    PendingPersistence,
     #[error("failed to encode LXMF reply ticket: {0}")]
     Encode(String),
 }
@@ -307,10 +277,6 @@ pub struct LxmRouter {
     /// Peers that will never be rotated out.
     pub static_peers: Vec<[u8; 16]>,
     pub propagation_store: PropagationStore,
-    /// Cached stamp costs keyed by destination hash.
-    pub outbound_stamp_costs: HashMap<[u8; 16], StampCostEntry>,
-    pub ticket_store: TicketStore,
-    ticket_intent_in_flight: std::sync::Weak<()>,
     /// Destination hash → recorded priority level. The propagation index uses
     /// membership to apply its fixed priority weight; it does not use the level.
     pub prioritized: HashMap<[u8; 16], u8>,
@@ -342,10 +308,17 @@ pub struct LxmRouter {
     /// A slow-path message concluded; outbound processing should run again.
     outbound_kick: bool,
     propagation_announce_due: bool,
-    /// Directory given to [`Self::load_state`]; delivered and processed IDs are
-    /// claimed there durably before delivery callbacks run.
-    claims_dir: Option<std::path::PathBuf>,
+    /// Stamp costs, tickets, and delivered and processed transient IDs, as
+    /// `LXMFStore` keeps them: in memory until [`Self::load_state`] opens `state.db`.
+    state_store: StateStoreHandle,
 }
+
+/// Rows removed per store cull call; `LXMFStore.CULL_CHUNK`.
+const STORE_CULL_ROWS: usize = 4096;
+/// Cull calls per cleaning pass; `LXMRouter.STORE_CULL_CHUNKS`.
+const STORE_CULL_CHUNKS: usize = 16;
+/// Pages freed per vacuum call; `LXMFStore.VACUUM_PAGES`.
+const STORE_VACUUM_PAGES: usize = 512;
 
 /// Delivered destinations a router holds for the embedder to retain.
 const MAX_PENDING_RETAINS: usize = 256;
@@ -368,47 +341,21 @@ pub struct AutopeerCandidate {
     pub hops: Option<u8>,
 }
 
-/// Cached stamp cost for a destination; `None` records an announce without
-/// a cost. Integer costs stored by older versions still load.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct StampCostEntry {
-    pub cost: Option<f64>,
-    pub recorded_at: f64,
-}
-
-/// Owned, coherent snapshot of the router state written by [`LxmRouter::save_state`].
+/// Owned snapshot of the router state written by [`LxmRouter::save_state`]:
+/// the node statistics. Stamp costs, tickets, and transient IDs are written to
+/// `state.db` as they change and are not part of it.
 ///
-/// Capturing this snapshot clones in-memory state and assigns a ticket revision.
 /// The caller can release any router lock before calling [`Self::save_state`],
 /// keeping filesystem I/O out of the router's critical section.
 #[derive(Debug, Clone)]
 pub struct RouterStateSnapshot {
-    outbound_stamp_costs: HashMap<[u8; 16], StampCostEntry>,
-    tickets: crate::persist::TicketPersistenceSnapshot,
-    local_deliveries: HashMap<PropagationTransientId, f64>,
-    locally_processed: HashMap<PropagationTransientId, f64>,
     node_stats: crate::persist::PersistedNodeStats,
-    claims_dir: Option<std::path::PathBuf>,
 }
 
 impl RouterStateSnapshot {
-    /// Persist this owned snapshot using the router's MessagePack layout.
-    ///
-    /// Each file is written atomically via rename, matching
-    /// [`LxmRouter::save_state`]. The group is not one transaction: an error can
-    /// follow successful writes to earlier files. Serialize snapshot writes.
+    /// Write the node statistics file atomically, as [`LxmRouter::save_state`] does.
     pub fn save_state(&self, state_dir: &std::path::Path) -> std::io::Result<()> {
-        use crate::persist;
-
-        persist::save_stamp_costs(state_dir, &self.outbound_stamp_costs)?;
-        self.tickets.save(state_dir, None)?;
-        persist::save_local_deliveries(state_dir, &self.local_deliveries)?;
-        persist::save_locally_processed(state_dir, &self.locally_processed)?;
-        persist::save_node_stats(state_dir, &self.node_stats)?;
-        if self.claims_dir.as_deref() == Some(state_dir) {
-            persist::clear_rotated_delivery_claims(state_dir)?;
-        }
-        Ok(())
+        crate::persist::save_node_stats(state_dir, &self.node_stats)
     }
 }
 
@@ -430,9 +377,6 @@ impl LxmRouter {
             peers: HashMap::new(),
             static_peers: Vec::new(),
             propagation_store: PropagationStore::new(),
-            outbound_stamp_costs: HashMap::new(),
-            ticket_store: TicketStore::new(),
-            ticket_intent_in_flight: std::sync::Weak::new(),
             prioritized: HashMap::new(),
             delivery_callback: None,
             transport_tx: None,
@@ -453,7 +397,7 @@ impl LxmRouter {
             path_request_times: HashMap::new(),
             outbound_kick: false,
             propagation_announce_due: false,
-            claims_dir: None,
+            state_store: StateStoreHandle::in_memory(),
         }
     }
 
@@ -603,43 +547,28 @@ impl LxmRouter {
         Ok(())
     }
 
-    /// Apply router-owned ticket state before a caller signs `message`.
+    /// Apply router-owned ticket state before a caller signs `message`
+    /// (`LXMRouter.handle_outbound`).
     ///
     /// Learned outbound tickets do not change signed fields and can be
     /// attached at any time. A requested reply ticket is a signed LXMF field,
-    /// so it must be inserted before signing. The method is deliberately
-    /// signer-agnostic. When the returned intent requires persistence, call
-    /// [`OutboundTicketIntent::persist`] with this draft before `sign` or
-    /// `sign_with`; signing remains blocked until that barrier is released.
+    /// so it must be inserted before signing. The ticket is in the state store
+    /// when this returns: no message can carry a ticket the router would not
+    /// recognise after a restart.
     pub fn prepare_outbound(
         &mut self,
         message: &mut LxMessageDraft,
-    ) -> Result<OutboundTicketIntent, TicketPreparationError> {
-        let now = now_f64();
+    ) -> Result<(), TicketPreparationError> {
         let destination = message.destination_hash();
         if message.outbound_ticket.is_none() {
-            message.outbound_ticket = self
-                .ticket_store
-                .find_outbound(&destination, now)
-                .map(|t| t.token);
+            message.outbound_ticket = self.get_outbound_ticket(&destination);
         }
         if message.stamp_cost.is_none() {
             message.stamp_cost = self.get_stamp_cost(&destination);
         }
         if message.include_ticket
             && message.get_field(FIELD_TICKET).is_none()
-            && self.ticket_intent_in_flight.upgrade().is_some()
-        {
-            return Err(TicketPreparationError::PendingPersistence);
-        }
-        let mut intent = OutboundTicketIntent {
-            barrier: None,
-            snapshot: None,
-            required_ticket: None,
-        };
-        if message.include_ticket
-            && message.get_field(FIELD_TICKET).is_none()
-            && let Some(ticket) = self.ticket_store.issue_for(destination, TICKET_EXPIRY, now)
+            && let Some(ticket) = self.generate_ticket(destination, None)
         {
             let encoded = ticket
                 .encode_field()
@@ -647,16 +576,8 @@ impl LxmRouter {
             message
                 .set_msgpack_field(FIELD_TICKET, encoded)
                 .map_err(|e| TicketPreparationError::Encode(e.to_string()))?;
-            let barrier = std::sync::Arc::new(());
-            message.mark_ticket_pending(barrier.clone());
-            self.ticket_intent_in_flight = std::sync::Arc::downgrade(&barrier);
-            intent.barrier = Some(barrier);
-            intent.required_ticket = Some(ticket);
-            intent.snapshot = Some(crate::persist::TicketPersistenceSnapshot::capture(
-                self.ticket_store.snapshot(),
-            ));
         }
-        Ok(intent)
+        Ok(())
     }
 
     /// Signatures freeze the body before recipient work; only finalized messages
@@ -998,60 +919,112 @@ impl LxmRouter {
         self.propagation_store.total_size()
     }
 
-    /// Generate a fresh random ticket for `destination_hash` and add it to the ticket store.
+    /// The reply ticket to include in a message to `destination_hash`
+    /// (`LXMRouter.generate_ticket`): none within [`TICKET_INTERVAL`] of the
+    /// last one delivered there, else the issued ticket with more than
+    /// [`TICKET_RENEW`] of validity left, else a new one valid for
+    /// `expiry_secs` (default [`TICKET_EXPIRY`]).
     ///
-    /// The returned token can be shared with a peer that should bypass stamp PoW when sending
-    /// to this router. Default expiry is [`TICKET_EXPIRY`] seconds.
-    ///
-    /// This low-level helper always generates a token, without renewal/interval
-    /// reuse or persistence. Persist ticket state before advertising the token;
-    /// [`Self::prepare_outbound`] supplies the normal reply-ticket barrier.
+    /// A new ticket is returned only once the state store has committed it and
+    /// flushed it to disk. Upstream returns it even when the write failed; here
+    /// the message then goes without a ticket, as it does while `state.db`
+    /// could not be opened, because the recipient's replies would stop
+    /// validating after a restart.
     pub fn generate_ticket(
         &mut self,
         destination_hash: [u8; 16],
         expiry_secs: Option<u64>,
-    ) -> [u8; 16] {
-        use rand::RngCore;
-        let mut token = [0u8; TICKET_LENGTH];
-        rand::thread_rng().fill_bytes(&mut token);
-        let expires = now_f64() + expiry_secs.unwrap_or(TICKET_EXPIRY) as f64;
-        self.ticket_store
-            .add_inbound(Ticket::new(token, destination_hash, expires));
-        token
+    ) -> Option<Ticket> {
+        let now = now_f64();
+        let expires = now + expiry_secs.unwrap_or(TICKET_EXPIRY) as f64;
+        let token: [u8; TICKET_LENGTH] = rand::random();
+        let durable = !self.state_store.is_fallback();
+        let outcome = self.state_store.call(move |s| {
+            // A failed read counts as no row, as `LXMFStore` returns `None`.
+            if let Ok(Some(last)) = s.get_last_ticket_delivery(&destination_hash)
+                && now - last < TICKET_INTERVAL as f64
+            {
+                return Ok(None);
+            }
+            if let Ok(Some(reusable)) =
+                s.get_reusable_inbound_ticket(&destination_hash, TICKET_RENEW as f64)
+            {
+                return Ok(Some(reusable));
+            }
+            if !durable {
+                return Ok(None);
+            }
+            let mut stored = Ok(());
+            s.synced(&mut |s| stored = s.store_inbound_ticket(&destination_hash, &token, expires))?;
+            stored.map(|()| Some((expires, token)))
+        });
+        match outcome {
+            Ok(ticket) => {
+                ticket.map(|(expires, token)| Ticket::new(token, destination_hash, expires))
+            }
+            Err(error) => {
+                tracing::error!(%error, "could not save inbound ticket in the LXMF state store; sending without a ticket");
+                None
+            }
+        }
     }
 
-    /// Record an externally-provided outbound ticket so the router can use it when sending.
+    /// Record a ticket received from `destination_hash` for stamping messages to it.
     ///
     /// Python reference: `LXMRouter.remember_ticket`.
     pub fn remember_ticket(&mut self, destination_hash: [u8; 16], token: [u8; 16], expires: f64) {
-        self.ticket_store
-            .remember_outbound(Ticket::new(token, destination_hash, expires));
+        self.state_store.write("remember ticket", move |s| {
+            s.remember_ticket(&destination_hash, expires, &token)
+        });
     }
 
     /// Return the currently stored valid outbound ticket for `destination_hash`.
     ///
     /// Python reference: `LXMRouter.get_outbound_ticket`.
     pub fn get_outbound_ticket(&self, destination_hash: &[u8; 16]) -> Option<[u8; 16]> {
-        let now = now_f64();
-        self.ticket_store
-            .find_outbound(destination_hash, now)
-            .map(|t| t.token)
+        let destination = *destination_hash;
+        self.store_read("recall outbound ticket", move |s| {
+            s.get_outbound_ticket(&destination)
+        })
     }
 
     /// Returns the expiry (Unix epoch seconds) of the valid ticket for `destination_hash`.
     ///
     /// Python reference: `LXMRouter.get_outbound_ticket_expiry`.
     pub fn get_outbound_ticket_expiry(&self, destination_hash: &[u8; 16]) -> Option<f64> {
-        let now = now_f64();
-        self.ticket_store
-            .find_outbound(destination_hash, now)
-            .map(|t| t.expires)
+        let destination = *destination_hash;
+        self.store_read("recall outbound ticket expiry", move |s| {
+            s.get_outbound_ticket_expiry(&destination)
+        })
     }
 
-    /// Borrow all locally issued inbound tickets, across destinations. Expired
-    /// entries remain visible until culled. This does not include learned outbound tickets.
-    pub fn get_inbound_tickets(&self) -> &[Ticket] {
-        self.ticket_store.inbound()
+    /// The unexpired tickets issued to `destination_hash`, against which its
+    /// stamps are checked; `None` when there are none.
+    ///
+    /// Python reference: `LXMRouter.get_inbound_tickets`.
+    pub fn get_inbound_tickets(&self, destination_hash: &[u8; 16]) -> Option<Vec<[u8; 16]>> {
+        let destination = *destination_hash;
+        self.store_read("recall inbound tickets", move |s| {
+            s.get_inbound_tickets(&destination)
+        })
+    }
+
+    /// A store read on behalf of the caller. A failure is logged and reads as
+    /// no row, as `LXMFStore`'s getters return `None`.
+    fn store_read<T: Send + 'static>(
+        &self,
+        what: &'static str,
+        job: impl FnOnce(&mut dyn crate::state_store::Backend) -> Result<Option<T>, StateStoreError>
+        + Send
+        + 'static,
+    ) -> Option<T> {
+        self.state_store
+            .call(job)
+            .inspect_err(
+                |error| tracing::error!(%error, "could not {what} from the LXMF state store"),
+            )
+            .ok()
+            .flatten()
     }
 
     /// Cancel a message in the router's outbound or deferred-stamp queue
@@ -1143,8 +1116,11 @@ impl LxmRouter {
     /// ticket-delivery accounting and callbacks reflect the observable result.
     pub fn complete_outbound_message(&mut self, mut msg: LxMessage) {
         if msg.fields().contains(FIELD_TICKET) {
-            self.ticket_store
-                .mark_ticket_delivered(msg.destination_hash(), now_f64());
+            let (destination, now) = (msg.destination_hash(), now_f64());
+            self.state_store
+                .write("record last ticket delivery", move |s| {
+                    s.mark_last_ticket_delivery(&destination, now)
+                });
         }
         let destination = msg.destination_hash();
         if !self.destination_retains.contains(&destination) {
@@ -1214,15 +1190,11 @@ impl LxmRouter {
             })
     }
 
-    /// Get the cached required stamp cost for a destination (delivery).
-    ///
-    /// Returns the cached entry unchanged, without an expiry check. Use
-    /// [`Self::get_stamp_cost`] to exclude expired entries. Unlike Python's
-    /// same-named message-ID lookup, this API takes a destination hash.
+    /// The stored stamp cost for a destination; the same read as
+    /// [`Self::get_stamp_cost`]. Unlike Python's same-named message-ID
+    /// lookup, this API takes a destination hash.
     pub fn get_outbound_lxm_stamp_cost(&self, destination_hash: &[u8; 16]) -> Option<f64> {
-        self.outbound_stamp_costs
-            .get(destination_hash)
-            .and_then(|e| e.cost)
+        self.get_stamp_cost(destination_hash)
     }
 
     /// Return the recipient stamp cost recorded on a deferred message.
@@ -1234,18 +1206,22 @@ impl LxmRouter {
             .and_then(|m| m.stamp_cost())
     }
 
-    /// Check the local-delivery dedupe cache for a message or transient ID.
-    /// Durable discard/deletion decisions can also populate it; presence does
-    /// not prove a message file exists. This lookup does not check expiry.
+    /// Whether a message or transient ID is recorded as delivered
+    /// (`LXMRouter.has_message`). Durable discard/deletion decisions can also
+    /// record one; presence does not prove a message file exists.
     pub fn has_message(&self, transient_id: &PropagationTransientId) -> bool {
-        self.propagation_store.is_locally_delivered(transient_id)
+        let id = *transient_id;
+        self.state_store
+            .call(move |s| s.has_delivered(&id))
+            .inspect_err(|error| tracing::error!(%error, "could not query delivered transient ID in the LXMF state store"))
+            .unwrap_or(false)
     }
 
-    /// Mark a message ID delivered in memory and invoke the registered callback.
+    /// Record a message ID as delivered and invoke the registered callback.
     /// A message from an ignored source returns `false` and is not recorded
     /// (Python `lxmf_delivery`). With `allow_duplicate = false`, an ID already
-    /// in the local-delivery cache returns `false`; with `true`, repeated calls
-    /// may invoke the callback again.
+    /// delivered returns `false`; with `true`, repeated calls may invoke the
+    /// callback again.
     /// This compatibility helper does not verify the message, persist local
     /// effects or record a distinct ciphertext transient ID. Use the reservation
     /// and durable-receipt commit path for application admission.
@@ -1254,36 +1230,70 @@ impl LxmRouter {
         if self.is_ignored(&message.source_hash()) {
             return false;
         }
-        let message_id = message.message_id();
-        if !allow_duplicate && self.propagation_store.is_locally_delivered(&message_id) {
+        if !self.claim_delivered(message.message_id(), allow_duplicate) {
             return false;
         }
-        self.claim_locally_delivered(message_id);
         if let Some(ref callback) = self.delivery_callback {
             callback(message);
         }
         true
     }
 
-    /// Record a delivered ID, durably first when state is loaded from a directory
-    /// (Python `conditionally_claim_delivered`). A failed write is logged and the
-    /// message still counts as new, as Python's store does.
-    fn claim_locally_delivered(&mut self, id: PropagationTransientId) {
-        self.propagation_store.mark_locally_delivered(id);
-        self.append_claim(&id, false);
+    /// Claim a delivered ID before the delivery is acted on, as `lxmf_delivery`
+    /// does: `conditionally_claim_delivered`, or `mark_locally_delivered` when
+    /// duplicates are allowed. The write is awaited and flushed, so the claim
+    /// is on disk before any callback runs. Returns `false` only for an ID the
+    /// store already holds; a failed write is logged and the message counts as
+    /// new, as `LXMFStore._claim` treats it.
+    fn claim_delivered(&mut self, id: PropagationTransientId, allow_duplicate: bool) -> bool {
+        let now = now_f64();
+        self.state_store
+            .call_synced(move |s| {
+                if allow_duplicate {
+                    s.mark_locally_delivered(&id, now).map(|()| true)
+                } else {
+                    s.conditionally_claim_delivered(&id, now)
+                }
+            })
+            .unwrap_or_else(|error| {
+                tracing::error!(%error, "could not claim delivered transient ID in the LXMF state store, treating as claimed");
+                true
+            })
     }
 
-    fn claim_locally_processed(&mut self, id: PropagationTransientId) {
-        self.propagation_store.mark_locally_processed(id);
-        self.append_claim(&id, true);
+    /// Claim a processed ID as `lxmf_propagation` does:
+    /// `conditionally_claim_processed`, or `unconditionally_mark_processed` when
+    /// duplicates are allowed. Awaited and flushed, and a failed write counts
+    /// as new, like [`Self::claim_delivered`]. The ID also enters the in-memory
+    /// index the propagation node shares.
+    fn claim_processed(&mut self, id: PropagationTransientId, allow_duplicate: bool) -> bool {
+        let now = now_f64();
+        self.propagation_store.claim_processed(id, now);
+        self.state_store
+            .call_synced(move |s| {
+                if allow_duplicate {
+                    s.unconditionally_mark_processed(&id, now).map(|()| true)
+                } else {
+                    s.conditionally_claim_processed(&id, now)
+                }
+            })
+            .unwrap_or_else(|error| {
+                tracing::error!(%error, "could not claim processed transient ID in the LXMF state store, treating as claimed");
+                true
+            })
     }
 
-    fn append_claim(&self, id: &PropagationTransientId, processed: bool) {
-        if let Some(dir) = &self.claims_dir
-            && let Err(error) = crate::persist::append_delivery_claim(dir, id, processed, now_f64())
-        {
-            tracing::error!(%error, "could not claim transient id in the router state directory");
-        }
+    /// Write processed IDs that propagation intake stored
+    /// (`unconditionally_mark_processed` in `lxmf_propagation`). The intake has
+    /// already made its duplicate decision, so nothing waits for the write, and
+    /// it is committed at upstream's level.
+    pub fn record_processed_claims(&mut self, ids: &[(PropagationTransientId, f64)]) {
+        let ids = ids.to_vec();
+        self.state_store
+            .write("mark processed transient IDs", move |s| {
+                ids.iter()
+                    .try_for_each(|(id, at)| s.unconditionally_mark_processed(id, *at))
+            });
     }
 
     /// Reserve a message ID before local disk/DB work. An existing reservation
@@ -1338,16 +1348,27 @@ impl LxmRouter {
         {
             self.learn_ticket_from_inbound(verified);
         }
-        self.claim_locally_delivered(receipt.record().scope.transient_id);
-        self.claim_locally_processed(receipt.record().scope.transient_id);
+        let (transient_id, message_id) =
+            (receipt.record().scope.transient_id, message.message_id());
         // Python lxmf_delivery drops ignored sources before claiming the message id.
-        if self.is_ignored(&message.source_hash()) {
-            return false;
-        }
-        let new_message = !self
-            .propagation_store
-            .is_locally_delivered(&message.message_id());
-        self.claim_locally_delivered(message.message_id());
+        let ignored = self.is_ignored(&message.source_hash());
+        let now = now_f64();
+        self.propagation_store.claim_processed(transient_id, now);
+        // The claims of `lxmf_propagation` and `lxmf_delivery`, in one flushed transaction.
+        let new_message = self
+            .state_store
+            .call_synced(move |s| {
+                s.mark_locally_delivered(&transient_id, now)?;
+                s.unconditionally_mark_processed(&transient_id, now)?;
+                if ignored {
+                    return Ok(false);
+                }
+                s.conditionally_claim_delivered(&message_id, now)
+            })
+            .unwrap_or_else(|error| {
+                tracing::error!(%error, "could not claim an admitted message in the LXMF state store, treating as claimed");
+                !ignored
+            });
         if new_message
             && receipt.record().disposition == crate::admission::DurableDisposition::Committed
         {
@@ -1370,7 +1391,7 @@ impl LxmRouter {
         else {
             return false;
         };
-        self.ticket_store.remember_outbound(ticket);
+        self.remember_ticket(ticket.destination_hash, ticket.token, ticket.expires);
         true
     }
 
@@ -1397,25 +1418,28 @@ impl LxmRouter {
         let transient_id = rns_crypto::sha::full_hash(&lxmf_data);
         if !allow_duplicate
             && (self.propagation_store.contains(&transient_id)
-                || self.propagation_store.is_locally_processed(&transient_id))
+                || !self.claim_processed(transient_id, false))
         {
             return Ok(PaperIngest::Duplicate);
         }
-        self.claim_locally_processed(transient_id);
+        if allow_duplicate {
+            self.claim_processed(transient_id, true);
+        }
 
         let mut packed = destination_hash.to_vec();
         packed.extend_from_slice(&decrypt_fn(&encrypted)?);
-        // Python records the transient id as delivered even when the decrypted
-        // bytes do not unpack (LXMRouter.py).
-        let unpacked = LxMessage::unpack(&packed);
-        self.claim_locally_delivered(transient_id);
-        let mut message = unpacked?;
-        message.method = DeliveryMethod::Propagated;
-        message.representation = DeliveryRepresentation::Paper;
-        message.transport_encrypted = true;
-        message.transport_encryption = Some(rns_identity::identity::CURVE.to_string());
-        self.deliver_inbound(&message, allow_duplicate);
-        Ok(PaperIngest::Delivered(Box::new(message)))
+        let delivered = LxMessage::unpack(&packed).map(|mut message| {
+            message.method = DeliveryMethod::Propagated;
+            message.representation = DeliveryRepresentation::Paper;
+            message.transport_encrypted = true;
+            message.transport_encryption = Some(rns_identity::identity::CURVE.to_string());
+            self.deliver_inbound(&message, allow_duplicate);
+            message
+        });
+        // `lxmf_propagation` marks the transient ID after the delivery attempt,
+        // also when the decrypted bytes did not unpack.
+        self.claim_delivered(transient_id, true);
+        Ok(PaperIngest::Delivered(Box::new(delivered?)))
     }
 
     /// Replace the router-wide callback used by inbound delivery/commit helpers.
@@ -1430,63 +1454,197 @@ impl LxmRouter {
         self.delivery_callback = Some(Box::new(callback));
     }
 
-    /// Load persisted runtime state (stamp costs, tickets, dedup sets) from
-    /// `state_dir`. Missing files are treated as empty state; other load errors
-    /// propagate after any earlier fields have already been replaced. Dedup-cache
-    /// timestamps are restored so age-based expiry survives restarts.
+    /// Open the router's storage in `state_dir`: the LXMF 1.3.0 store
+    /// `state_dir/state.db` and the node statistics file.
+    ///
+    /// The msgpack caches the store replaced (`local_deliveries`,
+    /// `locally_processed`, `outbound_stamp_costs`, `available_tickets`) are
+    /// imported in that order, each in one transaction, and renamed to
+    /// `<name>.imported` after its commit (`LXMRouter.__import_legacy_storage`).
+    /// Expired rows are then cleaned as upstream cleans them at start-up.
+    ///
+    /// A store that cannot be opened, is corrupt, or carries a newer version
+    /// never fails this call: the state is kept in memory for the session, the
+    /// old caches stay where they are, and one error line names the file and
+    /// the remedy. Only an unreadable node statistics file is an error.
     pub fn load_state(&mut self, state_dir: &std::path::Path) -> std::io::Result<()> {
-        use crate::persist;
-        self.outbound_stamp_costs = persist::load_stamp_costs(state_dir)?;
-        let (snapshot, legacy) = persist::load_tickets(state_dir)?;
-        if let Some(legacy) = legacy {
-            self.ticket_store.replace_legacy(legacy);
-        } else {
-            self.ticket_store.replace_snapshot(snapshot);
+        use crate::state_store::legacy::{self, Source};
+
+        self.state_store = Self::open_state_store(state_dir);
+        let durable = self.state_store.is_file_backed();
+
+        for source in Source::ALL {
+            let name = source.file_name();
+            let file = state_dir.join(name);
+            if !file.is_file() {
+                continue;
+            }
+            let outcome = self.state_store.call(move |s| {
+                Ok(if durable {
+                    legacy::import(s, source, &file)
+                } else {
+                    // The session's memory gets the rows; the file stays for a later import.
+                    legacy::read_rows(source, &file).and_then(|rows| {
+                        s.apply_imported(&rows).map_err(legacy::ImportError::Store)
+                    })
+                })
+            });
+            match outcome {
+                Ok(Ok(rows)) => {
+                    tracing::debug!(
+                        rows,
+                        file = name,
+                        "imported legacy cache into the LXMF state store"
+                    )
+                }
+                Ok(Err(error)) => {
+                    tracing::error!(
+                        file = name,
+                        "legacy cache not imported into the LXMF state store: {error}"
+                    )
+                }
+                Err(error) => {
+                    tracing::error!(%error, file = name, "legacy cache not imported into the LXMF state store")
+                }
+            }
         }
-        self.propagation_store
-            .replace_locally_delivered(persist::load_local_deliveries(state_dir)?);
-        self.propagation_store
-            .replace_locally_processed(persist::load_locally_processed(state_dir)?);
-        let (delivered, processed) = persist::load_delivery_claims(state_dir)?;
-        for (id, at) in delivered {
-            self.propagation_store.restore_locally_delivered(id, at);
+        self.import_delivery_claims(state_dir, durable);
+
+        // `LXMRouter.__import_legacy_storage` ends with these four.
+        self.clean_transient_id_caches();
+        self.cull_stamp_costs();
+        self.clean_available_tickets();
+        self.state_store.write("run incremental vacuum", |s| {
+            s.incremental_vacuum(STORE_VACUUM_PAGES).map(|_| ())
+        });
+
+        // The propagation node dedupes its intake against the processed IDs.
+        match self.state_store.call(|s| s.processed_ids()) {
+            Ok(processed) => self
+                .propagation_store
+                .replace_locally_processed(processed.into_iter().collect()),
+            Err(error) => {
+                tracing::error!(%error, "could not read processed transient IDs from the LXMF state store")
+            }
         }
-        for (id, at) in processed {
-            self.propagation_store.restore_locally_processed(id, at);
-        }
-        self.claims_dir = Some(state_dir.to_path_buf());
-        let stats = persist::load_node_stats(state_dir)?;
+
+        let stats = crate::persist::load_node_stats(state_dir)?;
         self.client_propagation_messages_received = stats.client_propagation_messages_received;
         self.client_propagation_messages_served = stats.client_propagation_messages_served;
         self.unpeered_propagation_incoming = stats.unpeered_propagation_incoming;
         self.unpeered_propagation_rx_bytes = stats.unpeered_propagation_rx_bytes;
-        // Python cleans transient IDs, tickets and stamp costs at load (LXMRouter.py).
-        let now = now_f64();
-        self.propagation_store.clean_transient_caches(now);
-        self.ticket_store.cull(now);
-        self.outbound_stamp_costs
-            .retain(|_, e| now - e.recorded_at < STAMP_COST_EXPIRY as f64);
         Ok(())
     }
 
-    /// Clone all runtime state written by [`Self::save_state`] into one owned
-    /// value. Embedders can take this snapshot while holding the router lock,
+    /// `state_dir/state.db`, or the in-memory store when it cannot be used
+    /// (`LXMRouter.__init__` falls back to the old files instead).
+    fn open_state_store(state_dir: &std::path::Path) -> StateStoreHandle {
+        #[cfg(feature = "sqlite-store")]
+        {
+            let path = state_dir.join(crate::state_store::FILE_NAME);
+            let opened = std::fs::create_dir_all(state_dir)
+                .map_err(|e| StateStoreError::Open(e.to_string()))
+                .and_then(|()| StateStoreHandle::open_file(&path));
+            match opened {
+                Ok(store) => store,
+                Err(error) => {
+                    tracing::error!(
+                        "LXMF state store {} cannot be used ({error}). Stamp costs, tickets, and \
+                         message deduplication are kept in memory until this process exits. To \
+                         start a new store, stop this program and remove state.db, state.db-wal, \
+                         and state.db-shm there; if the file was written by a newer version, \
+                         update instead",
+                        path.display()
+                    );
+                    StateStoreHandle::fallback()
+                }
+            }
+        }
+        #[cfg(not(feature = "sqlite-store"))]
+        {
+            let _ = state_dir;
+            StateStoreHandle::in_memory()
+        }
+    }
+
+    /// Fold the `delivery_claims` journal of earlier releases into the store.
+    /// It has no upstream counterpart: every claim is now written to the store
+    /// before its delivery, so the file is removed once its records commit.
+    fn import_delivery_claims(&mut self, state_dir: &std::path::Path, durable: bool) {
+        use crate::state_store::ImportRow;
+
+        let (delivered, processed) = match crate::persist::load_delivery_claims(state_dir) {
+            Ok(claims) => claims,
+            Err(error) => {
+                tracing::error!(%error, "could not read delivery claims");
+                return;
+            }
+        };
+        if delivered.is_empty() && processed.is_empty() {
+            return;
+        }
+        let rows: Vec<ImportRow> = delivered
+            .into_iter()
+            .map(|(id, at)| ImportRow::Delivered(id, at))
+            .chain(
+                processed
+                    .into_iter()
+                    .map(|(id, at)| ImportRow::Processed(id, at)),
+            )
+            .collect();
+        match self.state_store.call(move |s| s.apply_imported(&rows)) {
+            Ok(_) if durable => {
+                if let Err(error) = crate::persist::clear_delivery_claims(state_dir) {
+                    tracing::warn!(%error, "could not remove imported delivery claims");
+                }
+            }
+            Ok(_) => {}
+            Err(error) => tracing::error!(%error, "delivery claims not imported"),
+        }
+    }
+
+    /// Run `cull` up to [`STORE_CULL_CHUNKS`] times, stopping at the first
+    /// empty pass; `LXMRouter.__cull_store`.
+    fn cull_store(
+        store: &mut dyn crate::state_store::Backend,
+        mut cull: impl FnMut(&mut dyn crate::state_store::Backend) -> Result<usize, StateStoreError>,
+    ) -> Result<(), StateStoreError> {
+        for _ in 0..STORE_CULL_CHUNKS {
+            if cull(store)? == 0 {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// `LXMRouter.clean_transient_id_caches`.
+    fn clean_transient_id_caches(&mut self) {
+        let now = now_f64();
+        self.propagation_store.clean_transient_caches(now);
+        let cutoff = now - MESSAGE_EXPIRY as f64 * 6.0;
+        self.state_store.write("cull transient IDs", move |s| {
+            Self::cull_store(s, |s| s.cull_delivered(cutoff, STORE_CULL_ROWS))?;
+            Self::cull_store(s, |s| s.cull_processed(cutoff, STORE_CULL_ROWS))
+        });
+    }
+
+    /// `LXMRouter.clean_available_tickets`.
+    fn clean_available_tickets(&mut self) {
+        let now = now_f64();
+        self.state_store.write("cull tickets", move |s| {
+            Self::cull_store(s, |s| s.cull_tickets_outbound(now, STORE_CULL_ROWS))?;
+            Self::cull_store(s, |s| {
+                s.cull_tickets_inbound(now - TICKET_GRACE as f64, STORE_CULL_ROWS)
+            })
+        });
+    }
+
+    /// Clone the state written by [`Self::save_state`] into one owned value.
+    /// Embedders can take this snapshot while holding the router lock,
     /// release the lock, and perform persistence through
     /// [`RouterStateSnapshot::save_state`].
     pub fn state_snapshot(&self) -> RouterStateSnapshot {
-        let claims_dir = self.claims_dir.as_ref().filter(|dir| {
-            crate::persist::rotate_delivery_claims(dir)
-                .inspect_err(|error| tracing::warn!(%error, "could not rotate delivery claims"))
-                .is_ok()
-        });
         RouterStateSnapshot {
-            claims_dir: claims_dir.cloned(),
-            outbound_stamp_costs: self.outbound_stamp_costs.clone(),
-            tickets: crate::persist::TicketPersistenceSnapshot::capture(
-                self.ticket_store.snapshot(),
-            ),
-            local_deliveries: self.propagation_store.locally_delivered_ids().clone(),
-            locally_processed: self.propagation_store.locally_processed_ids().clone(),
             node_stats: crate::persist::PersistedNodeStats {
                 client_propagation_messages_received: self.client_propagation_messages_received,
                 client_propagation_messages_served: self.client_propagation_messages_served,
@@ -1496,9 +1654,8 @@ impl LxmRouter {
         }
     }
 
-    /// Persist runtime state to `state_dir` using MessagePack. Each file is
-    /// replaced atomically; the set is not a single transaction. Serialize writes
-    /// so an older snapshot cannot overwrite newer state.
+    /// Write the node statistics to `state_dir`. Everything else
+    /// [`Self::load_state`] restores is already in `state.db`.
     pub fn save_state(&self, state_dir: &std::path::Path) -> std::io::Result<()> {
         self.state_snapshot().save_state(state_dir)
     }
@@ -1657,16 +1814,15 @@ impl LxmRouter {
         self.static_peers.retain(|h| h != destination_hash);
     }
 
-    /// Get a cached outbound stamp cost, or `None` if missing, expired or
-    /// announced without a cost.
+    /// The stamp cost a destination's latest announce carried, or `None` if
+    /// none is stored or it announced without one
+    /// (`LXMRouter.get_outbound_stamp_cost`). Entries leave the store when
+    /// [`Self::cull_stamp_costs`] next runs after [`STAMP_COST_EXPIRY`].
     pub fn get_stamp_cost(&self, destination_hash: &[u8; 16]) -> Option<f64> {
-        let entry = self.outbound_stamp_costs.get(destination_hash)?;
-        let now = now_f64();
-        if now - entry.recorded_at < STAMP_COST_EXPIRY as f64 {
-            entry.cost
-        } else {
-            None
-        }
+        let destination = *destination_hash;
+        self.store_read("recall outbound stamp cost", move |s| {
+            s.get_outbound_stamp_cost(&destination)
+        })
     }
 
     pub fn set_stamp_cost(&mut self, destination_hash: [u8; 16], cost: f64) {
@@ -1677,14 +1833,10 @@ impl LxmRouter {
     /// announce carried. `None` keeps an entry that makes later messages
     /// unstamped until the next announce.
     pub fn update_stamp_cost(&mut self, destination_hash: [u8; 16], cost: Option<f64>) {
-        let now = now_f64();
-        self.outbound_stamp_costs.insert(
-            destination_hash,
-            StampCostEntry {
-                cost,
-                recorded_at: now,
-            },
-        );
+        self.state_store
+            .write("update outbound stamp cost", move |s| {
+                s.update_stamp_cost(&destination_hash, cost)
+            });
     }
 
     pub fn set_propagation_enabled(&mut self, enabled: bool) {
@@ -1829,8 +1981,10 @@ impl LxmRouter {
         required_cost: f64,
         destination_hash: &[u8; 16],
     ) -> bool {
-        let now = now_f64();
-        for token in self.ticket_store.inbound_tokens(destination_hash, now) {
+        for token in self
+            .get_inbound_tickets(destination_hash)
+            .unwrap_or_default()
+        {
             let mut material = Vec::with_capacity(16 + 32);
             material.extend_from_slice(&token);
             material.extend_from_slice(message_id);
@@ -2522,10 +2676,14 @@ impl LxmRouter {
         std::mem::take(&mut self.outbound_kick)
     }
 
+    /// Remove stamp costs last updated more than [`STAMP_COST_EXPIRY`] ago
+    /// (`LXMRouter.clean_outbound_stamp_costs`).
     pub fn cull_stamp_costs(&mut self) {
-        let now = now_f64();
-        self.outbound_stamp_costs
-            .retain(|_, e| now - e.recorded_at < STAMP_COST_EXPIRY as f64);
+        let cutoff = now_f64() - STAMP_COST_EXPIRY as f64;
+        self.state_store
+            .write("cull outbound stamp costs", move |s| {
+                Self::cull_store(s, |s| s.cull_stamp_costs(cutoff, STORE_CULL_ROWS))
+            });
     }
 
     pub fn cull_propagation(&mut self) {
@@ -2690,7 +2848,7 @@ impl LxmRouter {
     fn run_periodic_jobs(&mut self) {
         // Job cadences match the Python LXMRouter jobloop.
         if self.processing_count.is_multiple_of(JOB_TRANSIENT_INTERVAL) {
-            self.propagation_store.clean_transient_caches(now_f64());
+            self.clean_transient_id_caches();
         }
         if self.processing_count.is_multiple_of(JOB_STORE_INTERVAL)
             && self.config.propagation_enabled
@@ -2707,7 +2865,10 @@ impl LxmRouter {
         }
         if self.processing_count.is_multiple_of(JOB_STAMPCOST_INTERVAL) {
             self.cull_stamp_costs();
-            self.ticket_store.cull(now_f64());
+            self.clean_available_tickets();
+            self.state_store.write("run incremental vacuum", |s| {
+                s.incremental_vacuum(STORE_VACUUM_PAGES).map(|_| ())
+            });
         }
     }
 
@@ -2719,7 +2880,6 @@ impl LxmRouter {
             peers: self.peers.len(),
             propagation_entries: self.propagation_store.len(),
             propagation_size: self.propagation_store.total_size(),
-            stamp_costs_cached: self.outbound_stamp_costs.len(),
         }
     }
 }
@@ -2773,7 +2933,6 @@ pub struct RouterStats {
     pub peers: usize,
     pub propagation_entries: usize,
     pub propagation_size: usize,
-    pub stamp_costs_cached: usize,
 }
 
 /// Outcome of one [`LxmRouter::sync_peers`] pass.
@@ -2850,11 +3009,11 @@ mod tests {
     fn run_jobs_tick_cleans_transient_caches_at_job_interval() {
         let mut router = LxmRouter::new(RouterConfig::default());
         let ancient = 1.0; // far older than MESSAGE_EXPIRY * 6
-        let mut delivered = std::collections::HashMap::new();
-        delivered.insert([0xAB; 32], ancient);
         router
-            .propagation_store
-            .replace_locally_delivered(delivered);
+            .state_store
+            .call(move |s| s.mark_locally_delivered(&[0xAB; 32], ancient))
+            .unwrap();
+        assert!(router.has_message(&[0xAB; 32]));
 
         // Land exactly on the transient-cache job multiple.
         router.processing_count = JOB_TRANSIENT_INTERVAL - 1;
@@ -2862,10 +3021,7 @@ mod tests {
         router.run_jobs_tick();
 
         assert!(
-            !router
-                .propagation_store
-                .locally_delivered_ids()
-                .contains_key(&[0xAB; 32]),
+            !router.has_message(&[0xAB; 32]),
             "expired dedup id must be aged out by the jobloop"
         );
     }
@@ -2962,23 +3118,16 @@ mod tests {
         let dest = [0xAA; 16];
         router.set_stamp_cost(dest, 8.5);
         router.update_stamp_cost(dest, None);
-        assert!(router.outbound_stamp_costs.contains_key(&dest));
         assert_eq!(router.get_stamp_cost(&dest), None);
         let mut draft =
             crate::message::LxMessageDraft::new(dest, [0xBB; 16], "", "x", DeliveryMethod::Direct)
                 .unwrap();
         router.prepare_outbound(&mut draft).unwrap();
         assert_eq!(draft.stamp_cost, None);
-
-        let tmp = tempfile::TempDir::new().unwrap();
-        router.save_state(tmp.path()).unwrap();
-        let mut restored = LxmRouter::new(RouterConfig::default());
-        restored.load_state(tmp.path()).unwrap();
-        assert!(restored.outbound_stamp_costs[&dest].cost.is_none());
     }
 
     #[test]
-    fn integer_stamp_costs_stored_by_older_versions_still_load() {
+    fn stamp_costs_stored_by_older_versions_are_imported_once() {
         #[derive(serde::Serialize)]
         struct OldEntry {
             cost: u8,
@@ -2992,14 +3141,13 @@ mod tests {
                 recorded_at: now_f64(),
             },
         )]);
-        std::fs::write(
-            tmp.path().join(crate::persist::STAMP_COSTS_FILE),
-            rmp_serde::to_vec(&old).unwrap(),
-        )
-        .unwrap();
+        let file = tmp.path().join("outbound_stamp_costs");
+        std::fs::write(&file, rmp_serde::to_vec(&old).unwrap()).unwrap();
         let mut router = LxmRouter::new(RouterConfig::default());
         router.load_state(tmp.path()).unwrap();
         assert_eq!(router.get_stamp_cost(&[0xAA; 16]), Some(12.0));
+        assert!(!file.exists());
+        assert!(tmp.path().join("outbound_stamp_costs.imported").exists());
     }
 
     #[test]
@@ -3076,22 +3224,22 @@ mod tests {
     fn prepare_outbound_issues_native_reply_ticket_before_signing() {
         let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
         let mut router = LxmRouter::new(RouterConfig::default());
-        let dir = tempfile::tempdir().unwrap();
         let dest = [0xAA; 16];
         let mut msg =
             LxMessageDraft::new(dest, [0xBB; 16], "ticket", "reply", DeliveryMethod::Direct)
                 .unwrap();
         msg.include_ticket = true;
-        let intent = router.prepare_outbound(&mut msg).unwrap();
-        assert!(intent.requires_persistence());
+        router.prepare_outbound(&mut msg).unwrap();
         let crate::message::FieldValue::MessagePack(field) = msg.get_field(FIELD_TICKET).unwrap()
         else {
             panic!("native ticket field required")
         };
         let value = rmpv::decode::read_value(&mut field.encoded()).unwrap();
-        assert_eq!(value.as_array().unwrap().len(), 2);
-        assert!(msg.clone().sign(&key).is_err());
-        intent.persist(dir.path(), &mut msg).unwrap();
+        let issued = value.as_array().unwrap()[1].as_slice().unwrap().to_vec();
+        assert_eq!(
+            router.get_inbound_tickets(&dest),
+            Some(vec![issued.try_into().unwrap()])
+        );
         router.submit_signed(msg.sign(&key).unwrap()).unwrap();
         let hash = router.pending_outbound[0].message_id();
         assert!(router.mark_outbound_delivered(&hash));
@@ -3099,16 +3247,14 @@ mod tests {
             LxMessageDraft::new(dest, [0xBB; 16], "ticket", "later", DeliveryMethod::Direct)
                 .unwrap();
         next.include_ticket = true;
-        let intent = router.prepare_outbound(&mut next).unwrap();
+        router.prepare_outbound(&mut next).unwrap();
         assert!(!next.fields().contains_key(&FIELD_TICKET.into()));
-        assert!(!intent.requires_persistence());
     }
 
     #[test]
     fn externally_retained_message_updates_ticket_only_when_completed() {
         let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
         let mut router = LxmRouter::new(RouterConfig::default());
-        let dir = tempfile::tempdir().unwrap();
         let dest = [0xAC; 16];
         let mut in_flight = LxMessageDraft::new(
             dest,
@@ -3119,52 +3265,21 @@ mod tests {
         )
         .unwrap();
         in_flight.include_ticket = true;
-        router
-            .prepare_outbound(&mut in_flight)
-            .unwrap()
-            .persist(dir.path(), &mut in_flight)
-            .unwrap();
+        router.prepare_outbound(&mut in_flight).unwrap();
         let in_flight = in_flight.sign(&key).unwrap().finalize(None).unwrap();
         let mut before_proof =
             LxMessageDraft::new(dest, [0xBD; 16], "ticket", "before", DeliveryMethod::Direct)
                 .unwrap();
         before_proof.include_ticket = true;
-        router
-            .prepare_outbound(&mut before_proof)
-            .unwrap()
-            .persist(dir.path(), &mut before_proof)
-            .unwrap();
+        router.prepare_outbound(&mut before_proof).unwrap();
         assert!(before_proof.get_field(FIELD_TICKET).is_some());
         router.complete_outbound_message(in_flight);
         let mut after_proof =
             LxMessageDraft::new(dest, [0xBD; 16], "ticket", "after", DeliveryMethod::Direct)
                 .unwrap();
         after_proof.include_ticket = true;
-        let intent = router.prepare_outbound(&mut after_proof).unwrap();
+        router.prepare_outbound(&mut after_proof).unwrap();
         assert!(after_proof.get_field(FIELD_TICKET).is_none());
-        assert!(!intent.requires_persistence());
-    }
-
-    #[test]
-    fn signed_message_requesting_ticket_fails_instead_of_invalidating_signature() {
-        let key = rns_crypto::ed25519::Ed25519PrivateKey::generate();
-        let mut router = LxmRouter::new(RouterConfig::default());
-        let mut draft = LxMessageDraft::new(
-            [0xAA; 16],
-            [0xBB; 16],
-            "ticket",
-            "pending",
-            DeliveryMethod::Direct,
-        )
-        .unwrap();
-        draft.include_ticket = true;
-        let intent = router.prepare_outbound(&mut draft).unwrap();
-        assert!(intent.requires_persistence());
-        assert!(matches!(
-            draft.sign(&key),
-            Err(MessageError::TicketNotCommitted)
-        ));
-        assert!(router.pending_outbound.is_empty());
     }
 
     #[test]
@@ -3176,7 +3291,6 @@ mod tests {
             Some(&identity.hash),
         );
         let mut sender = LxmRouter::new(RouterConfig::default());
-        let dir = tempfile::tempdir().unwrap();
         let mut draft = LxMessageDraft::new(
             [0xAA; 16],
             source,
@@ -3186,11 +3300,7 @@ mod tests {
         )
         .unwrap();
         draft.include_ticket = true;
-        sender
-            .prepare_outbound(&mut draft)
-            .unwrap()
-            .persist(dir.path(), &mut draft)
-            .unwrap();
+        sender.prepare_outbound(&mut draft).unwrap();
         let message = draft.sign(&key).unwrap().finalize(None).unwrap();
         let mut receiver = LxmRouter::new(RouterConfig::default());
         assert!(receiver.deliver_inbound(&message, false));
@@ -3390,32 +3500,33 @@ mod tests {
 
         assert!(router.get_outbound_ticket(&dest).is_none());
         assert!(router.get_outbound_ticket_expiry(&dest).is_none());
-        assert!(router.get_inbound_tickets().is_empty());
+        assert!(router.get_inbound_tickets(&dest).is_none());
 
-        let token = router.generate_ticket(dest, None);
+        let ticket = router.generate_ticket(dest, None).unwrap();
         assert!(router.get_outbound_ticket(&dest).is_none());
-        assert_eq!(router.get_inbound_tickets().len(), 1);
-        assert_eq!(router.get_inbound_tickets()[0].token, token);
+        assert_eq!(router.get_inbound_tickets(&dest), Some(vec![ticket.token]));
+        // A ticket with enough validity left is reused, as upstream reuses it.
+        assert_eq!(router.generate_ticket(dest, None), Some(ticket.clone()));
 
         // A remembered peer ticket is outbound and does not alter the
         // locally-issued inbound set.
         router.remember_ticket(dest, [0x55; 16], now_f64() + 1000.0);
-        assert_eq!(router.get_inbound_tickets().len(), 1);
+        assert_eq!(router.get_inbound_tickets(&dest), Some(vec![ticket.token]));
         assert_eq!(router.get_outbound_ticket(&dest), Some([0x55; 16]));
         assert!(router.get_outbound_ticket_expiry(&dest).unwrap() > now_f64());
     }
 
     #[test]
     fn test_validate_stamp_checks_all_tickets() {
-        let mut router = LxmRouter::new(RouterConfig::default());
+        let router = LxmRouter::new(RouterConfig::default());
         let dest = [0xAA; 16];
         let expires = now_f64() + 1000.0;
-        router
-            .ticket_store
-            .add_inbound(Ticket::new([0x01; 16], dest, expires));
-        router
-            .ticket_store
-            .add_inbound(Ticket::new([0x02; 16], dest, expires));
+        for token in [[0x01; 16], [0x02; 16]] {
+            router
+                .state_store
+                .call(move |s| s.store_inbound_ticket(&dest, &token, expires))
+                .unwrap();
+        }
 
         // Stamp derived from the SECOND ticket must still validate.
         let message_id = [0x33u8; 32];
@@ -3640,168 +3751,210 @@ mod tests {
         assert!(fired.load(Ordering::Relaxed));
     }
 
+    #[cfg(feature = "sqlite-store")]
+    fn inbound(content: &str) -> LxMessage {
+        crate::message::test_message([0xAA; 16], [0xBB; 16], "t", content, DeliveryMethod::Direct)
+    }
+
     #[test]
-    fn test_save_and_load_state_roundtrip() {
+    #[cfg(feature = "sqlite-store")]
+    fn state_is_resumed_from_the_storage_directory() {
         let tmp = tempfile::TempDir::new().unwrap();
         let dest_a = [0xAA; 16];
         let transient_a = [0x11; 32];
+        let message = inbound("resumed");
 
         let mut r1 = LxmRouter::new(RouterConfig::default());
+        r1.load_state(tmp.path()).unwrap();
         r1.set_stamp_cost(dest_a, 8.0);
-        // Far-future expiry so get_outbound_ticket (which uses wall-clock now) matches.
         r1.remember_ticket(dest_a, [0x01; 16], 4_102_444_800.0);
-        r1.propagation_store.mark_locally_delivered(transient_a);
-        r1.propagation_store.mark_locally_processed(transient_a);
+        let issued = r1.generate_ticket(dest_a, None).unwrap();
+        assert!(r1.deliver_inbound(&message, false));
+        assert!(r1.claim_processed(transient_a, false));
         r1.client_propagation_messages_received = 10;
         r1.client_propagation_messages_served = 11;
         r1.unpeered_propagation_incoming = 12;
         r1.unpeered_propagation_rx_bytes = 13;
         r1.save_state(tmp.path()).unwrap();
+        drop(r1);
 
         let mut r2 = LxmRouter::new(RouterConfig::default());
         r2.load_state(tmp.path()).unwrap();
-        assert_eq!(
-            r2.outbound_stamp_costs.get(&dest_a).and_then(|e| e.cost),
-            Some(8.0)
-        );
+        assert_eq!(r2.get_stamp_cost(&dest_a), Some(8.0));
         assert_eq!(r2.get_outbound_ticket(&dest_a), Some([0x01; 16]));
-        assert!(r2.propagation_store.is_locally_delivered(&transient_a));
+        assert_eq!(r2.get_inbound_tickets(&dest_a), Some(vec![issued.token]));
+        assert!(r2.has_message(&message.message_id()));
+        assert!(!r2.deliver_inbound(&message, false));
         assert!(r2.propagation_store.is_locally_processed(&transient_a));
+        assert!(!r2.claim_processed(transient_a, false));
         assert_eq!(r2.client_propagation_messages_received, 10);
         assert_eq!(r2.client_propagation_messages_served, 11);
         assert_eq!(r2.unpeered_propagation_incoming, 12);
         assert_eq!(r2.unpeered_propagation_rx_bytes, 13);
+        // Nothing is written back in the old format.
+        for name in [
+            "local_deliveries",
+            "locally_processed",
+            "outbound_stamp_costs",
+            "available_tickets",
+            "delivery_claims",
+        ] {
+            assert!(!tmp.path().join(name).exists(), "{name} was written");
+        }
     }
 
     #[test]
-    fn test_state_snapshot_is_an_owned_coherent_copy() {
-        let dest = [0xA1; 16];
-        let transient = [0xB2; 32];
-
-        let mut router = LxmRouter::new(RouterConfig::default());
-        router.set_stamp_cost(dest, 8.0);
-        router.remember_ticket(dest, [0xC3; 16], 4_102_444_800.0);
-        router.propagation_store.mark_locally_delivered(transient);
-        router.propagation_store.mark_locally_processed(transient);
-        router.client_propagation_messages_received = 10;
-        router.client_propagation_messages_served = 11;
-        router.unpeered_propagation_incoming = 12;
-        router.unpeered_propagation_rx_bytes = 13;
-
-        let snapshot = router.state_snapshot();
-
-        // Mutating every persisted router dataset after capture must not alter
-        // the snapshot that a background persistence task owns.
-        router.set_stamp_cost(dest, 42.0);
-        router.remember_ticket(dest, [0xD4; 16], 4_102_444_800.0);
-        router
-            .propagation_store
-            .replace_locally_delivered(HashMap::new());
-        router
-            .propagation_store
-            .replace_locally_processed(HashMap::new());
-        router.client_propagation_messages_received = 20;
-        router.client_propagation_messages_served = 21;
-        router.unpeered_propagation_incoming = 22;
-        router.unpeered_propagation_rx_bytes = 23;
-
-        assert_eq!(snapshot.outbound_stamp_costs[&dest].cost, Some(8.0));
-        let dir = tempfile::tempdir().unwrap();
-        snapshot.tickets.save(dir.path(), None).unwrap();
-        let (tickets, _) = crate::persist::load_tickets(dir.path()).unwrap();
-        assert_eq!(tickets.outbound.len(), 1);
-        assert_eq!(tickets.outbound[0].token, [0xC3; 16]);
-        assert!(snapshot.local_deliveries.contains_key(&transient));
-        assert!(snapshot.locally_processed.contains_key(&transient));
-        assert_eq!(snapshot.node_stats.client_propagation_messages_received, 10);
-        assert_eq!(snapshot.node_stats.client_propagation_messages_served, 11);
-        assert_eq!(snapshot.node_stats.unpeered_propagation_incoming, 12);
-        assert_eq!(snapshot.node_stats.unpeered_propagation_rx_bytes, 13);
-    }
-
-    #[test]
-    fn test_state_snapshot_persists_after_router_is_dropped() {
+    fn state_snapshot_is_an_owned_copy_that_outlives_the_router() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let dest = [0xA5; 16];
-        let transient = [0xB6; 32];
-
         let snapshot = {
             let mut router = LxmRouter::new(RouterConfig::default());
-            router.set_stamp_cost(dest, 9.0);
-            router.remember_ticket(dest, [0xC7; 16], 4_102_444_800.0);
-            router.propagation_store.mark_locally_delivered(transient);
-            router.propagation_store.mark_locally_processed(transient);
-            router.client_propagation_messages_received = 30;
-            router.client_propagation_messages_served = 31;
-            router.unpeered_propagation_incoming = 32;
-            router.unpeered_propagation_rx_bytes = 33;
-            router.state_snapshot()
+            router.client_propagation_messages_received = 10;
+            router.client_propagation_messages_served = 11;
+            router.unpeered_propagation_incoming = 12;
+            router.unpeered_propagation_rx_bytes = 13;
+            let snapshot = router.state_snapshot();
+            router.client_propagation_messages_received = 20;
+            snapshot
         };
-
         snapshot.save_state(tmp.path()).unwrap();
 
         let mut restored = LxmRouter::new(RouterConfig::default());
         restored.load_state(tmp.path()).unwrap();
-        assert_eq!(restored.outbound_stamp_costs[&dest].cost, Some(9.0));
-        assert_eq!(restored.get_outbound_ticket(&dest), Some([0xC7; 16]));
-        assert!(restored.propagation_store.is_locally_delivered(&transient));
-        assert!(restored.propagation_store.is_locally_processed(&transient));
-        assert_eq!(restored.client_propagation_messages_received, 30);
-        assert_eq!(restored.client_propagation_messages_served, 31);
-        assert_eq!(restored.unpeered_propagation_incoming, 32);
-        assert_eq!(restored.unpeered_propagation_rx_bytes, 33);
+        assert_eq!(restored.client_propagation_messages_received, 10);
+        assert_eq!(restored.client_propagation_messages_served, 11);
+        assert_eq!(restored.unpeered_propagation_incoming, 12);
+        assert_eq!(restored.unpeered_propagation_rx_bytes, 13);
     }
 
-    /// T1-10: persisted dedup timestamps are the REAL first-seen times —
-    /// restored on load (not reset to save-time), so age-based expiry is
-    /// stable across arbitrarily many save/load cycles.
     #[test]
-    fn test_dedup_cache_timestamps_survive_save_load_cycles() {
+    #[cfg(feature = "sqlite-store")]
+    fn expired_rows_are_cleaned_when_the_store_is_opened() {
+        use crate::state_store::{FILE_NAME, SqliteStateStore, StateStore};
         let tmp = tempfile::TempDir::new().unwrap();
-        let transient = [0x42; 32];
+        let now = now_f64();
+        let expired = now - MESSAGE_EXPIRY as f64 * 6.0 - 60.0;
+        let (old, kept) = ([0x01; 32], [0x02; 32]);
+        let dest = [0xAA; 16];
+        {
+            let mut file = SqliteStateStore::open(&tmp.path().join(FILE_NAME)).unwrap();
+            file.mark_locally_delivered(&old, expired).unwrap();
+            file.mark_locally_delivered(&kept, now).unwrap();
+            file.unconditionally_mark_processed(&old, expired).unwrap();
+            file.remember_ticket(&dest, now - 1.0, &[0x05; 16]).unwrap();
+            // Inbound tickets stay for `TICKET_GRACE` after they expire.
+            file.store_inbound_ticket(&dest, &[0x06; 16], now - 1.0)
+                .unwrap();
+            file.store_inbound_ticket(&dest, &[0x07; 16], now - TICKET_GRACE as f64 - 60.0)
+                .unwrap();
+        }
+        let mut router = LxmRouter::new(RouterConfig::default());
+        router.load_state(tmp.path()).unwrap();
+        assert!(!router.has_message(&old));
+        assert!(router.has_message(&kept));
+        assert!(!router.propagation_store.is_locally_processed(&old));
+        drop(router);
+
+        let count = |table: &str| -> i64 {
+            rusqlite::Connection::open(tmp.path().join(FILE_NAME))
+                .unwrap()
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(count("processed_transient_ids"), 0);
+        assert_eq!(count("tickets_outbound"), 0);
+        assert_eq!(count("tickets_inbound"), 1);
+    }
+
+    #[test]
+    #[cfg(feature = "sqlite-store")]
+    fn an_unusable_store_file_leaves_the_router_running_in_memory() {
+        use crate::state_store::FILE_NAME;
+        let newer = |path: &std::path::Path| {
+            rusqlite::Connection::open(path)
+                .unwrap()
+                .execute_batch("CREATE TABLE later (x); PRAGMA user_version = 2")
+                .unwrap()
+        };
+        let corrupt = |path: &std::path::Path| std::fs::write(path, [0x5A; 4096]).unwrap();
+        let directory = |path: &std::path::Path| std::fs::create_dir(path).unwrap();
+        for spoil in [&newer as &dyn Fn(&std::path::Path), &corrupt, &directory] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let db = tmp.path().join(FILE_NAME);
+            spoil(&db);
+            let before = std::fs::read(&db).ok();
+            let costs = HashMap::from([([0xAA_u8; 16], (Some(12.0_f64), now_f64()))]);
+            let legacy = tmp.path().join("outbound_stamp_costs");
+            std::fs::write(&legacy, rmp_serde::to_vec(&costs).unwrap()).unwrap();
+
+            let mut router = LxmRouter::new(RouterConfig::default());
+            router.load_state(tmp.path()).unwrap();
+            // The old cache is read for the session and left for a later import.
+            assert_eq!(router.get_stamp_cost(&[0xAA; 16]), Some(12.0));
+            assert!(legacy.exists());
+            let message = inbound("fall-back");
+            assert!(router.deliver_inbound(&message, false));
+            assert!(!router.deliver_inbound(&message, false));
+            router.set_stamp_cost([0xBB; 16], 4.0);
+            assert_eq!(router.get_stamp_cost(&[0xBB; 16]), Some(4.0));
+            // A ticket that would not survive a restart is not handed out.
+            assert_eq!(router.generate_ticket([0xCC; 16], None), None);
+            router.save_state(tmp.path()).unwrap();
+            drop(router);
+            assert_eq!(std::fs::read(&db).ok(), before);
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "sqlite-store")]
+    fn a_failing_store_never_turns_a_new_message_into_a_duplicate() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut router = LxmRouter::new(RouterConfig::default());
+        router.load_state(tmp.path()).unwrap();
+        rusqlite::Connection::open(tmp.path().join(crate::state_store::FILE_NAME))
+            .unwrap()
+            .execute_batch(
+                "DROP TABLE delivered_transient_ids; DROP TABLE processed_transient_ids; \
+                 DROP TABLE tickets_inbound",
+            )
+            .unwrap();
+        assert!(router.deliver_inbound(&inbound("store failed"), false));
+        assert!(router.claim_processed([0x21; 32], false));
+        assert_eq!(router.generate_ticket([0xCC; 16], None), None);
+    }
+
+    #[test]
+    #[cfg(feature = "sqlite-store")]
+    fn delivery_claims_of_earlier_releases_are_imported_and_removed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (delivered, processed) = ([0x31; 32], [0x32; 32]);
+        let record = |kind: u8, id: [u8; 32]| {
+            let mut bytes = vec![kind];
+            bytes.extend_from_slice(&id);
+            bytes.extend_from_slice(&now_f64().to_le_bytes());
+            bytes
+        };
+        let claims = tmp.path().join("delivery_claims");
+        std::fs::write(&claims, record(0, delivered)).unwrap();
+        std::fs::write(
+            tmp.path().join("delivery_claims.saving"),
+            record(1, processed),
+        )
+        .unwrap();
 
         let mut router = LxmRouter::new(RouterConfig::default());
-        router.propagation_store.mark_locally_delivered(transient);
-        let original_ts = *router
-            .propagation_store
-            .locally_delivered_ids()
-            .get(&transient)
-            .unwrap();
-
-        // Multiple save/load cycles must not refresh the timestamp.
-        for _ in 0..3 {
-            router.save_state(tmp.path()).unwrap();
-            let mut reloaded = LxmRouter::new(RouterConfig::default());
-            reloaded.load_state(tmp.path()).unwrap();
-            let loaded_ts = *reloaded
-                .propagation_store
-                .locally_delivered_ids()
-                .get(&transient)
-                .unwrap();
-            assert_eq!(loaded_ts, original_ts, "timestamp must survive reload");
-            router = reloaded;
-        }
-        assert_eq!(router.propagation_store.locally_delivered_ids().len(), 1);
-
-        // An aged-out entry is gone after the periodic clean, and stays gone
-        // through persistence (growth bounded).
-        let expiry = crate::constants::MESSAGE_EXPIRY as f64 * 6.0;
-        router
-            .propagation_store
-            .clean_transient_caches(original_ts + expiry + 1.0);
-        assert!(!router.propagation_store.is_locally_delivered(&transient));
-        router.save_state(tmp.path()).unwrap();
-        let mut fresh = LxmRouter::new(RouterConfig::default());
-        fresh.load_state(tmp.path()).unwrap();
-        assert!(fresh.propagation_store.locally_delivered_ids().is_empty());
+        router.load_state(tmp.path()).unwrap();
+        assert!(router.has_message(&delivered));
+        assert!(router.propagation_store.is_locally_processed(&processed));
+        assert!(!claims.exists());
+        assert!(!tmp.path().join("delivery_claims.saving").exists());
     }
 
     #[test]
     fn test_load_state_missing_dir_is_ok() {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut r = LxmRouter::new(RouterConfig::default());
-        r.load_state(tmp.path()).unwrap();
-        assert!(r.outbound_stamp_costs.is_empty());
+        r.load_state(&tmp.path().join("lxmf")).unwrap();
+        assert_eq!(r.get_stamp_cost(&[0xAA; 16]), None);
     }
 
     #[test]

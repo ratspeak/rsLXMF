@@ -84,6 +84,7 @@ pub mod propagation_store_v2;
 pub mod propagation_sync;
 pub mod router;
 pub mod stamper;
+pub mod state_store;
 pub mod sync;
 pub mod ticket;
 pub mod types;

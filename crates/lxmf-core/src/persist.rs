@@ -1,76 +1,31 @@
 //! Router state files in a caller-supplied directory.
 //!
 //! Files:
-//! * `outbound_stamp_costs` — destination stamp costs and observation times
-//! * `available_tickets` — versioned directional ticket state
-//! * `local_deliveries` — delivered transient IDs and timestamps
-//! * `locally_processed` — processed transient IDs and timestamps
 //! * `node_stats` — propagation-node counters
-//! * `delivery_claims` — delivered/processed IDs appended since the last full save
 //! * `propagation_suppression_v1` — bounded download suppression records
 //! * `propagation_node_policies_v1` — recorded propagation-node policies
 //!
-//! These files use the Rust types' MessagePack representations; matching Python
-//! filenames does not establish interchangeable contents. Missing files yield
-//! empty/default state. Other I/O, malformed-data and capacity errors propagate
-//! to the caller.
+//! Stamp costs, tickets, and delivered and processed transient IDs live in
+//! `state.db` ([`crate::state_store`]). `delivery_claims`, which earlier
+//! releases appended to, is only read here so its records can be imported.
+//!
+//! Missing files yield empty/default state. Other I/O, malformed-data and
+//! capacity errors propagate to the caller.
 
 use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::Path;
 
-use crate::router::StampCostEntry;
-use crate::ticket::{Ticket, TicketStoreSnapshot};
 use crate::types::PropagationTransientId;
 
-pub const STAMP_COSTS_FILE: &str = "outbound_stamp_costs";
-pub const TICKETS_FILE: &str = "available_tickets";
-pub const LOCAL_DELIVERIES_FILE: &str = "local_deliveries";
-pub const LOCALLY_PROCESSED_FILE: &str = "locally_processed";
 pub const NODE_STATS_FILE: &str = "node_stats";
-/// Append-only delivered/processed claims written before delivery callbacks run.
-pub const DELIVERY_CLAIMS_FILE: &str = "delivery_claims";
+/// Delivered/processed claims that earlier releases appended before delivery callbacks ran.
+const DELIVERY_CLAIMS_FILE: &str = "delivery_claims";
 
 const CLAIM_DELIVERED: u8 = 0;
 const CLAIM_PROCESSED: u8 = 1;
 const CLAIM_RECORD_LEN: usize = 1 + 32 + 8;
-
-/// Durably append a claim (`processed = false` for delivered IDs).
-pub(crate) fn append_delivery_claim(
-    dir: &Path,
-    id: &PropagationTransientId,
-    processed: bool,
-    at: f64,
-) -> io::Result<()> {
-    use std::io::Write;
-    let mut record = [0u8; CLAIM_RECORD_LEN];
-    record[0] = if processed {
-        CLAIM_PROCESSED
-    } else {
-        CLAIM_DELIVERED
-    };
-    record[1..33].copy_from_slice(id);
-    record[33..].copy_from_slice(&at.to_le_bytes());
-    let mut file = open_claims_for_append(&dir.join(DELIVERY_CLAIMS_FILE), true)?;
-    file.write_all(&record)?;
-    file.sync_data()
-}
-
-/// Open a claims file for appending, first dropping a torn trailing record so
-/// later records stay aligned.
-fn open_claims_for_append(path: &Path, create: bool) -> io::Result<fs::File> {
-    let file = fs::OpenOptions::new()
-        .create(create)
-        .append(true)
-        .open(path)?;
-    let len = file.metadata()?.len();
-    let torn = len % CLAIM_RECORD_LEN as u64;
-    if torn != 0 {
-        file.set_len(len - torn)?;
-    }
-    Ok(file)
-}
 
 /// Read appended claims as (delivered, processed). A torn trailing record is ignored.
 #[allow(clippy::type_complexity)]
@@ -108,36 +63,15 @@ fn claims_saving(dir: &Path) -> std::path::PathBuf {
     dir.join(format!("{DELIVERY_CLAIMS_FILE}.saving"))
 }
 
-/// Set the claims appended so far aside for the snapshot being saved; later
-/// claims start a new file. Claims set aside by an unfinished save are kept.
-pub(crate) fn rotate_delivery_claims(dir: &Path) -> io::Result<()> {
-    use std::io::Write;
-    let current = dir.join(DELIVERY_CLAIMS_FILE);
-    let saving = claims_saving(dir);
-    if !saving.exists() {
-        return match fs::rename(&current, &saving) {
-            Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
-            _ => Ok(()),
-        };
+/// Remove every claim file once its records are committed to the LXMF state store.
+pub(crate) fn clear_delivery_claims(dir: &Path) -> io::Result<()> {
+    for path in [claims_saving(dir), dir.join(DELIVERY_CLAIMS_FILE)] {
+        match fs::remove_file(path) {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+            _ => {}
+        }
     }
-    let bytes = match fs::read(&current) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error),
-    };
-    let whole = bytes.len() - bytes.len() % CLAIM_RECORD_LEN;
-    let mut file = open_claims_for_append(&saving, false)?;
-    file.write_all(&bytes[..whole])?;
-    file.sync_data()?;
-    fs::remove_file(current)
-}
-
-/// Drop the claims set aside once the caches holding them are saved.
-pub(crate) fn clear_rotated_delivery_claims(dir: &Path) -> io::Result<()> {
-    match fs::remove_file(claims_saving(dir)) {
-        Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
-        _ => Ok(()),
-    }
+    Ok(())
 }
 
 /// Counters persisted by Python's `LXMRouter.save_node_stats`.
@@ -259,130 +193,6 @@ fn read_mpk_bounded<T: serde::de::DeserializeOwned>(
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
-pub fn save_stamp_costs(dir: &Path, costs: &HashMap<[u8; 16], StampCostEntry>) -> io::Result<()> {
-    write_mpk(&dir.join(STAMP_COSTS_FILE), costs)
-}
-
-pub fn load_stamp_costs(dir: &Path) -> io::Result<HashMap<[u8; 16], StampCostEntry>> {
-    Ok(read_mpk(&dir.join(STAMP_COSTS_FILE))?.unwrap_or_default())
-}
-
-/// Process-local revision of a captured ticket state. All production ticket
-/// writes pass through the same path coordinator, so a delayed checkpoint can
-/// never replace a ticket that a newer signing intent already committed.
-#[derive(Debug, Clone)]
-pub(crate) struct TicketPersistenceSnapshot {
-    revision: u64,
-    snapshot: std::sync::Arc<TicketStoreSnapshot>,
-}
-impl TicketPersistenceSnapshot {
-    pub(crate) fn capture(snapshot: TicketStoreSnapshot) -> Self {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static NEXT: AtomicU64 = AtomicU64::new(1);
-        // Rust 1.99 renamed this operation; keep the identical Rust 1.89 API.
-        #[allow(deprecated)]
-        let revision = NEXT
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
-            .expect("ticket checkpoint revision exhausted");
-        Self {
-            revision,
-            snapshot: std::sync::Arc::new(snapshot),
-        }
-    }
-    pub(crate) fn save(&self, dir: &Path, required: Option<&Ticket>) -> io::Result<()> {
-        use std::sync::{Mutex, OnceLock};
-        struct Latest {
-            revision: u64,
-            committed: bool,
-        }
-        static WRITERS: OnceLock<Mutex<HashMap<std::path::PathBuf, Latest>>> = OnceLock::new();
-        fs::create_dir_all(dir)?;
-        let path = fs::canonicalize(dir)?.join(TICKETS_FILE);
-        let mut writers = WRITERS
-            .get_or_init(|| Mutex::new(HashMap::new()))
-            .lock()
-            .map_err(|_| io::Error::other("ticket persistence coordinator unavailable"))?;
-        if !writers.contains_key(&path) && writers.len() >= 4096 {
-            return Err(io::Error::other("ticket persistence path quota exhausted"));
-        }
-        let latest = writers.entry(path.clone()).or_insert(Latest {
-            revision: self.revision,
-            committed: false,
-        });
-        if self.revision < latest.revision {
-            if !latest.committed {
-                return Err(io::Error::other(
-                    "newer ticket checkpoint is uncertain and must be retried",
-                ));
-            }
-            if let Some(required) = required {
-                let (stored, _) = load_tickets(dir)?;
-                if !stored.inbound.contains(required) {
-                    return Err(io::Error::other(
-                        "newer ticket state no longer contains this signing intent",
-                    ));
-                }
-            }
-            return Ok(());
-        }
-        if required.is_some_and(|required| !self.snapshot.inbound.contains(required)) {
-            return Err(io::Error::other(
-                "ticket snapshot does not contain this signing intent",
-            ));
-        }
-        latest.revision = self.revision;
-        latest.committed = false;
-        // Even an uncertain publication raises the revision floor. Older
-        // snapshots fail closed until this or a newly captured current state
-        // reestablishes the strict barrier. No failed payload is retained by
-        // this bounded process-wide metadata coordinator.
-        write_mpk(&path, &*self.snapshot)?;
-        latest.committed = true;
-        Ok(())
-    }
-}
-
-pub fn save_tickets(dir: &Path, tickets: &TicketStoreSnapshot) -> io::Result<()> {
-    TicketPersistenceSnapshot::capture(tickets.clone()).save(dir, None)
-}
-
-#[derive(serde::Deserialize)]
-#[serde(untagged)]
-enum PersistedTickets {
-    Directional(TicketStoreSnapshot),
-    Legacy(Vec<Ticket>),
-}
-
-pub fn load_tickets(dir: &Path) -> io::Result<(TicketStoreSnapshot, Option<Vec<Ticket>>)> {
-    Ok(match read_mpk(&dir.join(TICKETS_FILE))? {
-        Some(PersistedTickets::Directional(snapshot)) => (snapshot, None),
-        Some(PersistedTickets::Legacy(tickets)) => (TicketStoreSnapshot::default(), Some(tickets)),
-        None => (TicketStoreSnapshot::default(), None),
-    })
-}
-
-pub fn save_local_deliveries(
-    dir: &Path,
-    ids: &HashMap<PropagationTransientId, f64>,
-) -> io::Result<()> {
-    write_mpk(&dir.join(LOCAL_DELIVERIES_FILE), ids)
-}
-
-pub fn load_local_deliveries(dir: &Path) -> io::Result<HashMap<PropagationTransientId, f64>> {
-    Ok(read_mpk(&dir.join(LOCAL_DELIVERIES_FILE))?.unwrap_or_default())
-}
-
-pub fn save_locally_processed(
-    dir: &Path,
-    ids: &HashMap<PropagationTransientId, f64>,
-) -> io::Result<()> {
-    write_mpk(&dir.join(LOCALLY_PROCESSED_FILE), ids)
-}
-
-pub fn load_locally_processed(dir: &Path) -> io::Result<HashMap<PropagationTransientId, f64>> {
-    Ok(read_mpk(&dir.join(LOCALLY_PROCESSED_FILE))?.unwrap_or_default())
-}
-
 pub fn save_node_stats(dir: &Path, stats: &PersistedNodeStats) -> io::Result<()> {
     let bytes = rmp_serde::to_vec_named(stats)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -400,84 +210,14 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn claims_after_a_torn_record_stay_readable() {
-        let tmp = TempDir::new().unwrap();
-        append_delivery_claim(tmp.path(), &[1; 32], false, 1.0).unwrap();
-        let path = tmp.path().join(DELIVERY_CLAIMS_FILE);
-        let mut bytes = fs::read(&path).unwrap();
-        bytes.extend_from_slice(&[0xFF; 7]);
-        fs::write(&path, bytes).unwrap();
-        append_delivery_claim(tmp.path(), &[2; 32], true, 2.0).unwrap();
-        let (delivered, processed) = load_delivery_claims(tmp.path()).unwrap();
-        assert_eq!(delivered, vec![([1; 32], 1.0)]);
-        assert_eq!(processed, vec![([2; 32], 2.0)]);
-    }
-
-    #[test]
-    fn stamp_costs_roundtrip() {
-        let tmp = TempDir::new().unwrap();
-        let mut costs = HashMap::new();
-        costs.insert(
-            [0xAA; 16],
-            StampCostEntry {
-                cost: Some(12.5),
-                recorded_at: 1_700_000_000.0,
-            },
-        );
-        save_stamp_costs(tmp.path(), &costs).unwrap();
-        let loaded = load_stamp_costs(tmp.path()).unwrap();
-        assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[&[0xAA; 16]].cost, Some(12.5));
-    }
-
-    #[test]
-    fn tickets_roundtrip() {
-        let tmp = TempDir::new().unwrap();
-        let tickets = TicketStoreSnapshot {
-            version: 1,
-            outbound: vec![Ticket::new([0x01; 16], [0x02; 16], 9_999.0)],
-            inbound: vec![Ticket::new([0x03; 16], [0x04; 16], 8_888.0)],
-            last_deliveries: HashMap::from([([0x02; 16], 7_777.0)]),
-        };
-        save_tickets(tmp.path(), &tickets).unwrap();
-        let (loaded, legacy) = load_tickets(tmp.path()).unwrap();
-        assert!(legacy.is_none());
-        assert_eq!(loaded, tickets);
-    }
-
-    #[test]
-    fn legacy_flat_tickets_are_detected_for_migration() {
-        let tmp = TempDir::new().unwrap();
-        let tickets = vec![Ticket::new([0x01; 16], [0x02; 16], 9_999.0)];
-        write_mpk(&tmp.path().join(TICKETS_FILE), &tickets).unwrap();
-        let (snapshot, legacy) = load_tickets(tmp.path()).unwrap();
-        assert_eq!(snapshot, TicketStoreSnapshot::default());
-        assert_eq!(legacy.unwrap(), tickets);
-    }
-
-    #[test]
-    fn local_deliveries_roundtrip() {
-        let tmp = TempDir::new().unwrap();
-        let mut ids = HashMap::new();
-        ids.insert([0x03; 32], 1_700_000_000.0);
-        save_local_deliveries(tmp.path(), &ids).unwrap();
-        let loaded = load_local_deliveries(tmp.path()).unwrap();
-        assert_eq!(loaded.len(), 1);
-    }
-
-    #[test]
     fn missing_file_returns_default() {
         let tmp = TempDir::new().unwrap();
-        assert!(load_stamp_costs(tmp.path()).unwrap().is_empty());
-        let (tickets, legacy) = load_tickets(tmp.path()).unwrap();
-        assert_eq!(tickets, TicketStoreSnapshot::default());
-        assert!(legacy.is_none());
-        assert!(load_local_deliveries(tmp.path()).unwrap().is_empty());
-        assert!(load_locally_processed(tmp.path()).unwrap().is_empty());
         assert_eq!(
             load_node_stats(tmp.path()).unwrap(),
             PersistedNodeStats::default()
         );
+        let (delivered, processed) = load_delivery_claims(tmp.path()).unwrap();
+        assert!(delivered.is_empty() && processed.is_empty());
     }
 
     #[test]

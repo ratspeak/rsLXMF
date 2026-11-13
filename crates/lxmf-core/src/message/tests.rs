@@ -609,22 +609,6 @@ fn nested_field_duplicate_schema_reader_rejects_ambiguous_keys() {
     );
 }
 #[test]
-fn signed_body_finalization_ticket_barrier_blocks_signer() {
-    let owner = Arc::new(());
-    let mut d = draft();
-    d.mark_ticket_pending(owner.clone());
-    assert!(!d.release_ticket_barrier(&Arc::new(())));
-    assert!(matches!(
-        d.clone()
-            .sign_with(|_| -> Result<[u8; 64], &str> { panic!("uncommitted signer called") }),
-        Err(MessageError::TicketNotCommitted)
-    ));
-    assert!(d.release_ticket_barrier(&owner));
-    assert!(!d.release_ticket_barrier(&owner));
-    assert!(d.sign(&key()).is_ok());
-}
-
-#[test]
 fn lossy_projection_uses_exact_capacity_and_preserves_utf8_replacement() {
     for bytes in [
         b"".as_slice(),
