@@ -2806,7 +2806,7 @@ impl LxmdRunner {
             self.router.set_autopeer(self.config.autopeer);
             self.router.set_max_peers(self.config.max_peers);
             self.router
-                .set_propagation_limit(self.config.propagation_limit_kb.as_f64());
+                .set_propagation_limit(self.config.propagation_limit_kb);
             self.router.set_stamp_requirements(
                 self.config.propagation_stamp_cost,
                 self.config.propagation_stamp_flex,

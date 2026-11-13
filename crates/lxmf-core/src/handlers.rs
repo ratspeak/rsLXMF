@@ -66,7 +66,8 @@ impl PnLimit {
         }
     }
 
-    fn to_value(self) -> rmpv::Value {
+    /// The msgpack form Python packs: an int or a float, whichever is held.
+    pub fn to_value(self) -> rmpv::Value {
         match self {
             Self::Int(n) => rmpv::Value::from(n),
             Self::Float(f) => rmpv::Value::F64(f),

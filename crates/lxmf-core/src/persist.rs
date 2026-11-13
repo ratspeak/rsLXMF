@@ -37,7 +37,7 @@ const CLAIM_PROCESSED: u8 = 1;
 const CLAIM_RECORD_LEN: usize = 1 + 32 + 8;
 
 /// Durably append a claim (`processed = false` for delivered IDs).
-pub fn append_delivery_claim(
+pub(crate) fn append_delivery_claim(
     dir: &Path,
     id: &PropagationTransientId,
     processed: bool,
@@ -74,7 +74,7 @@ fn open_claims_for_append(path: &Path, create: bool) -> io::Result<fs::File> {
 
 /// Read appended claims as (delivered, processed). A torn trailing record is ignored.
 #[allow(clippy::type_complexity)]
-pub fn load_delivery_claims(
+pub(crate) fn load_delivery_claims(
     dir: &Path,
 ) -> io::Result<(
     Vec<(PropagationTransientId, f64)>,
@@ -110,7 +110,7 @@ fn claims_saving(dir: &Path) -> std::path::PathBuf {
 
 /// Set the claims appended so far aside for the snapshot being saved; later
 /// claims start a new file. Claims set aside by an unfinished save are kept.
-pub fn rotate_delivery_claims(dir: &Path) -> io::Result<()> {
+pub(crate) fn rotate_delivery_claims(dir: &Path) -> io::Result<()> {
     use std::io::Write;
     let current = dir.join(DELIVERY_CLAIMS_FILE);
     let saving = claims_saving(dir);
@@ -133,7 +133,7 @@ pub fn rotate_delivery_claims(dir: &Path) -> io::Result<()> {
 }
 
 /// Drop the claims set aside once the caches holding them are saved.
-pub fn clear_rotated_delivery_claims(dir: &Path) -> io::Result<()> {
+pub(crate) fn clear_rotated_delivery_claims(dir: &Path) -> io::Result<()> {
     match fs::remove_file(claims_saving(dir)) {
         Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
         _ => Ok(()),

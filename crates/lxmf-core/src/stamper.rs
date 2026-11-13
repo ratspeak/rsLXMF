@@ -7,9 +7,11 @@
 
 use std::sync::atomic::Ordering;
 
+/// The same type as `rns_identity::stamps::StampError`, not an LXMF-specific error.
+pub use rns_identity::stamps::StampError;
 pub use rns_identity::stamps::{
-    STAMP_COST_CAP, STAMP_COST_CAP_FP, StampControl, StampError, cost_from_fp, cost_to_fp,
-    quantize_cost, stamp_value, stamp_workblock,
+    STAMP_COST_CAP, STAMP_COST_CAP_FP, StampControl, cost_from_fp, cost_to_fp, quantize_cost,
+    stamp_value, stamp_workblock,
 };
 
 use crate::constants::{

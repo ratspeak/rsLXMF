@@ -13,6 +13,7 @@ use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::constants::*;
+use crate::handlers::PnLimit;
 use crate::inbound_resource::{
     InboundResourceCancelRequest, InboundResourceEvent, InboundResourceHandle, InboundResourceKey,
     InboundResourceTracker,
@@ -77,9 +78,11 @@ pub struct RouterConfig {
     pub propagation_enabled: bool,
     pub autopeer: bool,
     pub max_peers: usize,
-    pub propagation_limit_kb: f64,
+    /// Per-transfer propagation limit in decimal kB, announced as held.
+    pub propagation_limit_kb: PnLimit,
     pub delivery_limit_kb: f64,
-    pub sync_limit_kb: f64,
+    /// Per-sync propagation limit in decimal kB, announced as held.
+    pub sync_limit_kb: PnLimit,
     pub propagation_stamp_cost: f64,
     pub propagation_stamp_flex: f64,
     pub stamp_cost: Option<f64>,
@@ -138,9 +141,9 @@ impl Default for RouterConfig {
             propagation_enabled: false,
             autopeer: AUTOPEER,
             max_peers: MAX_PEERS,
-            propagation_limit_kb: PROPAGATION_LIMIT as f64,
+            propagation_limit_kb: PnLimit::Int(PROPAGATION_LIMIT as u64),
             delivery_limit_kb: DELIVERY_LIMIT as f64,
-            sync_limit_kb: SYNC_LIMIT as f64,
+            sync_limit_kb: PnLimit::Int(SYNC_LIMIT as u64),
             propagation_stamp_cost: PROPAGATION_COST,
             propagation_stamp_flex: PROPAGATION_COST_FLEX,
             stamp_cost: None,
@@ -337,16 +340,6 @@ pub struct LxmRouter {
     /// Directory given to [`Self::load_state`]; delivered and processed IDs are
     /// claimed there durably before delivery callbacks run.
     claims_dir: Option<std::path::PathBuf>,
-}
-
-/// `RouterConfig` holds limits as f64: a whole number announces as Python's int
-/// default, anything else as the float LXMRouter was given.
-fn router_limit(limit_kb: f64) -> crate::handlers::PnLimit {
-    if limit_kb.fract() == 0.0 && (0.0..=u64::MAX as f64).contains(&limit_kb) {
-        crate::handlers::PnLimit::Int(limit_kb as u64)
-    } else {
-        crate::handlers::PnLimit::Float(limit_kb)
-    }
 }
 
 /// Delivered destinations a router holds for the embedder to retain.
@@ -1768,8 +1761,8 @@ impl LxmRouter {
 
     /// Set the advertised per-transfer propagation limit in decimal kB.
     /// This does not set total storage capacity or update a separate node owner.
-    pub fn set_propagation_limit(&mut self, limit_kb: f64) {
-        self.config.propagation_limit_kb = limit_kb;
+    pub fn set_propagation_limit(&mut self, limit_kb: impl Into<PnLimit>) {
+        self.config.propagation_limit_kb = limit_kb.into();
     }
 
     pub fn set_stamp_requirements(&mut self, cost: f64, flex: f64) {
@@ -1790,8 +1783,8 @@ impl LxmRouter {
 
         let mut data = crate::handlers::PropagationNodeAnnounceData::new(
             self.config.propagation_enabled && !self.config.ext.from_static_only,
-            router_limit(self.config.propagation_limit_kb),
-            router_limit(self.config.sync_limit_kb),
+            self.config.propagation_limit_kb,
+            self.config.sync_limit_kb,
             self.config.propagation_stamp_cost,
             self.config.propagation_stamp_flex,
             self.config.ext.peering_cost,
@@ -2808,8 +2801,8 @@ pub struct PeerStats {
 pub struct NodeStats {
     pub uptime: f64,
     pub delivery_limit: f64,
-    pub propagation_limit: f64,
-    pub sync_limit: f64,
+    pub propagation_limit: PnLimit,
+    pub sync_limit: PnLimit,
     pub stamp_cost: f64,
     pub stamp_flex: f64,
     pub peering_cost: f64,

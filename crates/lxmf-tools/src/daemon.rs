@@ -494,9 +494,9 @@ impl DaemonConfig {
             propagation_enabled: self.propagation_enabled,
             autopeer: self.autopeer,
             max_peers: self.max_peers,
-            propagation_limit_kb: self.propagation_limit_kb.as_f64(),
+            propagation_limit_kb: self.propagation_limit_kb,
             delivery_limit_kb: self.delivery_transfer_max_accepted_size,
-            sync_limit_kb: self.sync_limit_kb.as_f64(),
+            sync_limit_kb: self.sync_limit_kb,
             propagation_stamp_cost: self.propagation_stamp_cost,
             propagation_stamp_flex: self.propagation_stamp_flex,
             stamp_cost: self.stamp_cost,
@@ -1006,8 +1006,8 @@ propagation_transfer_max_accepted_size = 12
         assert_eq!(rc.max_peers, 20);
         assert_eq!(rc.delivery_limit_kb, 1.0);
         assert_eq!(RouterConfig::default().delivery_limit_kb, 1000.0);
-        assert_eq!(rc.propagation_limit_kb, 256.0);
-        assert_eq!(rc.sync_limit_kb, 10_240.0);
+        assert_eq!(rc.propagation_limit_kb, PnLimit::Int(256));
+        assert_eq!(rc.sync_limit_kb, PnLimit::Int(10_240));
         assert_eq!(rc.propagation_stamp_cost, 16.0);
         assert_eq!(rc.propagation_stamp_flex, 3.0);
         assert_eq!(rc.ext.autopeer_maxdepth, AUTOPEER_MAXDEPTH);
@@ -1171,6 +1171,20 @@ from_static_only = yes
                 other => panic!("{other}"),
             }
         }
+    }
+
+    #[test]
+    fn configured_whole_limits_reach_the_router_as_floats() {
+        let config = rns_runtime::config::Config::parse(
+            "[propagation]\npropagation_message_max_accepted_size = 300\npropagation_sync_max_accepted_size = 900\n",
+        )
+        .unwrap();
+        let rc = DaemonConfig::from_config(&config)
+            .unwrap()
+            .to_router_config();
+
+        assert_eq!(rc.propagation_limit_kb, PnLimit::Float(300.0));
+        assert_eq!(rc.sync_limit_kb, PnLimit::Float(900.0));
     }
 
     #[test]
