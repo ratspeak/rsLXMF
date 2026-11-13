@@ -6338,6 +6338,18 @@ fn initialize_storage_namespace(config_dir: &Path) -> std::io::Result<()> {
 pub(crate) async fn main() {
     let args = Args::parse();
 
+    if args.version {
+        println!(
+            "{}",
+            rns_tools::version_line(
+                "lxmd-rs",
+                env!("CARGO_PKG_VERSION"),
+                &[("LXMF", lxmf_tools::lxmd_cli::LXMF_COMPAT_VERSION)],
+            )
+        );
+        return;
+    }
+
     if args.exampleconfig {
         println!("{}", example_config());
         return;

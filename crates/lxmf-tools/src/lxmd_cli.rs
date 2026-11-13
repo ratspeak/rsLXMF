@@ -26,17 +26,20 @@ impl SendMethod {
     }
 }
 
+/// The LXMF release `lxmd-rs` follows, named in its `--version` line.
+pub const LXMF_COMPAT_VERSION: &str = "1.3.0";
+
 #[derive(Parser)]
 #[command(
     name = "lxmd-rs",
     bin_name = "lxmd-rs",
     about = "LXMF Propagation Daemon",
-    version,
+    disable_version_flag = true,
     infer_long_args = true
 )]
 pub struct Args {
     /// Path to configuration directory.
-    #[arg(short, long)]
+    #[arg(long)]
     pub config: Option<String>,
 
     /// Path to alternative Reticulum configuration directory.
@@ -79,6 +82,10 @@ pub struct Args {
     /// Generate and print example configuration.
     #[arg(long)]
     pub exampleconfig: bool,
+
+    /// Print version and exit.
+    #[arg(long)]
+    pub version: bool,
 
     /// Service mode; the process remains in the foreground.
     #[arg(short = 's', long)]
@@ -262,6 +269,19 @@ mod tests {
         assert_eq!(args.timeout, Some(1.5));
         assert!(args.remote.is_some());
         assert_eq!(args.identity.as_deref(), Some(Path::new("/tmp/id")));
+    }
+
+    // lxmd.py has `--config` and `--version` only: no `-c`, no `-V`.
+    #[test]
+    fn short_forms_upstream_lacks_are_refused() {
+        for flag in [&["-c", "/tmp/lxmd"][..], &["-V"]] {
+            let error = Args::try_parse_from(["lxmd"].iter().chain(flag))
+                .err()
+                .unwrap_or_else(|| panic!("{flag:?} must be refused"));
+            assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+            assert_eq!(error.exit_code(), 2, "argparse exits 2");
+        }
+        assert!(Args::try_parse_from(["lxmd", "--version"]).unwrap().version);
     }
 
     #[test]

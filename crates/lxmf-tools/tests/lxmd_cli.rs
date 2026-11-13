@@ -188,7 +188,12 @@ fn version_reports_binary_name_and_package_version() {
     );
     assert_eq!(
         stdout(&output).trim(),
-        format!("lxmd-rs {}", env!("CARGO_PKG_VERSION"))
+        format!(
+            "lxmd-rs {} (LXMF {}, Reticulum {})",
+            env!("CARGO_PKG_VERSION"),
+            lxmf_tools::lxmd_cli::LXMF_COMPAT_VERSION,
+            rns_tools::RETICULUM_COMPAT_VERSION
+        )
     );
     assert!(stderr(&output).is_empty());
 }
@@ -204,7 +209,12 @@ fn rust_binary_runs_cli() {
     );
     assert_eq!(
         stdout(&output).trim(),
-        format!("lxmd-rs {}", env!("CARGO_PKG_VERSION"))
+        format!(
+            "lxmd-rs {} (LXMF {}, Reticulum {})",
+            env!("CARGO_PKG_VERSION"),
+            lxmf_tools::lxmd_cli::LXMF_COMPAT_VERSION,
+            rns_tools::RETICULUM_COMPAT_VERSION
+        )
     );
     assert!(stderr(&output).is_empty());
 }
