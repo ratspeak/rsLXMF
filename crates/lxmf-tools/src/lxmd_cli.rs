@@ -39,7 +39,7 @@ pub const LXMF_COMPAT_VERSION: &str = "1.3.0";
 )]
 pub struct Args {
     /// Path to configuration directory.
-    #[arg(long)]
+    #[arg(long, short_alias = 'c')]
     pub config: Option<String>,
 
     /// Path to alternative Reticulum configuration directory.
@@ -84,7 +84,7 @@ pub struct Args {
     pub exampleconfig: bool,
 
     /// Print version and exit.
-    #[arg(long)]
+    #[arg(long, short_alias = 'V')]
     pub version: bool,
 
     /// Service mode; the process remains in the foreground.
@@ -271,17 +271,22 @@ mod tests {
         assert_eq!(args.identity.as_deref(), Some(Path::new("/tmp/id")));
     }
 
-    // lxmd.py has `--config` and `--version` only: no `-c`, no `-V`.
+    // lxmd.py has `--config` and `--version` only; the releases also took
+    // `-c` and `-V`, which still parse and stay out of the help.
     #[test]
-    fn short_forms_upstream_lacks_are_refused() {
-        for flag in [&["-c", "/tmp/lxmd"][..], &["-V"]] {
-            let error = Args::try_parse_from(["lxmd"].iter().chain(flag))
-                .err()
-                .unwrap_or_else(|| panic!("{flag:?} must be refused"));
-            assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
-            assert_eq!(error.exit_code(), 2, "argparse exits 2");
-        }
+    fn released_short_forms_still_parse_and_are_hidden() {
+        let args = Args::try_parse_from(["lxmd", "-c", "/tmp/lxmd"]).unwrap();
+        assert_eq!(args.config.as_deref(), Some("/tmp/lxmd"));
+        assert!(Args::try_parse_from(["lxmd", "-V"]).unwrap().version);
         assert!(Args::try_parse_from(["lxmd", "--version"]).unwrap().version);
+
+        use clap::CommandFactory;
+        let help = Args::command().render_long_help().to_string();
+        assert!(help.contains("--config") && help.contains("--version"));
+        assert!(!help.contains("-c,") && !help.contains("-V,"), "{help}");
+
+        let error = Args::try_parse_from(["lxmd", "-x"]).err().unwrap();
+        assert_eq!(error.exit_code(), 2, "argparse exits 2");
     }
 
     #[test]

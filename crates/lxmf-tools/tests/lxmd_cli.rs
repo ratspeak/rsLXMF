@@ -219,6 +219,41 @@ fn rust_binary_runs_cli() {
     assert!(stderr(&output).is_empty());
 }
 
+/// `-c` and `-V` are spellings the 1.3 and 1.4 releases accepted and
+/// upstream never had: they still work and are announced on stderr.
+#[test]
+fn released_short_spellings_work_with_a_warning() {
+    let long = lxmd(&["--config", "/nonexistent/lxmd", "--exampleconfig"]);
+    assert!(long.status.success(), "{}", combined_output(&long));
+    assert!(stderr(&long).is_empty());
+    for short in [
+        &["-c", "/nonexistent/lxmd", "--exampleconfig"][..],
+        &["-c/nonexistent/lxmd", "--exampleconfig"],
+    ] {
+        let output = lxmd(short);
+        assert!(output.status.success(), "{}", combined_output(&output));
+        assert_eq!(stdout(&output), stdout(&long), "{short:?}");
+        assert_eq!(
+            stderr(&output),
+            "lxmd-rs: warning: -c is deprecated, use --config\n",
+            "{short:?}"
+        );
+    }
+
+    let version = lxmd(&["--version"]);
+    let short = lxmd(&["-V"]);
+    assert!(short.status.success(), "{}", combined_output(&short));
+    assert_eq!(stdout(&short), stdout(&version));
+    assert_eq!(
+        stderr(&short),
+        "lxmd-rs: warning: -V is deprecated, use --version\n"
+    );
+
+    let help = stdout(&lxmd(&["--help"]));
+    assert!(help.contains("--config") && help.contains("--version"));
+    assert!(!help.contains("-c,") && !help.contains("-V,"), "{help}");
+}
+
 #[test]
 fn example_config_exits_before_runtime_initialisation() {
     let output = lxmd(&["--exampleconfig"]);

@@ -6334,9 +6334,14 @@ fn initialize_storage_namespace(config_dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Rust-only spellings the 1.3 and 1.4 releases accepted, kept for existing
+/// scripts (lxmd.py has `--config` and `--version` only).
+const DEPRECATED_SPELLINGS: &[(&str, &str)] = &[("-c", "--config"), ("-V", "--version")];
+
 #[tokio::main]
 pub(crate) async fn main() {
     let args = Args::parse();
+    rns_tools::warn_deprecated_spellings("lxmd-rs", DEPRECATED_SPELLINGS);
 
     if args.version {
         println!(
