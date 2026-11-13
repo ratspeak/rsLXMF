@@ -19,8 +19,10 @@ pub struct LxmdPaths {
     pub ratchets_dir: PathBuf,
     pub ratchet_ring_path: PathBuf,
     pub ratchet_control_path: PathBuf,
-    pub received_ratchets_dir: PathBuf,
-    pub known_identities_path: PathBuf,
+    /// Received-ratchet files of earlier releases; Reticulum keeps received ratchets now.
+    pub legacy_received_ratchets_dir: PathBuf,
+    /// Identity-key file of earlier releases; Reticulum keeps the known destinations.
+    pub legacy_known_identities_path: PathBuf,
     pub legacy_lxmf_dir: PathBuf,
     pub legacy_identity_path: PathBuf,
     pub legacy_messages_dir: PathBuf,
@@ -40,8 +42,8 @@ impl LxmdPaths {
         let ratchets_dir = lxmf_storage_dir.join("ratchets");
         let ratchet_ring_path = ratchets_dir.join("ring");
         let ratchet_control_path = ratchets_dir.join("ring.control");
-        let received_ratchets_dir = ratchets_dir.join("received");
-        let known_identities_path = ratchets_dir.join("known_identities");
+        let legacy_received_ratchets_dir = ratchets_dir.join("received");
+        let legacy_known_identities_path = ratchets_dir.join("known_identities");
 
         let legacy_lxmf_dir = config_dir.join(".lxmf");
         let legacy_identity_path = legacy_lxmf_dir.join("identity");
@@ -60,8 +62,8 @@ impl LxmdPaths {
             ratchets_dir,
             ratchet_ring_path,
             ratchet_control_path,
-            received_ratchets_dir,
-            known_identities_path,
+            legacy_received_ratchets_dir,
+            legacy_known_identities_path,
             legacy_lxmf_dir,
             legacy_identity_path,
             legacy_messages_dir,
@@ -347,11 +349,11 @@ mod tests {
             PathBuf::from("/tmp/lxmd-config/storage/lxmf/ratchets/ring.control")
         );
         assert_eq!(
-            paths.received_ratchets_dir,
+            paths.legacy_received_ratchets_dir,
             PathBuf::from("/tmp/lxmd-config/storage/lxmf/ratchets/received")
         );
         assert_eq!(
-            paths.known_identities_path,
+            paths.legacy_known_identities_path,
             PathBuf::from("/tmp/lxmd-config/storage/lxmf/ratchets/known_identities")
         );
     }

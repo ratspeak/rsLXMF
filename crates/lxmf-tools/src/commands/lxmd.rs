@@ -69,9 +69,6 @@ use rns_identity::identity::Identity;
 use rns_identity::persistence::{
     durable_create_dir_all, durable_reconcile, durable_write, validate_durable_storage_directory,
 };
-use rns_identity::ratchet::{
-    ReceivedRatchet, clean_received_ratchets_dir, purge_expired_ratchets_in_memory,
-};
 use rns_runtime::destination_stamper::{Admission, DestinationStamps, StampOutcome};
 use rns_runtime::lifecycle::ShutdownSignal;
 use rns_runtime::link_manager::{
@@ -1343,10 +1340,9 @@ async fn forward_delivery_events(
     }
 }
 
-/// Soft cap on announce-learned identity keys. Python bounds its equivalent
-/// store via Transport's known-destinations cleanup; lxmd has no last-use
-/// signal, so over the cap it evicts entries without a live ratchet first,
-/// then oldest-ratchet entries. Evicted keys re-learn from the next announce.
+/// Soft cap on the identity keys held for this session. Reticulum keeps the
+/// durable copy (`Identity.recall`); a key dropped over the cap is recalled
+/// again or re-learned from the next announce.
 const KNOWN_IDENTITIES_SOFT_CAP: usize = 10_000;
 
 /// Full path-table resync cadence for `route_hops`. Announce events keep the
@@ -1367,6 +1363,14 @@ struct PeerPathCheck {
     response: Option<oneshot::Receiver<TransportQueryResponse>>,
     grace_until: Option<f64>,
 }
+
+/// What `propagation_resource_concluded` reads before autopeering with an
+/// unpeered sender: `Identity.recall_app_data` and `Transport.hops_to`.
+#[derive(Debug)]
+struct SyncAutopeerRecall {
+    recalled: oneshot::Receiver<TransportQueryResponse>,
+    hops: oneshot::Receiver<TransportQueryResponse>,
+}
 const JOBS_INTERVAL: u64 = 5;
 
 /// Resolve a destination hash to its identity hash via the learned identity
@@ -1381,44 +1385,39 @@ fn recall_identity_hash(
         .map(|pub_key| rns_crypto::sha::truncated_hash(pub_key))
 }
 
-fn prune_known_identities(
-    known_identities: &mut HashMap<String, [u8; 64]>,
-    received_ratchets: &HashMap<String, ReceivedRatchet>,
-) -> usize {
-    if known_identities.len() <= KNOWN_IDENTITIES_SOFT_CAP {
-        return 0;
-    }
-    let mut excess = known_identities.len() - KNOWN_IDENTITIES_SOFT_CAP;
-    let before = known_identities.len();
+/// Bound the daemon's working copy of recalled identity keys. Reticulum keeps
+/// the known destinations; a dropped key is recalled again when it is needed.
+/// The aspects whose identities the daemon keeps for the session.
+const LXMF_ASPECTS: [&str; 2] = [DELIVERY_APP_NAME, "lxmf.propagation"];
 
-    let no_ratchet: Vec<String> = known_identities
-        .keys()
-        .filter(|k| !received_ratchets.contains_key(*k))
-        .take(excess)
-        .cloned()
-        .collect();
-    for k in &no_ratchet {
-        known_identities.remove(k);
+/// Whether a listed announce is an LXMF destination. An entry whose facts are
+/// unknown (a row upstream wrote) carries a placeholder name hash, so its
+/// aspect is read from its destination hash, which is derived from the name
+/// hash and the identity: a message from it must still verify after a restart.
+fn is_lxmf_destination(
+    announce: &rns_transport::messages::AnnounceRpcEntry,
+    public_key: &[u8; 64],
+) -> bool {
+    if announce.facts_known {
+        return LXMF_ASPECTS
+            .iter()
+            .any(|aspect| rns_identity::name_hash::name_hash(aspect) == announce.name_hash);
     }
-    excess = known_identities
+    let identity = rns_crypto::sha::truncated_hash(public_key);
+    LXMF_ASPECTS.iter().any(|aspect| {
+        Destination::hash_from_name_and_identity(aspect, Some(&identity)) == announce.dest_hash
+    })
+}
+
+fn prune_known_identities(known_identities: &mut HashMap<String, [u8; 64]>) -> usize {
+    let excess = known_identities
         .len()
         .saturating_sub(KNOWN_IDENTITIES_SOFT_CAP);
-
-    if excess > 0 {
-        let mut by_age: Vec<(String, f64)> = known_identities
-            .keys()
-            .filter_map(|k| {
-                received_ratchets
-                    .get(k)
-                    .map(|rr| (k.clone(), rr.received_at))
-            })
-            .collect();
-        by_age.sort_by(|a, b| a.1.total_cmp(&b.1));
-        for (k, _) in by_age.into_iter().take(excess) {
-            known_identities.remove(&k);
-        }
+    let dropped: Vec<String> = known_identities.keys().take(excess).cloned().collect();
+    for key in &dropped {
+        known_identities.remove(key);
     }
-    before - known_identities.len()
+    dropped.len()
 }
 
 /// Atomically reserve capacity for receipt tracking and packet dispatch.
@@ -1594,33 +1593,12 @@ struct DownloadCommitResult {
 }
 
 struct DaemonCheckpoint {
-    ratchets: PathBuf,
-    received: HashMap<String, ReceivedRatchet>,
-    keys: HashMap<String, [u8; 64]>,
     state_dir: PathBuf,
     router: lxmf_core::router::RouterStateSnapshot,
     policies: HashMap<[u8; 16], AdvertisedNodePolicy>,
 }
 impl DaemonCheckpoint {
     fn persist(self) -> std::io::Result<()> {
-        let received = self.ratchets.join("received");
-        require_ratchet_directory(&received)?;
-        for (hash, ratchet) in self.received {
-            if !hex::decode(&hash).is_ok_and(|bytes| bytes.len() == 16) {
-                return Err(std::io::Error::other("invalid ratchet destination"));
-            }
-            ratchet.save_durable(&received.join(format!("{hash}.ratchet")))?;
-        }
-        let mut keys = Vec::with_capacity(self.keys.len() * 80);
-        for (hash, key) in self.keys {
-            let hash = hex::decode(hash).map_err(std::io::Error::other)?;
-            if hash.len() != 16 {
-                return Err(std::io::Error::other("invalid identity destination"));
-            }
-            keys.extend_from_slice(&hash);
-            keys.extend_from_slice(&key);
-        }
-        lxmf_core::persist::write_file_atomic(&self.ratchets.join("known_identities"), &keys)?;
         self.router.save_state(&self.state_dir)?;
         lxmf_core::persist::save_node_policies(&self.state_dir, &self.policies)
     }
@@ -1667,8 +1645,13 @@ struct LxmdRunner {
     propagation_preparation_tasks: Vec<tokio::task::JoinHandle<()>>,
     ratchets_dir: PathBuf,
     delivery_ratchets: DeliveryRatchetState,
-    received_ratchets: HashMap<String, ReceivedRatchet>,
+    /// Identity keys Reticulum has reported this session; it keeps the known
+    /// destinations, as `RNS.Identity.recall` answers for Python's LXMF.
     known_identities: HashMap<String, [u8; 64]>,
+    /// What Reticulum answered this tick for each pending destination's
+    /// ratchet (`RNS.Identity.get_ratchet`, read by `Destination.encrypt`).
+    /// Reticulum alone keeps received ratchets; no entry means no answer yet.
+    outbound_ratchets: HashMap<[u8; 16], Option<[u8; 32]>>,
     /// Identities asked of Transport's validated announce cache.
     identity_recalls: HashMap<[u8; 16], oneshot::Receiver<TransportQueryResponse>>,
     /// Outbound destinations whose persisted announce app data was recalled once.
@@ -1707,8 +1690,9 @@ struct LxmdRunner {
     /// Loaded peers whose identity must resolve within a path wait (seconds),
     /// and the deadline once the wait has started.
     peer_identity_deadlines: HashMap<[u8; 16], (f64, Option<f64>)>,
-    /// Unpeered remotes whose announce data is recalled for autopeering.
-    sync_autopeer_recalls: HashMap<[u8; 16], oneshot::Receiver<TransportQueryResponse>>,
+    /// Unpeered remotes whose announce data and path hops are asked of
+    /// Reticulum for autopeering.
+    sync_autopeer_recalls: HashMap<[u8; 16], SyncAutopeerRecall>,
     peer_state_dirty: bool,
     /// Python `peer_distribution_queue`: stored IDs and the peer they came from.
     peer_distribution_queue: Vec<([u8; 32], Option<[u8; 16]>)>,
@@ -1780,9 +1764,8 @@ struct LxmdRunner {
     last_crypto_save: f64,
     checkpoint_task: Option<DaemonCheckpointTask>,
     last_cull: f64,
-    last_ratchet_clean: f64,
+    last_identity_prune: f64,
     last_route_refresh: f64,
-    received_ratchets_dir: PathBuf,
     control_state: Arc<Mutex<ControlSnapshot>>,
     control_command_rx: mpsc::UnboundedReceiver<ControlCommand>,
 }
@@ -1868,20 +1851,11 @@ impl LxmdRunner {
             tracing::warn!("Transport did not list its validated announces");
             return;
         };
-        let lxmf_aspects = [
-            rns_identity::name_hash::name_hash(DELIVERY_APP_NAME),
-            rns_identity::name_hash::name_hash("lxmf.propagation"),
-        ];
         for announce in announces {
             if let Some(public_key) = announce.public_key
-                && lxmf_aspects.contains(&announce.name_hash)
+                && is_lxmf_destination(&announce, &public_key)
             {
-                self.learn_identity(
-                    &announce.dest_hash,
-                    public_key,
-                    announce.ratchet,
-                    Some(announce.timestamp),
-                );
+                self.learn_identity(&announce.dest_hash, public_key);
             }
         }
     }
@@ -1927,12 +1901,7 @@ impl LxmdRunner {
             if let Some(recalled) = recalled {
                 self.router
                     .update_compression_support(destination_hash, recalled.app_data.as_deref());
-                self.learn_identity(
-                    &destination_hash,
-                    recalled.public_key,
-                    recalled.ratchet,
-                    Some(recalled.timestamp),
-                );
+                self.learn_identity(&destination_hash, recalled.public_key);
             }
         }
     }
@@ -1971,41 +1940,13 @@ impl LxmdRunner {
         }));
     }
 
-    /// Record an announced identity key and ratchet, persisting only a
-    /// changed ratchet (Python `Identity._remember_ratchet`), off the daemon
-    /// loop. Identity keys stay on the periodic and shutdown saves.
-    fn learn_identity(
-        &mut self,
-        destination_hash: &[u8; 16],
-        public_key: [u8; 64],
-        ratchet: Option<[u8; 32]>,
-        received_at: Option<f64>,
-    ) {
+    /// Keep an identity key Reticulum reported. An announced ratchet is not
+    /// kept here: Reticulum remembers it (`Identity._remember_ratchet`).
+    fn learn_identity(&mut self, destination_hash: &[u8; 16], public_key: [u8; 64]) {
         let dest_hex = hex::encode(destination_hash);
         if self.known_identities.get(&dest_hex) != Some(&public_key) {
             self.known_identities.insert(dest_hex.clone(), public_key);
             tracing::debug!(dest = %dest_hex, "learned identity key from announce");
-        }
-        if let Some(ratchet_key) = ratchet
-            && self
-                .received_ratchets
-                .get(&dest_hex)
-                .is_none_or(|rr| rr.ratchet_pub != ratchet_key)
-        {
-            let rr = received_at.map_or_else(
-                || ReceivedRatchet::new(ratchet_key),
-                |at| ReceivedRatchet::new_at(ratchet_key, at),
-            );
-            self.received_ratchets.insert(dest_hex.clone(), rr);
-            tracing::debug!(dest = %dest_hex, "learned ratchet from announce");
-            let path = self
-                .received_ratchets_dir
-                .join(format!("{dest_hex}.ratchet"));
-            tokio::task::spawn_blocking(move || {
-                if let Err(e) = rr.save_durable(&path) {
-                    tracing::warn!("Failed to persist received ratchet: {e}");
-                }
-            });
         }
     }
 
@@ -2076,46 +2017,8 @@ impl LxmdRunner {
             &identity,
         );
 
-        // Mirrors Python `Identity._clean_ratchets()`: sweep the directory at
-        // startup so stale entries don't survive a restart.
-        let received_dir = paths.received_ratchets_dir.clone();
-        let removed = clean_received_ratchets_dir(&received_dir);
-        if removed > 0 {
-            tracing::info!(removed, "swept expired received-ratchet files at startup");
-        }
-        let mut received_ratchets = HashMap::new();
-        if let Ok(entries) = std::fs::read_dir(&received_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if let Some(name) = path.file_stem().and_then(|n| n.to_str())
-                    && let Ok(rr) = ReceivedRatchet::load(&path)
-                {
-                    received_ratchets.insert(name.to_string(), rr);
-                }
-            }
-        }
-
-        // known_identities format: concat of [dest_hash:16][pubkey:64]
-        let ki_path = paths.known_identities_path.clone();
-        let mut known_identities: HashMap<String, [u8; 64]> = HashMap::new();
-        if ki_path.exists()
-            && let Ok(data) = std::fs::read(&ki_path)
-        {
-            let mut pos = 0;
-            while pos + 80 <= data.len() {
-                let mut dh = [0u8; 16];
-                dh.copy_from_slice(&data[pos..pos + 16]);
-                let mut pk = [0u8; 64];
-                pk.copy_from_slice(&data[pos + 16..pos + 80]);
-                known_identities.insert(hex::encode(dh), pk);
-                pos += 80;
-            }
-        }
-
         tracing::info!(
             ratchet_keys = delivery_ratchets.ring().len(),
-            received_ratchets = received_ratchets.len(),
-            known_identities = known_identities.len(),
             "Crypto state loaded"
         );
 
@@ -2649,8 +2552,8 @@ impl LxmdRunner {
             propagation_preparation_tasks: Vec::new(),
             ratchets_dir: paths.ratchets_dir,
             delivery_ratchets,
-            received_ratchets,
-            known_identities,
+            known_identities: HashMap::new(),
+            outbound_ratchets: HashMap::new(),
             identity_recalls: HashMap::new(),
             compression_recalled: HashSet::new(),
             control_plane: None,
@@ -2724,9 +2627,8 @@ impl LxmdRunner {
             last_crypto_save: now,
             checkpoint_task: None,
             last_cull: now,
-            last_ratchet_clean: now,
+            last_identity_prune: now,
             last_route_refresh: 0.0,
-            received_ratchets_dir: received_dir,
             control_state,
             control_command_rx,
         };
@@ -3509,35 +3411,51 @@ impl LxmdRunner {
         {
             return;
         }
-        let (response_tx, response_rx) = oneshot::channel();
-        if self
+        let (recalled_tx, recalled) = oneshot::channel();
+        let (hops_tx, hops) = oneshot::channel();
+        let asked = self
             .transport_tx
             .try_send(TransportMessage::Rpc {
                 query: TransportQuery::RecallDestination { dest: peer_hash },
-                response_tx,
+                response_tx: recalled_tx,
             })
             .is_ok()
-        {
-            self.sync_autopeer_recalls.insert(peer_hash, response_rx);
+            && self
+                .transport_tx
+                .try_send(TransportMessage::Rpc {
+                    query: TransportQuery::HopsTo { dest: peer_hash },
+                    response_tx: hops_tx,
+                })
+                .is_ok();
+        if asked {
+            self.sync_autopeer_recalls
+                .insert(peer_hash, SyncAutopeerRecall { recalled, hops });
         }
     }
 
     fn drain_sync_autopeer_recalls(&mut self) {
         let mut answered = Vec::new();
-        for (peer_hash, response) in &mut self.sync_autopeer_recalls {
-            match response.try_recv() {
-                Err(oneshot::error::TryRecvError::Empty) => {}
-                Ok(TransportQueryResponse::RecalledDestination(Some(recalled))) => {
-                    answered.push((*peer_hash, Some(recalled)));
-                }
-                _ => answered.push((*peer_hash, None)),
-            }
+        for (peer_hash, recall) in &mut self.sync_autopeer_recalls {
+            // Reticulum answers in the order asked: the hop count comes last.
+            let hops = match recall.hops.try_recv() {
+                Err(oneshot::error::TryRecvError::Empty) => continue,
+                Ok(TransportQueryResponse::IntResult(hops)) => u8::try_from(hops).ok(),
+                _ => None,
+            };
+            let recalled = match recall.recalled.try_recv() {
+                Ok(TransportQueryResponse::RecalledDestination(recalled)) => recalled,
+                _ => None,
+            };
+            answered.push((*peer_hash, recalled, hops));
         }
-        for (peer_hash, recalled) in answered {
+        for (peer_hash, recalled, hops) in answered {
             self.sync_autopeer_recalls.remove(&peer_hash);
             let Some(recalled) = recalled else {
                 continue;
             };
+            // `Transport.hops_to`: the path's hops, never the remembered
+            // announce's, which may be older than the path or unknown.
+            let hops = hops.unwrap_or(rns_transport::constants::PATHFINDER_M);
             let Some(pn) = recalled
                 .app_data
                 .as_deref()
@@ -3545,10 +3463,14 @@ impl LxmdRunner {
             else {
                 continue;
             };
-            if !pn.node_state || !self.config.autopeer {
+            if !pn.node_state
+                || !self.config.autopeer
+                || self.router.peers.contains_key(&peer_hash)
+                || usize::from(hops) > self.router.config.ext.autopeer_maxdepth
+            {
                 continue;
             }
-            self.learn_identity(&peer_hash, recalled.public_key, recalled.ratchet, None);
+            self.learn_identity(&peer_hash, recalled.public_key);
             tracing::debug!(
                 peer = %hex::encode(peer_hash),
                 "auto-peering with propagation node discovered via incoming sync"
@@ -3561,12 +3483,7 @@ impl LxmdRunner {
                 stamp_cost: Some(pn.stamp_cost),
                 stamp_flexibility: Some(pn.stamp_flex),
                 peering_cost: Some(pn.peering_cost),
-                hops: Some(
-                    self.route_hops
-                        .get(&peer_hash)
-                        .copied()
-                        .unwrap_or(recalled.hops),
-                ),
+                hops: Some(hops),
                 metadata: Some(pn.metadata.clone()),
             }) {
                 self.peer_state_dirty = true;
@@ -4118,6 +4035,13 @@ impl LxmdRunner {
             .pending_outbound
             .iter()
             .map(|message| message.destination_hash())
+            // A message leaves the stamp queue and is sent within one tick.
+            .chain(
+                self.router
+                    .pending_deferred_stamps
+                    .values()
+                    .map(|message| message.destination_hash()),
+            )
             .collect();
         if let Some(node) = self.router.outbound_propagation_node {
             targets.insert(node);
@@ -4187,6 +4111,25 @@ impl LxmdRunner {
         }
         self.medium.routes = routes;
         self.next_hop_hardware_mtus = hardware_mtus;
+
+        // `Destination.encrypt` reads `Identity.get_ratchet` at each send; the
+        // daemon asks Reticulum for every destination this tick may encrypt for.
+        let mut ratchets = HashMap::new();
+        let mut recalled_keys = Vec::new();
+        for destination in targets {
+            if let Some(TransportQueryResponse::RecalledDestination(recalled)) =
+                query(TransportQuery::RecallDestination { dest: destination }).await
+            {
+                ratchets.insert(destination, recalled.as_ref().and_then(|r| r.ratchet));
+                if let Some(recalled) = recalled {
+                    recalled_keys.push((destination, recalled.public_key));
+                }
+            }
+        }
+        self.outbound_ratchets = ratchets;
+        for (destination, public_key) in recalled_keys {
+            self.learn_identity(&destination, public_key);
+        }
     }
 
     fn outbound_inputs(&self) -> OutboundInputs {
@@ -4469,9 +4412,6 @@ impl LxmdRunner {
         }
         if self.checkpoint_task.is_none() && now - self.last_crypto_save > 300.0 {
             let checkpoint = DaemonCheckpoint {
-                ratchets: self.ratchets_dir.clone(),
-                received: self.received_ratchets.clone(),
-                keys: self.known_identities.clone(),
                 state_dir: self.data_dir.clone(),
                 router: self.router.state_snapshot(),
                 policies: self.node_policies.clone(),
@@ -4484,21 +4424,12 @@ impl LxmdRunner {
             self.last_crypto_save = now;
         }
 
-        // 15-minute interval matches Python's CLEAN_INTERVAL.
-        if now - self.last_ratchet_clean > 900.0 {
-            let mem_dropped = purge_expired_ratchets_in_memory(&mut self.received_ratchets);
-            let disk_dropped = clean_received_ratchets_dir(&self.received_ratchets_dir);
-            let ids_dropped =
-                prune_known_identities(&mut self.known_identities, &self.received_ratchets);
-            if mem_dropped > 0 || disk_dropped > 0 || ids_dropped > 0 {
-                tracing::debug!(
-                    mem_dropped,
-                    disk_dropped,
-                    ids_dropped,
-                    "crypto cache cleanup pass: removed expired entries"
-                );
+        if now - self.last_identity_prune > 900.0 {
+            let dropped = prune_known_identities(&mut self.known_identities);
+            if dropped > 0 {
+                tracing::debug!(dropped, "dropped recalled identity keys over the cap");
             }
-            self.last_ratchet_clean = now;
+            self.last_identity_prune = now;
         }
 
         self.refresh_control_state();
@@ -4680,7 +4611,7 @@ impl LxmdRunner {
                 }
             }
             if let Some(public_key) = event.public_key {
-                self.learn_identity(&event.destination_hash, public_key, event.ratchet, None);
+                self.learn_identity(&event.destination_hash, public_key);
             }
         }
         seen
@@ -5901,7 +5832,12 @@ impl LxmdRunner {
         let dest_hash = message.destination_hash();
         let dest_hex = hex::encode(dest_hash);
         let msg_hash = message.message_id();
-        let Some(destination_public_key) = self.known_identities.get(&dest_hex).copied() else {
+        let destination_public_key = self
+            .known_identities
+            .get(&dest_hex)
+            .copied()
+            .filter(|_| self.outbound_ratchets.contains_key(&dest_hash));
+        let Some(destination_public_key) = destination_public_key else {
             tracing::warn!(dest = %dest_hex, "destination key unknown, waiting for path");
             self.recall_identity(dest_hash);
             let actions = self
@@ -6069,12 +6005,10 @@ impl LxmdRunner {
     fn encrypt_for_destination(&self, dest_hash_hex: &str, plaintext: &[u8]) -> Option<Vec<u8>> {
         let pub_key = self.known_identities.get(dest_hash_hex)?;
         let remote = Identity::from_public_key(pub_key).ok()?;
-        let ratchet_pub = self
-            .received_ratchets
-            .get(dest_hash_hex)
-            .filter(|rr| !rr.is_expired())
-            .map(|rr| &rr.ratchet_pub);
-        remote.encrypt(plaintext, ratchet_pub).ok()
+        let destination: [u8; 16] = hex::decode(dest_hash_hex).ok()?.try_into().ok()?;
+        // No answer this tick: the caller waits instead of sending unratcheted.
+        let ratchet = self.outbound_ratchets.get(&destination)?;
+        remote.encrypt(plaintext, ratchet.as_ref()).ok()
     }
 
     fn pack_message_for_propagation(
@@ -6089,16 +6023,16 @@ impl LxmdRunner {
             // LXMRouter checks RNS.Transport.has_path; the medium snapshot is refreshed per tick.
             self.medium.has_path(&prop_hash),
             self.node_policies.get(&prop_hash).copied(),
-            self.known_identities.contains_key(&dest_hex),
+            // The recipient is ready once Reticulum has answered for its key and ratchet.
+            self.known_identities.contains_key(&dest_hex)
+                && self
+                    .outbound_ratchets
+                    .contains_key(&message.destination_hash()),
             now_f64(),
         )
         .map_err(PropagationPreparationError::Missing)?;
         let key = self.known_identities[&dest_hex];
-        let ratchet = self
-            .received_ratchets
-            .get(&dest_hex)
-            .filter(|r| !r.is_expired())
-            .map(|r| r.ratchet_pub);
+        let ratchet = self.outbound_ratchets[&message.destination_hash()];
         let mut binding = key.to_vec();
         if let Some(r) = ratchet {
             binding.extend_from_slice(&r);
@@ -6235,34 +6169,7 @@ impl LxmdRunner {
     fn save_crypto_state(&self) -> std::io::Result<()> {
         let ratchet_dir = self.ratchets_dir.clone();
         require_ratchet_directory(&ratchet_dir)?;
-        let received_dir = ratchet_dir.join("received");
-        require_ratchet_directory(&received_dir)?;
-
-        self.delivery_ratchets.save_durable(&self.identity)?;
-
-        for (hash_hex, rr) in &self.received_ratchets {
-            let path = received_dir.join(format!("{hash_hex}.ratchet"));
-            if !hex::decode(hash_hex).is_ok_and(|hash| hash.len() == 16) {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "invalid received ratchet destination",
-                ));
-            }
-            rr.save_durable(&path)?;
-        }
-
-        // Flat binary: [dest_hash:16][pub:64] per entry.
-        let ki_path = ratchet_dir.join("known_identities");
-        let mut data = Vec::with_capacity(self.known_identities.len() * 80);
-        for (hash_hex, pk) in &self.known_identities {
-            if let Ok(hash_bytes) = hex::decode(hash_hex)
-                && hash_bytes.len() == 16
-            {
-                data.extend_from_slice(&hash_bytes);
-                data.extend_from_slice(pk);
-            }
-        }
-        lxmf_core::persist::write_file_atomic(&ki_path, &data)
+        self.delivery_ratchets.save_durable(&self.identity)
     }
 }
 
@@ -6290,11 +6197,60 @@ fn require_storage_namespace(paths: &LxmdPaths) -> std::io::Result<()> {
         &paths.storage_dir,
         &paths.lxmf_storage_dir,
         &paths.ratchets_dir,
-        &paths.received_ratchets_dir,
     ] {
         require_ratchet_directory(path)?;
     }
     Ok(())
+}
+
+/// Hand the received ratchets earlier releases kept under
+/// `storage/lxmf/ratchets/received` to Reticulum, which alone keeps them now.
+/// The files have upstream's layout, so each moves to the directory
+/// Reticulum's store imports (`Identity.ratchetpath`) with upstream's filter:
+/// a 32-byte ratchet, not expired, for a destination it knows. A file is
+/// removed here only once its copy is durable there; Reticulum removes that
+/// copy after its own commit. The identity-key file beside them goes too:
+/// Reticulum's known destinations hold the keys.
+///
+/// Runs before Reticulum starts: the instance that owns the storage imports
+/// the files as it starts (`Identity.load_known_destinations`).
+fn hand_received_ratchets_to_reticulum(
+    paths: &LxmdPaths,
+    rns_config_dir: &Path,
+) -> std::io::Result<()> {
+    let received = &paths.legacy_received_ratchets_dir;
+    if received.is_dir() {
+        let import_dir = rns_runtime::platform::StoragePaths::from_config_dir(rns_config_dir)
+            .storage_dir
+            .join("ratchets");
+        for entry in std::fs::read_dir(received)? {
+            let path = entry?.path();
+            let destination = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .filter(|stem| hex::decode(stem).is_ok_and(|hash| hash.len() == 16))
+                .filter(|_| path.extension().is_some_and(|ext| ext == "ratchet"));
+            if let Some(destination) = destination
+                && path.is_file()
+            {
+                let target = import_dir.join(destination);
+                // A file already there is Reticulum's own and is not replaced.
+                if !target.try_exists()? {
+                    std::fs::create_dir_all(&import_dir)?;
+                    let bytes = std::fs::read(&path)?;
+                    durable_write(&target, &bytes).map_err(std::io::Error::other)?;
+                }
+            }
+            if path.is_file() {
+                std::fs::remove_file(&path)?;
+            }
+        }
+        std::fs::remove_dir(received)?;
+    }
+    match std::fs::remove_file(&paths.legacy_known_identities_path) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+        _ => Ok(()),
+    }
 }
 
 /// Establish/reconcile the entire private ratchet namespace before config,
@@ -6333,7 +6289,6 @@ fn initialize_storage_namespace(config_dir: &Path) -> std::io::Result<()> {
         &paths.storage_dir,
         &paths.lxmf_storage_dir,
         &paths.ratchets_dir,
-        &paths.received_ratchets_dir,
     ] {
         durable_create_dir_all(path, &witness).map_err(std::io::Error::other)?;
     }
@@ -6386,6 +6341,12 @@ pub(crate) async fn main() {
         if let Err(error) = initialize_storage_namespace(&config_dir) {
             println!("Failed to establish private daemon storage namespace: {error}");
             std::process::exit(1);
+        }
+        if let Err(error) =
+            hand_received_ratchets_to_reticulum(&LxmdPaths::new(&config_dir), &rns_config_dir)
+        {
+            // Left in place, the files are handed over at the next start.
+            tracing::warn!(%error, "could not hand earlier received ratchets to Reticulum");
         }
         let (config, created) = load_or_create_daemon_config(&config_dir);
         let loaded = DaemonConfig::from_config(&config).and_then(|daemon_config| {
@@ -7374,6 +7335,169 @@ mod tests {
         shutdown.trigger();
     }
 
+    #[test]
+    fn received_ratchet_files_of_earlier_releases_are_handed_to_reticulum() {
+        let temp = tempfile::tempdir().unwrap();
+        let rns = temp.path().join("rns");
+        let paths = LxmdPaths::new(temp.path().join("lxmd"));
+        let received = &paths.legacy_received_ratchets_dir;
+        std::fs::create_dir_all(received).unwrap();
+        let import_dir = rns.join("storage/ratchets");
+        std::fs::create_dir_all(&import_dir).unwrap();
+        let (moved, kept) = (hex::encode([0x11; 16]), hex::encode([0x22; 16]));
+        std::fs::write(received.join(format!("{moved}.ratchet")), b"moved").unwrap();
+        std::fs::write(received.join(format!("{kept}.ratchet")), b"older copy").unwrap();
+        std::fs::write(received.join("notes.txt"), b"not a ratchet").unwrap();
+        std::fs::write(import_dir.join(&kept), b"reticulum's own").unwrap();
+        std::fs::write(&paths.legacy_known_identities_path, [0u8; 80]).unwrap();
+
+        hand_received_ratchets_to_reticulum(&paths, &rns).unwrap();
+
+        assert_eq!(std::fs::read(import_dir.join(&moved)).unwrap(), b"moved");
+        assert_eq!(
+            std::fs::read(import_dir.join(&kept)).unwrap(),
+            b"reticulum's own"
+        );
+        assert_eq!(std::fs::read_dir(&import_dir).unwrap().count(), 2);
+        assert!(!received.exists());
+        assert!(!paths.legacy_known_identities_path.exists());
+        // Nothing left to hand over.
+        hand_received_ratchets_to_reticulum(&paths, &rns).unwrap();
+    }
+
+    /// A recipient's delivery announce, with `ratchet` as its ratchet key.
+    fn recipient_announce(recipient: &Identity, ratchet: Option<&[u8; 32]>) -> (Vec<u8>, [u8; 16]) {
+        let mut destination = Destination::new(
+            Some(recipient),
+            rns_identity::destination::Direction::In,
+            rns_identity::destination::DestType::Single,
+            DELIVERY_APP_NAME,
+        )
+        .unwrap();
+        let raw = destination
+            .announce_packet(recipient, None, ratchet, false, None, now_f64())
+            .unwrap();
+        (raw, destination.hash)
+    }
+
+    /// Reticulum hears the recipient's announce and stops. After a restart in
+    /// which nothing is heard, the daemon must encrypt for the recipient with
+    /// `ratchet`. With `earlier_release_file`, Reticulum heard no ratchet and
+    /// only an earlier release's file under `storage/lxmf` holds it.
+    async fn encrypts_with_the_ratchet_after_a_restart(earlier_release_file: bool) {
+        let temp = tempfile::tempdir().unwrap();
+        let rns = temp.path().join("rns");
+        let lxmf_dir = temp.path().join("lxmf");
+        initialize_storage_namespace(&lxmf_dir).unwrap();
+        let recipient = Identity::new();
+        let ratchet_key = rns_crypto::x25519::X25519PrivateKey::generate().to_bytes();
+        let ratchet = rns_identity::ratchet::ratchet_public_bytes(&ratchet_key);
+        let heard = (!earlier_release_file).then_some(&ratchet);
+        let (announce, recipient_hash) = recipient_announce(&recipient, heard);
+
+        let (reticulum, _shutdown) = standalone_reticulum(&rns).await;
+        let _driver = hear(&reticulum.transport_tx, 9001, &announce).await;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !matches!(
+            reticulum
+                .query_transport(TransportQuery::RecallDestination {
+                    dest: recipient_hash
+                })
+                .await,
+            Some(TransportQueryResponse::RecalledDestination(Some(_)))
+        ) {
+            assert!(
+                Instant::now() < deadline,
+                "Reticulum validates the announce"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        reticulum.shutdown_and_wait().await;
+
+        if earlier_release_file {
+            let paths = LxmdPaths::new(&lxmf_dir);
+            std::fs::create_dir_all(&paths.legacy_received_ratchets_dir).unwrap();
+            rns_identity::ratchet::ReceivedRatchet::new(ratchet)
+                .save(
+                    &paths
+                        .legacy_received_ratchets_dir
+                        .join(format!("{}.ratchet", hex::encode(recipient_hash))),
+                )
+                .unwrap();
+            hand_received_ratchets_to_reticulum(&paths, &rns).unwrap();
+            assert!(!paths.legacy_received_ratchets_dir.exists());
+        }
+
+        let (reticulum, _shutdown) = standalone_reticulum(&rns).await;
+        if earlier_release_file {
+            // Reticulum, owning its storage, imports the files as it starts.
+            assert_eq!(
+                std::fs::read_dir(rns.join("storage/ratchets"))
+                    .unwrap()
+                    .count(),
+                0
+            );
+        }
+        let mut runner = LxmdRunner::new(
+            DaemonConfig::default(),
+            &lxmf_dir,
+            reticulum.transport_tx.clone(),
+            None,
+        )
+        .unwrap();
+        let message = LxMessageDraft::new(
+            recipient_hash,
+            runner.lxmf_dest_hash,
+            "",
+            "after the restart",
+            DeliveryMethod::Opportunistic,
+        )
+        .unwrap()
+        .sign(&runner.identity.get_signing_key().unwrap())
+        .unwrap();
+        runner.router.submit_signed(message).unwrap();
+        // Before Reticulum has answered for this tick nothing is encrypted.
+        let recipient_hex = hex::encode(recipient_hash);
+        assert!(
+            runner
+                .encrypt_for_destination(&recipient_hex, b"x")
+                .is_none()
+        );
+
+        runner.refresh_outbound_medium().await;
+
+        assert_eq!(
+            runner.outbound_ratchets.get(&recipient_hash),
+            Some(&Some(ratchet))
+        );
+        let ciphertext = runner
+            .encrypt_for_destination(&recipient_hex, b"after the restart")
+            .expect("recipient key recalled from Reticulum");
+        // Enforcing ratchets, the recipient opens it only with that ratchet key.
+        let opened = recipient
+            .decrypt_with_ratchet_id(&ciphertext, Some(&[&ratchet_key]), true)
+            .unwrap();
+        assert_eq!(opened.plaintext, b"after the restart");
+        assert!(opened.ratchet_id.is_some());
+        assert!(!lxmf_dir.join("storage/lxmf/ratchets/received").exists());
+        assert!(
+            !lxmf_dir
+                .join("storage/lxmf/ratchets/known_identities")
+                .exists()
+        );
+        reticulum.shutdown_and_wait().await;
+    }
+
+    #[tokio::test]
+    async fn a_ratchet_learned_before_a_restart_encrypts_the_next_message() {
+        encrypts_with_the_ratchet_after_a_restart(false).await;
+    }
+
+    #[tokio::test]
+    async fn a_ratchet_only_an_earlier_release_file_held_encrypts_after_the_hand_over() {
+        encrypts_with_the_ratchet_after_a_restart(true).await;
+    }
+
     /// Python's LXMF recalls identities that Transport validated before the
     /// router registered its handlers (Transport.py, Identity.recall).
     #[tokio::test]
@@ -7488,6 +7612,151 @@ mod tests {
         assert!(runner.router.peers[&node_hash].autopeered);
     }
 
+    /// `propagation_resource_concluded()` reads `Transport.hops_to`: the hops of
+    /// the remembered announce, which a restored destination may not carry,
+    /// decide nothing.
+    #[tokio::test]
+    async fn sync_autopeering_goes_by_the_path_hops_not_the_recalled_announce() {
+        let app_data =
+            propagation_announce_app_data(&lxmf_core::handlers::PropagationNodeAnnounceData::new(
+                true, 256, 10240, 16.0, 3.0, 18.0,
+            ));
+        // (hops of the path, hops of the recalled announce and whether known, peered)
+        let cases = [
+            (rns_transport::constants::PATHFINDER_M, 0, false, false),
+            (rns_transport::constants::PATHFINDER_M, 1, true, false),
+            (2, 0, false, true),
+            (2, 9, true, true),
+        ];
+        for (path_hops, announce_hops, hops_known, peered) in cases {
+            let node = Identity::new();
+            let node_hash = [path_hops, announce_hops, u8::from(hops_known), 7].repeat(4);
+            let node_hash: [u8; 16] = node_hash.try_into().unwrap();
+            let temp = tempfile::tempdir().unwrap();
+            initialize_storage_namespace(temp.path()).unwrap();
+            let (tx, mut rx) = mpsc::channel(64);
+            let mut runner =
+                LxmdRunner::new(DaemonConfig::default(), temp.path(), tx, None).unwrap();
+            while rx.try_recv().is_ok() {}
+
+            runner.recall_sync_autopeer(node_hash);
+            runner.drain_sync_autopeer_recalls();
+            assert!(runner.router.peers.is_empty(), "nothing is answered yet");
+            let mut asked = Vec::new();
+            while let Ok(message) = rx.try_recv() {
+                let TransportMessage::Rpc { query, response_tx } = message else {
+                    continue;
+                };
+                match query {
+                    TransportQuery::RecallDestination { dest } if dest == node_hash => {
+                        let mut entry =
+                            rns_transport::messages::RecalledDestinationRpcEntry::default();
+                        entry.dest_hash = node_hash;
+                        entry.public_key = node.get_public_key();
+                        entry.app_data = Some(app_data.clone());
+                        entry.hops = announce_hops;
+                        entry.hops_known = hops_known;
+                        let _ = response_tx
+                            .send(TransportQueryResponse::RecalledDestination(Some(entry)));
+                        asked.push("recall");
+                    }
+                    TransportQuery::HopsTo { dest } if dest == node_hash => {
+                        let _ = response_tx
+                            .send(TransportQueryResponse::IntResult(i64::from(path_hops)));
+                        asked.push("hops");
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(asked, ["recall", "hops"]);
+            runner.drain_sync_autopeer_recalls();
+            assert!(runner.sync_autopeer_recalls.is_empty());
+            assert_eq!(
+                runner.router.peers.contains_key(&node_hash),
+                peered,
+                "path hops {path_hops}, announce hops {announce_hops} (known: {hops_known})"
+            );
+        }
+    }
+
+    /// A destination restored from a store that does not carry its announce's
+    /// facts has a placeholder name hash. Its aspect is read from its
+    /// destination hash, so an LXMF identity heard before the restart is kept
+    /// and another destination of the same identity is not.
+    #[tokio::test]
+    async fn a_listed_destination_with_unknown_facts_is_matched_by_its_hash() {
+        let identity = Identity::new();
+        let destination =
+            |aspect: &str| Destination::hash_from_name_and_identity(aspect, Some(&identity.hash));
+        let entry = |dest_hash: [u8; 16], name_hash: [u8; 10], facts_known: bool| {
+            let mut entry = rns_transport::messages::AnnounceRpcEntry::default();
+            entry.dest_hash = dest_hash;
+            entry.public_key = Some(identity.get_public_key());
+            entry.name_hash = name_hash;
+            entry.facts_known = facts_known;
+            entry
+        };
+        let delivery = rns_identity::name_hash::name_hash(DELIVERY_APP_NAME);
+        let propagation = rns_identity::name_hash::name_hash("lxmf.propagation");
+        let other = rns_identity::name_hash::name_hash("nomadnetwork.node");
+        let unknown = [0u8; 10];
+        let listed = vec![
+            // Heard this session: taken at the announce's word.
+            (entry([1; 16], delivery, true), true),
+            (entry([2; 16], propagation, true), true),
+            (entry([3; 16], other, true), false),
+            (entry(destination(DELIVERY_APP_NAME), unknown, true), false),
+            // Restored without facts: matched by destination hash.
+            (entry(destination(DELIVERY_APP_NAME), unknown, false), true),
+            (entry(destination("lxmf.propagation"), unknown, false), true),
+            (
+                entry(destination("nomadnetwork.node"), unknown, false),
+                false,
+            ),
+            (entry([4; 16], delivery, false), false),
+        ];
+        for (announce, lxmf) in &listed {
+            assert_eq!(
+                is_lxmf_destination(announce, &identity.get_public_key()),
+                *lxmf,
+                "{} (facts known: {})",
+                hex::encode(announce.dest_hash),
+                announce.facts_known
+            );
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        initialize_storage_namespace(temp.path()).unwrap();
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut runner = LxmdRunner::new(DaemonConfig::default(), temp.path(), tx, None).unwrap();
+        while rx.try_recv().is_ok() {}
+        let mut expected: Vec<String> = listed
+            .iter()
+            .filter(|(_, lxmf)| *lxmf)
+            .map(|(announce, _)| hex::encode(announce.dest_hash))
+            .collect();
+        expected.sort();
+        expected.dedup();
+        let announces = listed.into_iter().map(|(announce, _)| announce).collect();
+        let responder = tokio::spawn(async move {
+            while let Some(message) = rx.recv().await {
+                if let TransportMessage::Rpc {
+                    query: TransportQuery::GetRecentAnnounces,
+                    response_tx,
+                } = message
+                {
+                    let _ = response_tx.send(TransportQueryResponse::Announces(announces));
+                    return;
+                }
+            }
+        });
+        runner.learn_validated_identities().await;
+        responder.await.unwrap();
+        let mut learned: Vec<String> = runner.known_identities.keys().cloned().collect();
+        learned.sort();
+        assert_eq!(learned, expected);
+    }
+
     /// A propagation node the daemon never heard announced is recalled from
     /// Transport before the download, as Python's LXMF does
     /// (LXMRouter.request_messages_from_propagation_node, Identity.recall).
@@ -7529,9 +7798,9 @@ mod tests {
             restarted.delivery_ratchets.ring().current_public_key(),
             public
         );
-        std::fs::remove_dir(&restarted.received_ratchets_dir).unwrap();
+        std::fs::remove_dir_all(&restarted.ratchets_dir).unwrap();
         assert!(restarted.save_crypto_state().is_err());
-        assert!(!restarted.received_ratchets_dir.exists());
+        assert!(!restarted.ratchets_dir.exists());
         drop(restarted);
         assert!(initialize_storage_namespace(&root).is_err());
     }
@@ -8619,31 +8888,18 @@ mod tests {
         assert_eq!(recall_identity_hash(&known, &[0xEE; 16]), None);
     }
 
-    /// Cap eviction prefers entries without a live ratchet, then oldest
-    /// ratchets; under the cap nothing is touched.
     #[test]
-    fn prune_known_identities_respects_cap_and_recency() {
+    fn prune_known_identities_keeps_the_working_copy_under_its_cap() {
         let mut ids: HashMap<String, [u8; 64]> = HashMap::new();
-        let mut ratchets: HashMap<String, ReceivedRatchet> = HashMap::new();
         for i in 0..KNOWN_IDENTITIES_SOFT_CAP + 10 {
             ids.insert(format!("id{i:05}"), [0u8; 64]);
         }
-        // All but 4 of the overflow have ratchets; two ratchets are older.
-        for (i, key) in ids.keys().cloned().enumerate().collect::<Vec<_>>() {
-            if i >= 4 {
-                let mut rr = ReceivedRatchet::new([1u8; 32]);
-                rr.received_at = if i < 6 { 1.0 } else { 1000.0 };
-                ratchets.insert(key, rr);
-            }
-        }
-
-        let dropped = prune_known_identities(&mut ids, &ratchets);
-        assert_eq!(dropped, 10);
+        assert_eq!(prune_known_identities(&mut ids), 10);
         assert_eq!(ids.len(), KNOWN_IDENTITIES_SOFT_CAP);
 
         let mut under: HashMap<String, [u8; 64]> = HashMap::new();
         under.insert("only".into(), [0u8; 64]);
-        assert_eq!(prune_known_identities(&mut under, &ratchets), 0);
+        assert_eq!(prune_known_identities(&mut under), 0);
         assert_eq!(under.len(), 1);
     }
 
