@@ -963,16 +963,16 @@ mod tests {
                 TransportQuery::RecallDestination { dest } if dest == remote_destination_hash
             ));
             response_tx
-                .send(TransportQueryResponse::RecalledDestination(Some(
-                    RecalledDestinationRpcEntry {
-                        dest_hash: remote_destination_hash,
-                        public_key,
-                        app_data: None,
-                        ratchet: None,
-                        hops: 2,
-                        timestamp: 1.0,
-                    },
-                )))
+                .send(TransportQueryResponse::RecalledDestination(Some({
+                    let mut entry = RecalledDestinationRpcEntry::default();
+                    entry.dest_hash = remote_destination_hash;
+                    entry.public_key = public_key;
+                    entry.app_data = None;
+                    entry.ratchet = None;
+                    entry.hops = 2;
+                    entry.timestamp = 1.0;
+                    entry
+                })))
                 .expect("return resolved identity");
             assert!(transport_rx.try_recv().is_err());
         });
@@ -1104,10 +1104,8 @@ mod tests {
         use lxmf_core::peer::LxmPeer;
         use lxmf_core::router::{LxmRouter, RouterConfig};
 
-        let mut config = RouterConfig {
-            propagation_enabled: true,
-            ..Default::default()
-        };
+        let mut config = RouterConfig::default();
+        config.propagation_enabled = true;
         config.delivery_limit_kb = 0.38;
         config.ext.message_storage_limit = Some(500_000_000);
         let mut router = LxmRouter::new(config);

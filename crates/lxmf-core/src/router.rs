@@ -29,8 +29,11 @@ use crate::stamper;
 use crate::ticket::{Ticket, TicketStore};
 use crate::types::PropagationTransientId;
 
-pub mod outbound;
-pub use outbound::{MediumSnapshot, RouteInfo, attempt_due, attempt_limit, schedule_attempt};
+mod outbound;
+pub use outbound::{
+    MediumSnapshot, RouteInfo, attempt_due, attempt_limit, opportunistic_receipt_timeout,
+    schedule_attempt,
+};
 
 /// Outstanding inbound admission reservation. Return it to the same router
 /// instance that issued it; its counter is not unique across router instances.
@@ -74,6 +77,7 @@ impl OutboundTicketIntent {
 /// Additional settings live in [`RouterConfigExt`] behind the `ext` field.
 /// Embedders must pass relevant policy to their transport and propagation owners.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct RouterConfig {
     pub propagation_enabled: bool,
     pub autopeer: bool,
@@ -93,6 +97,7 @@ pub struct RouterConfig {
 ///
 /// Additional routing, admission and propagation settings with a [`Default`] implementation.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct RouterConfigExt {
     pub autopeer_maxdepth: usize,
     pub propagation_cost_min: f64,

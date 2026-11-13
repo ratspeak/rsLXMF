@@ -7,7 +7,7 @@ pub use lxmf_core::handlers::PnLimit;
 use lxmf_core::propagation_admission::{
     PN_DEFAULT_MAX_INBOUND_SYNCS, PN_MIN_MAX_INBOUND_SYNCS, PnInboundAdmissionConfig,
 };
-use lxmf_core::router::{LxmRouter, RouterConfig, RouterConfigExt};
+use lxmf_core::router::{LxmRouter, RouterConfig};
 use rns_runtime::config::{Config, ConfigSection};
 
 /// Normalized view of Python `lxmd.apply_config()` behavior.
@@ -410,6 +410,7 @@ fn parse_static_peer(raw: &str) -> Result<[u8; 16], DaemonConfigError> {
 
 /// Daemon configuration parsed from an INI config file.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct DaemonConfig {
     pub display_name: Option<String>,
     pub node_name: Option<String>,
@@ -490,28 +491,25 @@ impl Default for DaemonConfig {
 
 impl DaemonConfig {
     pub fn to_router_config(&self) -> RouterConfig {
-        RouterConfig {
-            propagation_enabled: self.propagation_enabled,
-            autopeer: self.autopeer,
-            max_peers: self.max_peers,
-            propagation_limit_kb: self.propagation_limit_kb,
-            delivery_limit_kb: self.delivery_transfer_max_accepted_size,
-            sync_limit_kb: self.sync_limit_kb,
-            propagation_stamp_cost: self.propagation_stamp_cost,
-            propagation_stamp_flex: self.propagation_stamp_flex,
-            stamp_cost: self.stamp_cost,
-            ext: RouterConfigExt {
-                autopeer_maxdepth: self.autopeer_maxdepth,
-                peering_cost: self.peering_cost,
-                max_peering_cost: self.max_peering_cost,
-                auth_required: self.auth_required,
-                message_storage_limit: self.message_storage_limit,
-                name: self.node_name.clone(),
-                from_static_only: self.from_static_only,
-                pn_stamp_throttle: self.pn_stamp_throttle,
-                ..Default::default()
-            },
-        }
+        let mut config = RouterConfig::default();
+        config.propagation_enabled = self.propagation_enabled;
+        config.autopeer = self.autopeer;
+        config.max_peers = self.max_peers;
+        config.propagation_limit_kb = self.propagation_limit_kb;
+        config.delivery_limit_kb = self.delivery_transfer_max_accepted_size;
+        config.sync_limit_kb = self.sync_limit_kb;
+        config.propagation_stamp_cost = self.propagation_stamp_cost;
+        config.propagation_stamp_flex = self.propagation_stamp_flex;
+        config.stamp_cost = self.stamp_cost;
+        config.ext.autopeer_maxdepth = self.autopeer_maxdepth;
+        config.ext.peering_cost = self.peering_cost;
+        config.ext.max_peering_cost = self.max_peering_cost;
+        config.ext.auth_required = self.auth_required;
+        config.ext.message_storage_limit = self.message_storage_limit;
+        config.ext.name = self.node_name.clone();
+        config.ext.from_static_only = self.from_static_only;
+        config.ext.pn_stamp_throttle = self.pn_stamp_throttle;
+        config
     }
 
     /// Python `max(0, propagation_stamp_cost - propagation_stamp_cost_flexibility)`.

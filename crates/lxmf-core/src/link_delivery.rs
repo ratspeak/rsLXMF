@@ -6466,6 +6466,63 @@ mod tests {
     }
 
     use super::*;
+
+    /// Returns once the actor has handled everything already in its mailbox.
+    async fn actor_settled(tx: &mpsc::Sender<TransportMessage>) {
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        tx.send(TransportMessage::Rpc {
+            query: rns_transport::messages::TransportQuery::GetLinkCount,
+            response_tx,
+        })
+        .await
+        .unwrap();
+        response_rx.await.unwrap();
+    }
+
+    /// A signed announce heard on `interface_id`, which gives the actor a
+    /// one-hop path to the returned destination.
+    fn heard_announce(
+        interface_id: u64,
+        owner: &rns_transport::InterfaceOwner,
+    ) -> ([u8; 16], TransportMessage) {
+        let identity = rns_identity::identity::Identity::new();
+        let app = "lxmf.test.path";
+        let dest = rns_identity::destination::Destination::hash_from_name_and_identity(
+            app,
+            Some(&identity.hash),
+        );
+        let announce =
+            rns_identity::announce::AnnounceData::create(&identity, app, None, None).unwrap();
+        let header = rns_wire::header::PacketHeader {
+            flags: rns_wire::flags::PacketFlags {
+                header_type: rns_wire::flags::HeaderType::Header1,
+                context_flag: false,
+                transport_type: rns_wire::flags::TransportType::Broadcast,
+                destination_type: rns_wire::flags::DestinationType::Single,
+                packet_type: rns_wire::flags::PacketType::Announce,
+            },
+            hops: 0,
+            transport_id: None,
+            destination_hash: dest,
+            context: rns_wire::context::PacketContext::None,
+        };
+        let mut raw = header.pack();
+        raw.extend(announce.pack());
+        let event = TransportMessage::InterfaceEvent {
+            interface_id,
+            owner: owner.clone(),
+            message: Box::new(TransportMessage::Inbound(
+                rns_transport::messages::InboundPacket {
+                    raw: raw.into(),
+                    interface_id,
+                    rssi: None,
+                    snr: None,
+                    q: None,
+                },
+            )),
+        };
+        (dest, event)
+    }
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -6807,20 +6864,21 @@ mod tests {
         use rns_transport::actor::TransportActor;
         use rns_transport::constants::{InterfaceDirection, InterfaceMode};
         use rns_transport::messages::InterfaceEntry;
-        let (mut actor, actor_tx) = TransportActor::new();
+        let (actor, actor_tx) = TransportActor::new();
         let (driver_tx, _driver_rx) = mpsc::channel(8);
-        actor.interfaces.insert(
-            7,
-            InterfaceEntry::new(
-                "bind cancellation".to_string(),
-                InterfaceMode::Full,
-                InterfaceDirection::bidirectional(),
-                3_515,
-                500,
-                driver_tx,
-            ),
+        let entry = InterfaceEntry::new(
+            "bind cancellation".to_string(),
+            InterfaceMode::Full,
+            InterfaceDirection::bidirectional(),
+            3_515,
+            500,
+            driver_tx,
         );
-        let interface_owner = actor.interfaces[&7].owner.id();
+        let entry_owner = entry.owner.clone();
+        actor_tx
+            .try_send(TransportMessage::RegisterInterface { id: 7, entry })
+            .unwrap();
+        let interface_owner = entry_owner.id();
         let dispatch = actor.link_endpoint_dispatch_handle();
         let (tx, mut rx) = mpsc::channel(32);
         let mut mgr = LinkDeliveryManager::new(tx, None, None);
@@ -6847,6 +6905,7 @@ mod tests {
         assert!(mgr.pending_endpoint_binds.is_empty());
         assert!(!mgr.pending.contains_key(&link_id));
         let task = tokio::spawn(actor.run());
+        actor_settled(&actor_tx).await;
         let (lifecycle_tx, _lifecycle_rx) = mpsc::unbounded_channel();
         let receipt = dispatch
             .try_bind(
@@ -6884,30 +6943,28 @@ mod tests {
         use rns_transport::actor::TransportActor;
         use rns_transport::constants::{InterfaceDirection, InterfaceMode};
         use rns_transport::messages::InterfaceEntry;
-        use rns_transport::path_table::PathEntry;
         // Cancel the first before LRPROOF, after LRPROOF but before exact bind
         // publication, or cancel only the middle queued message.
         for mode in 0..3 {
-            let (mut actor, tx) = TransportActor::new();
+            let (actor, tx) = TransportActor::new();
             let (driver_tx, mut driver_rx) = mpsc::channel(8);
-            let dest = [0x38; 16];
-            actor.interfaces.insert(
-                7,
-                InterfaceEntry::new(
-                    "queued cancellation".into(),
-                    InterfaceMode::Full,
-                    InterfaceDirection::bidirectional(),
-                    3_515,
-                    500,
-                    driver_tx,
-                ),
+            let entry = InterfaceEntry::new(
+                "queued cancellation".into(),
+                InterfaceMode::Full,
+                InterfaceDirection::bidirectional(),
+                3_515,
+                500,
+                driver_tx,
             );
-            actor
-                .path_table
-                .insert(dest, PathEntry::new(None, 1, 7, InterfaceMode::Full));
-            let interface_owner = actor.interfaces[&7].owner.id();
+            let entry_owner = entry.owner.clone();
+            tx.try_send(TransportMessage::RegisterInterface { id: 7, entry })
+                .unwrap();
+            let (dest, heard) = heard_announce(7, &entry_owner);
+            tx.try_send(heard).unwrap();
+            let interface_owner = entry_owner.id();
             let dispatch = actor.link_endpoint_dispatch_handle();
             let task = tokio::spawn(actor.run());
+            actor_settled(&tx).await;
             let mut mgr = LinkDeliveryManager::new(tx.clone(), None, None);
             mgr.set_link_endpoint_dispatch_handle(dispatch);
             let mut messages = [
@@ -7005,28 +7062,26 @@ mod tests {
         use rns_transport::actor::TransportActor;
         use rns_transport::constants::{InterfaceDirection, InterfaceMode};
         use rns_transport::messages::{InterfaceEntry, TimerTick};
-        use rns_transport::path_table::PathEntry;
 
-        let (mut actor, tx) = TransportActor::new();
+        let (actor, tx) = TransportActor::new();
         let (driver_tx, mut driver_rx) = mpsc::channel(1);
-        let dest = [0x94; 16];
-        actor.interfaces.insert(
-            7,
-            InterfaceEntry::new(
-                "bounded test driver".to_string(),
-                InterfaceMode::Full,
-                InterfaceDirection::bidirectional(),
-                3_515,
-                500,
-                driver_tx,
-            ),
+        let entry = InterfaceEntry::new(
+            "bounded test driver".to_string(),
+            InterfaceMode::Full,
+            InterfaceDirection::bidirectional(),
+            3_515,
+            500,
+            driver_tx,
         );
-        actor
-            .path_table
-            .insert(dest, PathEntry::new(None, 1, 7, InterfaceMode::Full));
-        let interface_owner = actor.interfaces[&7].owner.id();
+        let entry_owner = entry.owner.clone();
+        tx.try_send(TransportMessage::RegisterInterface { id: 7, entry })
+            .unwrap();
+        let (dest, heard) = heard_announce(7, &entry_owner);
+        tx.try_send(heard).unwrap();
+        let interface_owner = entry_owner.id();
         let handle = actor.link_endpoint_dispatch_handle();
         let actor_task = tokio::spawn(actor.run());
+        actor_settled(&tx).await;
         let identity = Ed25519PrivateKey::generate();
         let mut identity_pub = [0; 64];
         identity_pub[32..].copy_from_slice(&identity.public_key().to_bytes());
@@ -7095,14 +7150,7 @@ mod tests {
         // Propagation uploads are never identified, even with identity keys.
         assert_eq!(header.context, rns_wire::context::PacketContext::Lrrtt);
         responder.receive_rtt_packet(&rtt[offset..]).unwrap();
-        tx.send(TransportMessage::Tick(TimerTick {
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs_f64(),
-        }))
-        .await
-        .unwrap();
+        tx.send(TransportMessage::Tick(TimerTick)).await.unwrap();
         if cancel {
             assert!(
                 tokio::time::timeout(Duration::from_millis(50), driver_rx.recv())
@@ -8038,23 +8086,24 @@ mod tests {
         use rns_transport::constants::{InterfaceDirection, InterfaceMode};
         use rns_transport::messages::{InterfaceEntry, TimerTick};
         for mode in 0..4 {
-            let (mut actor, tx) = TransportActor::new();
+            let (actor, tx) = TransportActor::new();
             let (driver_tx, mut driver_rx) = mpsc::channel(1);
             driver_tx.try_send(Bytes::from_static(b"occupied")).unwrap();
-            actor.interfaces.insert(
-                7,
-                InterfaceEntry::new(
-                    "cancelled backchannel driver".to_string(),
-                    InterfaceMode::Full,
-                    InterfaceDirection::bidirectional(),
-                    3_515,
-                    500,
-                    driver_tx,
-                ),
+            let entry = InterfaceEntry::new(
+                "cancelled backchannel driver".to_string(),
+                InterfaceMode::Full,
+                InterfaceDirection::bidirectional(),
+                3_515,
+                500,
+                driver_tx,
             );
-            let interface_owner = actor.interfaces[&7].owner.id();
+            let entry_owner = entry.owner.clone();
+            tx.try_send(TransportMessage::RegisterInterface { id: 7, entry })
+                .unwrap();
+            let interface_owner = entry_owner.id();
             let dispatch = actor.link_endpoint_dispatch_handle();
             let actor_task = tokio::spawn(actor.run());
+            actor_settled(&tx).await;
             let link_id = [0x59; 16];
             let dest = [0x5A; 16];
             let (lifecycle_tx, _lifecycle_rx) = mpsc::unbounded_channel();
@@ -8153,14 +8202,7 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(driver_rx.recv().await.unwrap(), b"occupied"[..]);
-            tx.send(TransportMessage::Tick(TimerTick {
-                timestamp: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs_f64(),
-            }))
-            .await
-            .unwrap();
+            tx.send(TransportMessage::Tick(TimerTick)).await.unwrap();
             assert_eq!(
                 tokio::time::timeout(Duration::from_secs(2), driver_rx.recv())
                     .await

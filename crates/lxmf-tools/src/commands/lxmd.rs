@@ -5927,7 +5927,7 @@ impl LxmdRunner {
         };
         let mut raw = header.pack();
         raw.extend_from_slice(&payload);
-        let timeout = lxmf_core::router::outbound::opportunistic_receipt_timeout(
+        let timeout = lxmf_core::router::opportunistic_receipt_timeout(
             self.medium.route(&dest_hash),
             message.receipt_timeout,
         );
@@ -7475,10 +7475,8 @@ mod tests {
         let (tx, _driver) = transport_that_heard(&announce).await;
         let temp = tempfile::tempdir().unwrap();
         initialize_storage_namespace(temp.path()).unwrap();
-        let config = DaemonConfig {
-            outbound_propagation_node: Some(node_hex.clone()),
-            ..DaemonConfig::default()
-        };
+        let mut config = DaemonConfig::default();
+        config.outbound_propagation_node = Some(node_hex.clone());
         let mut runner = LxmdRunner::new(config, temp.path(), tx, None).unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -7700,20 +7698,19 @@ mod tests {
                     response_tx,
                 } = message
                 {
-                    let entry = rns_transport::messages::PathTableRpcEntry {
-                        hash: neighbour,
-                        timestamp: now_f64(),
-                        via: Some(neighbour),
-                        hops: 0,
-                        expires: now_f64() + 600.0,
-                        value: None,
-                        used: 0.0,
-                        lr_cost: None,
-                        interface: String::new(),
-                        interface_id: 1,
-                        interface_mode: rns_transport::constants::InterfaceMode::Full,
-                        interface_role: Default::default(),
-                    };
+                    let mut entry = rns_transport::messages::PathTableRpcEntry::default();
+                    entry.hash = neighbour;
+                    entry.timestamp = now_f64();
+                    entry.via = Some(neighbour);
+                    entry.hops = 0;
+                    entry.expires = now_f64() + 600.0;
+                    entry.value = None;
+                    entry.used = 0.0;
+                    entry.lr_cost = None;
+                    entry.interface = String::new();
+                    entry.interface_id = 1;
+                    entry.interface_mode = rns_transport::constants::InterfaceMode::Full;
+                    entry.interface_role = Default::default();
                     let _ = response_tx.send(TransportQueryResponse::PathTable(vec![entry]));
                     return;
                 }
@@ -7762,14 +7759,13 @@ mod tests {
                 && dest == recipient_hash
             {
                 // Announce app data whose feature list lacks SF_COMPRESSION.
-                let entry = rns_transport::messages::RecalledDestinationRpcEntry {
-                    dest_hash: recipient_hash,
-                    public_key: recipient.get_public_key(),
-                    app_data: Some(vec![0x93, 0xc4, 0x01, b'n', 0xc0, 0x90]),
-                    ratchet: None,
-                    hops: 1,
-                    timestamp: now_f64(),
-                };
+                let mut entry = rns_transport::messages::RecalledDestinationRpcEntry::default();
+                entry.dest_hash = recipient_hash;
+                entry.public_key = recipient.get_public_key();
+                entry.app_data = Some(vec![0x93, 0xc4, 0x01, b'n', 0xc0, 0x90]);
+                entry.ratchet = None;
+                entry.hops = 1;
+                entry.timestamp = now_f64();
                 let _ = response_tx.send(TransportQueryResponse::RecalledDestination(Some(entry)));
                 answered = true;
             }
@@ -8593,11 +8589,9 @@ mod tests {
                 std::process::id()
             ));
             let (tx, _rx) = mpsc::channel::<TransportMessage>(64);
-            let config = DaemonConfig {
-                stamp_cost: Some(12.0),
-                enforce_stamps,
-                ..Default::default()
-            };
+            let mut config = DaemonConfig::default();
+            config.stamp_cost = Some(12.0);
+            config.enforce_stamps = enforce_stamps;
             initialize_storage_namespace(&temp).unwrap();
             let mut runner = LxmdRunner::new(config, &temp, tx, None).expect("runner");
             let raw = runner
