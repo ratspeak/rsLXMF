@@ -6193,49 +6193,15 @@ fn require_storage_namespace(paths: &LxmdPaths) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Hand the received ratchets earlier releases kept under
-/// `storage/lxmf/ratchets/received` to Reticulum, which alone keeps them now.
-/// The files have upstream's layout, so each moves to the directory
-/// Reticulum's store imports (`Identity.ratchetpath`) with upstream's filter:
-/// a 32-byte ratchet, not expired, for a destination it knows. A file is
-/// removed here only once its copy is durable there; Reticulum removes that
-/// copy after its own commit. The identity-key file beside them goes too:
-/// Reticulum's known destinations hold the keys.
-///
-/// Runs before Reticulum starts: the instance that owns the storage imports
-/// the files as it starts (`Identity.load_known_destinations`).
-fn hand_received_ratchets_to_reticulum(
-    paths: &LxmdPaths,
-    rns_config_dir: &Path,
-) -> std::io::Result<()> {
-    let received = &paths.legacy_received_ratchets_dir;
-    if received.is_dir() {
-        let import_dir = rns_runtime::platform::StoragePaths::from_config_dir(rns_config_dir)
-            .storage_dir
-            .join("ratchets");
-        for entry in std::fs::read_dir(received)? {
-            let path = entry?.path();
-            let destination = path
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-                .filter(|stem| hex::decode(stem).is_ok_and(|hash| hash.len() == 16))
-                .filter(|_| path.extension().is_some_and(|ext| ext == "ratchet"));
-            if let Some(destination) = destination
-                && path.is_file()
-            {
-                let target = import_dir.join(destination);
-                // A file already there is Reticulum's own and is not replaced.
-                if !target.try_exists()? {
-                    std::fs::create_dir_all(&import_dir)?;
-                    let bytes = std::fs::read(&path)?;
-                    durable_write(&target, &bytes).map_err(std::io::Error::other)?;
-                }
-            }
-            if path.is_file() {
-                std::fs::remove_file(&path)?;
-            }
-        }
-        std::fs::remove_dir(received)?;
+/// Remove the received-ratchet and identity-key files earlier releases kept
+/// under `storage/lxmf/ratchets`. Reticulum keeps received ratchets and known
+/// destinations now and, as upstream, imports only its own legacy files; until
+/// a recipient announces again, a message to it is encrypted to its identity
+/// key. Python `lxmd` never had these files.
+fn remove_earlier_ratchet_files(paths: &LxmdPaths) -> std::io::Result<()> {
+    match std::fs::remove_dir_all(&paths.legacy_received_ratchets_dir) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
+        _ => {}
     }
     match std::fs::remove_file(&paths.legacy_known_identities_path) {
         Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
@@ -6332,11 +6298,9 @@ pub(crate) async fn main() {
             println!("Failed to establish private daemon storage namespace: {error}");
             std::process::exit(1);
         }
-        if let Err(error) =
-            hand_received_ratchets_to_reticulum(&LxmdPaths::new(&config_dir), &rns_config_dir)
-        {
-            // Left in place, the files are handed over at the next start.
-            tracing::warn!(%error, "could not hand earlier received ratchets to Reticulum");
+        if let Err(error) = remove_earlier_ratchet_files(&LxmdPaths::new(&config_dir)) {
+            // Left in place, the files are removed at the next start.
+            tracing::warn!(%error, "could not remove earlier ratchet files");
         }
         let (config, created) = load_or_create_daemon_config(&config_dir);
         let loaded = DaemonConfig::from_config(&config).and_then(|daemon_config| {
@@ -7326,7 +7290,7 @@ mod tests {
     }
 
     #[test]
-    fn received_ratchet_files_of_earlier_releases_are_handed_to_reticulum() {
+    fn received_ratchet_files_of_earlier_releases_are_removed() {
         let temp = tempfile::tempdir().unwrap();
         let rns = temp.path().join("rns");
         let paths = LxmdPaths::new(temp.path().join("lxmd"));
@@ -7334,25 +7298,28 @@ mod tests {
         std::fs::create_dir_all(received).unwrap();
         let import_dir = rns.join("storage/ratchets");
         std::fs::create_dir_all(&import_dir).unwrap();
-        let (moved, kept) = (hex::encode([0x11; 16]), hex::encode([0x22; 16]));
-        std::fs::write(received.join(format!("{moved}.ratchet")), b"moved").unwrap();
-        std::fs::write(received.join(format!("{kept}.ratchet")), b"older copy").unwrap();
+        let destination = hex::encode([0x11; 16]);
+        std::fs::write(received.join(format!("{destination}.ratchet")), b"earlier").unwrap();
         std::fs::write(received.join("notes.txt"), b"not a ratchet").unwrap();
-        std::fs::write(import_dir.join(&kept), b"reticulum's own").unwrap();
+        std::fs::write(import_dir.join(&destination), b"reticulum's own").unwrap();
         std::fs::write(&paths.legacy_known_identities_path, [0u8; 80]).unwrap();
+        std::fs::write(&paths.ratchet_ring_path, b"own keys").unwrap();
 
-        hand_received_ratchets_to_reticulum(&paths, &rns).unwrap();
+        remove_earlier_ratchet_files(&paths).unwrap();
 
-        assert_eq!(std::fs::read(import_dir.join(&moved)).unwrap(), b"moved");
-        assert_eq!(
-            std::fs::read(import_dir.join(&kept)).unwrap(),
-            b"reticulum's own"
-        );
-        assert_eq!(std::fs::read_dir(&import_dir).unwrap().count(), 2);
         assert!(!received.exists());
         assert!(!paths.legacy_known_identities_path.exists());
-        // Nothing left to hand over.
-        hand_received_ratchets_to_reticulum(&paths, &rns).unwrap();
+        assert_eq!(
+            std::fs::read(&paths.ratchet_ring_path).unwrap(),
+            b"own keys"
+        );
+        // Reticulum's own legacy files are its import's, not this one's.
+        assert_eq!(
+            std::fs::read(import_dir.join(&destination)).unwrap(),
+            b"reticulum's own"
+        );
+        // Nothing left to remove.
+        remove_earlier_ratchet_files(&paths).unwrap();
     }
 
     /// A recipient's delivery announce, with `ratchet` as its ratchet key.
@@ -7370,23 +7337,14 @@ mod tests {
         (raw, destination.hash)
     }
 
-    /// Reticulum hears the recipient's announce and stops. After a restart in
-    /// which nothing is heard, the daemon must encrypt for the recipient with
-    /// `ratchet`. With `earlier_release_file`, Reticulum heard no ratchet and
-    /// only an earlier release's file under `storage/lxmf` holds it.
-    async fn encrypts_with_the_ratchet_after_a_restart(earlier_release_file: bool) {
-        let temp = tempfile::tempdir().unwrap();
-        let rns = temp.path().join("rns");
-        let lxmf_dir = temp.path().join("lxmf");
-        initialize_storage_namespace(&lxmf_dir).unwrap();
-        let recipient = Identity::new();
-        let ratchet_key = rns_crypto::x25519::X25519PrivateKey::generate().to_bytes();
-        let ratchet = rns_identity::ratchet::ratchet_public_bytes(&ratchet_key);
-        let heard = (!earlier_release_file).then_some(&ratchet);
-        let (announce, recipient_hash) = recipient_announce(&recipient, heard);
-
-        let (reticulum, _shutdown) = standalone_reticulum(&rns).await;
-        let _driver = hear(&reticulum.transport_tx, 9001, &announce).await;
+    /// Reticulum hears `announce` and the recipient's destination becomes recallable.
+    async fn hear_and_recall(
+        reticulum: &ReticulumHandle,
+        announce: &[u8],
+        recipient_hash: [u8; 16],
+        ratchet: Option<[u8; 32]>,
+    ) -> mpsc::Receiver<Bytes> {
+        let driver = hear(&reticulum.transport_tx, 9001, announce).await;
         let deadline = Instant::now() + Duration::from_secs(5);
         while !matches!(
             reticulum
@@ -7394,7 +7352,8 @@ mod tests {
                     dest: recipient_hash
                 })
                 .await,
-            Some(TransportQueryResponse::RecalledDestination(Some(_)))
+            Some(TransportQueryResponse::RecalledDestination(Some(ref recalled)))
+                if recalled.ratchet == ratchet
         ) {
             assert!(
                 Instant::now() < deadline,
@@ -7402,32 +7361,51 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        reticulum.shutdown_and_wait().await;
+        driver
+    }
 
-        if earlier_release_file {
-            let paths = LxmdPaths::new(&lxmf_dir);
-            std::fs::create_dir_all(&paths.legacy_received_ratchets_dir).unwrap();
-            rns_identity::ratchet::ReceivedRatchet::new(ratchet)
-                .save(
-                    &paths
-                        .legacy_received_ratchets_dir
-                        .join(format!("{}.ratchet", hex::encode(recipient_hash))),
-                )
-                .unwrap();
-            hand_received_ratchets_to_reticulum(&paths, &rns).unwrap();
-            assert!(!paths.legacy_received_ratchets_dir.exists());
-        }
+    /// Submit a message to the recipient and encrypt it as a tick does.
+    async fn encrypt_next_message(
+        runner: &mut LxmdRunner,
+        recipient_hash: [u8; 16],
+        content: &str,
+    ) -> Vec<u8> {
+        let message = LxMessageDraft::new(
+            recipient_hash,
+            runner.lxmf_dest_hash,
+            "",
+            content,
+            DeliveryMethod::Opportunistic,
+        )
+        .unwrap()
+        .sign(&runner.identity.get_signing_key().unwrap())
+        .unwrap();
+        runner.router.submit_signed(message).unwrap();
+        runner.refresh_outbound_medium().await;
+        runner
+            .encrypt_for_destination(&hex::encode(recipient_hash), content.as_bytes())
+            .expect("recipient key recalled from Reticulum")
+    }
+
+    /// Reticulum hears the recipient's announce and stops. After a restart in
+    /// which nothing is heard, the daemon must encrypt for the recipient with
+    /// `ratchet`.
+    #[tokio::test]
+    async fn a_ratchet_learned_before_a_restart_encrypts_the_next_message() {
+        let temp = tempfile::tempdir().unwrap();
+        let rns = temp.path().join("rns");
+        let lxmf_dir = temp.path().join("lxmf");
+        initialize_storage_namespace(&lxmf_dir).unwrap();
+        let recipient = Identity::new();
+        let ratchet_key = rns_crypto::x25519::X25519PrivateKey::generate().to_bytes();
+        let ratchet = rns_identity::ratchet::ratchet_public_bytes(&ratchet_key);
+        let (announce, recipient_hash) = recipient_announce(&recipient, Some(&ratchet));
 
         let (reticulum, _shutdown) = standalone_reticulum(&rns).await;
-        if earlier_release_file {
-            // Reticulum, owning its storage, imports the files as it starts.
-            assert_eq!(
-                std::fs::read_dir(rns.join("storage/ratchets"))
-                    .unwrap()
-                    .count(),
-                0
-            );
-        }
+        let _driver = hear_and_recall(&reticulum, &announce, recipient_hash, Some(ratchet)).await;
+        reticulum.shutdown_and_wait().await;
+
+        let (reticulum, _shutdown) = standalone_reticulum(&rns).await;
         let mut runner = LxmdRunner::new(
             DaemonConfig::default(),
             &lxmf_dir,
@@ -7435,57 +7413,94 @@ mod tests {
             None,
         )
         .unwrap();
-        let message = LxMessageDraft::new(
-            recipient_hash,
-            runner.lxmf_dest_hash,
-            "",
-            "after the restart",
-            DeliveryMethod::Opportunistic,
-        )
-        .unwrap()
-        .sign(&runner.identity.get_signing_key().unwrap())
-        .unwrap();
-        runner.router.submit_signed(message).unwrap();
         // Before Reticulum has answered for this tick nothing is encrypted.
-        let recipient_hex = hex::encode(recipient_hash);
         assert!(
             runner
-                .encrypt_for_destination(&recipient_hex, b"x")
+                .encrypt_for_destination(&hex::encode(recipient_hash), b"x")
                 .is_none()
         );
-
-        runner.refresh_outbound_medium().await;
-
+        let ciphertext =
+            encrypt_next_message(&mut runner, recipient_hash, "after the restart").await;
         assert_eq!(
             runner.outbound_ratchets.get(&recipient_hash),
             Some(&Some(ratchet))
         );
-        let ciphertext = runner
-            .encrypt_for_destination(&recipient_hex, b"after the restart")
-            .expect("recipient key recalled from Reticulum");
         // Enforcing ratchets, the recipient opens it only with that ratchet key.
         let opened = recipient
             .decrypt_with_ratchet_id(&ciphertext, Some(&[&ratchet_key]), true)
             .unwrap();
         assert_eq!(opened.plaintext, b"after the restart");
         assert!(opened.ratchet_id.is_some());
-        assert!(!lxmf_dir.join("storage/lxmf/ratchets/received").exists());
-        assert!(
-            !lxmf_dir
-                .join("storage/lxmf/ratchets/known_identities")
-                .exists()
-        );
         reticulum.shutdown_and_wait().await;
     }
 
+    /// An earlier release kept the recipient's ratchet in its own file, which
+    /// Reticulum, as upstream, does not import: the file goes at the next
+    /// start, a message sent before the recipient announces again is encrypted
+    /// to its identity key, and the next announce's ratchet encrypts the one after.
     #[tokio::test]
-    async fn a_ratchet_learned_before_a_restart_encrypts_the_next_message() {
-        encrypts_with_the_ratchet_after_a_restart(false).await;
-    }
+    async fn an_earlier_release_ratchet_file_goes_and_the_next_announce_brings_the_ratchet() {
+        let temp = tempfile::tempdir().unwrap();
+        let rns = temp.path().join("rns");
+        let lxmf_dir = temp.path().join("lxmf");
+        initialize_storage_namespace(&lxmf_dir).unwrap();
+        let recipient = Identity::new();
+        let (announce, recipient_hash) = recipient_announce(&recipient, None);
 
-    #[tokio::test]
-    async fn a_ratchet_only_an_earlier_release_file_held_encrypts_after_the_hand_over() {
-        encrypts_with_the_ratchet_after_a_restart(true).await;
+        let (reticulum, _shutdown) = standalone_reticulum(&rns).await;
+        let _driver = hear_and_recall(&reticulum, &announce, recipient_hash, None).await;
+        reticulum.shutdown_and_wait().await;
+
+        let paths = LxmdPaths::new(&lxmf_dir);
+        std::fs::create_dir_all(&paths.legacy_received_ratchets_dir).unwrap();
+        let earlier_key = rns_crypto::x25519::X25519PrivateKey::generate().to_bytes();
+        rns_identity::ratchet::ReceivedRatchet::new(rns_identity::ratchet::ratchet_public_bytes(
+            &earlier_key,
+        ))
+        .save(
+            &paths
+                .legacy_received_ratchets_dir
+                .join(format!("{}.ratchet", hex::encode(recipient_hash))),
+        )
+        .unwrap();
+        remove_earlier_ratchet_files(&paths).unwrap();
+        assert!(!paths.legacy_received_ratchets_dir.exists());
+
+        let (reticulum, _shutdown) = standalone_reticulum(&rns).await;
+        let mut runner = LxmdRunner::new(
+            DaemonConfig::default(),
+            &lxmf_dir,
+            reticulum.transport_tx.clone(),
+            None,
+        )
+        .unwrap();
+        let ciphertext =
+            encrypt_next_message(&mut runner, recipient_hash, "before it announces").await;
+        assert_eq!(runner.outbound_ratchets.get(&recipient_hash), Some(&None));
+        assert!(
+            recipient
+                .decrypt_with_ratchet_id(&ciphertext, Some(&[&earlier_key]), true)
+                .is_err(),
+            "the earlier release's ratchet is not used"
+        );
+        let opened = recipient
+            .decrypt_with_ratchet_id(&ciphertext, None, false)
+            .unwrap();
+        assert_eq!(opened.plaintext, b"before it announces");
+        assert!(opened.ratchet_id.is_none(), "encrypted to the identity key");
+
+        let ratchet_key = rns_crypto::x25519::X25519PrivateKey::generate().to_bytes();
+        let ratchet = rns_identity::ratchet::ratchet_public_bytes(&ratchet_key);
+        let (announce, _) = recipient_announce(&recipient, Some(&ratchet));
+        let _driver = hear_and_recall(&reticulum, &announce, recipient_hash, Some(ratchet)).await;
+        let ciphertext =
+            encrypt_next_message(&mut runner, recipient_hash, "after it announces").await;
+        let opened = recipient
+            .decrypt_with_ratchet_id(&ciphertext, Some(&[&ratchet_key]), true)
+            .unwrap();
+        assert_eq!(opened.plaintext, b"after it announces");
+        assert!(opened.ratchet_id.is_some());
+        reticulum.shutdown_and_wait().await;
     }
 
     /// Python's LXMF recalls identities that Transport validated before the

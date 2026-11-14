@@ -22,7 +22,7 @@
 
 ### Build and compatibility
 
-- Delivered message ids, stamp costs, and tickets are stored in `lxmf/state.db`, the same SQLite store LXMF 1.3.0 uses, and ratchets and identities are left to Reticulum. Old files are imported on first start, so going back to an older release starts without them.
+- Delivered message ids, stamp costs, and tickets are stored in `lxmf/state.db`, the same SQLite store LXMF 1.3.0 uses, and ratchets and identities are left to Reticulum. The old cache files are imported on first start, and `lxmd-rs`'s old ratchet and identity files are removed: each contact's ratchet returns with its next announce. Going back to an older release starts without them.
 - Breaking API changes are listed in the [1.5 migration guide](api/migrations/1.5.md); use the `~1.5.0` line with rsReticulum `~1.5.0`. The default `sqlite-store` feature builds a bundled SQLite, so builds need a C compiler.
 
 ## 1.4.0 - 2026-11-08
