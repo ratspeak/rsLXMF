@@ -11,7 +11,7 @@ license-file.workspace = true
 default = ["sqlite-store"]
 # SQLite router state at lxmf/state.db, as LXMF 1.3.0 keeps it. Without it the
 # router keeps that state in memory only.
-sqlite-store = ["dep:rusqlite"]
+sqlite-store = ["dep:rusqlite", "rns-transport/sqlite-store"]
 
 [dependencies]
 base64 = { workspace = true }
