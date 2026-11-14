@@ -1,12 +1,9 @@
 # Rust API
 
-This guide describes the 1.5.0 API, published as v1.5.0, not the 1.4.0
-daemon. Application code should use `lxmf_core::message_api`, which
+This guide describes the 1.5.0 API, published as v1.5.0. Application code should use `lxmf_core::message_api`, which
 re-exports the message types without wrappers. The equivalent module-qualified
 paths remain available. The [1.5 migration guide](migrations/1.5.md) covers
-the changes since 1.4.0. The [1.4 migration guide](migrations/1.4.md) explains
-the source-breaking change from mutable messages to drafts, signed messages,
-and immutable finalized messages.
+the changes since 1.4.0.
 
 The compiled `lxmf-core` `message` example demonstrates message construction,
 signing, packing, and unpacking through this path.

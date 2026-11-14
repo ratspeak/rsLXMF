@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+## 1.5.0 - 2026-11-13
+
+### Added
+
+- **Fractional stamp costs**: stamp costs can be fractional, as in LXMF 1.3.0, and announces carry them where LXMF 1.3.0 reads them.
+- **Stamped links**: delivery, propagation downloads, and peer sync stamp their link requests when the destination asks for it, following Reticulum's `[stamps]` settings. With stamping on, `lxmd-rs` also stamps its own announces.
+
+### Fixed and improved
+
+- `lxmd-rs` reads its config as Python's `lxmd` does: a malformed value, or a stamp cost of 100 or more, now stops it instead of being replaced by a default. It writes a default config on first run and, as a service, logs to `logfile` in its config directory.
+- `lxmd-rs --version` prints `lxmd-rs 1.5.0 (LXMF 1.3.0, Reticulum 1.6.0)`, and it logs at Notice by default.
+- Control commands (`--status`, `--peers`, `--sync`, `--break`) wait for a path to the node within `--timeout`.
+- Propagation nodes follow LXMF 1.3.0 in storage limits, peering, and sync, throttle peers that send invalid stamps, and announce LXMF 1.3.0 as their version.
+- The propagation client waits for a path, reuses an open link, and reports a missing path, refused access, and a missing identity as separate failures.
+- Outgoing messages reuse an open link to the same destination, and a link that closes no longer fails messages it already delivered.
+- Paper messages are checked for duplicates, and messages are compressed only when the recipient says it supports it.
+- Message ids and signatures match Python LXMF for messages packed by any encoder. Display names in announces are passed through unchanged; use `presentation::sanitize_name` before showing one.
+
+### Build and compatibility
+
+- Delivered message ids, stamp costs, and tickets are stored in `lxmf/state.db`, the same SQLite store LXMF 1.3.0 uses, and ratchets and identities are left to Reticulum. Old files are imported on first start, so going back to an older release starts without them.
+- Breaking API changes are listed in the [1.5 migration guide](api/migrations/1.5.md); use the `~1.5.0` line with rsReticulum `~1.5.0`. The default `sqlite-store` feature builds a bundled SQLite, so builds need a C compiler.
+
 ## 1.4.0 - 2026-11-08
 
 - Start a propagation node without rereading and flushing every stored message, so restarts with large stores no longer delay announces and hosting. Each message is still verified when it is served.

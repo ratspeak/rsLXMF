@@ -6,8 +6,8 @@
 
 [![License: Reticulum License](https://img.shields.io/badge/license-Reticulum%20License-blue.svg)](LICENSE)
 [![Rust 1.89+](https://img.shields.io/badge/rust-1.89%2B-orange.svg)](https://www.rust-lang.org)
-[![Compatibility floor: LXMF 1.0.1](https://img.shields.io/badge/compatibility%20floor-LXMF%201.0.1-success.svg)](https://github.com/markqvist/LXMF)
-[![Supplementary release reference: LXMF 1.1.0](https://img.shields.io/badge/supplementary%20release%20reference-LXMF%201.1.0-blue.svg)](https://github.com/markqvist/LXMF)
+[![Baseline: LXMF 1.3.0](https://img.shields.io/badge/baseline-LXMF%201.3.0-success.svg)](https://github.com/markqvist/LXMF)
+[![Reticulum 1.6.0](https://img.shields.io/badge/reticulum-1.6.0-blue.svg)](https://reticulum.network/)
 [![Status](https://img.shields.io/badge/status-experimental-yellow.svg)](#feature-status)
 
 [LXMF Reference](https://github.com/markqvist/LXMF) |
@@ -22,11 +22,7 @@
 rsLXMF is a Rust port of [LXMF](https://github.com/markqvist/LXMF), the
 Reticulum messaging layer, from the reference implementation by Mark Qvist. It
 was written from the reference source, not from a specification, and tracks the
-reference's wire behavior release by release. The Python reference
-implementation remains the source of truth. See [License](#license).
-
-Commands are intentionally namespaced for Rust with the Rust-specific `lxmd-rs` command, so rsLXMF can live beside other
-LXMF daemons on `PATH` without worry.
+reference's wire behavior release by release.
 
 ## Contents
 
@@ -37,12 +33,11 @@ LXMF daemons on `PATH` without worry.
 - [Delivery Model](#delivery-model)
 - [Feature Status](#feature-status)
 - [Compatibility Notes](#compatibility-notes)
-- [Contributing](#contributing)
 - [License](#license)
 
 ## Build It
 
-This guide describes the 1.4.0 release, [v1.4.0](https://github.com/ratspeak/rsLXMF/releases/tag/v1.4.0), built with rsReticulum [v1.4.0](https://github.com/ratspeak/rsReticulum/releases/tag/v1.4.0); it is the source line Ratspeak builds from. For the 1.3.0 daemon, use [the v1.3.0 README](https://github.com/ratspeak/rsLXMF/blob/v1.3.0/README.md) and that build's `--help`. The 1.4 message and durable relay APIs require a coordinated source migration.
+This guide describes the 1.5.0 release, [v1.5.0](https://github.com/ratspeak/rsLXMF/releases/tag/v1.5.0), built with rsReticulum [v1.5.0](https://github.com/ratspeak/rsReticulum/releases/tag/v1.5.0), the source line Ratspeak builds from.
 
 The current development layout for rsLXMF requires
 rsReticulum as a sibling directory/repo next to it, such as:
@@ -58,12 +53,12 @@ mkdir ratspeak-src
 cd ratspeak-src
 git clone https://github.com/ratspeak/rsReticulum
 git clone https://github.com/ratspeak/rsLXMF
-git -C rsReticulum checkout --detach v1.4.0
-git -C rsLXMF checkout --detach v1.4.0
+git -C rsReticulum checkout --detach v1.5.0
+git -C rsLXMF checkout --detach v1.5.0
 cd rsLXMF
 ```
 
-Run the build commands below from that `rsLXMF` directory. The host crates require Rust 1.89 or newer.
+Run the build commands below from that `rsLXMF` directory. The host crates require Rust 1.89 or newer. The default build compiles a bundled SQLite, so it also needs a C compiler; the build tools below provide one.
 
 ### macOS
 
@@ -244,7 +239,7 @@ Recommended standalone locations:
 
 Use existing LXMF or Reticulum directories, such as `~/.lxmd`, `~/.lxmf`, or
 `~/.reticulum`, only by passing them explicitly. That keeps the default install
-isolated while still allowing deliberate drop-in and migration tests.
+isolated.
 
 Minimal config:
 
@@ -282,7 +277,7 @@ Common sections and supported keys (see `--exampleconfig` for annotated defaults
 | Section | Keys |
 | --- | --- |
 | `[lxmf]` | `display_name`, `announce_at_start`, `announce_interval`, `delivery_transfer_max_accepted_size`, `stamp_cost`, `on_inbound` |
-| `[propagation]` | `enable_node`, `node_name`, `auth_required`, `announce_at_start`, `announce_interval`, `autopeer`, `autopeer_maxdepth`, `message_storage_limit`, `propagation_message_max_accepted_size`, `propagation_sync_max_accepted_size`, `propagation_stamp_cost_target`, `propagation_stamp_cost_flexibility`, `peering_cost`, `remote_peering_cost_max`, `max_peers`, `static_peers`, `prioritise_destinations`, `control_allowed`, `from_static_only`, `sequential_pn_stamp_validation`, `static_peers_bypass_sequential`, `max_inbound_syncs`, `outbound_node`, `propagation_stamp_cost`, `propagation_limit`, `enforce_stamps` |
+| `[propagation]` | `enable_node`, `node_name`, `auth_required`, `announce_at_start`, `announce_interval`, `autopeer`, `autopeer_maxdepth`, `message_storage_limit`, `propagation_message_max_accepted_size`, `propagation_sync_max_accepted_size`, `propagation_stamp_cost_target`, `propagation_stamp_cost_flexibility`, `propagation_stamp_throttle`, `peering_cost`, `remote_peering_cost_max`, `max_peers`, `static_peers`, `prioritise_destinations`, `control_allowed`, `from_static_only`, `sequential_pn_stamp_validation`, `static_peers_bypass_sequential`, `max_inbound_syncs`, `outbound_node`, `propagation_stamp_cost`, `propagation_limit`, `enforce_stamps` |
 | `[control]` | `auth_required`, `allowed` |
 | `[logging]` | `loglevel` |
 
@@ -294,6 +289,13 @@ Optional hash-list files live next to `<config-dir>/config`:
 | `allowed` | Reticulum **identity hashes** permitted to retrieve messages when propagation `auth_required = yes`. An empty list then admits no clients. |
 
 Each file accepts one raw 32-character hex hash per line. The two files use different hash types. Propagation administration is separate: `control_allowed` contains authorized control identity hashes; the daemon’s own identity is also authorized. Client retrieval authorization does not make the node’s stored messages readable to other clients.
+
+Router state (delivered and processed transient IDs, stamp costs, and tickets)
+is kept in `<config-dir>/storage/lxmf/state.db`, the SQLite file LXMF 1.3.0 uses.
+Received ratchets are kept
+by Reticulum in its own storage. These stores come from the default
+`sqlite-store` feature of `lxmf-core`; without it, router state lasts only for
+the session.
 
 ## Delivery Model
 
@@ -325,15 +327,14 @@ payload           MessagePack([timestamp, title, content, fields, optional_stamp
 
 `title` and `content` are bytes on the wire. `fields` maps integer IDs to
 MessagePack values, which can be binary, text, arrays, maps or other supported
-values. Standard fields have defined schemas. The 1.4 library preserves signed
+values. Standard fields have defined schemas. The library preserves signed
 and unsigned integer IDs beyond the CLI’s 0–255 range and rejects duplicate
 outer IDs. Encoding a structured field as a binary blob changes its meaning.
 
-In the 1.4 API, construct `LxMessageDraft` and set `include_ticket` before
-calling `LxmRouter::prepare_outbound`. Persist the returned ticket intent before
-signing; a pending intent blocks signing. Signing consumes the draft, and
-finalization produces an immutable message. See the [1.4 migration guide](api/migrations/1.4.md)
-for stamp work, typed fields, inbound verification and propagation storage.
+Construct `LxMessageDraft` and set `include_ticket` before calling
+`LxmRouter::prepare_outbound`; any reply ticket it adds is already in the
+router's state store when the call returns. Signing consumes the draft, and
+finalization produces an immutable message.
 
 
 ## Feature Status
@@ -343,33 +344,22 @@ for stamp work, typed fields, inbound verification and propagation storage.
 | Message format | Signed LXMF envelopes, custom field maps, standard reply/reaction/comment fields, propagation wrappers, `.lxm` containers, and paper URI encode/decode. |
 | Delivery | Opportunistic, Direct, Propagated, callbacks, failure callbacks, cancellation, progress state, opportunistic-to-direct fallback, and compression signalling in delivery announces. |
 | Propagation | Transactional disk-backed store, deposit, retrieve, peer sync, autopeer/static peers, weighted culling, duplicate checks, size checks, and stamp checks. |
-| Stamps and tickets | Soft/hard stamp validation, HKDF-expanded workblocks, cached destination stamp costs, automatic reply-ticket issue and signed learning, ticket-backed stamps, and restart-safe directional persistence. |
+| Stamps and tickets | Soft/hard stamp validation, HKDF-expanded workblocks, fractional and cached destination stamp costs, automatic reply-ticket issue and signed learning, ticket-backed stamps, and restart-safe directional persistence. |
 | Control | `--status`, `--peers`, `--sync`, and `--break` over the propagation-control link. |
 | Access lists | `ignored` and `allowed` hash-list files in the LXMF config directory. |
 
 ## Compatibility Notes
 
-Most daemon and control flags are implemented: `--config`, `--rnsconfig`,
-`--propagation-node`, `--on-inbound`, `--status`, `--peers`, `--sync`,
-`--break`, `--remote`, `--identity`, `--timeout`, `--exampleconfig`, and
-`--version`.
+All upstream `lxmd` flags are implemented: `--config`, `--rnsconfig`,
+`--propagation-node`, `--on-inbound`, `--verbose`, `--quiet`, `--service`,
+`--status`, `--peers`, `--sync`, `--break`, `--remote`, `--identity`,
+`--timeout`, `--exampleconfig`, and `--version`.
 
 Additional rsLXMF-only flags: `--send`, `--send-file`, `--send-method`,
 `--send-timeout-secs`, and `--send-fields-json`.
 
-The complete corpus and live matrix for 1.3.0 and 1.4.0 use Python LXMF 1.0.1
-with Reticulum 1.4.2. A supplementary lane checks daemon, delivery,
-Resource/proof, and propagation behavior against exact LXMF 1.1.0 with the
-same Reticulum 1.4.2 source. Historical vectors retain their original
-provenance. Later source changes include selected LXMF 1.2.0 behavior; that
-does not establish complete compatibility with every later Python release.
-
-## Contributing
-
-If the issue or contribution belongs upstream as well, start there. Python LXMF
-and Reticulum remain the reference implementations.
-
-PRs are closed for now until I have time to catch up on everything. I'm tired.
+rsLXMF 1.5.0 follows Python LXMF 1.3.0 with Reticulum 1.6.0, and
+`lxmd-rs --version` names both.
 
 ## License
 
