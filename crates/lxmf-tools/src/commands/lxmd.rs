@@ -40,7 +40,8 @@ use lxmf_core::propagation_node::{
     PropagationNode, PropagationNodeConfig, PropagationStoreWritePlan,
 };
 use lxmf_core::propagation_send::{
-    AdvertisedNodePolicy, MissingPropagationInput, PropagationEnvelope, propagation_readiness,
+    AdvertisedNodePolicy, EncryptionBinding, MissingPropagationInput, PropagationEnvelope,
+    propagation_readiness,
 };
 use lxmf_core::router::{
     AutopeerCandidate, DirectReusableLinkState, LinkDeliveryPlan, LxmRouter, MediumSnapshot,
@@ -1486,7 +1487,7 @@ enum PropagationPreparationError {
     Invalid(String),
 }
 struct PendingPropagationEnvelope {
-    binding: [u8; 32],
+    binding: EncryptionBinding,
     cost: f64,
     result: oneshot::Receiver<Result<PropagationEnvelope, MessageError>>,
     cancel: Arc<std::sync::atomic::AtomicBool>,
@@ -4504,16 +4505,9 @@ impl LxmdRunner {
                 })
             {
                 // Outbound costs read slot 5 as given; peering reads int() of it.
-                let outbound_cost =
-                    lxmf_core::handlers::pn_stamp_cost_from_app_data(data).unwrap_or(pn.stamp_cost);
-                self.node_policies.insert(
-                    event.destination_hash,
-                    AdvertisedNodePolicy {
-                        stamp_cost: outbound_cost,
-                        transfer_limit_kb: pn.transfer_limit.as_f64().trunc(),
-                        recorded_at: now_f64(),
-                    },
-                );
+                if let Some(policy) = AdvertisedNodePolicy::from_announce(data, now_f64()) {
+                    self.node_policies.insert(event.destination_hash, policy);
+                }
                 let is_static = self.router.static_peers.contains(&event.destination_hash);
                 let previous_offer_constraints = self
                     .router
@@ -6033,11 +6027,7 @@ impl LxmdRunner {
         .map_err(PropagationPreparationError::Missing)?;
         let key = self.known_identities[&dest_hex];
         let ratchet = self.outbound_ratchets[&message.destination_hash()];
-        let mut binding = key.to_vec();
-        if let Some(r) = ratchet {
-            binding.extend_from_slice(&r);
-        }
-        let binding = rns_crypto::sha::full_hash(&binding);
+        let binding = EncryptionBinding::for_recipient(&key, ratchet.as_ref());
         let id = message.message_id();
         self.propagation_preparation_tasks
             .retain(|task| !task.is_finished());

@@ -14,6 +14,46 @@ pub struct AdvertisedNodePolicy {
     pub recorded_at: f64,
 }
 
+impl AdvertisedNodePolicy {
+    /// The policy in a propagation node's announce `app_data`, heard at Unix
+    /// time `heard_at`; `None` when Python `pn_announce_data_is_valid` refuses
+    /// the data. The cost is the one a sender stamps to
+    /// (`LXMRouter.get_outbound_propagation_cost`): slot 7's when present, else
+    /// slot 5's as announced. The transfer limit is whole kilobytes, as the
+    /// announce handler reads it (Handlers.py).
+    pub fn from_announce(app_data: &[u8], heard_at: f64) -> Option<Self> {
+        let announced = crate::handlers::parse_pn_announce_data(app_data)?;
+        Some(Self {
+            stamp_cost: crate::handlers::pn_stamp_cost_from_app_data(app_data)?,
+            transfer_limit_kb: announced.transfer_limit.as_f64().trunc(),
+            recorded_at: heard_at,
+        })
+    }
+}
+
+/// Which recipient key material an envelope's ciphertext was made for. A
+/// sender compares it to learn that the recipient's key or ratchet changed and
+/// the message has to be encrypted again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncryptionBinding([u8; 32]);
+
+impl EncryptionBinding {
+    /// The binding for a recipient's 64-byte public key and the ratchet the
+    /// message is encrypted to, if any.
+    pub fn for_recipient(public_key: &[u8; 64], ratchet: Option<&[u8; 32]>) -> Self {
+        let mut material = [0u8; 96];
+        material[..64].copy_from_slice(public_key);
+        let len = match ratchet {
+            Some(ratchet) => {
+                material[64..].copy_from_slice(ratchet);
+                96
+            }
+            None => 64,
+        };
+        Self(rns_crypto::sha::full_hash(&material[..len]))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MissingPropagationInput {
     NodeIdentity,
@@ -69,7 +109,7 @@ pub struct PropagationEnvelope {
     message: LxMessage,
     ciphertext: Bytes,
     transient_id: [u8; 32],
-    encryption_binding: [u8; 32],
+    encryption_binding: EncryptionBinding,
     stamp: [u8; 32],
     stamp_value: f64,
     required_cost: f64,
@@ -98,7 +138,7 @@ fn generate_pn_stamp(
 impl PropagationEnvelope {
     pub fn new<F>(
         message: LxMessage,
-        encryption_binding: [u8; 32],
+        encryption_binding: EncryptionBinding,
         required_cost: f64,
         encrypt: F,
     ) -> Result<Self, MessageError>
@@ -115,7 +155,7 @@ impl PropagationEnvelope {
     }
     pub fn new_cancellable<F>(
         message: LxMessage,
-        encryption_binding: [u8; 32],
+        encryption_binding: EncryptionBinding,
         required_cost: f64,
         encrypt: F,
         ctl: &StampControl,
@@ -158,7 +198,7 @@ impl PropagationEnvelope {
     pub fn meets(&self, cost: f64) -> bool {
         crate::stamper::value_meets(self.stamp_value, outbound_pn_cost(cost))
     }
-    pub fn matches(&self, message: &LxMessage, encryption_binding: &[u8; 32]) -> bool {
+    pub fn matches(&self, message: &LxMessage, encryption_binding: &EncryptionBinding) -> bool {
         self.message.wire_bytes() == message.wire_bytes()
             && &self.encryption_binding == encryption_binding
     }
@@ -258,7 +298,8 @@ mod tests {
             .unwrap()
             .finalize(None)
             .unwrap();
-        let mut envelope = PropagationEnvelope::new(msg, [4; 32], 0.0, |p| Ok(p.to_vec())).unwrap();
+        let binding = EncryptionBinding::for_recipient(&[4; 64], None);
+        let mut envelope = PropagationEnvelope::new(msg, binding, 0.0, |p| Ok(p.to_vec())).unwrap();
         let before = envelope.ciphertext.clone();
         let tid = envelope.transient_id();
         assert_eq!(
@@ -288,6 +329,88 @@ mod tests {
                 &crate::stamper::stamp_workblock(&tid, STAMP_WORKBLOCK_EXPAND_ROUNDS_PN),
                 envelope.stamp()
             ) >= 4.5
+        );
+    }
+    /// A node announce as Python packs it; `fractional` adds the transitional slot 7.
+    fn announce(
+        limit: rmpv::Value,
+        slot5: [rmpv::Value; 3],
+        fractional: Option<[f64; 3]>,
+    ) -> Vec<u8> {
+        use rmpv::Value;
+        let mut slots = vec![
+            Value::Boolean(false),
+            Value::from(1_700_000_000i64),
+            Value::Boolean(true),
+            limit,
+            Value::from(10240),
+            Value::Array(slot5.to_vec()),
+            Value::Map(Vec::new()),
+        ];
+        if let Some(costs) = fractional {
+            slots.push(Value::Array(costs.map(Value::F64).to_vec()));
+        }
+        crate::encode_value(&Value::Array(slots))
+    }
+    #[test]
+    fn announce_policy_takes_the_cost_a_sender_stamps_to_and_whole_kilobytes() {
+        use rmpv::Value;
+        let ints = [Value::from(14), Value::from(3), Value::from(18)];
+        // Slot 7 wins over slot 5's rounded-up costs.
+        let policy = AdvertisedNodePolicy::from_announce(
+            &announce(Value::from(256), ints.clone(), Some([13.5, 3.0, 18.0])),
+            100.,
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                policy.stamp_cost,
+                policy.transfer_limit_kb,
+                policy.recorded_at
+            ),
+            (13.5, 256., 100.)
+        );
+        // Without slot 7, slot 5's cost is taken as announced, not through int().
+        let floats = [Value::F64(13.5), Value::F64(3.0), Value::F64(18.0)];
+        let policy =
+            AdvertisedNodePolicy::from_announce(&announce(Value::F64(256.9), floats, None), 100.)
+                .unwrap();
+        assert_eq!((policy.stamp_cost, policy.transfer_limit_kb), (13.5, 256.));
+        let policy =
+            AdvertisedNodePolicy::from_announce(&announce(Value::from(256), ints, None), 100.)
+                .unwrap();
+        assert_eq!(policy.stamp_cost, 14.);
+        // What `get_propagation_node_app_data` packs reads back the same way.
+        let node =
+            crate::handlers::PropagationNodeAnnounceData::new(true, 1024, 2048, 23.25, 3., 0.);
+        let policy = AdvertisedNodePolicy::from_announce(
+            &crate::handlers::get_propagation_node_app_data(&node),
+            5.,
+        )
+        .unwrap();
+        assert_eq!(
+            (policy.stamp_cost, policy.transfer_limit_kb),
+            (23.25, 1024.)
+        );
+        assert!(AdvertisedNodePolicy::from_announce(b"not an announce", 100.).is_none());
+        assert!(AdvertisedNodePolicy::from_announce(&[], 100.).is_none());
+    }
+    #[test]
+    fn encryption_binding_is_the_hash_of_the_key_then_the_ratchet() {
+        let (key, ratchet) = ([7u8; 64], [9u8; 32]);
+        assert_eq!(
+            EncryptionBinding::for_recipient(&key, None).0,
+            rns_crypto::sha::full_hash(&key)
+        );
+        let mut both = key.to_vec();
+        both.extend_from_slice(&ratchet);
+        assert_eq!(
+            EncryptionBinding::for_recipient(&key, Some(&ratchet)).0,
+            rns_crypto::sha::full_hash(&both)
+        );
+        assert_ne!(
+            EncryptionBinding::for_recipient(&key, None),
+            EncryptionBinding::for_recipient(&key, Some(&ratchet))
         );
     }
 }

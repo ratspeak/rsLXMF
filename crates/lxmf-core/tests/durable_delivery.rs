@@ -241,7 +241,8 @@ fn processing_admission_fails_promptly_without_partial_credit_deadlock() {
 #[test]
 fn propagation_retry_keeps_ciphertext_and_tid_when_cost_rises() {
     let msg = message(None);
-    let mut envelope = PropagationEnvelope::new(msg, [6; 32], 0.0, |p| Ok(p.to_vec())).unwrap();
+    let binding = EncryptionBinding::for_recipient(&[6; 64], None);
+    let mut envelope = PropagationEnvelope::new(msg, binding, 0.0, |p| Ok(p.to_vec())).unwrap();
     let initial = envelope.ciphertext().clone();
     let tid = envelope.transient_id();
     let policy = AdvertisedNodePolicy {
