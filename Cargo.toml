@@ -21,7 +21,7 @@ rns-protocol = { path = "../rsReticulum/crates/rns-protocol", version = "~1.4.0"
 rns-transport = { path = "../rsReticulum/crates/rns-transport", version = "~1.4.0", default-features = false }
 rns-runtime = { path = "../rsReticulum/crates/rns-runtime", version = "~1.4.0" }
 rns-interface = { path = "../rsReticulum/crates/rns-interface", version = "~1.4.0" }
-rns-tools = { path = "../rsReticulum/crates/rns-tools", version = "~1.4.0" }
+rns-tools = { path = "../rsReticulum/crates/rns-tools", version = "~1.4.0", default-features = false }
 
 # Workspace LXMF crates
 lxmf-core = { path = "crates/lxmf-core", version = "~1.4.0" }
