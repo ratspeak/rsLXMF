@@ -116,7 +116,8 @@ pub struct PropagationNodeAnnounceData {
     pub peering_cost: f64,
     /// [`PN_META_IMPL_NAME`] string; `new` sets `"lxmd"` as upstream does.
     pub impl_name: Option<String>,
-    /// [`PN_META_VERSION`] string; `new` sets this crate's version.
+    /// [`PN_META_VERSION`] string; `new` sets the LXMF version this port
+    /// follows, [`LXMF_COMPAT_VERSION`], as upstream sets `LXMF.__version__`.
     pub version: Option<String>,
     /// Binary metadata entries, such as [`PN_META_NAME`].
     pub metadata: HashMap<u8, Vec<u8>>,
@@ -144,7 +145,7 @@ impl PropagationNodeAnnounceData {
             stamp_flex,
             peering_cost,
             impl_name: Some(PN_IMPL_NAME.to_string()),
-            version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            version: Some(LXMF_COMPAT_VERSION.to_string()),
             metadata: HashMap::new(),
         }
     }

@@ -480,7 +480,6 @@ mod tests {
         );
         data.timebase = 1_700_000_000;
         data.set_name("Node");
-        data.version = Some("1.3.0".into());
 
         // Upstream metadata order: 0xFE impl name, 0x00 version, then binary 0x01 name.
         assert_eq!(

@@ -176,6 +176,12 @@ Exhaustive literals and matches over these types need updating:
   Costs below their floor are raised to it, as `lxmd.py` does
   (`LXMF/Utilities/lxmd.py:187-215`); a cost of 100 or more, which upstream
   accepts but no stamp can meet, is rejected at load.
+- **Announced node version.** A propagation node announces the LXMF release
+  it follows (`lxmf_core::constants::LXMF_COMPAT_VERSION`, "1.3.0") as its
+  version, where it announced the Rust crate version
+  (`LXMF/LXMRouter.py`, `get_propagation_node_announce_metadata`).
+  `PropagationNodeAnnounceData::new` sets it. `lxmd-rs --version` still names
+  both versions.
 - **Stored files.**
   - Delivered message ids are journaled in `delivery_claims` in the router's
     storage directory.

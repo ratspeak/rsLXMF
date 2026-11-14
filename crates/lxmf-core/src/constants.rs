@@ -88,6 +88,10 @@ pub const COMMENT_FOR: u8 = 0x00;
 pub const CONTINUATION_OF: u8 = 0x00;
 
 pub const PN_META_VERSION: u8 = 0x00;
+/// The LXMF release this port follows. A propagation node announces it as
+/// its [`PN_META_VERSION`], where upstream announces `LXMF.__version__`
+/// (LXMRouter.py, `get_propagation_node_announce_metadata`).
+pub const LXMF_COMPAT_VERSION: &str = "1.3.0";
 pub const PN_META_NAME: u8 = 0x01;
 pub const PN_META_SYNC_STRATUM: u8 = 0x02;
 pub const PN_META_SYNC_THROTTLE: u8 = 0x03;

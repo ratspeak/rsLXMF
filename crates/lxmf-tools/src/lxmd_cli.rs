@@ -26,8 +26,9 @@ impl SendMethod {
     }
 }
 
-/// The LXMF release `lxmd-rs` follows, named in its `--version` line.
-pub const LXMF_COMPAT_VERSION: &str = "1.3.0";
+/// The LXMF release `lxmd-rs` follows, named in its `--version` line and
+/// announced as its propagation node version.
+pub const LXMF_COMPAT_VERSION: &str = lxmf_core::constants::LXMF_COMPAT_VERSION;
 
 #[derive(Parser)]
 #[command(
