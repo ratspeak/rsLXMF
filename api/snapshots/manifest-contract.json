@@ -4,10 +4,18 @@
   "packages": [
     {
       "name": "lxmf-core",
-      "version": "1.4.0",
+      "version": "1.5.0",
       "rustVersion": "1.89",
       "edition": "2024",
-      "features": {},
+      "features": {
+        "default": [
+          "sqlite-store"
+        ],
+        "sqlite-store": [
+          "dep:rusqlite",
+          "rns-transport/sqlite-store"
+        ]
+      },
       "targets": [
         {
           "name": "lxmf_core",
@@ -105,7 +113,7 @@
           "rename": null,
           "kind": null,
           "target": null,
-          "requirement": "~1.4.0",
+          "requirement": "~1.5.0",
           "optional": false,
           "defaultFeatures": true,
           "features": [],
@@ -116,7 +124,7 @@
           "rename": null,
           "kind": null,
           "target": null,
-          "requirement": "~1.4.0",
+          "requirement": "~1.5.0",
           "optional": false,
           "defaultFeatures": true,
           "features": [],
@@ -127,7 +135,7 @@
           "rename": null,
           "kind": null,
           "target": null,
-          "requirement": "~1.4.0",
+          "requirement": "~1.5.0",
           "optional": false,
           "defaultFeatures": true,
           "features": [],
@@ -138,7 +146,7 @@
           "rename": null,
           "kind": null,
           "target": null,
-          "requirement": "~1.4.0",
+          "requirement": "~1.5.0",
           "optional": false,
           "defaultFeatures": true,
           "features": [],
@@ -149,9 +157,9 @@
           "rename": null,
           "kind": null,
           "target": null,
-          "requirement": "~1.4.0",
+          "requirement": "~1.5.0",
           "optional": false,
-          "defaultFeatures": true,
+          "defaultFeatures": false,
           "features": [],
           "sourceKind": "path"
         },
@@ -160,11 +168,24 @@
           "rename": null,
           "kind": null,
           "target": null,
-          "requirement": "~1.4.0",
+          "requirement": "~1.5.0",
           "optional": false,
           "defaultFeatures": true,
           "features": [],
           "sourceKind": "path"
+        },
+        {
+          "name": "rusqlite",
+          "rename": null,
+          "kind": null,
+          "target": null,
+          "requirement": "^0.32",
+          "optional": true,
+          "defaultFeatures": true,
+          "features": [
+            "bundled"
+          ],
+          "sourceKind": "registry"
         },
         {
           "name": "serde",
@@ -273,7 +294,7 @@
     },
     {
       "name": "lxmf-tools",
-      "version": "1.4.0",
+      "version": "1.5.0",
       "rustVersion": "1.89",
       "edition": "2024",
       "features": {},
@@ -341,7 +362,7 @@
           "rename": null,
           "kind": null,
           "target": null,
-          "requirement": "~1.4.0",
+          "requirement": "~1.5.0",
           "optional": false,
           "defaultFeatures": true,
           "features": [],
@@ -363,7 +384,7 @@
           "rename": null,
           "kind": null,
           "target": null,
-          "requirement": "~1.4.0",
+          "requirement": "~1.5.0",
           "optional": false,
           "defaultFeatures": true,
           "features": [],
@@ -374,7 +395,7 @@
           "rename": null,
           "kind": null,
           "target": null,
-          "requirement": "~1.4.0",
+          "requirement": "~1.5.0",
           "optional": false,
           "defaultFeatures": true,
           "features": [],
@@ -385,7 +406,7 @@
           "rename": null,
           "kind": null,
           "target": null,
-          "requirement": "~1.4.0",
+          "requirement": "~1.5.0",
           "optional": false,
           "defaultFeatures": true,
           "features": [
@@ -398,9 +419,9 @@
           "rename": null,
           "kind": null,
           "target": null,
-          "requirement": "~1.4.0",
+          "requirement": "~1.5.0",
           "optional": false,
-          "defaultFeatures": true,
+          "defaultFeatures": false,
           "features": [],
           "sourceKind": "path"
         },
@@ -409,9 +430,9 @@
           "rename": null,
           "kind": null,
           "target": null,
-          "requirement": "~1.4.0",
+          "requirement": "~1.5.0",
           "optional": false,
-          "defaultFeatures": true,
+          "defaultFeatures": false,
           "features": [],
           "sourceKind": "path"
         },
@@ -420,7 +441,7 @@
           "rename": null,
           "kind": null,
           "target": null,
-          "requirement": "~1.4.0",
+          "requirement": "~1.5.0",
           "optional": false,
           "defaultFeatures": true,
           "features": [],

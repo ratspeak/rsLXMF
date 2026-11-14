@@ -20,7 +20,7 @@ pub lxmf_tools::daemon::DaemonConfigError::NotAnInteger
 pub lxmf_tools::daemon::DaemonConfigError::NotAnInteger::key: &'static str
 pub lxmf_tools::daemon::DaemonConfigError::NotAnInteger::section: &'static str
 pub lxmf_tools::daemon::DaemonConfigError::NotAnInteger::value: alloc::string::String
-pub struct lxmf_tools::daemon::DaemonConfig
+#[non_exhaustive] pub struct lxmf_tools::daemon::DaemonConfig
 pub lxmf_tools::daemon::DaemonConfig::announce_at_start: bool
 pub lxmf_tools::daemon::DaemonConfig::announce_interval: core::option::Option<u64>
 pub lxmf_tools::daemon::DaemonConfig::auth_required: bool
@@ -129,6 +129,8 @@ pub lxmf_tools::lxmd_cli::Args::sync: core::option::Option<alloc::string::String
 pub lxmf_tools::lxmd_cli::Args::timeout: core::option::Option<f64>
 pub lxmf_tools::lxmd_cli::Args::unpeer: core::option::Option<alloc::string::String>
 pub lxmf_tools::lxmd_cli::Args::verbose: u8
+pub lxmf_tools::lxmd_cli::Args::version: bool
+pub const lxmf_tools::lxmd_cli::LXMF_COMPAT_VERSION: &str
 pub fn lxmf_tools::lxmd_cli::default_config_file_text() -> alloc::string::String
 pub fn lxmf_tools::lxmd_cli::example_config() -> &'static str
 pub fn lxmf_tools::lxmd_cli::load_hash_list(&std::path::Path) -> alloc::vec::Vec<[u8; 16]>
@@ -181,25 +183,24 @@ pub lxmf_tools::lxmd_runtime::LocalStatusView::pending_outbound: usize
 pub lxmf_tools::lxmd_runtime::LocalStatusView::propagation_enabled: bool
 pub lxmf_tools::lxmd_runtime::LocalStatusView::propagation_entries: usize
 pub lxmf_tools::lxmd_runtime::LocalStatusView::propagation_size: usize
-pub lxmf_tools::lxmd_runtime::LocalStatusView::stamp_costs_cached: usize
 impl lxmf_tools::lxmd_runtime::LocalStatusView
 pub fn lxmf_tools::lxmd_runtime::LocalStatusView::from_router_stats([u8; 16], bool, &lxmf_core::router::RouterStats) -> Self
 pub struct lxmf_tools::lxmd_runtime::LxmdPaths
 pub lxmf_tools::lxmd_runtime::LxmdPaths::config_dir: std::path::PathBuf
 pub lxmf_tools::lxmd_runtime::LxmdPaths::identity_path: std::path::PathBuf
-pub lxmf_tools::lxmd_runtime::LxmdPaths::known_identities_path: std::path::PathBuf
 pub lxmf_tools::lxmd_runtime::LxmdPaths::legacy_identity_path: std::path::PathBuf
+pub lxmf_tools::lxmd_runtime::LxmdPaths::legacy_known_identities_path: std::path::PathBuf
 pub lxmf_tools::lxmd_runtime::LxmdPaths::legacy_lxmf_dir: std::path::PathBuf
 pub lxmf_tools::lxmd_runtime::LxmdPaths::legacy_messages_dir: std::path::PathBuf
 pub lxmf_tools::lxmd_runtime::LxmdPaths::legacy_propagation_store_dir: std::path::PathBuf
 pub lxmf_tools::lxmd_runtime::LxmdPaths::legacy_ratchets_dir: std::path::PathBuf
+pub lxmf_tools::lxmd_runtime::LxmdPaths::legacy_received_ratchets_dir: std::path::PathBuf
 pub lxmf_tools::lxmd_runtime::LxmdPaths::lxmf_storage_dir: std::path::PathBuf
 pub lxmf_tools::lxmd_runtime::LxmdPaths::messages_dir: std::path::PathBuf
 pub lxmf_tools::lxmd_runtime::LxmdPaths::propagation_store_dir: std::path::PathBuf
 pub lxmf_tools::lxmd_runtime::LxmdPaths::ratchet_control_path: std::path::PathBuf
 pub lxmf_tools::lxmd_runtime::LxmdPaths::ratchet_ring_path: std::path::PathBuf
 pub lxmf_tools::lxmd_runtime::LxmdPaths::ratchets_dir: std::path::PathBuf
-pub lxmf_tools::lxmd_runtime::LxmdPaths::received_ratchets_dir: std::path::PathBuf
 pub lxmf_tools::lxmd_runtime::LxmdPaths::router_state_dir: std::path::PathBuf
 pub lxmf_tools::lxmd_runtime::LxmdPaths::storage_dir: std::path::PathBuf
 impl lxmf_tools::lxmd_runtime::LxmdPaths

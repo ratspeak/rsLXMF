@@ -1,16 +1,22 @@
 # Rust API
 
-This guide describes the 1.4.0 API, published as v1.4.0, not the 1.3.0
+This guide describes the 1.5.0 API, published as v1.5.0, not the 1.4.0
 daemon. Application code should use `lxmf_core::message_api`, which
 re-exports the message types without wrappers. The equivalent module-qualified
-paths remain available. The [1.4 migration guide](migrations/1.4.md) explains
-the source-breaking change from mutable messages to drafts, signed messages
+paths remain available. The [1.5 migration guide](migrations/1.5.md) covers
+the changes since 1.4.0. The [1.4 migration guide](migrations/1.4.md) explains
+the source-breaking change from mutable messages to drafts, signed messages,
 and immutable finalized messages.
 
 The compiled `lxmf-core` `message` example demonstrates message construction,
 signing, packing, and unpacking through this path.
 
 ## Stability
+
+The 1.5 line follows LXMF 1.3.0. It makes stamp costs and values `f64`, keeps
+the router's delivered ids, stamp costs, and tickets in LXMF's SQLite state
+store, and marks the router and daemon configuration structs
+`#[non_exhaustive]`. See the [1.5 migration guide](migrations/1.5.md).
 
 `lxmf-core` is candidate stable, but that classification does not make every
 public implementation detail a permanent API. The message facade is the
@@ -23,9 +29,10 @@ provisional module-qualified APIs.
 integration target.
 
 Choosing the facade instead of the equivalent module-qualified path does not
-change behavior. Upgrading from 1.3 to 1.4 does change message and persistence
-APIs; follow the migration guide. Further reductions to the broader module tree
-require a reviewed API diff, downstream migration and an explicit version decision.
+change behavior. Upgrading from 1.3 to 1.4, and from 1.4 to 1.5, does change
+message and persistence APIs; follow the migration guides. Further reductions
+to the broader module tree require a reviewed API diff, downstream migration,
+and an explicit version decision.
 
 ## Delivery-owner integration
 
@@ -36,7 +43,7 @@ Keep periodic ticks for protocol deadlines, but schedule application maintenance
 separately. Drains are bounded and may leave another ready turn. Cancelling the
 wait does not discard a packet or publish an unread endpoint binding; existing
 periodic consumers remain supported. The API is provisional delivery-owner
-integration (LXMF-02/03, RET-05/07), not a new wire protocol or success signal.
+integration, not a new wire protocol or success signal.
 
 `LinkDeliveryManager::set_link_endpoint_dispatch_handle` opts Direct packet
 sends into the Reticulum owner's exact local-admission receipts. Supply the
