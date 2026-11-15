@@ -59,6 +59,35 @@ fn write_rust_identity(path: &Path) {
         .expect("write Rust identity");
 }
 
+/// Kills and reaps the daemon on every path out of the test, panics included.
+#[cfg(unix)]
+struct Daemon(Option<Child>);
+
+#[cfg(unix)]
+impl Daemon {
+    fn child(&mut self) -> &mut Child {
+        self.0.as_mut().expect("daemon still owned")
+    }
+
+    fn output(mut self) -> Output {
+        self.0
+            .take()
+            .expect("daemon still owned")
+            .wait_with_output()
+            .expect("collect lxmd-rs output")
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 #[cfg(unix)]
 fn wait_with_timeout(child: &mut Child, timeout: Duration) -> Option<std::process::ExitStatus> {
     let deadline = Instant::now() + timeout;
@@ -126,24 +155,27 @@ discover_interfaces = No
     )
     .expect("write no-interface Reticulum config");
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_lxmd-rs"))
-        .arg("--config")
-        .arg(lxmf_dir.path())
-        .arg("--rnsconfig")
-        .arg(rns_dir.path())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("lxmd-rs subprocess should start");
+    // Declared after the directories so it is dropped first: the daemon must not outlive its config.
+    let mut daemon = Daemon(Some(
+        Command::new(env!("CARGO_BIN_EXE_lxmd-rs"))
+            .arg("--config")
+            .arg(lxmf_dir.path())
+            .arg("--rnsconfig")
+            .arg(rns_dir.path())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("lxmd-rs subprocess should start"),
+    ));
 
     let identity_path = lxmf_dir.path().join("identity");
-    let startup_deadline = Instant::now() + Duration::from_secs(5);
+    // A loaded host can take seconds over a fresh debug binary's first exec.
+    let startup_deadline = Instant::now() + Duration::from_secs(30);
     while !identity_path.exists() {
-        if let Some(status) = child.try_wait().expect("poll lxmd-rs startup") {
-            let output = child.wait_with_output().expect("collect lxmd-rs output");
+        if let Some(status) = daemon.child().try_wait().expect("poll lxmd-rs startup") {
             panic!(
                 "lxmd-rs exited before startup announce wait ({status}):\n{}",
-                combined_output(&output)
+                combined_output(&daemon.output())
             );
         }
         assert!(
@@ -155,21 +187,20 @@ discover_interfaces = No
     std::thread::sleep(Duration::from_millis(100));
     let signal_status = Command::new("kill")
         .arg("-INT")
-        .arg(child.id().to_string())
+        .arg(daemon.child().id().to_string())
         .status()
         .expect("send SIGINT to lxmd-rs");
     assert!(signal_status.success(), "kill -INT should succeed");
 
-    if wait_with_timeout(&mut child, Duration::from_secs(3)).is_none() {
-        let _ = child.kill();
-        let output = child.wait_with_output().expect("collect lxmd-rs output");
+    if wait_with_timeout(daemon.child(), Duration::from_secs(3)).is_none() {
+        let _ = daemon.child().kill();
         panic!(
             "lxmd-rs did not exit after Ctrl+C during startup announce wait:\n{}",
-            combined_output(&output)
+            combined_output(&daemon.output())
         );
     }
 
-    let output = child.wait_with_output().expect("collect lxmd-rs output");
+    let output = daemon.output();
     assert!(
         output.status.success(),
         "expected clean shutdown after Ctrl+C, got:\n{}",
