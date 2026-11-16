@@ -77,6 +77,7 @@ use rns_runtime::link_manager::{
     LinkResourceEvent,
 };
 use rns_runtime::reticulum::{AnnounceSubscription, AnnounceSubscriptionError, ReticulumHandle};
+use rns_tools::format::pretty_hex_rep;
 use rns_transport::link_messages::{AnnounceRequest, DestinationEvent};
 use rns_transport::messages::{TransportMessage, TransportQuery, TransportQueryResponse};
 
@@ -1981,11 +1982,14 @@ impl LxmdRunner {
         let identity_path = paths.preferred_identity_path().to_path_buf();
         let identity = if identity_path.exists() {
             rns_transport::notice!("Loading identity from {}", identity_path.display());
-            Identity::from_file(&identity_path)?
+            let id = Identity::from_file(&identity_path)?;
+            rns_transport::notice!("Loaded Primary Identity {}", pretty_hex_rep(&id.hash));
+            id
         } else {
-            rns_transport::notice!("No identity found, generating new one");
+            rns_transport::notice!("No Primary Identity file found, creating new...");
             let id = Identity::new();
             id.to_file(&paths.identity_path)?;
+            rns_transport::notice!("Created new Primary Identity {}", pretty_hex_rep(&id.hash));
             id
         };
 
@@ -1997,12 +2001,6 @@ impl LxmdRunner {
             Destination::hash_from_name_and_identity("lxmf.propagation", Some(&identity.hash));
         let control_dest_hash =
             Destination::hash_from_name_and_identity(CONTROL_APP_NAME, Some(&identity.hash));
-
-        rns_transport::notice!(
-            "Identity: {} (LXMF: {})",
-            &identity_hash[..16],
-            &hex::encode(lxmf_dest_hash)[..16],
-        );
 
         let wall_now = now_f64() as u64;
         let delivery_ratchets = DeliveryRatchetState::load_or_initialize(
@@ -6689,7 +6687,10 @@ pub(crate) async fn main() {
 
     runner.refresh_control_state();
 
-    rns_transport::notice!("LXMF router initialized");
+    rns_transport::notice!(
+        "LXMF Router ready to receive on {}",
+        pretty_hex_rep(&runner.lxmf_dest_hash)
+    );
 
     // Python's enable_propagation() always announces the node, independent of
     // the deferred start jobs.
@@ -6697,6 +6698,10 @@ pub(crate) async fn main() {
         runner.schedule_node_announce(now_f64());
         runner.startup_node_announce_pending = true;
         tracing::info!("Startup propagation announce scheduled in {NODE_ANNOUNCE_DELAY}s");
+        rns_transport::notice!(
+            "LXMF Propagation Node started on {}",
+            pretty_hex_rep(&runner.propagation_dest_hash)
+        );
     }
     let deferred_start = tokio::time::sleep(Duration::from_secs(DEFERRED_JOBS_DELAY));
     tokio::pin!(deferred_start);

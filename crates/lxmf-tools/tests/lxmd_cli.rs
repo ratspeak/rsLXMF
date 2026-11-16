@@ -208,6 +208,111 @@ discover_interfaces = No
     );
 }
 
+/// lxmd.py's startup lines with full `RNS.prettyhexrep` hashes: a loaded identity
+/// with the propagation node on, a created one with it off.
+#[cfg(unix)]
+#[test]
+fn startup_logs_full_identity_delivery_and_propagation_hashes() {
+    use rns_identity::destination::Destination;
+    use rns_identity::identity::Identity;
+
+    for propagation in [true, false] {
+        let lxmf_dir = TestDir::new("lxmf-startup-lines");
+        let rns_dir = TestDir::new("rns-startup-lines");
+        let identity_path = lxmf_dir.path().join("identity");
+        if propagation {
+            write_rust_identity(&identity_path);
+        }
+        fs::write(
+            lxmf_dir.path().join("config"),
+            format!(
+                "[lxmf]\n\n[propagation]\nenable_node = {}\n",
+                if propagation { "yes" } else { "no" }
+            ),
+        )
+        .expect("write LXMF config");
+        fs::write(
+            rns_dir.path().join("config"),
+            "\
+[reticulum]
+share_instance = No
+enable_transport = No
+respond_to_probes = No
+panic_on_interface_error = No
+discover_interfaces = No
+
+[interfaces]
+",
+        )
+        .expect("write no-interface Reticulum config");
+
+        let log_path = rns_dir.path().join("lxmd-rs.log");
+        let log = fs::File::create(&log_path).expect("create lxmd-rs log");
+        let log_err = log.try_clone().expect("clone lxmd-rs log");
+        let mut daemon = Daemon(Some(
+            Command::new(env!("CARGO_BIN_EXE_lxmd-rs"))
+                .arg("--config")
+                .arg(lxmf_dir.path())
+                .arg("--rnsconfig")
+                .arg(rns_dir.path())
+                .stdout(log)
+                .stderr(log_err)
+                .spawn()
+                .expect("lxmd-rs subprocess should start"),
+        ));
+
+        let read_log = || fs::read_to_string(&log_path).unwrap_or_default();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !read_log().contains("LXMF Daemon running") {
+            if let Some(status) = daemon.child().try_wait().expect("poll lxmd-rs startup") {
+                panic!("lxmd-rs exited during startup ({status}):\n{}", read_log());
+            }
+            assert!(
+                Instant::now() < deadline,
+                "lxmd-rs did not finish startup:\n{}",
+                read_log()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        drop(daemon);
+        let text = read_log();
+
+        let identity = Identity::from_file(&identity_path).expect("read lxmd-rs identity");
+        let pretty = |hash: &[u8]| format!("<{}>", hex::encode(hash));
+        let delivery =
+            Destination::hash_from_name_and_identity("lxmf.delivery", Some(&identity.hash));
+        let node =
+            Destination::hash_from_name_and_identity("lxmf.propagation", Some(&identity.hash));
+        let identity_line = if propagation {
+            format!("Loaded Primary Identity {}", pretty(&identity.hash))
+        } else {
+            format!("Created new Primary Identity {}", pretty(&identity.hash))
+        };
+        let delivery_line = format!("LXMF Router ready to receive on {}", pretty(&delivery));
+        let node_line = format!("LXMF Propagation Node started on {}", pretty(&node));
+
+        let position = |line: &str| {
+            text.find(line)
+                .unwrap_or_else(|| panic!("missing {line:?} in lxmd-rs output:\n{text}"))
+        };
+        let running = position("LXMF Daemon running");
+        assert!(
+            position(&identity_line) < position(&delivery_line),
+            "{text}"
+        );
+        if propagation {
+            assert!(position(&delivery_line) < position(&node_line), "{text}");
+            assert!(position(&node_line) < running, "{text}");
+        } else {
+            assert!(position(&delivery_line) < running, "{text}");
+            assert!(
+                !text.contains("LXMF Propagation Node started on"),
+                "propagation line without a propagation node:\n{text}"
+            );
+        }
+    }
+}
+
 #[test]
 fn version_reports_binary_name_and_package_version() {
     let output = lxmd(&["--version"]);
