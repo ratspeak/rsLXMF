@@ -323,7 +323,13 @@ mod tests {
     fn pn_stamp_parts_carry_the_fractional_value() {
         let lxm_data = vec![0xAB; LXMF_OVERHEAD + 64];
         let tid = rns_crypto::sha::full_hash(&lxm_data);
-        let (stamp, value) = found(&tid, 2.5, STAMP_WORKBLOCK_EXPAND_ROUNDS_PN);
+        // At cost 2.5 an expanded stamp often meets the non-expanded check too; keep one that doesn't.
+        let (stamp, value) = loop {
+            let (stamp, value) = found(&tid, 2.5, STAMP_WORKBLOCK_EXPAND_ROUNDS_PN);
+            if !stamp_valid(&stamp, 2.5, &tid) {
+                break (stamp, value);
+            }
+        };
         let mut transient_data = lxm_data.clone();
         transient_data.extend_from_slice(&stamp);
         let (transient_id, extracted, got, extracted_stamp) =
