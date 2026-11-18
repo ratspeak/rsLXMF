@@ -277,6 +277,22 @@ mod tests {
     }
 
     #[test]
+    fn a_non_expanded_peering_key_is_accepted() {
+        // Upstream LXMF 1.3.1 `validate_peering_key` accepts this key at cost 8
+        // for the peering id `[0x11; 16] || [0x22; 16]`.
+        let key = hex::decode("d63d05f5dbe354b33213745d275a343924b38da05098d2b7cbc521ca4ff103d1")
+            .unwrap();
+        let request = encode_offer(
+            Value::Binary(key),
+            Value::Array(vec![Value::Binary(id(3).to_vec())]),
+        );
+        assert_eq!(
+            evaluate(&request, &[0x11; 16], &[0x22; 16], 8.0, 1024, |_| false),
+            Ok(PnOfferEvaluation::WantAll)
+        );
+    }
+
+    #[test]
     fn empty_key_is_valid_only_when_peering_work_is_disabled() {
         let request = encode_offer(
             Value::Binary(vec![]),

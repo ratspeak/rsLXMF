@@ -375,6 +375,21 @@ fn recipient_stamp_array_range_and_malformed_dispositions() {
     }
 }
 #[test]
+fn non_expanded_recipient_stamp_validates_with_its_own_value() {
+    let signed = draft().sign(&key()).unwrap();
+    let (stamp, value) = crate::stamper::generate_stamp(
+        &signed.message_id(),
+        6.0,
+        0,
+        &crate::stamper::StampControl::default(),
+    )
+    .unwrap()
+    .unwrap();
+    let mut m = signed.finalize(RecipientStamp::from_bytes(&stamp)).unwrap();
+    assert_eq!(m.validated_stamp_value(6.0, None), Some(value));
+    assert!(m.check_stamp(6.0, None));
+}
+#[test]
 fn recipient_ticket_stamp_and_missing_stamp_policy() {
     let mut d = draft();
     d.outbound_ticket = Some([3; 16]);

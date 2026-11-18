@@ -485,9 +485,12 @@ impl LxMessage {
             }
         }
         let stamp = <&[u8; 32]>::try_from(stamp).ok()?;
-        let work = crate::stamper::stamp_workblock(&self.message_id, STAMP_WORKBLOCK_EXPAND_ROUNDS);
-        crate::stamper::stamp_valid(stamp, target_cost, &work)
-            .then(|| crate::stamper::stamp_value(&work, stamp))
+        crate::stamper::validated_stamp_value(
+            &self.message_id,
+            stamp,
+            target_cost,
+            STAMP_WORKBLOCK_EXPAND_ROUNDS,
+        )
     }
     /// Update [`auto_compress`](MessageMetadata::auto_compress) based on a peer's cached announce app_data.
     ///

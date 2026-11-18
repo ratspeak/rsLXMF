@@ -4,6 +4,10 @@
 //! validity and generation from `RNS.Stamps`. Only the expand-round counts per
 //! stamp kind are LXMF's own (`STAMP_WORKBLOCK_EXPAND_ROUNDS{,_PN,_PEERING}`
 //! in constants.rs). Costs and values are fractional on the 1/256 grid.
+//!
+//! Validation accepts the non-expanded workblock (the material itself) as well
+//! as the expanded one, as LXMF 1.3.1 does while senders move to it.
+//! Generation stays expanded: LXMF 1.3.0 receivers accept only that form.
 
 use std::sync::atomic::Ordering;
 
@@ -50,20 +54,43 @@ pub fn generate_stamp(
     }))
 }
 
+/// The stamp's value when it meets `cost` over the non-expanded workblock,
+/// else over `expand_rounds`, from the workblock that passed (LXMF 1.3.1
+/// `LXMessage.validate_stamp`, `LXStamper.validate_pn_stamp`). The value can
+/// depend on `cost`: below about cost 4 an expanded stamp often passes the
+/// non-expanded check too, and at cost 0 it always does.
+pub fn validated_stamp_value(
+    material: &[u8],
+    stamp: &[u8],
+    cost: f64,
+    expand_rounds: usize,
+) -> Option<f64> {
+    if stamp_valid(stamp, cost, material) {
+        return Some(stamp_value(material, stamp));
+    }
+    let workblock = stamp_workblock(material, expand_rounds);
+    stamp_valid(stamp, cost, &workblock).then(|| stamp_value(&workblock, stamp))
+}
+
+/// Whether `stamp` meets `cost` in either workblock form; see [`validated_stamp_value`].
 pub fn validate_stamp(
     message_id: &[u8; 32],
     stamp: &[u8],
     cost: f64,
     expand_rounds: usize,
 ) -> bool {
-    let workblock = stamp_workblock(message_id, expand_rounds);
-    stamp_valid(stamp, cost, &workblock)
+    validated_stamp_value(message_id, stamp, cost, expand_rounds).is_some()
 }
 
 /// Python reference: `LXStamper.validate_peering_key`.
 pub fn validate_peering_key(peering_id: &[u8], peering_key: &[u8], target_cost: f64) -> bool {
-    let workblock = stamp_workblock(peering_id, STAMP_WORKBLOCK_EXPAND_ROUNDS_PEERING);
-    stamp_valid(peering_key, target_cost, &workblock)
+    validated_stamp_value(
+        peering_id,
+        peering_key,
+        target_cost,
+        STAMP_WORKBLOCK_EXPAND_ROUNDS_PEERING,
+    )
+    .is_some()
 }
 
 /// Python reference: `LXStamper.validate_pn_stamp`.
@@ -77,11 +104,12 @@ pub fn validate_pn_stamp(transient_data: &[u8], target_cost: f64) -> Option<Prop
     let lxm_data = &transient_data[..split];
     let stamp: [u8; 32] = transient_data[split..].try_into().ok()?;
     let transient_id = rns_crypto::sha::full_hash(lxm_data);
-    let workblock = stamp_workblock(&transient_id, STAMP_WORKBLOCK_EXPAND_ROUNDS_PN);
-    if !stamp_valid(&stamp, target_cost, &workblock) {
-        return None;
-    }
-    let value = stamp_value(&workblock, &stamp);
+    let value = validated_stamp_value(
+        &transient_id,
+        &stamp,
+        target_cost,
+        STAMP_WORKBLOCK_EXPAND_ROUNDS_PN,
+    )?;
     Some((transient_id, lxm_data.to_vec(), value, stamp))
 }
 
@@ -170,6 +198,59 @@ mod tests {
     use super::*;
     use crate::constants::{STAMP_WORKBLOCK_EXPAND_ROUNDS, STAMP_WORKBLOCK_EXPAND_ROUNDS_PN};
     use rns_crypto::sha::sha256;
+
+    // Upstream LXMF 1.3.1 / RNS 1.6.1 results: `LXMessage.validate_stamp`,
+    // `LXStamper.validate_pn_stamp` and `validate_peering_key` over the same
+    // inputs (gen_lxmf_ne.py in the K1 hand-back).
+    fn bytes32(hex: &str) -> [u8; 32] {
+        hex::decode(hex).unwrap().try_into().unwrap()
+    }
+
+    #[test]
+    fn message_stamps_validate_in_both_forms_as_upstream() {
+        let id = bytes32("179201d9189af65b2fee7b97dc90a4e9232121e084050aff94d27f171dc71f55");
+        let ne = bytes32("84276a6ab90c48763474eef01f7ce3e48b8ffad7f4b0eb1de8dd5761f9614ccd");
+        let ex = bytes32("a824ef0289c7542b417588d5e93fd3e8e2a0f624c6dc27c1a02e3f864c45fba4");
+        let rounds = STAMP_WORKBLOCK_EXPAND_ROUNDS;
+        assert_eq!(
+            validated_stamp_value(&id, &ne, 8.0, rounds),
+            Some(11.84765625)
+        );
+        assert_eq!(validated_stamp_value(&id, &ex, 8.0, rounds), Some(8.09375));
+        assert_eq!(
+            validated_stamp_value(&id, &ex, 0.0, rounds),
+            Some(0.37109375)
+        );
+        assert_eq!(validated_stamp_value(&id, &ne, 11.8515625, rounds), None);
+        assert!(validate_stamp(&id, &ne, 8.0, rounds));
+    }
+
+    #[test]
+    fn propagation_stamps_validate_in_both_forms_as_upstream() {
+        let lxm_data: Vec<u8> = (0..150).collect();
+        let entry = |stamp: &str| [lxm_data.clone(), bytes32(stamp).to_vec()].concat();
+        let ne = entry("228341ee29d47d4d9defe50c2704b1feb4bc2ef066a740637916cc690aaa4fd1");
+        let ex = entry("7e340b0726c99d8f60ae845912ecccc8aa7363db7a971a09132acd83c88ad771");
+        let value = |entry: &[u8], cost| validate_pn_stamp(entry, cost).map(|parts| parts.2);
+        assert_eq!(
+            validate_pn_stamp(&ne, 8.0).unwrap().0,
+            bytes32("f22b2e614e92d6453612b707385038300293d2cc292b148bc5335754b5ea30fd")
+        );
+        assert_eq!(value(&ne, 8.0), Some(8.0703125));
+        assert_eq!(value(&ex, 8.0), Some(8.1953125));
+        assert_eq!(value(&ex, 0.0), Some(2.19921875));
+        assert_eq!(value(&ne, 8.07421875), None);
+    }
+
+    #[test]
+    fn peering_keys_validate_in_both_forms_as_upstream() {
+        let id: Vec<u8> = [[0x11; 16], [0x22; 16]].concat();
+        let ne = bytes32("d63d05f5dbe354b33213745d275a343924b38da05098d2b7cbc521ca4ff103d1");
+        let ex = bytes32("4269201b6742c33c84098644f37c3f159c66235bda2c26f108cc7c824936ac7f");
+        assert!(validate_peering_key(&id, &ne, 8.0));
+        assert!(validate_peering_key(&id, &ex, 8.0));
+        assert!(!validate_peering_key(&id, &ne, 8.2578125));
+    }
 
     fn found(material: &[u8], cost: f64, rounds: usize) -> ([u8; 32], f64) {
         generate_stamp(material, cost, rounds, &StampControl::default())

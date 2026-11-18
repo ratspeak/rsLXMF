@@ -402,10 +402,13 @@ impl ValidatedOpaquePropagationBlob {
         let body = &bytes[..bytes.len() - 32];
         let stamp: &[u8; 32] = bytes[bytes.len() - 32..].try_into().ok()?;
         let transient_id = rns_crypto::sha::full_hash(body);
-        let workblock =
-            crate::stamper::stamp_workblock(&transient_id, STAMP_WORKBLOCK_EXPAND_ROUNDS_PN);
-        let stamp_value = crate::stamper::stamp_value(&workblock, stamp);
-        crate::stamper::stamp_valid(stamp, minimum_stamp_cost, &workblock).then_some(Self {
+        let stamp_value = crate::stamper::validated_stamp_value(
+            &transient_id,
+            stamp,
+            minimum_stamp_cost,
+            STAMP_WORKBLOCK_EXPAND_ROUNDS_PN,
+        )?;
+        Some(Self {
             bytes,
             transient_id,
             stamp_value,
@@ -896,8 +899,10 @@ impl PropagationNode {
     }
 
     /// Validate and reserve a new opaque propagation image plus its 32-byte stamp.
-    /// Checks the measured stamp value against `stamp_value` and node policy;
-    /// this method does not persist the returned plan.
+    /// `stamp_value` must be one the stamp measures in either workblock form,
+    /// since a check at another cost can report the other form; the plan
+    /// records the value measured at the node's cost. This method does not
+    /// persist the returned plan.
     ///
     /// Stored images retain `lxmf_data || stamp` for peer sync. Client `/get`
     /// strips that stamp. Duplicates return `None`; use [`Self::plan_opaque_admission`]
@@ -917,7 +922,13 @@ impl PropagationNode {
         let blob =
             ValidatedOpaquePropagationBlob::validate(bytes.into(), self.config.min_stamp_cost)?;
         if blob.stamp_value() != stamp_value {
-            return None;
+            let tid = blob.transient_id();
+            let expanded = crate::stamper::stamp_workblock(&tid, STAMP_WORKBLOCK_EXPAND_ROUNDS_PN);
+            if stamp_value != crate::stamper::stamp_value(&tid, stamp_data)
+                && stamp_value != crate::stamper::stamp_value(&expanded, stamp_data)
+            {
+                return None;
+            }
         }
         match self.plan_opaque_admission(blob) {
             PropagationAdmission::Reserved(plan) => Some(*plan),
@@ -3311,6 +3322,49 @@ pub(crate) mod tests {
         assert_eq!(messages[0].as_slice().unwrap(), lxmf_data.as_slice());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Upstream LXMF 1.3.1 `validate_pn_stamp` over `range(150)`: a
+    // non-expanded stamp (8.0703125 at cost 8) and an expanded one (8.1953125
+    // at cost 8, 2.19921875 at cost 0, from the non-expanded check).
+    const PN_NE_STAMP: &str = "228341ee29d47d4d9defe50c2704b1feb4bc2ef066a740637916cc690aaa4fd1";
+    const PN_EXPANDED_STAMP: &str =
+        "7e340b0726c99d8f60ae845912ecccc8aa7363db7a971a09132acd83c88ad771";
+
+    fn pn_vector(stamp: &str) -> (Vec<u8>, [u8; 32]) {
+        let stamp = hex::decode(stamp).unwrap().try_into().unwrap();
+        ((0..150).collect(), stamp)
+    }
+
+    #[test]
+    fn non_expanded_deposits_validate_with_their_own_value() {
+        let (data, stamp) = pn_vector(PN_NE_STAMP);
+        let blob = ValidatedOpaquePropagationBlob::validate(
+            [data.as_slice(), &stamp].concat().into(),
+            8.0,
+        )
+        .unwrap();
+        assert_eq!(blob.stamp_value(), 8.0703125);
+        let config = PropagationNodeConfig {
+            min_stamp_cost: 8.0,
+            ..Default::default()
+        };
+        let mut node = durable_test_node(config, [0xAA; 16]);
+        assert!(node.accept_stamped_propagated_blob(&data, &stamp, 8.0703125));
+    }
+
+    #[test]
+    fn a_value_measured_at_another_cost_is_accepted_at_the_node_value() {
+        let (data, stamp) = pn_vector(PN_EXPANDED_STAMP);
+        let config = PropagationNodeConfig {
+            min_stamp_cost: 8.0,
+            ..Default::default()
+        };
+        let mut node = durable_test_node(config, [0xAA; 16]);
+        assert!(!node.accept_stamped_propagated_blob(&data, &stamp, 9.0));
+        assert!(node.accept_stamped_propagated_blob(&data, &stamp, 2.19921875));
+        let tid = rns_crypto::sha::full_hash(&data);
+        assert_eq!(node.store.get_stamp_value(&tid), Some(8.1953125));
     }
 
     #[test]

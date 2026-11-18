@@ -58,14 +58,13 @@ fn validate(
     }
     let stamp_value = if record.stamped {
         let stamp: &[u8; 32] = bytes[bytes.len() - 32..].try_into().map_err(err)?;
-        let workblock = crate::stamper::stamp_workblock(
+        crate::stamper::validated_stamp_value(
             &record.transient_id,
+            stamp,
+            minimum_stamp_cost,
             crate::constants::STAMP_WORKBLOCK_EXPAND_ROUNDS_PN,
-        );
-        if !crate::stamper::stamp_valid(stamp, minimum_stamp_cost, &workblock) {
-            return Err(invalid("recovered stamp does not meet node policy"));
-        }
-        crate::stamper::stamp_value(&workblock, stamp)
+        )
+        .ok_or_else(|| invalid("recovered stamp does not meet node policy"))?
     } else {
         if minimum_stamp_cost > 0.0 {
             return Err(invalid("unstamped recovery does not meet node policy"));
