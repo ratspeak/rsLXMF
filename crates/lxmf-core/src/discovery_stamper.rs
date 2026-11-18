@@ -58,6 +58,10 @@ impl DiscoveryStamper for LxmfDiscoveryStamper {
     fn valid(&self, infohash: &[u8; 32], stamp: &[u8], required_value: f64) -> bool {
         rns_transport::discovery::RnsDiscoveryStamper.valid(infohash, stamp, required_value)
     }
+
+    fn validate(&self, infohash: &[u8; 32], stamp: &[u8], required_value: f64) -> Option<f64> {
+        rns_transport::discovery::RnsDiscoveryStamper.validate(infohash, stamp, required_value)
+    }
 }
 
 /// Synchronous discovery stamp search with 20 HKDF workblock rounds and an
@@ -138,6 +142,18 @@ mod tests {
                 .generate(&mk_infohash(b"unreachable"), 64.0, &ctl)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn non_expanded_stamps_validate_with_their_own_value() {
+        let infohash = mk_infohash(b"non-expanded");
+        let (stamp, value) =
+            rns_identity::stamps::generate_stamp(&infohash, 6.0, 0, 32, &StampControl::default())
+                .unwrap()
+                .unwrap();
+        let stamper = LxmfDiscoveryStamper::default();
+        assert_eq!(stamper.validate(&infohash, &stamp, 6.0), Some(value));
+        assert!(stamper.valid(&infohash, &stamp, 6.0));
     }
 
     #[test]
