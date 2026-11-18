@@ -482,10 +482,11 @@ mod tests {
         data.set_name("Node");
 
         // Upstream metadata order: 0xFE impl name, 0x00 version, then binary 0x01 name.
+        // `LXMRouter.get_propagation_node_app_data` at LXMF 1.3.1, `time.time` fixed to the timebase.
         assert_eq!(
             hex::encode(propagation_announce_app_data(&data)),
             concat!(
-                "98c2ce6553f100c3cd0100cd28009311031383ccfea46c786d6400a5312e332e3001c4044e6f6465",
+                "98c2ce6553f100c3cd0100cd28009311031383ccfea46c786d6400a5312e332e3101c4044e6f6465",
                 "93cb4030400000000000cb4008000000000000cb4032800000000000"
             )
         );
