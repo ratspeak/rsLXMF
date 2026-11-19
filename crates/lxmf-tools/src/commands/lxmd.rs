@@ -7132,8 +7132,9 @@ pub(crate) async fn main() {
         }
     }
 
-    // Reticulum's exit handler deregisters this process's destination types.
-    rns_handle.unwants_all_destination_types().await;
+    // Reticulum's exit handler: runtime shutdown deregisters this process's
+    // destination types once, then persists transport state.
+    rns_handle.shutdown_and_wait().await;
     tracing::info!("LXMF Daemon stopped");
     if let Some(status) = one_shot_status {
         std::process::exit(status);
