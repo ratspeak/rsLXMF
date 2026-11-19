@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.5.1 - 2026-11-18
+
+- **Follows Python LXMF 1.3.1** with Reticulum 1.6.1 (rsReticulum 1.5.1), and reports LXMF 1.3.1, propagation-node announces included.
+- Message, propagation-node, and peering stamps are accepted in both workblock forms: the non-expanded one LXMF senders are moving to, tried first, then the expanded one. A stamp's value comes from the form that passed. Generation stays expanded until senders switch.
+- Discovery stamps are validated in both forms through rsReticulum's discovery stamper.
+
 ## 1.5.0 - 2026-11-13
 
 ### Added

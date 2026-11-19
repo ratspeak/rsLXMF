@@ -336,6 +336,7 @@ pub fn lxmf_core::discovery_stamper::LxmfDiscoveryStamper::with_max_iterations(u
 impl rns_transport::discovery::stamper::DiscoveryStamper for lxmf_core::discovery_stamper::LxmfDiscoveryStamper
 pub fn lxmf_core::discovery_stamper::LxmfDiscoveryStamper::generate(&self, &[u8; 32], f64, &rns_identity::stamps::StampControl) -> core::option::Option<alloc::vec::Vec<u8>>
 pub fn lxmf_core::discovery_stamper::LxmfDiscoveryStamper::valid(&self, &[u8; 32], &[u8], f64) -> bool
+pub fn lxmf_core::discovery_stamper::LxmfDiscoveryStamper::validate(&self, &[u8; 32], &[u8], f64) -> core::option::Option<f64>
 pub fn lxmf_core::discovery_stamper::LxmfDiscoveryStamper::value(&self, &[u8; 32], &[u8]) -> f64
 pub const lxmf_core::discovery_stamper::DISCOVERY_MAX_ITERATIONS: u64
 pub const lxmf_core::discovery_stamper::DISCOVERY_WORKBLOCK_EXPAND_ROUNDS: usize
@@ -2261,6 +2262,7 @@ pub fn lxmf_core::stamper::stamp_valid(&[u8], f64, &[u8]) -> bool
 pub fn lxmf_core::stamper::validate_peering_key(&[u8], &[u8], f64) -> bool
 pub fn lxmf_core::stamper::validate_pn_stamp(&[u8], f64) -> core::option::Option<lxmf_core::stamper::PropagationStampParts>
 pub fn lxmf_core::stamper::validate_stamp(&[u8; 32], &[u8], f64, usize) -> bool
+pub fn lxmf_core::stamper::validated_stamp_value(&[u8], &[u8], f64, usize) -> core::option::Option<f64>
 pub fn lxmf_core::stamper::value_meets(f64, f64) -> bool
 pub type lxmf_core::stamper::PropagationStampParts = ([u8; 32], alloc::vec::Vec<u8>, f64, [u8; 32])
 pub mod lxmf_core::state_store
