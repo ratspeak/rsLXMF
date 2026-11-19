@@ -7328,8 +7328,12 @@ mod tests {
         remove_earlier_ratchet_files(&paths).unwrap();
     }
 
-    /// A recipient's delivery announce, with `ratchet` as its ratchet key.
-    fn recipient_announce(recipient: &Identity, ratchet: Option<&[u8; 32]>) -> (Vec<u8>, [u8; 16]) {
+    /// A recipient's delivery announce, with `ratchet` as its ratchet key, emitted at `emitted`.
+    fn recipient_announce(
+        recipient: &Identity,
+        ratchet: Option<&[u8; 32]>,
+        emitted: f64,
+    ) -> (Vec<u8>, [u8; 16]) {
         let mut destination = Destination::new(
             Some(recipient),
             rns_identity::destination::Direction::In,
@@ -7338,7 +7342,7 @@ mod tests {
         )
         .unwrap();
         let raw = destination
-            .announce_packet(recipient, None, ratchet, false, None, now_f64())
+            .announce_packet(recipient, None, ratchet, false, None, emitted)
             .unwrap();
         (raw, destination.hash)
     }
@@ -7405,7 +7409,7 @@ mod tests {
         let recipient = Identity::new();
         let ratchet_key = rns_crypto::x25519::X25519PrivateKey::generate().to_bytes();
         let ratchet = rns_identity::ratchet::ratchet_public_bytes(&ratchet_key);
-        let (announce, recipient_hash) = recipient_announce(&recipient, Some(&ratchet));
+        let (announce, recipient_hash) = recipient_announce(&recipient, Some(&ratchet), now_f64());
 
         let (reticulum, _shutdown) = standalone_reticulum(&rns).await;
         let _driver = hear_and_recall(&reticulum, &announce, recipient_hash, Some(ratchet)).await;
@@ -7451,7 +7455,8 @@ mod tests {
         let lxmf_dir = temp.path().join("lxmf");
         initialize_storage_namespace(&lxmf_dir).unwrap();
         let recipient = Identity::new();
-        let (announce, recipient_hash) = recipient_announce(&recipient, None);
+        let emitted = now_f64();
+        let (announce, recipient_hash) = recipient_announce(&recipient, None, emitted);
 
         let (reticulum, _shutdown) = standalone_reticulum(&rns).await;
         let _driver = hear_and_recall(&reticulum, &announce, recipient_hash, None).await;
@@ -7497,7 +7502,8 @@ mod tests {
 
         let ratchet_key = rns_crypto::x25519::X25519PrivateKey::generate().to_bytes();
         let ratchet = rns_identity::ratchet::ratchet_public_bytes(&ratchet_key);
-        let (announce, _) = recipient_announce(&recipient, Some(&ratchet));
+        // A later second: Reticulum's prefilter drops a same-second re-announce on the same path.
+        let (announce, _) = recipient_announce(&recipient, Some(&ratchet), emitted + 1.0);
         let _driver = hear_and_recall(&reticulum, &announce, recipient_hash, Some(ratchet)).await;
         let ciphertext =
             encrypt_next_message(&mut runner, recipient_hash, "after it announces").await;
