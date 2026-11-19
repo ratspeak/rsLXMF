@@ -6,8 +6,8 @@
 
 [![License: Reticulum License](https://img.shields.io/badge/license-Reticulum%20License-blue.svg)](LICENSE)
 [![Rust 1.89+](https://img.shields.io/badge/rust-1.89%2B-orange.svg)](https://www.rust-lang.org)
-[![Baseline: LXMF 1.3.0](https://img.shields.io/badge/baseline-LXMF%201.3.0-success.svg)](https://github.com/markqvist/LXMF)
-[![Reticulum 1.6.0](https://img.shields.io/badge/reticulum-1.6.0-blue.svg)](https://reticulum.network/)
+[![Baseline: LXMF 1.3.1](https://img.shields.io/badge/baseline-LXMF%201.3.1-success.svg)](https://github.com/markqvist/LXMF)
+[![Reticulum 1.6.1](https://img.shields.io/badge/reticulum-1.6.1-blue.svg)](https://reticulum.network/)
 [![Status](https://img.shields.io/badge/status-experimental-yellow.svg)](#feature-status)
 
 [LXMF Reference](https://github.com/markqvist/LXMF) |
@@ -37,7 +37,7 @@ reference's wire behavior release by release.
 
 ## Build It
 
-This guide describes the 1.5.0 release, [v1.5.0](https://github.com/ratspeak/rsLXMF/releases/tag/v1.5.0), built with rsReticulum [v1.5.0](https://github.com/ratspeak/rsReticulum/releases/tag/v1.5.0), the source line Ratspeak builds from.
+This guide describes the 1.5.1 release, [v1.5.1](https://github.com/ratspeak/rsLXMF/releases/tag/v1.5.1), built with rsReticulum [v1.5.1](https://github.com/ratspeak/rsReticulum/releases/tag/v1.5.1), the source line Ratspeak builds from.
 
 The current development layout for rsLXMF requires
 rsReticulum as a sibling directory/repo next to it, such as:
@@ -53,8 +53,8 @@ mkdir ratspeak-src
 cd ratspeak-src
 git clone https://github.com/ratspeak/rsReticulum
 git clone https://github.com/ratspeak/rsLXMF
-git -C rsReticulum checkout --detach v1.5.0
-git -C rsLXMF checkout --detach v1.5.0
+git -C rsReticulum checkout --detach v1.5.1
+git -C rsLXMF checkout --detach v1.5.1
 cd rsLXMF
 ```
 
@@ -291,7 +291,7 @@ Optional hash-list files live next to `<config-dir>/config`:
 Each file accepts one raw 32-character hex hash per line. The two files use different hash types. Propagation administration is separate: `control_allowed` contains authorized control identity hashes; the daemon’s own identity is also authorized. Client retrieval authorization does not make the node’s stored messages readable to other clients.
 
 Router state (delivered and processed transient IDs, stamp costs, and tickets)
-is kept in `<config-dir>/storage/lxmf/state.db`, the SQLite file LXMF 1.3.0 uses.
+is kept in `<config-dir>/storage/lxmf/state.db`, the SQLite file LXMF 1.3.1 uses.
 Received ratchets are kept
 by Reticulum in its own storage. These stores come from the default
 `sqlite-store` feature of `lxmf-core`; without it, router state lasts only for
@@ -358,7 +358,7 @@ All upstream `lxmd` flags are implemented: `--config`, `--rnsconfig`,
 Additional rsLXMF-only flags: `--send`, `--send-file`, `--send-method`,
 `--send-timeout-secs`, and `--send-fields-json`.
 
-rsLXMF 1.5.0 follows Python LXMF 1.3.0 with Reticulum 1.6.0, and
+rsLXMF 1.5.1 follows Python LXMF 1.3.1 with Reticulum 1.6.1, and
 `lxmd-rs --version` names both.
 
 ## License
