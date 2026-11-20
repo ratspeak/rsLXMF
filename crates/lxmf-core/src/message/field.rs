@@ -84,6 +84,13 @@ impl EncodedFieldValue {
     pub fn encoded(&self) -> &[u8] {
         &self.0
     }
+    /// For this crate's encoders, whose output is canonical by construction.
+    pub(crate) fn trusted(bytes: Bytes) -> Self {
+        Self(bytes)
+    }
+    pub(crate) fn into_bytes(self) -> Bytes {
+        self.0
+    }
 }
 /// A binary byte string or a native structured MessagePack value.
 #[derive(Debug, Clone, PartialEq, Eq)]

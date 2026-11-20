@@ -169,23 +169,38 @@ impl LxMessageDraft {
         id: impl Into<FieldId>,
         bytes: impl Into<Bytes>,
     ) -> Result<(), MessageError> {
-        self.set_field_value(
-            id,
-            FieldValue::MessagePack(EncodedFieldValue::canonical(bytes.into())?),
-        )
+        let value = EncodedFieldValue::canonical(bytes.into())?;
+        self.insert_field(id.into(), FieldValue::MessagePack(value))
     }
     pub fn set_field_value(
         &mut self,
         id: impl Into<FieldId>,
         value: FieldValue,
     ) -> Result<(), MessageError> {
-        let id = id.into();
         let value = match value {
-            FieldValue::MessagePack(v) => FieldValue::MessagePack(EncodedFieldValue::canonical(
-                Bytes::copy_from_slice(v.encoded()),
-            )?),
+            FieldValue::MessagePack(v) => {
+                FieldValue::MessagePack(EncodedFieldValue::canonical(v.into_bytes())?)
+            }
             binary => binary,
         };
+        self.insert_field(id.into(), value)
+    }
+    /// Encode one of this crate's media fields at its exact size, once.
+    fn set_media_field<T: serde::Serialize>(
+        &mut self,
+        id: FieldId,
+        value: &T,
+        bytes: usize,
+        name: usize,
+    ) -> Result<(), MessageError> {
+        self.limits.check_wire(bytes)?;
+        // Two array headers, a str header and a bin header: at most 12 bytes.
+        let mut encoded = Vec::with_capacity(bytes + name + 12);
+        rmp_serde::encode::write(&mut encoded, value).map_err(packed)?;
+        let value = EncodedFieldValue::trusted(encoded.into());
+        self.insert_field(id, FieldValue::MessagePack(value))
+    }
+    fn insert_field(&mut self, id: FieldId, value: FieldValue) -> Result<(), MessageError> {
         if !self.fields.contains_key(&id) && self.fields.len() >= self.limits.max_top_level_fields {
             return Err(MessageError::TooManyFields);
         }
@@ -207,24 +222,25 @@ impl LxMessageDraft {
         self.fields.remove(&id.into())
     }
     pub fn set_image_field(&mut self, format: &str, bytes: &[u8]) -> Result<(), MessageError> {
-        self.limits.check_wire(bytes.len())?;
-        let encoded = rmp_serde::to_vec(&ImageFieldRef { format, bytes }).map_err(packed)?;
-        self.set_msgpack_field(FIELD_IMAGE, encoded)
+        let value = ImageFieldRef { format, bytes };
+        self.set_media_field(FIELD_IMAGE.into(), &value, bytes.len(), format.len())
     }
     pub fn set_audio_field(&mut self, mode: u8, bytes: &[u8]) -> Result<(), MessageError> {
-        self.limits.check_wire(bytes.len())?;
-        let encoded = rmp_serde::to_vec(&AudioFieldRef { mode, bytes }).map_err(packed)?;
-        self.set_msgpack_field(FIELD_AUDIO, encoded)
+        let value = AudioFieldRef { mode, bytes };
+        self.set_media_field(FIELD_AUDIO.into(), &value, bytes.len(), 0)
     }
     pub fn set_file_attachment_field(
         &mut self,
         file_name: &str,
         bytes: &[u8],
     ) -> Result<(), MessageError> {
-        self.limits.check_wire(bytes.len())?;
-        let encoded =
-            rmp_serde::to_vec(&FileAttachmentsFieldRef { file_name, bytes }).map_err(packed)?;
-        self.set_msgpack_field(FIELD_FILE_ATTACHMENTS, encoded)
+        let value = FileAttachmentsFieldRef { file_name, bytes };
+        self.set_media_field(
+            FIELD_FILE_ATTACHMENTS.into(),
+            &value,
+            bytes.len(),
+            file_name.len(),
+        )
     }
     /// Exact unsigned payload, for diagnostics; it is not a transmittable message.
     pub fn pack_payload(&self) -> Result<Vec<u8>, MessageError> {
@@ -270,7 +286,7 @@ impl LxMessageDraft {
     pub fn sign(self, key: &Ed25519PrivateKey) -> Result<SignedLxMessage, MessageError> {
         self.sign_with(|bytes| Ok::<_, std::convert::Infallible>(key.sign(bytes)))
     }
-    pub fn sign_with<F, E>(self, sign: F) -> Result<SignedLxMessage, MessageError>
+    pub fn sign_with<F, E>(mut self, sign: F) -> Result<SignedLxMessage, MessageError>
     where
         F: FnOnce(&[u8]) -> Result<[u8; 64], E>,
         E: std::fmt::Display,
@@ -280,16 +296,19 @@ impl LxMessageDraft {
         signed.extend_from_slice(&self.destination);
         signed.extend_from_slice(&self.source);
         self.write_payload(&mut signed)?;
+        // The payload now lives in `signed` alone.
+        self.fields.clear();
         let id = sha256(&signed);
         signed.extend_from_slice(&id);
         let signature = sign(&signed).map_err(packed)?;
-        let mut wire = Vec::with_capacity(size);
-        wire.extend_from_slice(&self.destination);
-        wire.extend_from_slice(&self.source);
-        wire.extend_from_slice(&signature);
-        wire.extend_from_slice(&signed[32..signed.len() - 32]);
-        drop(signed);
-        let mut message = LxMessage::unpack_owned(wire.into(), self.limits)?;
+        // The wire in place: drop the id and open the signature after the
+        // two hashes. `size` is exactly the wire length, so nothing moves.
+        let payload_end = signed.len() - 32;
+        signed.truncate(payload_end);
+        signed.resize(size, 0);
+        signed.copy_within(32..payload_end, 96);
+        signed[32..96].copy_from_slice(&signature);
+        let mut message = LxMessage::unpack_owned(signed.into(), self.limits)?;
         message.metadata = self.metadata;
         message.incoming = false;
         message.state = MessageState::Outbound;

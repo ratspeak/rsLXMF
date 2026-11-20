@@ -962,3 +962,65 @@ fn container_is_a_named_map() {
         ]
     );
 }
+
+/// Media fields are written once at their size, and the bytes are the
+/// canonical encoding the generic msgpack path produces.
+#[test]
+fn media_fields_encode_canonically_in_one_pass() {
+    for (name, len) in [
+        ("a.bin", 3usize),
+        (&"n".repeat(40) as &str, 300),
+        ("é.jpg", 70_000),
+    ] {
+        let bytes: Vec<u8> = (0..len).map(|i| i as u8).collect();
+        let mut d = draft();
+        d.set_file_attachment_field(name, &bytes).unwrap();
+        d.set_image_field(name, &bytes).unwrap();
+        d.set_audio_field(7, &bytes).unwrap();
+        let reference = [
+            (
+                FIELD_FILE_ATTACHMENTS,
+                rmp_serde::to_vec(&FileAttachmentsFieldRef {
+                    file_name: name,
+                    bytes: &bytes,
+                }),
+            ),
+            (
+                FIELD_IMAGE,
+                rmp_serde::to_vec(&ImageFieldRef {
+                    format: name,
+                    bytes: &bytes,
+                }),
+            ),
+            (
+                FIELD_AUDIO,
+                rmp_serde::to_vec(&AudioFieldRef {
+                    mode: 7,
+                    bytes: &bytes,
+                }),
+            ),
+        ];
+        for (id, encoded) in reference {
+            let encoded = canonical::canonicalize(&encoded.unwrap()).unwrap();
+            let Some(FieldValue::MessagePack(value)) = d.get_field(id) else {
+                panic!("field {id} missing");
+            };
+            assert_eq!(
+                value.encoded(),
+                encoded.as_slice(),
+                "field {id}, {len} bytes"
+            );
+        }
+    }
+}
+
+/// The wire built in place is `destination, source, signature, payload`,
+/// signed over `destination, source, payload, id`.
+#[test]
+fn signing_builds_the_wire_in_place() {
+    let mut d = draft();
+    d.set_file_attachment_field("f", &[9; 5000]).unwrap();
+    let payload = d.pack_payload().unwrap();
+    let message = freeze(d);
+    assert_eq!(message.wire_bytes(), wire(&payload).as_slice());
+}
