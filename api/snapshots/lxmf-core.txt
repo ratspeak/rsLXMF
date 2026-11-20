@@ -1012,8 +1012,10 @@ pub fn lxmf_core::message::SignedLxMessage::content_text(&self) -> alloc::borrow
 pub fn lxmf_core::message::SignedLxMessage::destination_hash(&self) -> [u8; 16]
 pub fn lxmf_core::message::SignedLxMessage::fields(&self) -> lxmf_core::message::Fields<'_>
 pub fn lxmf_core::message::SignedLxMessage::finalize(self, core::option::Option<lxmf_core::message::RecipientStamp>) -> core::result::Result<lxmf_core::message::LxMessage, lxmf_core::message::MessageError>
+pub fn lxmf_core::message::SignedLxMessage::first_file_attachment(&self) -> core::result::Result<core::option::Option<(alloc::string::String, &[u8])>, lxmf_core::message::MessageError>
 pub fn lxmf_core::message::SignedLxMessage::generate_recipient_stamp(&self) -> core::result::Result<core::option::Option<lxmf_core::message::RecipientStamp>, lxmf_core::message::MessageError>
 pub fn lxmf_core::message::SignedLxMessage::generate_recipient_stamp_with(&self, &rns_identity::stamps::StampControl) -> core::result::Result<core::option::Option<lxmf_core::message::RecipientStamp>, lxmf_core::message::MessageError>
+pub fn lxmf_core::message::SignedLxMessage::image_attachment(&self) -> core::result::Result<core::option::Option<(alloc::string::String, &[u8])>, lxmf_core::message::MessageError>
 pub fn lxmf_core::message::SignedLxMessage::into_unstamped(self) -> lxmf_core::message::LxMessage
 pub fn lxmf_core::message::SignedLxMessage::message_id(&self) -> [u8; 32]
 pub fn lxmf_core::message::SignedLxMessage::outbound_ticket(&self) -> core::option::Option<[u8; 16]>
@@ -1308,8 +1310,10 @@ pub fn lxmf_core::message::SignedLxMessage::content_text(&self) -> alloc::borrow
 pub fn lxmf_core::message::SignedLxMessage::destination_hash(&self) -> [u8; 16]
 pub fn lxmf_core::message::SignedLxMessage::fields(&self) -> lxmf_core::message::Fields<'_>
 pub fn lxmf_core::message::SignedLxMessage::finalize(self, core::option::Option<lxmf_core::message::RecipientStamp>) -> core::result::Result<lxmf_core::message::LxMessage, lxmf_core::message::MessageError>
+pub fn lxmf_core::message::SignedLxMessage::first_file_attachment(&self) -> core::result::Result<core::option::Option<(alloc::string::String, &[u8])>, lxmf_core::message::MessageError>
 pub fn lxmf_core::message::SignedLxMessage::generate_recipient_stamp(&self) -> core::result::Result<core::option::Option<lxmf_core::message::RecipientStamp>, lxmf_core::message::MessageError>
 pub fn lxmf_core::message::SignedLxMessage::generate_recipient_stamp_with(&self, &rns_identity::stamps::StampControl) -> core::result::Result<core::option::Option<lxmf_core::message::RecipientStamp>, lxmf_core::message::MessageError>
+pub fn lxmf_core::message::SignedLxMessage::image_attachment(&self) -> core::result::Result<core::option::Option<(alloc::string::String, &[u8])>, lxmf_core::message::MessageError>
 pub fn lxmf_core::message::SignedLxMessage::into_unstamped(self) -> lxmf_core::message::LxMessage
 pub fn lxmf_core::message::SignedLxMessage::message_id(&self) -> [u8; 32]
 pub fn lxmf_core::message::SignedLxMessage::outbound_ticket(&self) -> core::option::Option<[u8; 16]>

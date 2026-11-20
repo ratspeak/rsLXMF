@@ -372,6 +372,14 @@ impl SignedLxMessage {
     pub fn fields(&self) -> Fields<'_> {
         self.message.fields()
     }
+    /// The first file attachment's name and bytes, borrowed from the wire.
+    pub fn first_file_attachment(&self) -> Result<Option<(String, &[u8])>, MessageError> {
+        self.message.first_file_attachment()
+    }
+    /// The image field's format and bytes, borrowed from the wire.
+    pub fn image_attachment(&self) -> Result<Option<(String, &[u8])>, MessageError> {
+        self.message.image_attachment()
+    }
     /// The signed, unstamped message, for failing it without a stamp.
     pub fn into_unstamped(self) -> LxMessage {
         self.message
