@@ -433,6 +433,20 @@ impl PropagationClient {
         self.delivery_limit = Some(limit_kb);
     }
 
+    /// The largest `/get` response a node keeping to the delivery limit can
+    /// send: it spends at most the limit on messages (LXMRouter.py
+    /// `message_get_request`), and the Link response adds its request id.
+    fn response_size_limit(&self) -> usize {
+        const RESPONSE_FRAMING: usize = 64;
+        self.delivery_limit
+            .filter(|limit| limit.is_finite() && *limit > 0.0)
+            .map_or(MAX_RESOURCE_SIZE, |limit| {
+                ((limit * 1000.0) as usize)
+                    .saturating_add(RESPONSE_FRAMING)
+                    .min(MAX_RESOURCE_SIZE)
+            })
+    }
+
     /// Trust this ID as a durable local have, with no expiry. It may authorize
     /// remote purge on the next download cycle unless retention is enabled.
     /// The caller must establish the durable local effect; this method does not verify it.
@@ -1469,10 +1483,19 @@ impl PropagationClient {
             return;
         }
 
+        let response_limit = self.response_size_limit();
+        if adv.data_size > response_limit {
+            tracing::warn!(
+                size = adv.data_size,
+                limit = response_limit,
+                "propagation node offered a response above the delivery limit"
+            );
+            self.fail();
+            return;
+        }
         if adv.flags.is_request
             || !adv.flags.encrypted
             || adv.flags.has_metadata
-            || adv.data_size > MAX_RESOURCE_SIZE
             || adv.total_segments == 0
             || adv.segment_index == 0
             || adv.segment_index > adv.total_segments
@@ -1814,6 +1837,7 @@ impl PropagationClient {
         route: Option<SegmentRoute>,
         metadata: Option<Vec<u8>>,
     ) {
+        let response_limit = self.response_size_limit();
         let Some(response) = self
             .request
             .as_mut()
@@ -1824,7 +1848,7 @@ impl PropagationClient {
         let Some(total) = response
             .assembled_bytes
             .checked_add(assembled.len())
-            .filter(|total| *total <= MAX_RESOURCE_SIZE && *total <= response.data_size)
+            .filter(|total| *total <= response_limit && *total <= response.data_size)
         else {
             self.fail();
             return;
@@ -3766,6 +3790,51 @@ mod tests {
         let first_progress = client.status.progress;
         client.handle_resource_part(&first_part);
         assert!(client.status.progress >= first_progress);
+    }
+
+    /// A node keeping to the delivery limit never sends more than the limit
+    /// plus framing, so a larger offer fails the sync before any part arrives.
+    #[test]
+    fn get_response_above_the_delivery_limit_is_refused_when_offered() {
+        for (payload_len, accepted) in [(2_064, true), (2_065, false)] {
+            let (tx, _rx) = mpsc::channel(64);
+            let mut client = PropagationClient::new(tx, None, None);
+            client.set_delivery_limit(2.0);
+            let (initiator, responder) = active_link_pair([0xE4; 16]);
+            client.link_id = Some(initiator.link_id);
+            client.link = Some(initiator);
+            client.status.state = PropagationClientState::GetRequested;
+            client.request = Some(PendingRequest {
+                link_id: client.link_id.unwrap(),
+                generation: 1,
+                id: [0x45; 16],
+                kind: RequestKind::Get(0, 0),
+                sender_active: false,
+                outbound: None,
+                response: None,
+                waiting_since: Some(Instant::now()),
+                timeout: Duration::from_secs(60),
+            });
+            let mut sender = OutboundTransfer::new_encrypted(
+                vec![0xAB; payload_len],
+                false,
+                Duration::from_millis(50),
+                responder.session_keys().unwrap(),
+            )
+            .unwrap();
+            sender.resource.flags.is_response = true;
+            sender.resource.request_id = Some(vec![0x45; 16]);
+            let TransferAction::SendAdvertisement(advertisement) = sender.tick() else {
+                panic!("expected a Resource advertisement");
+            };
+            client.handle_resource_advertisement(&responder.encrypt(&advertisement).unwrap());
+            let state = client.status.state;
+            assert_eq!(
+                state == PropagationClientState::Receiving,
+                accepted,
+                "{payload_len}: {state:?}"
+            );
+        }
     }
 
     #[test]
