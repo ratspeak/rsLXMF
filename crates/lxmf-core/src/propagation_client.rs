@@ -433,11 +433,18 @@ impl PropagationClient {
         self.delivery_limit = Some(limit_kb);
     }
 
-    /// The largest `/get` response a node keeping to the delivery limit can
-    /// send: it spends at most the limit on messages (LXMRouter.py
-    /// `message_get_request`), and the Link response adds its request id.
+    /// The largest response a node keeping to upstream's accounting can send.
+    /// Only a message `/get` spends the delivery limit (LXMRouter.py
+    /// `message_get_request`); the ID list is unbounded there. The Link response
+    /// adds its request id.
     fn response_size_limit(&self) -> usize {
         const RESPONSE_FRAMING: usize = 64;
+        if !matches!(
+            self.request.as_ref().map(|request| request.kind),
+            Some(RequestKind::Get(..))
+        ) {
+            return MAX_RESOURCE_SIZE;
+        }
         self.delivery_limit
             .filter(|limit| limit.is_finite() && *limit > 0.0)
             .map_or(MAX_RESOURCE_SIZE, |limit| {
@@ -3794,21 +3801,26 @@ mod tests {
 
     /// A node keeping to the delivery limit never sends more than the limit
     /// plus framing, so a larger offer fails the sync before any part arrives.
+    /// The ID list is not bounded by it.
     #[test]
     fn get_response_above_the_delivery_limit_is_refused_when_offered() {
-        for (payload_len, accepted) in [(2_064, true), (2_065, false)] {
+        for (kind, payload_len, accepted) in [
+            (RequestKind::Get(0, 0), 2_064, true),
+            (RequestKind::Get(0, 0), 2_065, false),
+            (RequestKind::List, 2_065, true),
+        ] {
             let (tx, _rx) = mpsc::channel(64);
             let mut client = PropagationClient::new(tx, None, None);
             client.set_delivery_limit(2.0);
             let (initiator, responder) = active_link_pair([0xE4; 16]);
             client.link_id = Some(initiator.link_id);
             client.link = Some(initiator);
-            client.status.state = PropagationClientState::GetRequested;
+            client.status.state = kind.state();
             client.request = Some(PendingRequest {
                 link_id: client.link_id.unwrap(),
                 generation: 1,
                 id: [0x45; 16],
-                kind: RequestKind::Get(0, 0),
+                kind,
                 sender_active: false,
                 outbound: None,
                 response: None,
@@ -3832,7 +3844,7 @@ mod tests {
             assert_eq!(
                 state == PropagationClientState::Receiving,
                 accepted,
-                "{payload_len}: {state:?}"
+                "{kind:?} {payload_len}: {state:?}"
             );
         }
     }
